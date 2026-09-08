@@ -140,12 +140,13 @@ class UploadInfo(BaseModel):
 # =============================================================================
 
 
-def _get_db() -> Any:
-    # Same late import the routers use (orchestrator/routers/contacts.py):
-    # main imports this module, so the db handle is resolved per call.
-    import orchestrator.main
-
-    return orchestrator.main.postgres_db
+def _store(request: Request) -> Any:
+    # The store belongs to the application handling *this* request, published
+    # as `app.state.store` by composition. Reading it here rather than importing
+    # `orchestrator.main` keeps this module free of the application module while
+    # still resolving per call — the handle is rebound during `lifespan`
+    # (R1.B03 caller-boundary closure; same shape as `auth/bff.py` in B02).
+    return request.app.state.store
 
 
 async def _authenticate(request: Request) -> Optional[dict[str, Any]]:
@@ -157,7 +158,7 @@ async def _authenticate(request: Request) -> Optional[dict[str, Any]]:
     """
     if is_internal_call(request):
         return None
-    return await require_approved_user(request, _get_db())
+    return await require_approved_user(request, _store(request))
 
 
 def _validate_upload_id(upload_id: str) -> str:

@@ -9,6 +9,8 @@ field mapping), then the orchestration with AsyncMock deps.
 """
 
 import asyncio
+import logging
+import re
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -18,6 +20,8 @@ from shared.runtime.services.knowledge_store import KbWatermark
 from shared.runtime.knowledge.chunker import CHUNKER_VERSION, note_centroid
 from shared.runtime.knowledge.gardener import parse_note_md
 
+from orchestrator.services.kb_task_registry import KbDatasourceTaskRegistry
+from orchestrator.services.knowledge_index import KnowledgeIndexDependencies
 from orchestrator.services.kb_reindex import (
     FIRST_SWEEP_DELAY_SECONDS,
     SWEEP_TICK_SECONDS,
@@ -2745,11 +2749,16 @@ class TestPostJobReindexTriggerResolvesItsOwnRepo:
             "guard with it rather than deleting it (see §10a)."
         )
         body = _function_body(src, "async def _record_loop_job_outcome")
-        assert "_reindex_project_kb(pid)" in body, (
-            "The post-job KB trigger must call _reindex_project_kb without a "
-            "repo_name so it resolves the vault repo itself. Passing the job's "
-            "repo_name pins it to an execution repo and wipes the chunk index for "
-            "any project with a knowledge repo. See §10a."
+        # R1.B03 moved the callee to orchestrator.services.knowledge_index and
+        # dropped its leading underscore; the caller is still here, so the guard
+        # stays here too. Compare whitespace-insensitively — the call is wrapped
+        # across lines now, and formatting is not the thing under test.
+        compact = re.sub(r"\s+", "", body)
+        assert "reindex_project_kb(pid,dependencies=" in compact, (
+            "The post-job KB trigger must call reindex_project_kb with the "
+            "project id and no repo_name so it resolves the vault repo itself. "
+            "Passing the job's repo_name pins it to an execution repo and wipes "
+            "the chunk index for any project with a knowledge repo. See §10a."
         )
         assert "repo_name=" not in body, (
             "repo_name= reappeared in the post-job KB trigger — this is the "
@@ -2766,31 +2775,49 @@ class TestPostJobReindexTriggerResolvesItsOwnRepo:
         )
 
 
+def _index_deps(db) -> KnowledgeIndexDependencies:
+    """What main's ``_knowledge_index_dependencies()`` factory hands the op.
+
+    ``store`` is the app pool the projection ledger is settled through
+    (formerly ``orchestrator.main.postgres_db``) and ``vector_db`` the pgvector
+    pool the KnowledgeStore is built on (formerly
+    ``orchestrator.main.vector_db``); both used to arrive as patched module
+    globals.
+    """
+    return KnowledgeIndexDependencies(
+        store=db,
+        vector_db=MagicMock(),
+        gitea_client=MagicMock(),
+        logger=logging.getLogger("tests.kb_reindex"),
+        tasks=KbDatasourceTaskRegistry(),
+        inject_system_kb_embedding_profile=AsyncMock(return_value=None),
+    )
+
+
 class TestManualReindexProjectionSettlement:
     """A successful direct reindex closes the same ledger as the sweep."""
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("status", ["completed", "up-to-date"])
     async def test_success_settles_latest_canonical_intents(self, status):
-        from orchestrator.main import _reindex_project_kb
+        from orchestrator.services.knowledge_index import reindex_project_kb
 
         project_id = str(uuid.uuid4())
         db = AsyncMock()
         db.mark_knowledge_projections_synced.return_value = 2
         reindex = AsyncMock(return_value={"status": status, "upserted": 1})
         with (
-            patch("orchestrator.main.postgres_db", db),
-            patch("orchestrator.main.vector_db", MagicMock()),
             patch(
-                "orchestrator.main._build_kb_embedding_service",
+                "orchestrator.services.knowledge_index.build_kb_embedding_service",
                 AsyncMock(return_value=MagicMock()),
             ),
             patch("orchestrator.services.kb_reindex.reindex_kb", reindex),
         ):
-            result = await _reindex_project_kb(
+            result = await reindex_project_kb(
                 project_id,
                 repo_name="project-knowledge",
                 branch="main",
+                dependencies=_index_deps(db),
             )
 
         assert result["status"] == status
@@ -2799,15 +2826,13 @@ class TestManualReindexProjectionSettlement:
 
     @pytest.mark.asyncio
     async def test_partial_reindex_does_not_claim_projection_convergence(self):
-        from orchestrator.main import _reindex_project_kb
+        from orchestrator.services.knowledge_index import reindex_project_kb
 
         project_id = str(uuid.uuid4())
         db = AsyncMock()
         with (
-            patch("orchestrator.main.postgres_db", db),
-            patch("orchestrator.main.vector_db", MagicMock()),
             patch(
-                "orchestrator.main._build_kb_embedding_service",
+                "orchestrator.services.knowledge_index.build_kb_embedding_service",
                 AsyncMock(return_value=MagicMock()),
             ),
             patch(
@@ -2815,10 +2840,11 @@ class TestManualReindexProjectionSettlement:
                 AsyncMock(return_value={"status": "partial", "errors": 1}),
             ),
         ):
-            result = await _reindex_project_kb(
+            result = await reindex_project_kb(
                 project_id,
                 repo_name="project-knowledge",
                 branch="main",
+                dependencies=_index_deps(db),
             )
 
         assert result == {"status": "partial", "errors": 1}

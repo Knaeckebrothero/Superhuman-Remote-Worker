@@ -7,9 +7,10 @@ project-create gate. R1.B03 owns the endpoint, so it owned the defect.
 
 The failure was never the forge. With Gitea disabled the endpoint skips
 knowledge-repo provisioning through a guard that is already there
-(``gitea_client.is_initialized``); ``test_disabled_forge_alone_does_not_fail_project_create``
+(``forge.is_initialized``);
+``test_disabled_forge_alone_does_not_fail_project_create``
 isolates that and is the control for everything else here. The 500 came from
-the *cloud* step: ``_ensure_project_cloud_resources`` called
+the *cloud* step: ``ensure_project_cloud_resources`` called
 ``main_cloud_router.for_owner()`` outside its own ``try``, and that raises
 ``FeatureNotAvailable`` when no active backend instance has been bound — while
 every other remote effect in the helper is wrapped and logs, and the sibling
@@ -26,24 +27,28 @@ A real failure must still be a real failure, so
 ``test_a_genuine_store_failure_still_surfaces`` pins that the blanket 500 has
 not been turned into a blanket swallow.
 
-Written against the current owner (``orchestrator.main``) so it can be
-re-pointed at the extracted owner and keep meaning the same thing on both sides
-of the R1.B03 move.
+Re-pointed by R1.B03 lane P at the extracted owner
+(``orchestrator.services.projects.create_project`` over
+``orchestrator.services.project_provisioning``), which is where the endpoint's
+body now lives. Every assertion is the one written against ``orchestrator.main``
+and means the same thing: the collaborators that used to be patched module
+globals are now injected values, so the fakes are handed in rather than
+monkeypatched, and the caller's identity is supplied directly instead of
+through the gate the router owns.
 """
 
 from __future__ import annotations
 
-from contextlib import ExitStack
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
 import pytest
 from fastapi import HTTPException
 
-from orchestrator import main
 from orchestrator.schemas.projects import ProjectCreate
+from orchestrator.services import project_provisioning, projects
 from orchestrator.services.cloud.errors import FeatureNotAvailable
 
 
@@ -93,26 +98,38 @@ def _uninitialised_cloud_router() -> MagicMock:
     return router
 
 
-def _patched(db: MagicMock, cloud: MagicMock) -> ExitStack:
-    stack = ExitStack()
-    stack.enter_context(
-        patch(
-            "orchestrator.main.require_approved_user", AsyncMock(return_value=_owner())
-        )
+def _with_validated_tool_overrides(value: Any) -> Any:
+    """The application injects its own; this body sends no ``tools`` block."""
+    return value
+
+
+def _dependencies(db: MagicMock, cloud: MagicMock) -> projects.ProjectDependencies:
+    """The minimal profile, wired as values instead of patched globals.
+
+    The forge is off exactly as `values-e2e.yaml` ships it: `is_initialized` is
+    False, so no knowledge repo is provisioned. Keycloak is off for the same
+    reason.
+    """
+    forge = SimpleNamespace(is_initialized=False)
+    keycloak = SimpleNamespace(is_initialized=False)
+    return projects.ProjectDependencies(
+        store=db,
+        vector_db=MagicMock(),
+        forge=forge,
+        keycloak_groups=keycloak,
+        main_cloud_router=cloud,
+        logger=MagicMock(),
+        provisioning=project_provisioning.ProjectProvisioningDependencies(
+            store=db,
+            forge=forge,
+            keycloak_groups=keycloak,
+            main_cloud_router=cloud,
+            logger=MagicMock(),
+            repair=project_provisioning.ProjectRepairState(),
+            knowledge_index=MagicMock(),
+        ),
+        with_validated_tool_overrides=_with_validated_tool_overrides,
     )
-    stack.enter_context(patch("orchestrator.main.postgres_db", db))
-    stack.enter_context(patch("orchestrator.main.main_cloud_router", cloud))
-    # The forge is off in the minimal profile, exactly as `values-e2e.yaml`
-    # ships it: `is_initialized` is False, so no knowledge repo is provisioned.
-    stack.enter_context(
-        patch("orchestrator.main.gitea_client", SimpleNamespace(is_initialized=False))
-    )
-    stack.enter_context(
-        patch(
-            "orchestrator.main.keycloak_groups", SimpleNamespace(is_initialized=False)
-        )
-    )
-    return stack
 
 
 def _body() -> ProjectCreate:
@@ -132,10 +149,10 @@ async def test_create_project_succeeds_without_cloud_and_leaves_no_orphan_rows()
     """
     db = _store()
     cloud = _uninitialised_cloud_router()
-    request = MagicMock()
 
-    with _patched(db, cloud):
-        project = await main.create_project(_body(), request)
+    project = await projects.create_project(
+        _body(), user=_owner(), dependencies=_dependencies(db, cloud)
+    )
 
     assert project["id"] == PROJECT_ID
     assert project["name"] == "Minimal profile project"
@@ -180,11 +197,11 @@ async def test_a_genuine_store_failure_still_surfaces() -> None:
     db = _store()
     db.add_project_member = AsyncMock(side_effect=RuntimeError("membership write lost"))
     cloud = _uninitialised_cloud_router()
-    request = MagicMock()
 
-    with _patched(db, cloud):
-        with pytest.raises(HTTPException) as raised:
-            await main.create_project(_body(), request)
+    with pytest.raises(HTTPException) as raised:
+        await projects.create_project(
+            _body(), user=_owner(), dependencies=_dependencies(db, cloud)
+        )
 
     assert raised.value.status_code == 500
     assert "membership write lost" in str(raised.value.detail)
@@ -203,10 +220,10 @@ async def test_a_configured_but_unreachable_cloud_still_degrades() -> None:
     backend = MagicMock()
     backend.is_initialized = False
     cloud.for_owner.return_value = backend
-    request = MagicMock()
 
-    with _patched(db, cloud):
-        project = await main.create_project(_body(), request)
+    project = await projects.create_project(
+        _body(), user=_owner(), dependencies=_dependencies(db, cloud)
+    )
 
     assert project["id"] == PROJECT_ID
     db.update_project.assert_not_awaited()
@@ -226,10 +243,10 @@ async def test_disabled_forge_alone_does_not_fail_project_create() -> None:
     backend.is_initialized = False
     cloud.for_owner.return_value = backend
     cloud.for_project_optional.return_value = backend
-    request = MagicMock()
 
-    with _patched(db, cloud):
-        project = await main.create_project(_body(), request)
+    project = await projects.create_project(
+        _body(), user=_owner(), dependencies=_dependencies(db, cloud)
+    )
 
     assert project["id"] == PROJECT_ID
     db.create_project.assert_awaited_once()

@@ -185,6 +185,54 @@ source_modules = [
 forbidden_modules = ["orchestrator.main"]
 
 [[tool.importlinter.contracts]]
+name = "Projects, datasources, knowledge and citations do not import application startup"
+type = "forbidden"
+source_modules = [
+    "orchestrator.services.datasource_config",
+    "orchestrator.services.datasources",
+    "orchestrator.services.kb_task_registry",
+    "orchestrator.services.knowledge_index",
+    "orchestrator.services.knowledge_projection",
+    "orchestrator.services.knowledge_operations",
+    "orchestrator.services.citations",
+    "orchestrator.services.projects",
+    "orchestrator.services.project_provisioning",
+    "orchestrator.routers.datasources",
+    "orchestrator.routers.knowledge",
+    "orchestrator.routers.citations",
+    "orchestrator.routers.media",
+    "orchestrator.routers.projects",
+    "orchestrator.schemas.media",
+]
+forbidden_modules = ["orchestrator.main"]
+# Two *indirect* chains reach main from here, both through a module another
+# batch owns and both already recorded in the caller ledger. Ignoring the two
+# exact edges — rather than setting `allow_indirect_imports` — keeps every
+# other transitive path checked, so a new one would still fail this contract.
+# No B03 module imports main directly; that is what the poisoned-import cases
+# in tests/test_import_boundaries.py exercise.
+ignore_imports = [
+    # B10 owns this one (services/session_wake.py:919, a lazy import inside a
+    # function). Reached from every router through orchestrator.security.access
+    # -> services.sudo_gate.
+    "orchestrator.services.session_wake -> orchestrator.main",
+    # B07 owns this one (services/project_backlog.py:427,546). Reached from the
+    # datasource and knowledge services through kb_datasources -> kb_reindex ->
+    # kb_materialize.
+    "orchestrator.services.project_backlog -> orchestrator.main",
+    # B06 owns this one (services/session_lifecycle.py:48). Reached the same way
+    # as session_wake, through security.access -> sudo_gate -> session_wake.
+    "orchestrator.services.session_lifecycle -> orchestrator.main",
+    # B07 owns this one (services/sitrep.py:115,128).
+    "orchestrator.services.sitrep -> orchestrator.main",
+]
+# tests/test_import_boundaries.py lints a synthetic tree that contains only the
+# stub modules a contract names, so none of the four edges above exists there.
+# Warn rather than error on an unmatched ignore, or the poisoned-import cases
+# could never run. The real-tree run is what these entries are for.
+unmatched_ignore_imports_alerting = "warn"
+
+[[tool.importlinter.contracts]]
 name = "Shared initializer stays lightweight"
 type = "forbidden"
 # Check the root initializer separately without including its child packages.

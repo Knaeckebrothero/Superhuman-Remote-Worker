@@ -98,7 +98,7 @@ def lint_boundaries(root):
 def test_allowed_runtime_and_lightweight_dependencies_pass(boundary_tree):
     result = lint_boundaries(boundary_tree)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "Contracts: 14 kept, 0 broken" in result.stdout
+    assert "Contracts: 15 kept, 0 broken" in result.stdout
 
 
 @pytest.mark.parametrize(
@@ -170,6 +170,21 @@ def test_allowed_runtime_and_lightweight_dependencies_pass(boundary_tree):
         ("orchestrator/routers/system_settings.py", "orchestrator.main"),
         ("orchestrator/routers/user_administration.py", "orchestrator.main"),
         ("orchestrator/routers/job_diagnostics.py", "orchestrator.main"),
+        ("orchestrator/services/datasource_config.py", "orchestrator.main"),
+        ("orchestrator/services/datasources.py", "orchestrator.main"),
+        ("orchestrator/services/kb_task_registry.py", "orchestrator.main"),
+        ("orchestrator/services/knowledge_index.py", "orchestrator.main"),
+        ("orchestrator/services/knowledge_projection.py", "orchestrator.main"),
+        ("orchestrator/services/knowledge_operations.py", "orchestrator.main"),
+        ("orchestrator/services/citations.py", "orchestrator.main"),
+        ("orchestrator/services/projects.py", "orchestrator.main"),
+        ("orchestrator/services/project_provisioning.py", "orchestrator.main"),
+        ("orchestrator/routers/datasources.py", "orchestrator.main"),
+        ("orchestrator/routers/knowledge.py", "orchestrator.main"),
+        ("orchestrator/routers/citations.py", "orchestrator.main"),
+        ("orchestrator/routers/media.py", "orchestrator.main"),
+        ("orchestrator/routers/projects.py", "orchestrator.main"),
+        ("orchestrator/schemas/media.py", "orchestrator.main"),
         ("vm_controller/app.py", "headscale_client"),
     ],
 )

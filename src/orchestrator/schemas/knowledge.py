@@ -48,6 +48,25 @@ class KnowledgeMaterializeRequest(BaseModel):
     )
 
 
+class KnowledgeDeleteRequest(BaseModel):
+    """Request body for the internal purge of one note (agent/purge callers)."""
+
+    slug: str = Field(..., description="Note id — knowledge/<slug>.md in the KB repo")
+    job_id: str | None = Field(
+        None, description="Calling job UUID, for commit attribution"
+    )
+    reason: str | None = Field(
+        None, description="Why — journaled in the commit message"
+    )
+    expected_blob_sha: str | None = Field(
+        None,
+        description=(
+            "Compare-and-swap token: the blob SHA the caller read. The delete is "
+            "refused (failed/precondition-failed) if the repo holds another blob."
+        ),
+    )
+
+
 class KnowledgeProjectionRequest(BaseModel):
     """Internal report of the projection leg of a canonical mutation."""
 

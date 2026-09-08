@@ -800,7 +800,8 @@ class TestGatedReadEndpoints:
     async def test_list_job_citations_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from orchestrator.main import list_job_citations
+        from orchestrator.main import _citations_dependencies
+        from orchestrator.routers.citations import list_job_citations
 
         with (
             _patch_caller_and_db(user_b, fake_db),
@@ -814,6 +815,7 @@ class TestGatedReadEndpoints:
                     status=None,
                     limit=50,
                     offset=0,
+                    dependencies=_citations_dependencies(),
                 )
         assert exc.value.status_code == 403
 
@@ -821,7 +823,8 @@ class TestGatedReadEndpoints:
     async def test_list_job_memories_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from orchestrator.main import list_job_memories
+        from orchestrator.main import _citations_dependencies
+        from orchestrator.routers.citations import list_job_memories
 
         with (
             _patch_caller_and_db(user_b, fake_db),
@@ -838,6 +841,7 @@ class TestGatedReadEndpoints:
                     sort_order="desc",
                     limit=50,
                     offset=0,
+                    dependencies=_citations_dependencies(),
                 )
         assert exc.value.status_code == 403
 
@@ -845,35 +849,46 @@ class TestGatedReadEndpoints:
     async def test_get_memory_stats_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from orchestrator.main import get_memory_stats
+        from orchestrator.main import _citations_dependencies
+        from orchestrator.routers.citations import get_memory_stats
 
         with (
             _patch_caller_and_db(user_b, fake_db),
             patch("orchestrator.main.vector_db", _make_dud("vector_db")),
         ):
             with pytest.raises(HTTPException) as exc:
-                await get_memory_stats(fake_request, str(job_a["id"]))
+                await get_memory_stats(
+                    fake_request,
+                    str(job_a["id"]),
+                    dependencies=_citations_dependencies(),
+                )
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
     async def test_get_citation_stats_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from orchestrator.main import get_citation_stats
+        from orchestrator.main import _citations_dependencies
+        from orchestrator.routers.citations import get_citation_stats
 
         with (
             _patch_caller_and_db(user_b, fake_db),
             patch("orchestrator.main.vector_db", _make_dud("vector_db")),
         ):
             with pytest.raises(HTTPException) as exc:
-                await get_citation_stats(fake_request, str(job_a["id"]))
+                await get_citation_stats(
+                    fake_request,
+                    str(job_a["id"]),
+                    dependencies=_citations_dependencies(),
+                )
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
     async def test_search_job_sources_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from orchestrator.main import search_job_sources
+        from orchestrator.main import _citations_dependencies
+        from orchestrator.routers.citations import search_job_sources
 
         with (
             _patch_caller_and_db(user_b, fake_db),
@@ -888,6 +903,7 @@ class TestGatedReadEndpoints:
                     source_type=None,
                     tags=None,
                     top_k=10,
+                    dependencies=_citations_dependencies(),
                 )
         assert exc.value.status_code == 403
 
@@ -1211,28 +1227,40 @@ class TestJobMutationGates:
     async def test_get_source_annotations_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from orchestrator.main import get_source_annotations
+        from orchestrator.main import _citations_dependencies
+        from orchestrator.routers.citations import get_source_annotations
 
         with (
             _patch_caller_and_db(user_b, fake_db),
             patch("orchestrator.main.vector_db", _make_dud("vector_db")),
         ):
             with pytest.raises(HTTPException) as exc:
-                await get_source_annotations(fake_request, str(job_a["id"]), 1)
+                await get_source_annotations(
+                    fake_request,
+                    str(job_a["id"]),
+                    1,
+                    dependencies=_citations_dependencies(),
+                )
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
     async def test_get_source_tags_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from orchestrator.main import get_source_tags
+        from orchestrator.main import _citations_dependencies
+        from orchestrator.routers.citations import get_source_tags
 
         with (
             _patch_caller_and_db(user_b, fake_db),
             patch("orchestrator.main.vector_db", _make_dud("vector_db")),
         ):
             with pytest.raises(HTTPException) as exc:
-                await get_source_tags(fake_request, str(job_a["id"]), 1)
+                await get_source_tags(
+                    fake_request,
+                    str(job_a["id"]),
+                    1,
+                    dependencies=_citations_dependencies(),
+                )
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
@@ -1274,7 +1302,9 @@ class TestJobMutationGates:
     async def test_promote_job_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from orchestrator.main import PromoteRequest, promote_job
+        from orchestrator.main import _projects_dependencies
+        from orchestrator.routers.projects import promote_job
+        from orchestrator.schemas.projects import PromoteRequest
 
         body = PromoteRequest(
             name="hijack",
@@ -1284,7 +1314,12 @@ class TestJobMutationGates:
         )
         with _patch_caller_and_db(user_b, fake_db):
             with pytest.raises(HTTPException) as exc:
-                await promote_job(fake_request, str(job_a["id"]), body)
+                await promote_job(
+                    fake_request,
+                    str(job_a["id"]),
+                    body,
+                    dependencies=_projects_dependencies(),
+                )
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
@@ -1294,7 +1329,9 @@ class TestJobMutationGates:
         """Owner promotes their own job; the gate accepts user_a, and the
         handler must overwrite body.user_id with caller.id so a malicious body
         can't grant ownership of the new project to someone else."""
-        from orchestrator.main import PromoteRequest, promote_job
+        from orchestrator.main import _projects_dependencies
+        from orchestrator.routers.projects import promote_job
+        from orchestrator.schemas.projects import PromoteRequest
 
         body = PromoteRequest(
             name="hijack-attempt",
@@ -1308,7 +1345,12 @@ class TestJobMutationGates:
         # assert body.user_id was forced.
         with _patch_caller_and_db(user_a, fake_db):
             with pytest.raises(HTTPException) as exc:
-                await promote_job(fake_request, str(job_a["id"]), body)
+                await promote_job(
+                    fake_request,
+                    str(job_a["id"]),
+                    body,
+                    dependencies=_projects_dependencies(),
+                )
         assert exc.value.status_code == 400
         assert str(body.user_id) == str(user_a["id"])
 

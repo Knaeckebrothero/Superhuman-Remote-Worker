@@ -17,14 +17,21 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import logging
 import uuid
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
 
 import orchestrator.security.access as access_module
+from orchestrator.routers.knowledge import KnowledgeDependencies
+from orchestrator.security.access import require_project_member
+from orchestrator.services.kb_task_registry import KbDatasourceTaskRegistry
+from orchestrator.services.knowledge_index import KnowledgeIndexDependencies
+from orchestrator.services.knowledge_operations import KnowledgeOperationDependencies
 from orchestrator.services.kb_materialize import (
     materialize_knowledge_metadata_update,
     materialize_knowledge_note,
@@ -40,6 +47,53 @@ REPO = "project-1a387b4d-knowledge"
 SLUG = "chose-jwt-over-oauth"
 PATH = "knowledge/chose-jwt-over-oauth.md"
 BODY = "---\nid: chose-jwt-over-oauth\n---\n\n# Chose JWT\n"
+
+
+def _knowledge_deps(
+    *,
+    store=None,
+    gitea=None,
+    vector=None,
+    graph=None,
+    member_gate=None,
+) -> KnowledgeDependencies:
+    """Exactly what main's ``_knowledge_dependencies()`` factory composes.
+
+    Before R1.B03 each of these arrived by patching a module global on
+    ``orchestrator.main`` — ``postgres_db``, ``gitea_client``, ``vector_db``,
+    ``_get_knowledge_graph``, ``require_project_member``. The router handler
+    now takes them through this dataclass, so the same objects are passed in
+    here. ``member_gate=None`` leaves the dataclass default in place, which is
+    the REAL ``require_project_member``; ``require_internal`` is always left
+    real, because the ``X-Internal-Key`` tests below are about that gate.
+    """
+    log = logging.getLogger("tests.kb_materialize")
+    vector = MagicMock() if vector is None else vector
+    store = AsyncMock() if store is None else store
+    gitea = MagicMock() if gitea is None else gitea
+    return KnowledgeDependencies(
+        store=store,
+        operations=KnowledgeOperationDependencies(
+            store=store,
+            vector_db=vector,
+            gitea_client=gitea,
+            logger=log,
+            # No Neo4j attached, which is what the old
+            # `_get_knowledge_graph -> None` patches modelled.
+            graph=SimpleNamespace(get=lambda: None) if graph is None else graph,
+            knowledge_index=KnowledgeIndexDependencies(
+                store=store,
+                vector_db=vector,
+                gitea_client=gitea,
+                logger=log,
+                tasks=KbDatasourceTaskRegistry(),
+                inject_system_kb_embedding_profile=AsyncMock(return_value=None),
+            ),
+        ),
+        require_project_member=(
+            require_project_member if member_gate is None else member_gate
+        ),
+    )
 
 
 def _blob_sha(text: str) -> str:
@@ -554,23 +608,22 @@ class TestCompareAndSwap:
 
     @pytest.mark.asyncio
     async def test_endpoint_forwards_the_token(self, fake_request):
-        from orchestrator.main import (
-            KnowledgeMaterializeRequest,
-            materialize_knowledge_note,
-        )
+        from orchestrator.routers.knowledge import materialize_knowledge_note
+        from orchestrator.schemas.knowledge import KnowledgeMaterializeRequest
 
         g = _make_gitea(tree_paths={PATH: _blob_sha(BODY)})
         fake_request.headers = {"X-Internal-Key": "secret"}
         body = KnowledgeMaterializeRequest(
             slug=SLUG, content=self.NEW_BODY, job_id=JOB, expected_blob_sha="e" * 40
         )
+        deps = _knowledge_deps(store=_ledger_db(), gitea=g)
         with (
             patch.object(access_module, "_INTERNAL_KEY", "secret"),
-            patch("orchestrator.main.postgres_db", _ledger_db()),
-            patch("orchestrator.main.gitea_client", g),
             _patch_resolve(_ref()),
         ):
-            result = await materialize_knowledge_note(fake_request, PROJECT, body)
+            result = await materialize_knowledge_note(
+                fake_request, PROJECT, body, dependencies=deps
+            )
         assert result["reason"] == "precondition-failed"
         g.change_files.assert_not_awaited()
 
@@ -1179,37 +1232,36 @@ class TestMaterializeEndpoint:
     @pytest.mark.asyncio
     async def test_rejects_calls_without_the_internal_key(self, fake_request):
         """Agent-internal (P4b): same gate as the job /complete callback."""
-        from orchestrator.main import (
-            KnowledgeMaterializeRequest,
-            materialize_knowledge_note,
-        )
+        from orchestrator.routers.knowledge import materialize_knowledge_note
+        from orchestrator.schemas.knowledge import KnowledgeMaterializeRequest
 
         fake_request.headers = {}
         body = KnowledgeMaterializeRequest(slug=SLUG, content=BODY, job_id=JOB)
         with patch.object(access_module, "_INTERNAL_KEY", "secret"):
             with pytest.raises(HTTPException) as exc:
-                await materialize_knowledge_note(fake_request, PROJECT, body)
+                await materialize_knowledge_note(
+                    fake_request, PROJECT, body, dependencies=_knowledge_deps()
+                )
         assert exc.value.status_code == 401
 
     @pytest.mark.asyncio
     async def test_internal_call_commits_and_returns_the_service_result(
         self, fake_request
     ):
-        from orchestrator.main import (
-            KnowledgeMaterializeRequest,
-            materialize_knowledge_note,
-        )
+        from orchestrator.routers.knowledge import materialize_knowledge_note
+        from orchestrator.schemas.knowledge import KnowledgeMaterializeRequest
 
         g = _make_gitea()
         fake_request.headers = {"X-Internal-Key": "secret"}
         body = KnowledgeMaterializeRequest(slug=SLUG, content=BODY, job_id=JOB)
+        deps = _knowledge_deps(store=_ledger_db(), gitea=g)
         with (
             patch.object(access_module, "_INTERNAL_KEY", "secret"),
-            patch("orchestrator.main.postgres_db", _ledger_db()),
-            patch("orchestrator.main.gitea_client", g),
             _patch_resolve(_ref()),
         ):
-            result = await materialize_knowledge_note(fake_request, PROJECT, body)
+            result = await materialize_knowledge_note(
+                fake_request, PROJECT, body, dependencies=deps
+            )
 
         assert result["status"] == "committed"
         assert result["path"] == PATH
@@ -1218,21 +1270,20 @@ class TestMaterializeEndpoint:
     @pytest.mark.asyncio
     async def test_failure_is_a_200_body_not_an_http_error(self, fake_request):
         """The internal transport returns structured retry truth to callers."""
-        from orchestrator.main import (
-            KnowledgeMaterializeRequest,
-            materialize_knowledge_note,
-        )
+        from orchestrator.routers.knowledge import materialize_knowledge_note
+        from orchestrator.schemas.knowledge import KnowledgeMaterializeRequest
 
         g = _make_gitea(change_raises=True)
         fake_request.headers = {"X-Internal-Key": "secret"}
         body = KnowledgeMaterializeRequest(slug=SLUG, content=BODY, job_id=JOB)
+        deps = _knowledge_deps(store=_ledger_db(), gitea=g)
         with (
             patch.object(access_module, "_INTERNAL_KEY", "secret"),
-            patch("orchestrator.main.postgres_db", _ledger_db()),
-            patch("orchestrator.main.gitea_client", g),
             _patch_resolve(_ref()),
         ):
-            result = await materialize_knowledge_note(fake_request, PROJECT, body)
+            result = await materialize_knowledge_note(
+                fake_request, PROJECT, body, dependencies=deps
+            )
 
         assert result["status"] == "failed"
         assert result["reason"] == "commit-error"
@@ -1244,25 +1295,24 @@ class TestDeleteEndpoints:
 
     @pytest.mark.asyncio
     async def test_internal_delete_requires_the_internal_key(self, fake_request):
-        from orchestrator.main import (
-            KnowledgeDeleteRequest,
-            delete_knowledge_note_internal,
-        )
+        from orchestrator.routers.knowledge import delete_knowledge_note_internal
+        from orchestrator.schemas.knowledge import KnowledgeDeleteRequest
 
         fake_request.headers = {}
         with patch.object(access_module, "_INTERNAL_KEY", "secret"):
             with pytest.raises(HTTPException) as exc:
                 await delete_knowledge_note_internal(
-                    fake_request, PROJECT, KnowledgeDeleteRequest(slug=SLUG)
+                    fake_request,
+                    PROJECT,
+                    KnowledgeDeleteRequest(slug=SLUG),
+                    dependencies=_knowledge_deps(),
                 )
         assert exc.value.status_code == 401
 
     @pytest.mark.asyncio
     async def test_internal_delete_forwards_token_and_reason(self, fake_request):
-        from orchestrator.main import (
-            KnowledgeDeleteRequest,
-            delete_knowledge_note_internal,
-        )
+        from orchestrator.routers.knowledge import delete_knowledge_note_internal
+        from orchestrator.schemas.knowledge import KnowledgeDeleteRequest
 
         sha = _blob_sha(BODY)
         g = _make_gitea(tree_paths={PATH: sha})
@@ -1276,15 +1326,15 @@ class TestDeleteEndpoints:
         store.delete_kb_note = AsyncMock(return_value=True)
         store.delete_note = AsyncMock(return_value=False)
         store_cls.return_value = store
+        deps = _knowledge_deps(store=_ledger_db(), gitea=g, vector=MagicMock())
         with (
             patch.object(access_module, "_INTERNAL_KEY", "secret"),
-            patch("orchestrator.main.postgres_db", _ledger_db()),
-            patch("orchestrator.main.gitea_client", g),
-            patch("orchestrator.main.vector_db", MagicMock()),
             patch("shared.runtime.services.knowledge_store.KnowledgeStore", store_cls),
             _patch_resolve(_ref()),
         ):
-            result = await delete_knowledge_note_internal(fake_request, PROJECT, body)
+            result = await delete_knowledge_note_internal(
+                fake_request, PROJECT, body, dependencies=deps
+            )
         assert result["status"] == "committed"
         assert result["operation"] == "delete"
         assert result["row_deleted"] is True
@@ -1296,7 +1346,7 @@ class TestDeleteEndpoints:
         """A human's delete carries no CAS token: the cockpit button is the
         authority. It used to remove only the row, which the next sweep
         resurrected from the untouched file."""
-        from orchestrator.main import delete_knowledge_note
+        from orchestrator.routers.knowledge import delete_knowledge_note
 
         g = _make_gitea(tree_paths={PATH: _blob_sha(BODY)})
         g.delete_path = AsyncMock(return_value="deleted")
@@ -1305,20 +1355,20 @@ class TestDeleteEndpoints:
         store.delete_kb_note = AsyncMock(return_value=True)
         store.delete_note = AsyncMock(return_value=False)
         store_cls.return_value = store
+        deps = _knowledge_deps(
+            member_gate=AsyncMock(return_value=None),
+            store=_ledger_db(),
+            gitea=g,
+            vector=MagicMock(),
+            graph=SimpleNamespace(get=lambda: None),
+        )
         with (
-            patch(
-                "orchestrator.main.require_project_member", AsyncMock(return_value=None)
-            ),
-            patch("orchestrator.main.postgres_db", _ledger_db()),
-            patch("orchestrator.main.gitea_client", g),
-            patch("orchestrator.main.vector_db", MagicMock()),
-            patch(
-                "orchestrator.main._get_knowledge_graph", MagicMock(return_value=None)
-            ),
             patch("shared.runtime.services.knowledge_store.KnowledgeStore", store_cls),
             _patch_resolve(_ref()),
         ):
-            result = await delete_knowledge_note(fake_request, PROJECT, SLUG)
+            result = await delete_knowledge_note(
+                fake_request, PROJECT, SLUG, dependencies=deps
+            )
         assert result == {
             "status": "deleted",
             "file_removed": True,
@@ -1332,7 +1382,7 @@ class TestDeleteEndpoints:
     async def test_member_delete_of_a_note_that_exists_nowhere_is_404(
         self, fake_request
     ):
-        from orchestrator.main import delete_knowledge_note
+        from orchestrator.routers.knowledge import delete_knowledge_note
 
         g = _make_gitea(tree_paths={})
         g.delete_path = AsyncMock(return_value="deleted")
@@ -1341,28 +1391,28 @@ class TestDeleteEndpoints:
         store.delete_kb_note = AsyncMock(return_value=False)
         store.delete_note = AsyncMock(return_value=False)
         store_cls.return_value = store
+        deps = _knowledge_deps(
+            member_gate=AsyncMock(return_value=None),
+            store=_ledger_db(),
+            gitea=g,
+            vector=MagicMock(),
+            graph=SimpleNamespace(get=lambda: None),
+        )
         with (
-            patch(
-                "orchestrator.main.require_project_member", AsyncMock(return_value=None)
-            ),
-            patch("orchestrator.main.postgres_db", _ledger_db()),
-            patch("orchestrator.main.gitea_client", g),
-            patch("orchestrator.main.vector_db", MagicMock()),
-            patch(
-                "orchestrator.main._get_knowledge_graph", MagicMock(return_value=None)
-            ),
             patch("shared.runtime.services.knowledge_store.KnowledgeStore", store_cls),
             _patch_resolve(_ref()),
         ):
             with pytest.raises(HTTPException) as exc:
-                await delete_knowledge_note(fake_request, PROJECT, SLUG)
+                await delete_knowledge_note(
+                    fake_request, PROJECT, SLUG, dependencies=deps
+                )
         assert exc.value.status_code == 404
 
     @pytest.mark.asyncio
     async def test_member_delete_forge_failure_is_502_not_a_row_only_delete(
         self, fake_request
     ):
-        from orchestrator.main import delete_knowledge_note
+        from orchestrator.routers.knowledge import delete_knowledge_note
 
         g = _make_gitea(tree_paths={PATH: _blob_sha(BODY)})
         g.delete_path = AsyncMock(return_value="error")
@@ -1370,18 +1420,20 @@ class TestDeleteEndpoints:
         store = MagicMock()
         store.delete_kb_note = AsyncMock(return_value=True)
         store_cls.return_value = store
+        deps = _knowledge_deps(
+            member_gate=AsyncMock(return_value=None),
+            store=_ledger_db(),
+            gitea=g,
+            vector=MagicMock(),
+        )
         with (
-            patch(
-                "orchestrator.main.require_project_member", AsyncMock(return_value=None)
-            ),
-            patch("orchestrator.main.postgres_db", _ledger_db()),
-            patch("orchestrator.main.gitea_client", g),
-            patch("orchestrator.main.vector_db", MagicMock()),
             patch("shared.runtime.services.knowledge_store.KnowledgeStore", store_cls),
             _patch_resolve(_ref()),
         ):
             with pytest.raises(HTTPException) as exc:
-                await delete_knowledge_note(fake_request, PROJECT, SLUG)
+                await delete_knowledge_note(
+                    fake_request, PROJECT, SLUG, dependencies=deps
+                )
         assert exc.value.status_code == 502
         store.delete_kb_note.assert_not_awaited()
 
@@ -1399,14 +1451,14 @@ class TestKnowledgeMutationEndpoint:
 
     @pytest.mark.asyncio
     async def test_authorization_precedes_any_materialization(self, fake_request):
-        from orchestrator.main import KnowledgeNoteUpdate, update_knowledge_note
+        from orchestrator.routers.knowledge import update_knowledge_note
+        from orchestrator.schemas.knowledge import KnowledgeNoteUpdate
 
         materialize = AsyncMock()
+        deps = _knowledge_deps(
+            member_gate=AsyncMock(side_effect=HTTPException(status_code=403))
+        )
         with (
-            patch(
-                "orchestrator.main.require_project_member",
-                AsyncMock(side_effect=HTTPException(status_code=403)),
-            ),
             patch(
                 "orchestrator.services.kb_materialize.materialize_knowledge_metadata_update",
                 materialize,
@@ -1418,6 +1470,7 @@ class TestKnowledgeMutationEndpoint:
                     PROJECT,
                     SLUG,
                     KnowledgeNoteUpdate(status="resolved"),
+                    dependencies=deps,
                 )
 
         assert exc.value.status_code == 403
@@ -1427,7 +1480,8 @@ class TestKnowledgeMutationEndpoint:
     async def test_pending_canonical_write_returns_409_and_leaves_index_unchanged(
         self, fake_request
     ):
-        from orchestrator.main import KnowledgeNoteUpdate, update_knowledge_note
+        from orchestrator.routers.knowledge import update_knowledge_note
+        from orchestrator.schemas.knowledge import KnowledgeNoteUpdate
 
         vector, conn = self._vector()
         db = AsyncMock()
@@ -1439,10 +1493,8 @@ class TestKnowledgeMutationEndpoint:
             "projection_state": "pending",
             "retry_state": "retryable",
         }
+        deps = _knowledge_deps(member_gate=AsyncMock(), vector=vector, store=db)
         with (
-            patch("orchestrator.main.require_project_member", AsyncMock()),
-            patch("orchestrator.main.vector_db", vector),
-            patch("orchestrator.main.postgres_db", db),
             patch(
                 "orchestrator.services.kb_materialize.materialize_knowledge_metadata_update",
                 AsyncMock(return_value=pending),
@@ -1454,6 +1506,7 @@ class TestKnowledgeMutationEndpoint:
                     PROJECT,
                     SLUG,
                     KnowledgeNoteUpdate(status="resolved"),
+                    dependencies=deps,
                 )
 
         assert exc.value.status_code == 409
@@ -1464,7 +1517,8 @@ class TestKnowledgeMutationEndpoint:
 
     @pytest.mark.asyncio
     async def test_success_names_canonical_and_projection_truth(self, fake_request):
-        from orchestrator.main import KnowledgeNoteUpdate, update_knowledge_note
+        from orchestrator.routers.knowledge import update_knowledge_note
+        from orchestrator.schemas.knowledge import KnowledgeNoteUpdate
 
         vector, conn = self._vector()
         intent_id = str(uuid.uuid4())
@@ -1485,11 +1539,13 @@ class TestKnowledgeMutationEndpoint:
             "canonical_ready_at": None,
             "canonical_metadata_complete": True,
         }
+        deps = _knowledge_deps(
+            member_gate=AsyncMock(),
+            vector=vector,
+            store=db,
+            graph=SimpleNamespace(get=lambda: None),
+        )
         with (
-            patch("orchestrator.main.require_project_member", AsyncMock()),
-            patch("orchestrator.main.vector_db", vector),
-            patch("orchestrator.main.postgres_db", db),
-            patch("orchestrator.main._get_knowledge_graph", return_value=None),
             patch(
                 "orchestrator.services.kb_materialize.materialize_knowledge_metadata_update",
                 AsyncMock(return_value=canonical),
@@ -1500,6 +1556,7 @@ class TestKnowledgeMutationEndpoint:
                 PROJECT,
                 SLUG,
                 KnowledgeNoteUpdate(status="resolved"),
+                dependencies=deps,
             )
 
         assert result == {
@@ -1515,7 +1572,8 @@ class TestKnowledgeMutationEndpoint:
     async def test_tag_projection_uses_exact_canonical_tags_and_ready_time(
         self, fake_request
     ):
-        from orchestrator.main import KnowledgeNoteUpdate, update_knowledge_note
+        from orchestrator.routers.knowledge import update_knowledge_note
+        from orchestrator.schemas.knowledge import KnowledgeNoteUpdate
 
         vector, conn = self._vector()
         intent_id = str(uuid.uuid4())
@@ -1536,11 +1594,13 @@ class TestKnowledgeMutationEndpoint:
             "canonical_ready_at": ready_at,
             "canonical_metadata_complete": True,
         }
+        deps = _knowledge_deps(
+            member_gate=AsyncMock(),
+            vector=vector,
+            store=db,
+            graph=SimpleNamespace(get=lambda: None),
+        )
         with (
-            patch("orchestrator.main.require_project_member", AsyncMock()),
-            patch("orchestrator.main.vector_db", vector),
-            patch("orchestrator.main.postgres_db", db),
-            patch("orchestrator.main._get_knowledge_graph", return_value=None),
             patch(
                 "orchestrator.services.kb_materialize.materialize_knowledge_metadata_update",
                 AsyncMock(return_value=canonical),
@@ -1551,6 +1611,7 @@ class TestKnowledgeMutationEndpoint:
                 PROJECT,
                 SLUG,
                 KnowledgeNoteUpdate(add_tags=["ready"]),
+                dependencies=deps,
             )
 
         assert result["projection_state"] == "synced"
@@ -1561,7 +1622,8 @@ class TestKnowledgeMutationEndpoint:
 
     @pytest.mark.asyncio
     async def test_ready_removal_projects_canonical_null_generation(self, fake_request):
-        from orchestrator.main import KnowledgeNoteUpdate, update_knowledge_note
+        from orchestrator.routers.knowledge import update_knowledge_note
+        from orchestrator.schemas.knowledge import KnowledgeNoteUpdate
 
         vector, conn = self._vector()
         intent_id = str(uuid.uuid4())
@@ -1581,11 +1643,13 @@ class TestKnowledgeMutationEndpoint:
             "canonical_ready_at": None,
             "canonical_metadata_complete": True,
         }
+        deps = _knowledge_deps(
+            member_gate=AsyncMock(),
+            vector=vector,
+            store=db,
+            graph=SimpleNamespace(get=lambda: None),
+        )
         with (
-            patch("orchestrator.main.require_project_member", AsyncMock()),
-            patch("orchestrator.main.vector_db", vector),
-            patch("orchestrator.main.postgres_db", db),
-            patch("orchestrator.main._get_knowledge_graph", return_value=None),
             patch(
                 "orchestrator.services.kb_materialize.materialize_knowledge_metadata_update",
                 AsyncMock(return_value=canonical),
@@ -1596,6 +1660,7 @@ class TestKnowledgeMutationEndpoint:
                 PROJECT,
                 SLUG,
                 KnowledgeNoteUpdate(remove_tags=["ready"]),
+                dependencies=deps,
             )
 
         assert result["projection_state"] == "synced"
@@ -1605,7 +1670,8 @@ class TestKnowledgeMutationEndpoint:
     async def test_missing_canonical_snapshot_returns_409_without_projection(
         self, fake_request
     ):
-        from orchestrator.main import KnowledgeNoteUpdate, update_knowledge_note
+        from orchestrator.routers.knowledge import update_knowledge_note
+        from orchestrator.schemas.knowledge import KnowledgeNoteUpdate
 
         vector, conn = self._vector()
         intent_id = str(uuid.uuid4())
@@ -1618,10 +1684,8 @@ class TestKnowledgeMutationEndpoint:
             "projection_state": "pending",
             "retry_state": "none",
         }
+        deps = _knowledge_deps(member_gate=AsyncMock(), vector=vector, store=db)
         with (
-            patch("orchestrator.main.require_project_member", AsyncMock()),
-            patch("orchestrator.main.vector_db", vector),
-            patch("orchestrator.main.postgres_db", db),
             patch(
                 "orchestrator.services.kb_materialize.materialize_knowledge_metadata_update",
                 AsyncMock(return_value=canonical_without_snapshot),
@@ -1633,6 +1697,7 @@ class TestKnowledgeMutationEndpoint:
                     PROJECT,
                     SLUG,
                     KnowledgeNoteUpdate(add_tags=["ready"]),
+                    dependencies=deps,
                 )
 
         assert exc.value.status_code == 409
@@ -1644,7 +1709,8 @@ class TestKnowledgeMutationEndpoint:
     async def test_invalid_canonical_ready_time_returns_409_without_projection(
         self, fake_request
     ):
-        from orchestrator.main import KnowledgeNoteUpdate, update_knowledge_note
+        from orchestrator.routers.knowledge import update_knowledge_note
+        from orchestrator.schemas.knowledge import KnowledgeNoteUpdate
 
         vector, conn = self._vector()
         db = AsyncMock()
@@ -1658,10 +1724,8 @@ class TestKnowledgeMutationEndpoint:
             "canonical_ready_at": "not-a-timestamp",
             "canonical_metadata_complete": True,
         }
+        deps = _knowledge_deps(member_gate=AsyncMock(), vector=vector, store=db)
         with (
-            patch("orchestrator.main.require_project_member", AsyncMock()),
-            patch("orchestrator.main.vector_db", vector),
-            patch("orchestrator.main.postgres_db", db),
             patch(
                 "orchestrator.services.kb_materialize.materialize_knowledge_metadata_update",
                 AsyncMock(return_value=canonical),
@@ -1673,6 +1737,7 @@ class TestKnowledgeMutationEndpoint:
                     PROJECT,
                     SLUG,
                     KnowledgeNoteUpdate(add_tags=["ready"]),
+                    dependencies=deps,
                 )
 
         assert exc.value.status_code == 409
@@ -1685,7 +1750,6 @@ class TestKnowledgeMutationEndpoint:
 # next 900s sweep.
 
 import asyncio  # noqa: E402
-import logging  # noqa: E402
 from contextlib import asynccontextmanager  # noqa: E402
 
 from orchestrator.services.kb_reindex import NoteIndexOutcome  # noqa: E402

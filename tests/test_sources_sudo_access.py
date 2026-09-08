@@ -114,7 +114,8 @@ class TestListSources:
     async def test_with_job_id_gated_by_require_job_access(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from orchestrator.main import list_sources
+        from orchestrator.main import _citations_dependencies
+        from orchestrator.routers.citations import list_sources
 
         with (
             _patch_caller_and_db(user_b, fake_db),
@@ -130,12 +131,14 @@ class TestListSources:
                     type=None,
                     limit=50,
                     offset=0,
+                    dependencies=_citations_dependencies(),
                 )
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
     async def test_without_job_id_non_admin_403(self, user_a, fake_db, fake_request):
-        from orchestrator.main import list_sources
+        from orchestrator.main import _citations_dependencies
+        from orchestrator.routers.citations import list_sources
 
         with (
             _patch_caller_and_db(user_a, fake_db),
@@ -146,13 +149,19 @@ class TestListSources:
         ):
             with pytest.raises(HTTPException) as exc:
                 await list_sources(
-                    fake_request, job_id=None, type=None, limit=50, offset=0
+                    fake_request,
+                    job_id=None,
+                    type=None,
+                    limit=50,
+                    offset=0,
+                    dependencies=_citations_dependencies(),
                 )
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
     async def test_without_job_id_admin_passes(self, user_admin, fake_db, fake_request):
-        from orchestrator.main import list_sources
+        from orchestrator.main import _citations_dependencies
+        from orchestrator.routers.citations import list_sources
 
         # Mock vector_db.acquire() to return zero rows.
         conn = MagicMock()
@@ -169,7 +178,12 @@ class TestListSources:
             patch("orchestrator.main.vector_db", vector_db),
         ):
             result = await list_sources(
-                fake_request, job_id=None, type=None, limit=50, offset=0
+                fake_request,
+                job_id=None,
+                type=None,
+                limit=50,
+                offset=0,
+                dependencies=_citations_dependencies(),
             )
         assert result == {"sources": [], "total": 0}
 
@@ -182,7 +196,8 @@ class TestListSources:
 class TestGetSourceDetail:
     @pytest.mark.asyncio
     async def test_visible_via_owned_job(self, user_a, job_a, fake_db, fake_request):
-        from orchestrator.main import get_source_detail
+        from orchestrator.main import _citations_dependencies
+        from orchestrator.routers.citations import get_source_detail
 
         source_row = {
             "id": 1,
@@ -201,13 +216,19 @@ class TestGetSourceDetail:
             _patch_caller_and_db(user_a, fake_db),
             patch("orchestrator.main.vector_db", vector_db),
         ):
-            result = await get_source_detail(fake_request, 1, content_limit=0)
+            result = await get_source_detail(
+                fake_request,
+                1,
+                content_limit=0,
+                dependencies=_citations_dependencies(),
+            )
         assert result["id"] == 1
         assert result["job_ids"] == [str(job_a["id"])]
 
     @pytest.mark.asyncio
     async def test_no_accessible_job_403(self, user_b, job_a, fake_db, fake_request):
-        from orchestrator.main import get_source_detail
+        from orchestrator.main import _citations_dependencies
+        from orchestrator.routers.citations import get_source_detail
 
         source_row = {
             "id": 1,
@@ -227,12 +248,18 @@ class TestGetSourceDetail:
             patch("orchestrator.main.vector_db", vector_db),
         ):
             with pytest.raises(HTTPException) as exc:
-                await get_source_detail(fake_request, 1, content_limit=0)
+                await get_source_detail(
+                    fake_request,
+                    1,
+                    content_limit=0,
+                    dependencies=_citations_dependencies(),
+                )
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
     async def test_admin_bypass(self, user_admin, job_a, fake_db, fake_request):
-        from orchestrator.main import get_source_detail
+        from orchestrator.main import _citations_dependencies
+        from orchestrator.routers.citations import get_source_detail
 
         source_row = {
             "id": 1,
@@ -251,7 +278,12 @@ class TestGetSourceDetail:
             _patch_caller_and_db(user_admin, fake_db),
             patch("orchestrator.main.vector_db", vector_db),
         ):
-            result = await get_source_detail(fake_request, 1, content_limit=0)
+            result = await get_source_detail(
+                fake_request,
+                1,
+                content_limit=0,
+                dependencies=_citations_dependencies(),
+            )
         assert result["id"] == 1
 
     @pytest.mark.asyncio
@@ -259,7 +291,8 @@ class TestGetSourceDetail:
         self, user_a, fake_db, fake_request
     ):
         """Source with zero linked jobs is admin-only."""
-        from orchestrator.main import get_source_detail
+        from orchestrator.main import _citations_dependencies
+        from orchestrator.routers.citations import get_source_detail
 
         source_row = {
             "id": 1,
@@ -279,12 +312,18 @@ class TestGetSourceDetail:
             patch("orchestrator.main.vector_db", vector_db),
         ):
             with pytest.raises(HTTPException) as exc:
-                await get_source_detail(fake_request, 1, content_limit=0)
+                await get_source_detail(
+                    fake_request,
+                    1,
+                    content_limit=0,
+                    dependencies=_citations_dependencies(),
+                )
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
     async def test_missing_source_404(self, user_a, fake_db, fake_request):
-        from orchestrator.main import get_source_detail
+        from orchestrator.main import _citations_dependencies
+        from orchestrator.routers.citations import get_source_detail
 
         vector_db = _vector_db_with_source(None, [])
         with (
@@ -292,7 +331,12 @@ class TestGetSourceDetail:
             patch("orchestrator.main.vector_db", vector_db),
         ):
             with pytest.raises(HTTPException) as exc:
-                await get_source_detail(fake_request, 999, content_limit=0)
+                await get_source_detail(
+                    fake_request,
+                    999,
+                    content_limit=0,
+                    dependencies=_citations_dependencies(),
+                )
         assert exc.value.status_code == 404
 
 

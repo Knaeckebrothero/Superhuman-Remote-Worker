@@ -1424,8 +1424,17 @@ class TestSessionRuntimeUpdateBoundary:
                 "is_global": True,
             }
         )
-        with patch.object(
-            main, "user_can_access_datasource", AsyncMock(return_value=True)
+        # ``user_can_access_datasource`` moved to ``services.projects`` with
+        # ``link_datasource_to_project`` (R1.B03), so it is no longer a name on
+        # ``main``. Patch it where it is defined. NOTE: this stub is inert on
+        # this path — the thread-config selection authorizes through
+        # ``services.datasource_policy``, which reads ``is_global`` inline (set
+        # True on the row above); it was equally inert before the extraction,
+        # when the name on ``main`` was only reachable from the project-link
+        # endpoint.
+        with patch(
+            "orchestrator.security.access.user_can_access_datasource",
+            AsyncMock(return_value=True),
         ):
             await main.agent_update_thread_config(
                 MagicMock(),
@@ -1636,6 +1645,10 @@ class TestProjectDefaultOverrideBoundary:
 
     @pytest.fixture
     def project_env(self, monkeypatch):
+        """The handlers live in ``routers.projects`` now; the gates, store and
+        the ``with_validated_tool_overrides`` gate they run still come from
+        ``main`` — through ``main._projects_dependencies()``, which reads these
+        very module globals at call time, exactly as production does."""
         import orchestrator.main as main
 
         db = SimpleNamespace(
@@ -1654,31 +1667,39 @@ class TestProjectDefaultOverrideBoundary:
 
     @pytest.mark.asyncio
     async def test_create_rejects_a_smuggle(self, project_env):
+        from orchestrator.routers.projects import create_project
+        from orchestrator.schemas.projects import ProjectCreate
+
         main, db = project_env
 
         with pytest.raises(main.HTTPException) as exc:
-            await main.create_project(
-                main.ProjectCreate(
+            await create_project(
+                ProjectCreate(
                     name="p",
                     user_id=SESSION_USER_ID,
                     default_config_override={"tools": {"canvas": ["run_command"]}},
                 ),
                 MagicMock(),
+                dependencies=main._projects_dependencies(),
             )
         assert exc.value.status_code == 400
         db.create_project.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_patch_rejects_a_smuggle(self, project_env):
+        from orchestrator.routers.projects import update_project
+        from orchestrator.schemas.projects import ProjectUpdate
+
         main, db = project_env
 
         with pytest.raises(main.HTTPException) as exc:
-            await main.update_project(
+            await update_project(
                 "p1",
-                main.ProjectUpdate(
+                ProjectUpdate(
                     default_config_override={"tools": {"knowledge": ["run_command"]}}
                 ),
                 MagicMock(),
+                dependencies=main._projects_dependencies(),
             )
         assert exc.value.status_code == 400
         db.update_project.assert_not_awaited()
@@ -1688,9 +1709,17 @@ class TestProjectDefaultOverrideBoundary:
         """Write-only is what makes this back-compatible: an existing row with
         a bad override is never read, let alone rejected, until someone
         rewrites it."""
+        from orchestrator.routers.projects import update_project
+        from orchestrator.schemas.projects import ProjectUpdate
+
         main, db = project_env
 
-        await main.update_project("p1", main.ProjectUpdate(name="renamed"), MagicMock())
+        await update_project(
+            "p1",
+            ProjectUpdate(name="renamed"),
+            MagicMock(),
+            dependencies=main._projects_dependencies(),
+        )
 
         assert db.update_project.await_args.args[0] == "p1"
         assert "default_config_override" not in db.update_project.await_args.kwargs
@@ -1701,14 +1730,16 @@ class TestProjectDefaultOverrideBoundary:
         WHOLE stored override plus a memory key. It carries no tools block, so
         it is unaffected — this is the payload the write-path check has to keep
         working."""
+        from orchestrator.routers.projects import update_project
+        from orchestrator.schemas.projects import ProjectUpdate
+
         main, db = project_env
 
-        await main.update_project(
+        await update_project(
             "p1",
-            main.ProjectUpdate(
-                default_config_override={"memory": {"project_scoped": True}}
-            ),
+            ProjectUpdate(default_config_override={"memory": {"project_scoped": True}}),
             MagicMock(),
+            dependencies=main._projects_dependencies(),
         )
 
         assert db.update_project.await_args.kwargs["default_config_override"] == {

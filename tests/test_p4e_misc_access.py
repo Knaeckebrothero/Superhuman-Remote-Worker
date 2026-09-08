@@ -74,7 +74,8 @@ class TestExpertsGated:
 class TestSshKeyGenerateGated:
     @pytest.mark.asyncio
     async def test_runs_gate(self, fake_request):
-        from orchestrator.main import generate_datasource_ssh_key
+        from orchestrator.main import _datasources_dependencies
+        from orchestrator.routers.datasources import generate_datasource_ssh_key
 
         async def _denied(*_a, **_kw):
             raise HTTPException(status_code=403, detail="denied")
@@ -83,7 +84,9 @@ class TestSshKeyGenerateGated:
             "orchestrator.main.require_approved_user", AsyncMock(side_effect=_denied)
         ):
             with pytest.raises(HTTPException) as exc:
-                await generate_datasource_ssh_key(fake_request)
+                await generate_datasource_ssh_key(
+                    fake_request, dependencies=_datasources_dependencies()
+                )
         assert exc.value.status_code == 403
 
 
@@ -164,7 +167,8 @@ class TestPendingActions:
 class TestCitationDetail:
     @pytest.mark.asyncio
     async def test_runs_gate(self, fake_request):
-        from orchestrator.main import get_citation_detail
+        from orchestrator.main import _citations_dependencies
+        from orchestrator.routers.citations import get_citation_detail
 
         async def _denied(*_a, **_kw):
             raise HTTPException(status_code=403, detail="denied")
@@ -173,12 +177,15 @@ class TestCitationDetail:
             "orchestrator.main.require_approved_user", AsyncMock(side_effect=_denied)
         ):
             with pytest.raises(HTTPException) as exc:
-                await get_citation_detail(fake_request, 1)
+                await get_citation_detail(
+                    fake_request, 1, dependencies=_citations_dependencies()
+                )
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
     async def test_missing_citation_404(self, user_a, fake_db, fake_request):
-        from orchestrator.main import get_citation_detail
+        from orchestrator.main import _citations_dependencies
+        from orchestrator.routers.citations import get_citation_detail
 
         fake_conn = MagicMock()
         fake_conn.fetchrow = AsyncMock(return_value=None)
@@ -193,7 +200,9 @@ class TestCitationDetail:
             patch("orchestrator.main.vector_db", fake_vector_db),
         ):
             with pytest.raises(HTTPException) as exc:
-                await get_citation_detail(fake_request, 9999)
+                await get_citation_detail(
+                    fake_request, 9999, dependencies=_citations_dependencies()
+                )
         assert exc.value.status_code == 404
 
     @pytest.mark.asyncio
@@ -203,7 +212,8 @@ class TestCitationDetail:
         """Citation links to job_a (owned by user_a). user_b is a stranger
         to project_a, so user_can_access_any_job returns False and the
         endpoint 404s (probe-resistant — doesn't leak existence)."""
-        from orchestrator.main import get_citation_detail
+        from orchestrator.main import _citations_dependencies
+        from orchestrator.routers.citations import get_citation_detail
 
         fake_conn = MagicMock()
         fake_conn.fetchrow = AsyncMock(
@@ -225,12 +235,15 @@ class TestCitationDetail:
             patch("orchestrator.main.vector_db", fake_vector_db),
         ):
             with pytest.raises(HTTPException) as exc:
-                await get_citation_detail(fake_request, 1)
+                await get_citation_detail(
+                    fake_request, 1, dependencies=_citations_dependencies()
+                )
         assert exc.value.status_code == 404
 
     @pytest.mark.asyncio
     async def test_owner_succeeds(self, user_a, job_a, fake_db, fake_request):
-        from orchestrator.main import get_citation_detail
+        from orchestrator.main import _citations_dependencies
+        from orchestrator.routers.citations import get_citation_detail
 
         row = {
             "id": 1,
@@ -250,5 +263,7 @@ class TestCitationDetail:
             _patch_caller_and_db(user_a, fake_db),
             patch("orchestrator.main.vector_db", fake_vector_db),
         ):
-            result = await get_citation_detail(fake_request, 1)
+            result = await get_citation_detail(
+                fake_request, 1, dependencies=_citations_dependencies()
+            )
         assert result["id"] == 1

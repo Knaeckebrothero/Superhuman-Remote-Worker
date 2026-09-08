@@ -28,7 +28,24 @@ import pytest
 os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
 
 import orchestrator.main  # noqa: E402
+from orchestrator.services import knowledge_index  # noqa: E402
 from shared.runtime.core.model_registry import ModelMeta  # noqa: E402
+
+
+async def _build_kb_embedding_service():
+    """The central indexer's embedding resolution, through main's live wiring.
+
+    R1.B03 moved the builder to ``orchestrator.services.knowledge_index``; the
+    collaborators it used to read as main globals now arrive through
+    ``main._knowledge_index_dependencies()``. Going through that factory (rather
+    than a hand-built dependency value) is the point of these cases: the
+    indexer must resolve the *same* profile the dispatch path injects, off the
+    same ``postgres_db`` and the same ``_inject_system_kb_embedding_profile``
+    this module's fixtures monkeypatch.
+    """
+    return await knowledge_index.build_kb_embedding_service(
+        dependencies=orchestrator.main._knowledge_index_dependencies()
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -845,7 +862,7 @@ class TestEmbeddingCredentialReliability:
         dispatched = await orchestrator.main._inject_dispatch_credentials(
             _job_no_user(), {}, include_kb_profile=True
         )
-        service = await orchestrator.main._build_kb_embedding_service()
+        service = await _build_kb_embedding_service()
         env = dispatched["env_keys"]
 
         assert service.model == env["KB_EMBEDDING_MODEL"]
@@ -883,7 +900,7 @@ class TestEmbeddingCredentialReliability:
         result = await orchestrator.main._inject_dispatch_credentials(
             _job_no_user(), {}, include_kb_profile=True
         )
-        service = await orchestrator.main._build_kb_embedding_service()
+        service = await _build_kb_embedding_service()
         env = result["env_keys"]
 
         assert env["KB_EMBEDDING_MODEL"] == "dev-kb-model"
@@ -945,7 +962,7 @@ class TestEmbeddingCredentialReliability:
         monkeypatch.setenv("EMBEDDING_MODEL", "different-env-model")
         monkeypatch.setenv("EMBEDDING_API_KEY", "env-key")
 
-        assert await orchestrator.main._build_kb_embedding_service() is None
+        assert await _build_kb_embedding_service() is None
 
 
 # ---------------------------------------------------------------------------

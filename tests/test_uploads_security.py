@@ -100,7 +100,6 @@ def cookie_users(user_a, user_b, user_admin, monkeypatch):
         return sessions.get(session_id)
 
     monkeypatch.setattr("orchestrator.security.auth._resolve_from_cookie", _resolve)
-    monkeypatch.setattr(orchestrator.uploads, "_get_db", lambda: MagicMock())
     return users
 
 
@@ -108,6 +107,10 @@ def cookie_users(user_a, user_b, user_admin, monkeypatch):
 def app(uploads_dir, internal_key, cookie_users):
     application = FastAPI()
     application.include_router(orchestrator.uploads.router)
+    # The router reads its store from the application handling the request
+    # (`app.state.store`), not from `orchestrator.main` — R1.B03 closed that
+    # caller. Publishing it here is what composition does in production.
+    application.state.store = MagicMock()
     return application
 
 

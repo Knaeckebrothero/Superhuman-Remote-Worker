@@ -4,36 +4,72 @@ Spec: knowledge-base/knowledge/features/public_datasources.md. Covers the Postgr
 endpoint gates are covered in the classes added by later tasks.
 """
 
-from contextlib import ExitStack
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
 
 from orchestrator.database.postgres import PostgresDB
+from orchestrator.routers.datasources import create_datasource, update_datasource
+from orchestrator.schemas.datasources import DatasourceCreate, DatasourceUpdate
 
 # Every test in this module is async (endpoint + helper coverage).
 pytestmark = pytest.mark.asyncio
 
 
-def _patch_caller_and_db(user: dict, db):
-    """Patch the caller (require_approved_user) and DB on the main module.
+def _patch_caller(user: dict):
+    """Patch the caller resolution the *real* gates read.
+
+    ``require_datasource_owner`` is left real here (``_wire_owner_update``
+    below relies on it resolving through ``get_datasource`` + the creator
+    check), and it reads ``require_approved_user`` as a module global of
+    ``orchestrator.security.access`` — so that patch still bites. The route's
+    own approved-user gate now arrives through the dependency dataclass
+    instead of an ``orchestrator.main`` global; see ``_route_deps``.
+    """
+    return patch(
+        "orchestrator.security.access.require_approved_user",
+        AsyncMock(return_value=user),
+    )
+
+
+def _route_deps(user: dict, db):
+    """The connector router's collaborators, composed as main's
+    ``_datasources_dependencies`` factory composes them.
+
+    Only the store and the route's approved-user gate are substituted, which
+    is exactly what this file used to patch on ``orchestrator.main``. Every
+    other gate keeps the dataclass default — the real function from
+    ``orchestrator.security.access`` — so the publish gate is still reached
+    through a genuine owner check.
 
     Mirrors tests/test_datasource_access.py — kept local so this file stays
     self-contained.
     """
-    stack = ExitStack()
-    stack.enter_context(
-        patch("orchestrator.main.require_approved_user", AsyncMock(return_value=user))
+    from orchestrator.main import _mcp_datasources_enabled, _validate_mcp_datasource
+    from orchestrator.routers.datasources import DatasourcesDependencies
+    from orchestrator.services.datasources import DatasourceDependencies
+    from orchestrator.services.kb_task_registry import KbDatasourceTaskRegistry
+    from orchestrator.services.knowledge_index import KnowledgeIndexDependencies
+
+    return DatasourcesDependencies(
+        store=db,
+        operations=DatasourceDependencies(
+            store=db,
+            vector_db=MagicMock(),
+            knowledge_index=KnowledgeIndexDependencies(
+                store=db,
+                vector_db=MagicMock(),
+                gitea_client=MagicMock(),
+                logger=MagicMock(),
+                tasks=KbDatasourceTaskRegistry(),
+                inject_system_kb_embedding_profile=AsyncMock(return_value=None),
+            ),
+            mcp_datasources_enabled=_mcp_datasources_enabled,
+            validate_mcp_datasource=_validate_mcp_datasource,
+        ),
+        require_approved_user=AsyncMock(return_value=user),
     )
-    stack.enter_context(
-        patch(
-            "orchestrator.security.access.require_approved_user",
-            AsyncMock(return_value=user),
-        )
-    )
-    stack.enter_context(patch("orchestrator.main.postgres_db", db))
-    return stack
 
 
 EMPTY_SCOPES = {"user": [], "project": [], "global": []}
@@ -107,11 +143,9 @@ def _created_row(**overrides):
 
 class TestCreatePublishGate:
     async def test_publish_without_grant_403(self, user_a, fake_db, fake_request):
-        from orchestrator.main import DatasourceCreate, create_datasource
-
         fake_db.user_can_publish_datasource = AsyncMock(return_value=False)
         fake_db.create_datasource = AsyncMock()
-        with _patch_caller_and_db(user_a, fake_db):
+        with _patch_caller(user_a):
             with pytest.raises(HTTPException) as exc:
                 await create_datasource(
                     DatasourceCreate(
@@ -121,6 +155,7 @@ class TestCreatePublishGate:
                         is_global=True,
                     ),
                     fake_request,
+                    dependencies=_route_deps(user_a, fake_db),
                 )
         assert exc.value.status_code == 403
         assert "public_datasources" in exc.value.detail
@@ -129,11 +164,9 @@ class TestCreatePublishGate:
     async def test_publish_with_grant_defaults_read_only_true(
         self, user_a, fake_db, fake_request
     ):
-        from orchestrator.main import DatasourceCreate, create_datasource
-
         fake_db.user_can_publish_datasource = AsyncMock(return_value=True)
         fake_db.create_datasource = AsyncMock(return_value=_created_row())
-        with _patch_caller_and_db(user_a, fake_db):
+        with _patch_caller(user_a):
             result = await create_datasource(
                 DatasourceCreate(
                     name="Org Wiki",
@@ -142,6 +175,7 @@ class TestCreatePublishGate:
                     is_global=True,
                 ),
                 fake_request,
+                dependencies=_route_deps(user_a, fake_db),
             )
         kwargs = fake_db.create_datasource.await_args.kwargs
         assert kwargs["is_global"] is True
@@ -151,13 +185,11 @@ class TestCreatePublishGate:
     async def test_publish_read_write_with_grant_keeps_false(
         self, user_a, fake_db, fake_request
     ):
-        from orchestrator.main import DatasourceCreate, create_datasource
-
         fake_db.user_can_publish_datasource = AsyncMock(return_value=True)
         fake_db.create_datasource = AsyncMock(
             return_value=_created_row(read_only=False)
         )
-        with _patch_caller_and_db(user_a, fake_db):
+        with _patch_caller(user_a):
             await create_datasource(
                 DatasourceCreate(
                     name="Org Wiki",
@@ -167,17 +199,16 @@ class TestCreatePublishGate:
                     read_only=False,
                 ),
                 fake_request,
+                dependencies=_route_deps(user_a, fake_db),
             )
         assert fake_db.create_datasource.await_args.kwargs["read_only"] is False
 
     async def test_private_create_never_calls_gate(self, user_a, fake_db, fake_request):
-        from orchestrator.main import DatasourceCreate, create_datasource
-
         fake_db.user_can_publish_datasource = AsyncMock(return_value=False)
         fake_db.create_datasource = AsyncMock(
             return_value=_created_row(is_global=False, read_only=None)
         )
-        with _patch_caller_and_db(user_a, fake_db):
+        with _patch_caller(user_a):
             await create_datasource(
                 DatasourceCreate(
                     name="Mine",
@@ -185,16 +216,15 @@ class TestCreatePublishGate:
                     connection_url="https://github.com/me/mine",
                 ),
                 fake_request,
+                dependencies=_route_deps(user_a, fake_db),
             )
         fake_db.user_can_publish_datasource.assert_not_awaited()
         assert fake_db.create_datasource.await_args.kwargs["read_only"] is None
 
     async def test_kb_read_write_flag_400(self, user_a, fake_db, fake_request):
-        from orchestrator.main import DatasourceCreate, create_datasource
-
         fake_db.user_can_publish_datasource = AsyncMock(return_value=True)
         fake_db.create_datasource = AsyncMock()
-        with _patch_caller_and_db(user_a, fake_db):
+        with _patch_caller(user_a):
             with pytest.raises(HTTPException) as exc:
                 await create_datasource(
                     DatasourceCreate(
@@ -205,6 +235,7 @@ class TestCreatePublishGate:
                         read_only=False,
                     ),
                     fake_request,
+                    dependencies=_route_deps(user_a, fake_db),
                 )
         assert exc.value.status_code == 400
         assert "read-only" in exc.value.detail
@@ -230,14 +261,15 @@ def _wire_owner_update(fake_db, user, existing):
 
 class TestUpdatePublishGate:
     async def test_publish_flip_without_grant_403(self, user_a, fake_db, fake_request):
-        from orchestrator.main import DatasourceUpdate, update_datasource
-
         existing = _wire_owner_update(fake_db, user_a, _existing_private())
         fake_db.user_can_publish_datasource = AsyncMock(return_value=False)
-        with _patch_caller_and_db(user_a, fake_db):
+        with _patch_caller(user_a):
             with pytest.raises(HTTPException) as exc:
                 await update_datasource(
-                    fake_request, existing["id"], DatasourceUpdate(is_global=True)
+                    fake_request,
+                    existing["id"],
+                    DatasourceUpdate(is_global=True),
+                    dependencies=_route_deps(user_a, fake_db),
                 )
         assert exc.value.status_code == 403
         fake_db.update_datasource.assert_not_awaited()
@@ -245,13 +277,14 @@ class TestUpdatePublishGate:
     async def test_publish_flip_with_grant_defaults_read_only(
         self, user_a, fake_db, fake_request
     ):
-        from orchestrator.main import DatasourceUpdate, update_datasource
-
         existing = _wire_owner_update(fake_db, user_a, _existing_private())
         fake_db.user_can_publish_datasource = AsyncMock(return_value=True)
-        with _patch_caller_and_db(user_a, fake_db):
+        with _patch_caller(user_a):
             result = await update_datasource(
-                fake_request, existing["id"], DatasourceUpdate(is_global=True)
+                fake_request,
+                existing["id"],
+                DatasourceUpdate(is_global=True),
+                dependencies=_route_deps(user_a, fake_db),
             )
         assert result["id"] == existing["id"]
         kwargs = fake_db.update_datasource.await_args.kwargs
@@ -259,13 +292,14 @@ class TestUpdatePublishGate:
         assert kwargs["read_only"] is True
 
     async def test_unpublish_needs_no_grant(self, user_a, fake_db, fake_request):
-        from orchestrator.main import DatasourceUpdate, update_datasource
-
         existing = _wire_owner_update(fake_db, user_a, _existing_public())
         fake_db.user_can_publish_datasource = AsyncMock(return_value=False)
-        with _patch_caller_and_db(user_a, fake_db):
+        with _patch_caller(user_a):
             result = await update_datasource(
-                fake_request, existing["id"], DatasourceUpdate(is_global=False)
+                fake_request,
+                existing["id"],
+                DatasourceUpdate(is_global=False),
+                dependencies=_route_deps(user_a, fake_db),
             )
         assert result["id"] == existing["id"]
         fake_db.user_can_publish_datasource.assert_not_awaited()
@@ -274,28 +308,30 @@ class TestUpdatePublishGate:
     async def test_ro_to_rw_flip_needs_no_grant(self, user_a, fake_db, fake_request):
         # Spec: friction for RO→RW is the client-side typed confirmation;
         # the server gate is only on the publish transition.
-        from orchestrator.main import DatasourceUpdate, update_datasource
-
         existing = _wire_owner_update(fake_db, user_a, _existing_public())
         fake_db.user_can_publish_datasource = AsyncMock(return_value=False)
-        with _patch_caller_and_db(user_a, fake_db):
+        with _patch_caller(user_a):
             result = await update_datasource(
-                fake_request, existing["id"], DatasourceUpdate(read_only=False)
+                fake_request,
+                existing["id"],
+                DatasourceUpdate(read_only=False),
+                dependencies=_route_deps(user_a, fake_db),
             )
         assert result["id"] == existing["id"]
         fake_db.user_can_publish_datasource.assert_not_awaited()
         assert fake_db.update_datasource.await_args.kwargs["read_only"] is False
 
     async def test_kb_read_write_flag_400(self, user_a, fake_db, fake_request):
-        from orchestrator.main import DatasourceUpdate, update_datasource
-
         existing = _wire_owner_update(
             fake_db, user_a, _created_row(type="kb", is_global=True)
         )
-        with _patch_caller_and_db(user_a, fake_db):
+        with _patch_caller(user_a):
             with pytest.raises(HTTPException) as exc:
                 await update_datasource(
-                    fake_request, existing["id"], DatasourceUpdate(read_only=False)
+                    fake_request,
+                    existing["id"],
+                    DatasourceUpdate(read_only=False),
+                    dependencies=_route_deps(user_a, fake_db),
                 )
         assert exc.value.status_code == 400
         fake_db.update_datasource.assert_not_awaited()

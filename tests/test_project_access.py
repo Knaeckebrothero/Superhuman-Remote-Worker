@@ -39,6 +39,23 @@ from uuid import UUID
 import pytest
 from fastapi import HTTPException
 
+from orchestrator.routers.citations import get_project_memory_stats
+from orchestrator.routers.projects import (
+    add_project_repository,
+    get_project,
+    list_project_members,
+    list_project_repositories,
+    list_projects,
+    remove_project_repository,
+    update_project,
+    update_project_repository,
+)
+from orchestrator.schemas.projects import (
+    ProjectRepositoryCreate,
+    ProjectRepositoryUpdate,
+    ProjectUpdate,
+)
+
 
 # =============================================================================
 # Patch helpers
@@ -46,7 +63,14 @@ from fastapi import HTTPException
 
 
 def _patch_caller_and_db(user: dict, db):
-    """Stack the patches every endpoint test needs."""
+    """Stack the patches every endpoint test needs.
+
+    Still the right shape for the handlers that remain in ``main``
+    (``list_project_jobs``, ``create_project_job``, the expert-catalogue
+    routes). Routes extracted in R1.B03 read their caller gate and their store
+    off a dependency dataclass instead — those tests use ``_patch_caller``
+    plus ``_proj_deps`` / ``_citation_deps``.
+    """
     stack = ExitStack()
     stack.enter_context(
         patch("orchestrator.main.require_approved_user", AsyncMock(return_value=user))
@@ -59,6 +83,102 @@ def _patch_caller_and_db(user: dict, db):
     )
     stack.enter_context(patch("orchestrator.main.postgres_db", db))
     return stack
+
+
+def _patch_caller(user: dict):
+    """Patch the caller resolution the *real* gates read.
+
+    ``require_project_member`` / ``require_project_owner`` / ``require_job_access``
+    stay real in these tests — they are the subject — and each resolves its
+    caller through ``orchestrator.security.access.require_approved_user`` as a
+    module global, so this patch still intercepts it.
+    """
+    return patch(
+        "orchestrator.security.access.require_approved_user",
+        AsyncMock(return_value=user),
+    )
+
+
+def _proj_deps(
+    user: dict,
+    db,
+    *,
+    forge=None,
+    main_cloud_router=None,
+    require_approved_user=None,
+    require_project_owner=None,
+):
+    """The projects router's collaborators, composed as main's
+    ``_projects_dependencies`` factory composes them.
+
+    Substitutes exactly what this file used to patch on ``orchestrator.main``:
+    the store, ``gitea_client`` (``forge``), ``main_cloud_router``, and the
+    caller/owner gates where a test stubbed them. Every other gate keeps its
+    dataclass default — the real function from ``orchestrator.security.access``.
+    """
+    from orchestrator.routers.projects import ProjectsDependencies
+    from orchestrator.services import project_provisioning, projects
+
+    async def _no_admin(*_args, **_kwargs):
+        raise AssertionError("no route in this file may escalate to admin")
+
+    forge = MagicMock(is_initialized=False) if forge is None else forge
+    if main_cloud_router is None:
+        main_cloud_router = MagicMock(for_project_optional=MagicMock(return_value=None))
+    gates: dict = {}
+    if require_approved_user is not None:
+        gates["require_approved_user"] = require_approved_user
+    else:
+        gates["require_approved_user"] = AsyncMock(return_value=user)
+    if require_project_owner is not None:
+        gates["require_project_owner"] = require_project_owner
+
+    return ProjectsDependencies(
+        store=db,
+        operations=projects.ProjectDependencies(
+            store=db,
+            vector_db=MagicMock(),
+            forge=forge,
+            keycloak_groups=MagicMock(is_initialized=False),
+            main_cloud_router=main_cloud_router,
+            logger=MagicMock(),
+            provisioning=project_provisioning.ProjectProvisioningDependencies(
+                store=db,
+                forge=forge,
+                keycloak_groups=MagicMock(is_initialized=False),
+                main_cloud_router=main_cloud_router,
+                logger=MagicMock(),
+                repair=project_provisioning.ProjectRepairState(),
+                knowledge_index=MagicMock(),
+            ),
+            with_validated_tool_overrides=lambda value: value,
+        ),
+        require_admin=_no_admin,
+        **gates,
+    )
+
+
+def _citation_deps(user: dict, db, *, vector_db=None):
+    """The citations router's collaborators, composed as main's
+    ``_citations_dependencies`` factory composes them.
+
+    ``vector_db`` is a parameter because this file uses it as a tripwire: the
+    memory-stats gate must refuse before anything touches the vector pool.
+    """
+    from orchestrator.routers.citations import CitationsDependencies
+    from orchestrator.services import citations
+
+    return CitationsDependencies(
+        store=db,
+        operations=citations.CitationDependencies(
+            store=db,
+            vector_db=MagicMock() if vector_db is None else vector_db,
+            snapshot_service=MagicMock(),
+            main_cloud_router=MagicMock(),
+            logger=MagicMock(),
+        ),
+        require_approved_user=AsyncMock(return_value=user),
+    )
 
 
 def _scoped(user: dict, scope: str) -> dict:
@@ -102,10 +222,10 @@ class TestListProjects:
     async def test_non_admin_uses_get_projects_for_user(
         self, user_a, fake_db, fake_request
     ):
-        from orchestrator.main import list_projects
-
-        with _patch_caller_and_db(user_a, fake_db):
-            result = await list_projects(fake_request, user_id=None)
+        with _patch_caller(user_a):
+            result = await list_projects(
+                fake_request, user_id=None, dependencies=_proj_deps(user_a, fake_db)
+            )
 
         fake_db.get_projects_for_user.assert_awaited_with(
             str(user_a["id"]), statuses=["active"]
@@ -116,32 +236,36 @@ class TestListProjects:
     async def test_non_admin_cross_user_query_403(
         self, user_a, user_b, fake_db, fake_request
     ):
-        from orchestrator.main import list_projects
-
-        with _patch_caller_and_db(user_a, fake_db):
+        with _patch_caller(user_a):
             with pytest.raises(HTTPException) as exc:
-                await list_projects(fake_request, user_id=str(user_b["id"]))
+                await list_projects(
+                    fake_request,
+                    user_id=str(user_b["id"]),
+                    dependencies=_proj_deps(user_a, fake_db),
+                )
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
     async def test_non_admin_self_query_allowed(self, user_a, fake_db, fake_request):
-        from orchestrator.main import list_projects
-
-        with _patch_caller_and_db(user_a, fake_db):
-            result = await list_projects(fake_request, user_id=str(user_a["id"]))
+        with _patch_caller(user_a):
+            result = await list_projects(
+                fake_request,
+                user_id=str(user_a["id"]),
+                dependencies=_proj_deps(user_a, fake_db),
+            )
         assert len(result) == 1
 
     @pytest.mark.asyncio
     async def test_admin_no_user_id_uses_admin_view(
         self, user_admin, project_a, project_b, fake_db, fake_request
     ):
-        from orchestrator.main import list_projects
-
         fake_db.acquire = MagicMock(
             return_value=_patch_admin_list_fetch([project_a, project_b])
         )
-        with _patch_caller_and_db(user_admin, fake_db):
-            result = await list_projects(fake_request, user_id=None)
+        with _patch_caller(user_admin):
+            result = await list_projects(
+                fake_request, user_id=None, dependencies=_proj_deps(user_admin, fake_db)
+            )
         assert len(result) == 2
         # The non-admin helper must NOT be called for admin
         fake_db.get_projects_for_user.assert_not_awaited()
@@ -150,10 +274,12 @@ class TestListProjects:
     async def test_admin_cross_user_query_uses_helper(
         self, user_admin, user_a, fake_db, fake_request
     ):
-        from orchestrator.main import list_projects
-
-        with _patch_caller_and_db(user_admin, fake_db):
-            await list_projects(fake_request, user_id=str(user_a["id"]))
+        with _patch_caller(user_admin):
+            await list_projects(
+                fake_request,
+                user_id=str(user_a["id"]),
+                dependencies=_proj_deps(user_admin, fake_db),
+            )
         fake_db.get_projects_for_user.assert_awaited_with(
             str(user_a["id"]), statuses=["active"]
         )
@@ -162,14 +288,14 @@ class TestListProjects:
     async def test_mcp_project_scope_narrows_admin(
         self, user_admin, project_a, project_b, fake_db, fake_request
     ):
-        from orchestrator.main import list_projects
-
         scoped = _scoped(user_admin, f"project:{project_a['id']}")
         fake_db.acquire = MagicMock(
             return_value=_patch_admin_list_fetch([project_a, project_b])
         )
-        with _patch_caller_and_db(scoped, fake_db):
-            result = await list_projects(fake_request, user_id=None)
+        with _patch_caller(scoped):
+            result = await list_projects(
+                fake_request, user_id=None, dependencies=_proj_deps(scoped, fake_db)
+            )
         # Only project_a should remain after scope filter.
         assert len(result) == 1
         assert result[0]["id"] == project_a["id"]
@@ -178,27 +304,28 @@ class TestListProjects:
     async def test_mcp_project_scope_narrows_non_admin(
         self, user_a, project_a, project_b, fake_db, fake_request
     ):
-        from orchestrator.main import list_projects
-
         scoped = _scoped(user_a, f"project:{project_b['id']}")
-        with _patch_caller_and_db(scoped, fake_db):
-            result = await list_projects(fake_request, user_id=None)
+        with _patch_caller(scoped):
+            result = await list_projects(
+                fake_request, user_id=None, dependencies=_proj_deps(scoped, fake_db)
+            )
         # user_a's memberships filtered against project_b → empty.
         assert result == []
 
     @pytest.mark.asyncio
     async def test_unauthenticated_baseline(self, fake_db, fake_request):
-        from orchestrator.main import list_projects
-
-        with (
-            patch(
-                "orchestrator.main.require_approved_user",
-                AsyncMock(side_effect=HTTPException(status_code=401)),
-            ),
-            patch("orchestrator.main.postgres_db", fake_db),
-        ):
-            with pytest.raises(HTTPException) as exc:
-                await list_projects(fake_request, user_id=None)
+        with pytest.raises(HTTPException) as exc:
+            await list_projects(
+                fake_request,
+                user_id=None,
+                dependencies=_proj_deps(
+                    {},
+                    fake_db,
+                    require_approved_user=AsyncMock(
+                        side_effect=HTTPException(status_code=401)
+                    ),
+                ),
+            )
         assert exc.value.status_code == 401
 
 
@@ -210,76 +337,93 @@ class TestListProjects:
 class TestGetProject:
     @pytest.mark.asyncio
     async def test_owner_passes(self, user_a, project_a, fake_db, fake_request):
-        from orchestrator.main import get_project
-
+        router = MagicMock()
+        router.for_project_optional.return_value.is_initialized = False
         with (
-            _patch_caller_and_db(user_a, fake_db),
+            _patch_caller(user_a),
             patch(
-                "orchestrator.main._ensure_project_cloud_resources",
-                AsyncMock(side_effect=lambda p: p),
+                "orchestrator.services.project_provisioning."
+                "ensure_project_cloud_resources",
+                AsyncMock(side_effect=lambda p, **_: p),
             ),
-            patch("orchestrator.main.main_cloud_router") as router,
         ):
-            router.for_project_optional.return_value.is_initialized = False
-            result = await get_project(fake_request, str(project_a["id"]))
+            result = await get_project(
+                fake_request,
+                str(project_a["id"]),
+                dependencies=_proj_deps(user_a, fake_db, main_cloud_router=router),
+            )
         assert result["id"] == project_a["id"]
 
     @pytest.mark.asyncio
     async def test_cross_user_403(self, user_b, project_a, fake_db, fake_request):
-        from orchestrator.main import get_project
-
         # _ensure_project_cloud_resources must NOT fire — gate first.
         sentinel = AsyncMock(side_effect=AssertionError("side effect ran"))
         with (
-            _patch_caller_and_db(user_b, fake_db),
-            patch("orchestrator.main._ensure_project_cloud_resources", sentinel),
+            _patch_caller(user_b),
+            patch(
+                "orchestrator.services.project_provisioning."
+                "ensure_project_cloud_resources",
+                sentinel,
+            ),
         ):
             with pytest.raises(HTTPException) as exc:
-                await get_project(fake_request, str(project_a["id"]))
+                await get_project(
+                    fake_request,
+                    str(project_a["id"]),
+                    dependencies=_proj_deps(user_b, fake_db),
+                )
         assert exc.value.status_code == 403
         sentinel.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_missing_404(self, user_a, fake_db, fake_request):
-        from orchestrator.main import get_project
-
-        with _patch_caller_and_db(user_a, fake_db):
+        with _patch_caller(user_a):
             with pytest.raises(HTTPException) as exc:
-                await get_project(fake_request, "00000000-0000-0000-0000-000000000999")
+                await get_project(
+                    fake_request,
+                    "00000000-0000-0000-0000-000000000999",
+                    dependencies=_proj_deps(user_a, fake_db),
+                )
         assert exc.value.status_code == 404
 
     @pytest.mark.asyncio
     async def test_admin_bypass(self, user_admin, project_a, fake_db, fake_request):
-        from orchestrator.main import get_project
-
+        router = MagicMock()
+        router.for_project_optional.return_value.is_initialized = False
         with (
-            _patch_caller_and_db(user_admin, fake_db),
+            _patch_caller(user_admin),
             patch(
-                "orchestrator.main._ensure_project_cloud_resources",
-                AsyncMock(side_effect=lambda p: p),
+                "orchestrator.services.project_provisioning."
+                "ensure_project_cloud_resources",
+                AsyncMock(side_effect=lambda p, **_: p),
             ),
-            patch("orchestrator.main.main_cloud_router") as router,
         ):
-            router.for_project_optional.return_value.is_initialized = False
-            result = await get_project(fake_request, str(project_a["id"]))
+            result = await get_project(
+                fake_request,
+                str(project_a["id"]),
+                dependencies=_proj_deps(user_admin, fake_db, main_cloud_router=router),
+            )
         assert result["id"] == project_a["id"]
 
     @pytest.mark.asyncio
     async def test_viewer_passes(self, user_b, project_a, fake_db, fake_request):
         """user_b granted viewer on project_a → can read it."""
-        from orchestrator.main import get_project
-
         _set_role(fake_db, project_a["id"], user_b["id"], "viewer")
+        router = MagicMock()
+        router.for_project_optional.return_value.is_initialized = False
         with (
-            _patch_caller_and_db(user_b, fake_db),
+            _patch_caller(user_b),
             patch(
-                "orchestrator.main._ensure_project_cloud_resources",
-                AsyncMock(side_effect=lambda p: p),
+                "orchestrator.services.project_provisioning."
+                "ensure_project_cloud_resources",
+                AsyncMock(side_effect=lambda p, **_: p),
             ),
-            patch("orchestrator.main.main_cloud_router") as router,
         ):
-            router.for_project_optional.return_value.is_initialized = False
-            result = await get_project(fake_request, str(project_a["id"]))
+            result = await get_project(
+                fake_request,
+                str(project_a["id"]),
+                dependencies=_proj_deps(user_b, fake_db, main_cloud_router=router),
+            )
         assert result["id"] == project_a["id"]
 
 
@@ -297,14 +441,16 @@ class TestProjectReadGates:
     async def test_list_members_blocked_cross_user(
         self, user_b, project_a, fake_db, fake_request
     ):
-        from orchestrator.main import list_project_members
-
         fake_db.get_project_members = AsyncMock(
             side_effect=AssertionError("get_project_members called past the gate")
         )
-        with _patch_caller_and_db(user_b, fake_db):
+        with _patch_caller(user_b):
             with pytest.raises(HTTPException) as exc:
-                await list_project_members(fake_request, str(project_a["id"]))
+                await list_project_members(
+                    fake_request,
+                    str(project_a["id"]),
+                    dependencies=_proj_deps(user_b, fake_db),
+                )
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
@@ -332,14 +478,15 @@ class TestProjectReadGates:
     async def test_memory_stats_blocked_cross_user(
         self, user_b, project_a, fake_db, fake_request
     ):
-        from orchestrator.main import get_project_memory_stats
-
-        with (
-            _patch_caller_and_db(user_b, fake_db),
-            patch("orchestrator.main.vector_db", _explode("vector_db")),
-        ):
+        with _patch_caller(user_b):
             with pytest.raises(HTTPException) as exc:
-                await get_project_memory_stats(fake_request, str(project_a["id"]))
+                await get_project_memory_stats(
+                    fake_request,
+                    str(project_a["id"]),
+                    dependencies=_citation_deps(
+                        user_b, fake_db, vector_db=_explode("vector_db")
+                    ),
+                )
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
@@ -374,15 +521,16 @@ class TestProjectReadGates:
     async def test_list_repositories_blocked_cross_user(
         self, user_b, project_a, fake_db, fake_request
     ):
-        from orchestrator.main import list_project_repositories
-
         fake_db.get_project_repositories = AsyncMock(
             side_effect=AssertionError("get_project_repositories called past the gate")
         )
-        with _patch_caller_and_db(user_b, fake_db):
+        with _patch_caller(user_b):
             with pytest.raises(HTTPException) as exc:
                 await list_project_repositories(
-                    fake_request, str(project_a["id"]), role=None
+                    fake_request,
+                    str(project_a["id"]),
+                    role=None,
+                    dependencies=_proj_deps(user_b, fake_db),
                 )
         assert exc.value.status_code == 403
 
@@ -414,24 +562,28 @@ class TestProjectReadHappyPaths:
     async def test_list_members_owner_reaches_db(
         self, user_a, project_a, fake_db, fake_request
     ):
-        from orchestrator.main import list_project_members
-
         fake_db.get_project_members = AsyncMock(
             return_value=[{"user_id": str(user_a["id"]), "role": "owner"}]
         )
-        with _patch_caller_and_db(user_a, fake_db):
-            result = await list_project_members(fake_request, str(project_a["id"]))
+        with _patch_caller(user_a):
+            result = await list_project_members(
+                fake_request,
+                str(project_a["id"]),
+                dependencies=_proj_deps(user_a, fake_db),
+            )
         assert len(result) == 1
 
     @pytest.mark.asyncio
     async def test_list_members_admin_bypass(
         self, user_admin, project_a, fake_db, fake_request
     ):
-        from orchestrator.main import list_project_members
-
         fake_db.get_project_members = AsyncMock(return_value=[])
-        with _patch_caller_and_db(user_admin, fake_db):
-            await list_project_members(fake_request, str(project_a["id"]))
+        with _patch_caller(user_admin):
+            await list_project_members(
+                fake_request,
+                str(project_a["id"]),
+                dependencies=_proj_deps(user_admin, fake_db),
+            )
         fake_db.get_project_members.assert_awaited_once()
 
 
@@ -506,33 +658,35 @@ class TestProjectMutationRoles:
     async def test_add_repository_editor_403(
         self, user_b, project_a, fake_db, fake_request
     ):
-        from orchestrator.main import ProjectRepositoryCreate, add_project_repository
-
         _set_role(fake_db, project_a["id"], user_b["id"], "editor")
         fake_db.add_project_repository = AsyncMock(
             side_effect=AssertionError("add_project_repository called past the gate")
         )
         body = ProjectRepositoryCreate(name="r", repo_url="https://example.test/r.git")
-        with _patch_caller_and_db(user_b, fake_db):
+        with _patch_caller(user_b):
             with pytest.raises(HTTPException) as exc:
-                await add_project_repository(fake_request, str(project_a["id"]), body)
+                await add_project_repository(
+                    fake_request,
+                    str(project_a["id"]),
+                    body,
+                    dependencies=_proj_deps(user_b, fake_db),
+                )
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
     async def test_add_repository_owner_passes(
         self, user_a, project_a, fake_db, fake_request
     ):
-        from orchestrator.main import ProjectRepositoryCreate, add_project_repository
-
         fake_db.add_project_repository = AsyncMock(return_value={"id": "new"})
         body = ProjectRepositoryCreate(name="r", repo_url="https://example.test/r.git")
-        with (
-            _patch_caller_and_db(user_a, fake_db),
-            patch("orchestrator.main.gitea_client") as gitea,
-        ):
-            gitea.is_initialized = False
+        gitea = MagicMock()
+        gitea.is_initialized = False
+        with _patch_caller(user_a):
             result = await add_project_repository(
-                fake_request, str(project_a["id"]), body
+                fake_request,
+                str(project_a["id"]),
+                body,
+                dependencies=_proj_deps(user_a, fake_db, forge=gitea),
             )
         assert result == {"id": "new"}
 
@@ -540,17 +694,19 @@ class TestProjectMutationRoles:
     async def test_update_repository_editor_403(
         self, user_b, project_a, fake_db, fake_request
     ):
-        from orchestrator.main import ProjectRepositoryUpdate, update_project_repository
-
         _set_role(fake_db, project_a["id"], user_b["id"], "editor")
         fake_db.update_project_repository = AsyncMock(
             side_effect=AssertionError("update called past the gate")
         )
         body = ProjectRepositoryUpdate(description="x")
-        with _patch_caller_and_db(user_b, fake_db):
+        with _patch_caller(user_b):
             with pytest.raises(HTTPException) as exc:
                 await update_project_repository(
-                    fake_request, str(project_a["id"]), "repo-id", body
+                    fake_request,
+                    str(project_a["id"]),
+                    "repo-id",
+                    body,
+                    dependencies=_proj_deps(user_b, fake_db),
                 )
         assert exc.value.status_code == 403
 
@@ -558,8 +714,6 @@ class TestProjectMutationRoles:
     async def test_managed_repository_read_only_patch_rotates_before_row_update(
         self, user_a, project_a, fake_db, fake_request
     ):
-        from orchestrator.main import ProjectRepositoryUpdate, update_project_repository
-
         repository = {
             "id": "repo-id",
             "project_id": project_a["id"],
@@ -585,9 +739,9 @@ class TestProjectMutationRoles:
 
         fake_db.update_project_repository.side_effect = update
         with (
-            _patch_caller_and_db(user_a, fake_db),
+            _patch_caller(user_a),
             patch(
-                "orchestrator.main.rotate_project_repository_authority",
+                "orchestrator.services.projects.rotate_project_repository_authority",
                 AsyncMock(side_effect=rotate),
             ) as rotation,
         ):
@@ -596,6 +750,7 @@ class TestProjectMutationRoles:
                 str(project_a["id"]),
                 "repo-id",
                 ProjectRepositoryUpdate(read_only=True),
+                dependencies=_proj_deps(user_a, fake_db),
             )
 
         assert result == {"status": "updated"}
@@ -609,16 +764,17 @@ class TestProjectMutationRoles:
     async def test_remove_repository_editor_403(
         self, user_b, project_a, fake_db, fake_request
     ):
-        from orchestrator.main import remove_project_repository
-
         _set_role(fake_db, project_a["id"], user_b["id"], "editor")
         fake_db.get_project_repository = AsyncMock(
             side_effect=AssertionError("get_project_repository called past the gate")
         )
-        with _patch_caller_and_db(user_b, fake_db):
+        with _patch_caller(user_b):
             with pytest.raises(HTTPException) as exc:
                 await remove_project_repository(
-                    fake_request, str(project_a["id"]), "repo-id"
+                    fake_request,
+                    str(project_a["id"]),
+                    "repo-id",
+                    dependencies=_proj_deps(user_b, fake_db),
                 )
         assert exc.value.status_code == 403
 
@@ -626,8 +782,6 @@ class TestProjectMutationRoles:
     async def test_remove_repository_owner_passes(
         self, user_a, project_a, fake_db, fake_request
     ):
-        from orchestrator.main import remove_project_repository
-
         fake_db.get_project_repository = AsyncMock(
             return_value={
                 "id": "r",
@@ -640,13 +794,14 @@ class TestProjectMutationRoles:
         fake_db.remove_project_repository = AsyncMock(
             return_value={"is_managed": False, "name": "r"}
         )
-        with (
-            _patch_caller_and_db(user_a, fake_db),
-            patch("orchestrator.main.gitea_client") as gitea,
-        ):
-            gitea.is_initialized = False
+        gitea = MagicMock()
+        gitea.is_initialized = False
+        with _patch_caller(user_a):
             result = await remove_project_repository(
-                fake_request, str(project_a["id"]), "repo-id"
+                fake_request,
+                str(project_a["id"]),
+                "repo-id",
+                dependencies=_proj_deps(user_a, fake_db, forge=gitea),
             )
         assert result == {"status": "removed"}
 
@@ -714,10 +869,10 @@ class TestListProjectsStatusFilter:
     async def test_default_excludes_archived(
         self, user_b, archived_project, fake_db, fake_request
     ):
-        from orchestrator.main import list_projects
-
-        with _patch_caller_and_db(user_b, fake_db):
-            result = await list_projects(fake_request, user_id=None)
+        with _patch_caller(user_b):
+            result = await list_projects(
+                fake_request, user_id=None, dependencies=_proj_deps(user_b, fake_db)
+            )
 
         # user_b owns exactly one project, and it is archived.
         assert result == []
@@ -727,11 +882,12 @@ class TestListProjectsStatusFilter:
     async def test_status_archived_returns_the_archive(
         self, user_b, archived_project, fake_db, fake_request
     ):
-        from orchestrator.main import list_projects
-
-        with _patch_caller_and_db(user_b, fake_db):
+        with _patch_caller(user_b):
             result = await list_projects(
-                fake_request, user_id=None, status=["archived"]
+                fake_request,
+                user_id=None,
+                status=["archived"],
+                dependencies=_proj_deps(user_b, fake_db),
             )
 
         assert [p["id"] for p in result] == [archived_project["id"]]
@@ -740,11 +896,12 @@ class TestListProjectsStatusFilter:
     async def test_both_statuses_return_everything(
         self, user_b, archived_project, fake_db, fake_request
     ):
-        from orchestrator.main import list_projects
-
-        with _patch_caller_and_db(user_b, fake_db):
+        with _patch_caller(user_b):
             result = await list_projects(
-                fake_request, user_id=None, status=["active", "archived"]
+                fake_request,
+                user_id=None,
+                status=["active", "archived"],
+                dependencies=_proj_deps(user_b, fake_db),
             )
 
         assert len(result) == 1
@@ -756,11 +913,11 @@ class TestListProjectsStatusFilter:
         """Fail toward showing (§4.2): the column is nullable and the CHECK
         passes on NULL, so a NULL row must behave as active rather than
         vanishing from every listing."""
-        from orchestrator.main import list_projects
-
         project_b["status"] = None
-        with _patch_caller_and_db(user_b, fake_db):
-            result = await list_projects(fake_request, user_id=None)
+        with _patch_caller(user_b):
+            result = await list_projects(
+                fake_request, user_id=None, dependencies=_proj_deps(user_b, fake_db)
+            )
 
         assert len(result) == 1
 
@@ -768,12 +925,15 @@ class TestListProjectsStatusFilter:
     async def test_admin_branch_binds_the_statuses_and_drops_the_dead_filter(
         self, user_admin, project_a, project_b, fake_db, fake_request
     ):
-        from orchestrator.main import list_projects
-
         ctx = _patch_admin_list_fetch([project_a, project_b])
         fake_db.acquire = MagicMock(return_value=ctx)
-        with _patch_caller_and_db(user_admin, fake_db):
-            await list_projects(fake_request, user_id=None, status=["archived"])
+        with _patch_caller(user_admin):
+            await list_projects(
+                fake_request,
+                user_id=None,
+                status=["archived"],
+                dependencies=_proj_deps(user_admin, fake_db),
+            )
 
         conn = await ctx.__aenter__()
         sql, statuses = conn.fetch.await_args.args
@@ -788,27 +948,28 @@ class TestUpdateProjectOnAnArchivedProject:
     """§4.3a — status-only while archived, and never a partial apply."""
 
     def _patched(self, user, db, project):
-        stack = _patch_caller_and_db(user, db)
-        stack.enter_context(
-            patch(
-                "orchestrator.main.require_project_owner",
-                AsyncMock(return_value=(user, project)),
-            )
+        """Caller patch only — the owner gate is stubbed through ``_deps``,
+        which is where the extracted route now reads it from."""
+        return _patch_caller(user)
+
+    def _deps(self, user, db, project):
+        return _proj_deps(
+            user,
+            db,
+            require_project_owner=AsyncMock(return_value=(user, project)),
         )
-        return stack
 
     @pytest.mark.asyncio
     async def test_unarchive_is_allowed(
         self, user_b, archived_project, fake_db, fake_request
     ):
-        from orchestrator.main import ProjectUpdate, update_project
-
         fake_db.update_project = AsyncMock(return_value=True)
         with self._patched(user_b, fake_db, archived_project):
             result = await update_project(
                 str(archived_project["id"]),
                 ProjectUpdate(status="active"),
                 fake_request,
+                dependencies=self._deps(user_b, fake_db, archived_project),
             )
 
         assert result["status"] == "updated"
@@ -820,8 +981,6 @@ class TestUpdateProjectOnAnArchivedProject:
     async def test_renaming_an_archived_project_is_refused(
         self, user_b, archived_project, fake_db, fake_request
     ):
-        from orchestrator.main import ProjectUpdate, update_project
-
         fake_db.update_project = AsyncMock(return_value=True)
         with self._patched(user_b, fake_db, archived_project):
             with pytest.raises(HTTPException) as exc:
@@ -829,6 +988,7 @@ class TestUpdateProjectOnAnArchivedProject:
                     str(archived_project["id"]),
                     ProjectUpdate(name="renamed"),
                     fake_request,
+                    dependencies=self._deps(user_b, fake_db, archived_project),
                 )
 
         assert exc.value.status_code == 409
@@ -840,8 +1000,6 @@ class TestUpdateProjectOnAnArchivedProject:
     ):
         """The worst outcome is a half-applied PATCH: the caller has no way
         to tell which half landed."""
-        from orchestrator.main import ProjectUpdate, update_project
-
         fake_db.update_project = AsyncMock(return_value=True)
         with self._patched(user_b, fake_db, archived_project):
             with pytest.raises(HTTPException) as exc:
@@ -849,6 +1007,7 @@ class TestUpdateProjectOnAnArchivedProject:
                     str(archived_project["id"]),
                     ProjectUpdate(status="active", name="renamed"),
                     fake_request,
+                    dependencies=self._deps(user_b, fake_db, archived_project),
                 )
 
         assert exc.value.status_code == 409
@@ -858,12 +1017,13 @@ class TestUpdateProjectOnAnArchivedProject:
     async def test_an_active_project_still_takes_any_field(
         self, user_b, project_b, fake_db, fake_request
     ):
-        from orchestrator.main import ProjectUpdate, update_project
-
         fake_db.update_project = AsyncMock(return_value=True)
         with self._patched(user_b, fake_db, project_b):
             result = await update_project(
-                str(project_b["id"]), ProjectUpdate(name="renamed"), fake_request
+                str(project_b["id"]),
+                ProjectUpdate(name="renamed"),
+                fake_request,
+                dependencies=self._deps(user_b, fake_db, project_b),
             )
 
         assert result == {"status": "updated"}
@@ -875,8 +1035,6 @@ class TestUpdateProjectOnAnArchivedProject:
     ):
         """This layer is merged under EVERY job in the project — leaving it
         editable would stop "archived" meaning read-only."""
-        from orchestrator.main import ProjectUpdate, update_project
-
         fake_db.update_project = AsyncMock(return_value=True)
         with self._patched(user_b, fake_db, archived_project):
             with pytest.raises(HTTPException) as exc:
@@ -884,6 +1042,7 @@ class TestUpdateProjectOnAnArchivedProject:
                     str(archived_project["id"]),
                     ProjectUpdate(default_config_override={"memory": {"x": True}}),
                     fake_request,
+                    dependencies=self._deps(user_b, fake_db, archived_project),
                 )
 
         assert exc.value.status_code == 409
@@ -894,21 +1053,21 @@ class TestArchivingQuiescesChildren:
     """§4.5 — quiesce, never refuse; then report what happened."""
 
     def _patched(self, user, db, project):
-        stack = _patch_caller_and_db(user, db)
-        stack.enter_context(
-            patch(
-                "orchestrator.main.require_project_owner",
-                AsyncMock(return_value=(user, project)),
-            )
+        """Caller patch only — the owner gate is stubbed through ``_deps``,
+        which is where the extracted route now reads it from."""
+        return _patch_caller(user)
+
+    def _deps(self, user, db, project):
+        return _proj_deps(
+            user,
+            db,
+            require_project_owner=AsyncMock(return_value=(user, project)),
         )
-        return stack
 
     @pytest.mark.asyncio
     async def test_archiving_pauses_the_loop_holds_the_officer_and_parks_jobs(
         self, user_b, project_b, fake_db, fake_request
     ):
-        from orchestrator.main import ProjectUpdate, update_project
-
         loop_id = "1111aaaa-1111-4111-8111-111111111111"
         officer_id = "2222bbbb-2222-4222-8222-222222222222"
         fake_db.update_project = AsyncMock(return_value=True)
@@ -922,7 +1081,10 @@ class TestArchivingQuiescesChildren:
 
         with self._patched(user_b, fake_db, project_b):
             result = await update_project(
-                str(project_b["id"]), ProjectUpdate(status="archived"), fake_request
+                str(project_b["id"]),
+                ProjectUpdate(status="archived"),
+                fake_request,
+                dependencies=self._deps(user_b, fake_db, project_b),
             )
 
         assert result == {
@@ -943,8 +1105,6 @@ class TestArchivingQuiescesChildren:
     async def test_a_paused_loop_and_an_already_held_officer_are_left_alone(
         self, user_b, project_b, fake_db, fake_request
     ):
-        from orchestrator.main import ProjectUpdate, update_project
-
         fake_db.update_project = AsyncMock(return_value=True)
         fake_db.get_active_project_loop = AsyncMock(
             return_value={"id": "l1", "status": "paused"}
@@ -959,7 +1119,10 @@ class TestArchivingQuiescesChildren:
 
         with self._patched(user_b, fake_db, project_b):
             result = await update_project(
-                str(project_b["id"]), ProjectUpdate(status="archived"), fake_request
+                str(project_b["id"]),
+                ProjectUpdate(status="archived"),
+                fake_request,
+                dependencies=self._deps(user_b, fake_db, project_b),
             )
 
         assert result["loop_paused"] is False
@@ -973,8 +1136,6 @@ class TestArchivingQuiescesChildren:
     ):
         """Refusing makes archive un-completable exactly when you most want
         it — when something is wedged and you want it to stop mattering."""
-        from orchestrator.main import ProjectUpdate, update_project
-
         fake_db.update_project = AsyncMock(return_value=True)
         fake_db.get_active_project_loop = AsyncMock(side_effect=RuntimeError("boom"))
         fake_db.get_officer_thread_for_project = AsyncMock(
@@ -986,7 +1147,10 @@ class TestArchivingQuiescesChildren:
 
         with self._patched(user_b, fake_db, project_b):
             result = await update_project(
-                str(project_b["id"]), ProjectUpdate(status="archived"), fake_request
+                str(project_b["id"]),
+                ProjectUpdate(status="archived"),
+                fake_request,
+                dependencies=self._deps(user_b, fake_db, project_b),
             )
 
         assert result["archived"] is True
@@ -998,8 +1162,6 @@ class TestArchivingQuiescesChildren:
     ):
         """Only the transition INTO archived quiesces. A PATCH re-asserting
         the current status must not undo a hold the owner released."""
-        from orchestrator.main import ProjectUpdate, update_project
-
         fake_db.update_project = AsyncMock(return_value=True)
 
         with self._patched(user_b, fake_db, archived_project):
@@ -1007,6 +1169,7 @@ class TestArchivingQuiescesChildren:
                 str(archived_project["id"]),
                 ProjectUpdate(status="archived"),
                 fake_request,
+                dependencies=self._deps(user_b, fake_db, archived_project),
             )
 
         assert result == {"status": "updated"}
@@ -1066,12 +1229,12 @@ class TestArchivedProjectStaysReadableAndTearableDown:
     async def test_reading_its_members_still_works(
         self, user_b, archived_project, fake_db, fake_request
     ):
-        from orchestrator.main import list_project_members
-
         fake_db.get_project_members = AsyncMock(return_value=[{"user_id": "u"}])
-        with _patch_caller_and_db(user_b, fake_db):
+        with _patch_caller(user_b):
             result = await list_project_members(
-                fake_request, str(archived_project["id"])
+                fake_request,
+                str(archived_project["id"]),
+                dependencies=_proj_deps(user_b, fake_db),
             )
         assert result == [{"user_id": "u"}]
 
@@ -1079,8 +1242,6 @@ class TestArchivedProjectStaysReadableAndTearableDown:
     async def test_detaching_a_repository_still_works(
         self, user_b, archived_project, fake_db, fake_request
     ):
-        from orchestrator.main import remove_project_repository
-
         fake_db.get_project_repository = AsyncMock(
             return_value={
                 "id": "r",
@@ -1093,13 +1254,14 @@ class TestArchivedProjectStaysReadableAndTearableDown:
         fake_db.remove_project_repository = AsyncMock(
             return_value={"is_managed": False, "name": "r"}
         )
-        with (
-            _patch_caller_and_db(user_b, fake_db),
-            patch("orchestrator.main.gitea_client") as gitea,
-        ):
-            gitea.is_initialized = False
+        gitea = MagicMock()
+        gitea.is_initialized = False
+        with _patch_caller(user_b):
             result = await remove_project_repository(
-                fake_request, str(archived_project["id"]), "repo-id"
+                fake_request,
+                str(archived_project["id"]),
+                "repo-id",
+                dependencies=_proj_deps(user_b, fake_db, forge=gitea),
             )
         assert result == {"status": "removed"}
 
@@ -1108,13 +1270,12 @@ class TestArchivedProjectStaysReadableAndTearableDown:
         self, user_b, archived_project, fake_db, fake_request
     ):
         """The mirror image, so the pair is unambiguous: detach yes, attach no."""
-        from orchestrator.main import ProjectRepositoryCreate, add_project_repository
-
-        with _patch_caller_and_db(user_b, fake_db):
+        with _patch_caller(user_b):
             with pytest.raises(HTTPException) as exc:
                 await add_project_repository(
                     fake_request,
                     str(archived_project["id"]),
                     ProjectRepositoryCreate(name="new-repo"),
+                    dependencies=_proj_deps(user_b, fake_db),
                 )
         assert exc.value.status_code == 409

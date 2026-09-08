@@ -229,7 +229,8 @@ class TestProjectDefaultConfigNameWriteBoundary:
     async def test_create_project_refuses_hostile_default(
         self, user_a, fake_db, fake_request
     ):
-        from orchestrator.main import ProjectCreate, create_project
+        from orchestrator.routers.projects import create_project
+        from orchestrator.schemas.projects import ProjectCreate
 
         fake_db.create_project = AsyncMock()
         with _patch_caller(user_a, fake_db):
@@ -241,6 +242,7 @@ class TestProjectDefaultConfigNameWriteBoundary:
                         default_config_name="scholar && curl evil",
                     ),
                     fake_request,
+                    dependencies=orch_main._projects_dependencies(),
                 )
 
         assert exc.value.status_code == 422
@@ -250,7 +252,8 @@ class TestProjectDefaultConfigNameWriteBoundary:
     async def test_patch_project_refuses_hostile_default(
         self, user_a, project_a, fake_db, fake_request
     ):
-        from orchestrator.main import ProjectUpdate, update_project
+        from orchestrator.routers.projects import update_project
+        from orchestrator.schemas.projects import ProjectUpdate
 
         fake_db.update_project = AsyncMock(return_value=True)
         with _patch_caller(user_a, fake_db):
@@ -263,6 +266,7 @@ class TestProjectDefaultConfigNameWriteBoundary:
                         str(project_a["id"]),
                         ProjectUpdate(default_config_name="../../etc/passwd"),
                         fake_request,
+                        dependencies=orch_main._projects_dependencies(),
                     )
 
         assert exc.value.status_code == 422
