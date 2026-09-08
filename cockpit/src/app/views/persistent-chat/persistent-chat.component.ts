@@ -91,6 +91,7 @@ import {JobBatchCardComponent} from '../../ui/tool-card/job-batch-card.component
 import {AppReadAloudComponent} from '../../ui/read-aloud';
 import {AppInlineEditableTextComponent} from '../../ui/inline-editable-text';
 import {AppToastService} from '../../ui/toast';
+import {queueParkReasonKey} from '../../core/models/queue-park-reason';
 import {ErrorMessageService} from '../../core/services/error-message.service';
 import {ExternalImageDirective} from '../../ui/external-image';
 
@@ -1822,6 +1823,32 @@ export function clearDraft(threadId: string | null): void {
           }
         }
 
+        <!-- Parked unit: the input was accepted but nothing can claim it until
+             it is retried (attach failures, a maintenance interruption, a
+             settlement failure). Rendered from the durable queue block, so a
+             reload shows it too. Never the waiting/busy copy: this is a
+             failure with a way out, not a queue. -->
+        @if (chat.isParked()) {
+          <div class="message message-assistant turn-bubble parked-turn" role="alert" data-testid="chat-parked">
+            <div class="avatar">
+              <app-icon size="sm" class="avatar-icon parked-icon">error_outline</app-icon>
+            </div>
+            <div class="message-body turn-body parked-body">
+              <div class="parked-line">{{ 'chat.parked.title' | transloco }}</div>
+              <div class="parked-reason">{{ parkedReasonKey() | transloco }}</div>
+              @if (chat.queueState()?.retryable) {
+                <div class="parked-actions">
+                  <button type="button" class="queued-action parked-retry" data-testid="chat-parked-retry"
+                          [disabled]="retryingParked()"
+                          (click)="retryParked()">
+                    {{ (retryingParked() ? 'chat.parked.retrying' : 'chat.parked.retry') | transloco }}
+                  </button>
+                </div>
+              }
+            </div>
+          </div>
+        }
+
         <!-- Accepted-but-not-yet-started turn: the input is durably queued
              but no agent has claimed it yet (pool busy, or the previous
              turn's cloud push still flushing). Shown standalone because no
@@ -2548,6 +2575,19 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     /** Escalation tier + m:ss label for the queued-turn bubble. */
     readonly queuedTier = computed(() => queueWaitTier(this.chat.awaitingElapsedMs()));
     readonly queuedWaitLabel = computed(() => formatQueueWait(this.chat.awaitingElapsedMs()));
+    /** Reason line under the parked bubble, keyed by run_queue.park_reason. */
+    readonly parkedReasonKey = computed(() => queueParkReasonKey(this.chat.queueState()?.park_reason));
+    readonly retryingParked = signal(false);
+
+    async retryParked(): Promise<void> {
+        if (this.retryingParked()) return;
+        this.retryingParked.set(true);
+        try {
+            await this.chat.retryParked();
+        } finally {
+            this.retryingParked.set(false);
+        }
+    }
 
     private readonly compactionNow = signal(Date.now());
     private compactionTimer: ReturnType<typeof setInterval> | null = null;
@@ -3209,6 +3249,8 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         if (!this.chat.isConnected()) return this.transloco.translate('chat.input.connect');
         if (this.chat.isInterrupting()) return this.transloco.translate('chat.input.stopping');
         if (this.chat.isStreaming()) return this.transloco.translate('chat.input.working');
+        // A parked unit needs a retry — say so, not "waiting".
+        if (this.chat.isParked()) return this.transloco.translate('chat.input.parked');
         // isAwaitingTurn: the send is accepted but no agent has picked it up
         // yet — say "waiting", not "working"; the queued bubble carries the
         // escalation copy.

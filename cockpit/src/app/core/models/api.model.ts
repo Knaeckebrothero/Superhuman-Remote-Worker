@@ -2868,3 +2868,65 @@ export interface Contact {
   created_at: string;
   updated_at: string;
 }
+
+// =============================================================================
+// Stateless run_queue state (stateless_turn_resilience.md, step 2)
+// =============================================================================
+
+/** Why a session's queue unit was parked. Mirrors run_queue.park_reason. */
+export type SessionQueueParkReason =
+  | 'attach_failed'
+  | 'shutdown_cancelled'
+  | 'completion_cas_failed'
+  | 'reaper_max_attempts'
+  | string;
+
+/**
+ * The `queue` block the orchestrator returns on the input accept response,
+ * on `/connection`, and on `GET /persistent/threads/{id}/queue`. `state` is
+ * the run_queue row state ('queued' | 'leased' | 'parked' | 'done'); a parked
+ * unit accepts input but nothing can claim it until it is retried.
+ */
+export interface SessionQueueState {
+  state: string;
+  park_reason: SessionQueueParkReason | null;
+  parked_at: string | null;
+  retryable: boolean;
+  attempts: number;
+  pending_input: boolean;
+}
+
+/** One parked unit as listed on GET /api/admin/capacity. */
+export interface AdminCapacityParkedRow {
+  unit_id: string;
+  unit_kind: string;
+  thread_id: string | null;
+  title: string | null;
+  owner: string | null;
+  park_reason: SessionQueueParkReason | null;
+  parked_at: string | null;
+  attempts: number;
+  pending_input: boolean;
+}
+
+/** GET /api/admin/capacity — what the KEDA scaler sees, plus the parked worklist. */
+export interface AdminCapacity {
+  observed_at: string;
+  executors: { total: number | null; ready: number | null; busy: number };
+  queued: { session_turn: number; worker_batch: number; total: number };
+  oldest_queued_age_s: number;
+  desired: number;
+  params: { min_replicas: number; reserve: number };
+  parked?: AdminCapacityParkedRow[];
+}
+
+/** POST /api/admin/run-queue/{unit}/unpark */
+export interface RunQueueUnparkResult {
+  unit_id: string;
+  state: string;
+}
+
+/** POST /api/persistent/threads/{id}/queue/retry, folded to a discriminated outcome. */
+export type SessionQueueRetryOutcome =
+  | { kind: 'ok'; state: string }
+  | { kind: 'refused'; status: number; code: string };

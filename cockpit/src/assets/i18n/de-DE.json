@@ -860,6 +860,7 @@
       "subagentsTranscript": "Transkript",
       "subagentsStatuses": {
         "queued": "In Warteschlange",
+      "parked": "Diese Nachricht muss erneut versucht werden",
         "running": "Läuft",
         "completed": "Abgeschlossen",
         "parked": "Geparkt",
@@ -878,6 +879,36 @@
     }
   },
   "admin": {
+    "capacity": {
+      "title": "Kapazität",
+      "desc": "Was der Stateless-Pool und sein Autoscaler gerade sehen: Executors, anstehende Arbeit und nach einem Fehler geparkte Einheiten.",
+      "executors": "Executors",
+      "ready": "bereit",
+      "busy": "belegt",
+      "queued": "In der Warteschlange",
+      "sessions": "Sitzungen",
+      "batches": "Batches",
+      "oldestQueued": "Älteste wartende",
+      "desired": "Gewünschte Replikas",
+      "floor": "Minimum",
+      "reserve": "Reserve",
+      "parked": "Geparkte Einheiten",
+      "none": "Nichts ist geparkt.",
+      "unpark": "Freigeben",
+      "unparked": "Einheit wieder eingereiht.",
+      "unparkFailed": "Freigeben fehlgeschlagen.",
+      "loadFailed": "Kapazität konnte nicht geladen werden.",
+      "observedAt": "Stand {{time}}",
+      "colTitle": "Sitzung",
+      "colOwner": "Besitzer",
+      "colKind": "Art",
+      "colReason": "Grund",
+      "colParkedAt": "Geparkt",
+      "colAttempts": "Versuche",
+      "colPending": "Offene Eingabe",
+      "yes": "ja",
+      "no": "nein"
+    },
     "config": {
       "messages": {
         "saveEmpty": "Nichts zu speichern — wählen Sie einen Konfigurationsschlüssel und geben Sie einen Wert ein.",
@@ -1708,6 +1739,18 @@
       "waiting": "Warten auf einen verfügbaren Agenten…",
       "busy": "Unsere Systeme sind stärker ausgelastet als üblich – das kann einige Minuten dauern. Sie können die Seite verlassen; die Antwort wartet hier auf Sie.",
       "elapsed": "Wartezeit {{time}}"
+    },
+    "parked": {
+      "title": "Diese Nachricht konnte nicht verarbeitet werden",
+      "retry": "Erneut versuchen",
+      "retrying": "Wird erneut eingereiht…",
+      "retryFailed": "Erneuter Versuch abgelehnt ({{code}})",
+      "reason": {
+        "attachFailed": "Der Agent konnte diese Sitzung nicht wieder aufnehmen.",
+        "shutdownCancelled": "Die Antwort wurde durch Wartungsarbeiten unterbrochen.",
+        "stopped": "Die Sitzung wurde beendet, bevor diese Nachricht verarbeitet wurde.",
+        "generic": "Die Sitzung ist auf ein Problem gestoßen. Versuchen Sie es erneut."
+      }
     },
     "queued": {
       "notSent": "Nicht gesendet",

@@ -136,6 +136,12 @@ export const routes: Routes = [
     canActivate: [authGuard, adminGuard],
   },
   {
+    path: 'admin/capacity',
+    loadComponent: () =>
+      import('./views/admin/capacity/admin-capacity.component').then(m => m.AdminCapacityComponent),
+    canActivate: [authGuard, adminGuard],
+  },
+  {
     path: 'workbench',
     loadComponent: () =>
       import('./workbench/pages/workbench.component').then(m => m.WorkbenchPageComponent),

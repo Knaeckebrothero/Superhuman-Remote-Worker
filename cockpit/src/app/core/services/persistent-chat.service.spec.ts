@@ -142,6 +142,11 @@ function createService(
     uploadOneToThread: vi.fn().mockReturnValue(of({ kind: 'done', files: [] })),
     deleteThreadUpload: vi.fn().mockReturnValue(of(undefined)),
     humanizeUploadError: vi.fn().mockReturnValue('upload failed'),
+    // Durable queue block (stateless_turn_resilience.md step 2): the awaiting
+    // poll and the owner retry must never throw inside a timer in tests that
+    // don't care about them.
+    getThreadQueue: vi.fn().mockReturnValue(of(null)),
+    retryThreadQueue: vi.fn().mockReturnValue(of({ kind: 'ok', state: 'queued' })),
   };
 
   const mockCache: any = {
@@ -10335,5 +10340,144 @@ describe('PersistentChatService — control transport is declared, never inferre
     // instead of sitting in the outbox for the life of the tab.
     expect((ctx.service as any).controlOutbox).toEqual([]);
     expect(ctx.service.error()).toBe('chat.control.unavailable');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Durable queue state: parked units, the awaiting poll, owner retry
+// (stateless_turn_resilience.md, step 2)
+// ---------------------------------------------------------------------------
+describe('PersistentChatService — queue state (parked / poll / retry)', () => {
+  const parkedBlock = {
+    state: 'parked',
+    park_reason: 'attach_failed',
+    parked_at: '2026-09-08T14:00:00Z',
+    retryable: true,
+    attempts: 5,
+    pending_input: true,
+  };
+
+  async function readyOn(threadId: string, connection: Record<string, unknown> = {}) {
+    const ctx = createService();
+    ctx.mockHttp.get.mockImplementation((url: string) => {
+      if (url.endsWith(`/sessions/${threadId}/connection`)) {
+        return of({ state: 'ready', ws_url: null, control_socket: 'none', ...connection });
+      }
+      return of({ status: 'active', total_turns: 0, messages: [], total: 0 });
+    });
+    await ctx.service.connect(threadId);
+    fireSseOpen(ctx.sseInstances[0]);
+    fireSseMessage(ctx.sseInstances[0], { method: 'ready', params: {} }, '1:1');
+    ctx.mockHttp.post.mockClear();
+    return ctx;
+  }
+
+  it('renders a parked accept as parked, never as awaiting', async () => {
+    const ctx = await readyOn('thread-p');
+    ctx.mockHttp.post.mockReturnValue(
+      of({ accepted: true, turn_id: 3, queue: parkedBlock }),
+    );
+    await ctx.service.sendMessage('hello?');
+    await Promise.resolve();
+    expect(ctx.service.queueState()).toEqual(parkedBlock);
+    expect(ctx.service.isParked()).toBe(true);
+    // The accept still bumped pendingTurnCount, but a parked unit is not "waiting".
+    expect(ctx.service.pendingTurnCount()).toBe(1);
+    expect(ctx.service.isAwaitingTurn()).toBe(false);
+  });
+
+  it('takes the queue block from /connection so a reload shows the parked unit', async () => {
+    const ctx = await readyOn('thread-c', { queue: parkedBlock });
+    // The control-plane resolve reads /connection; give it a tick.
+    await new Promise((r) => setTimeout(r, 0));
+    expect(ctx.service.queueState()?.state).toBe('parked');
+    expect(ctx.service.isParked()).toBe(true);
+  });
+
+  it('polls GET /queue every 5 s only while awaiting, and stops on turn.started', async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = await readyOn('thread-q');
+      const getQueue = vi.fn().mockReturnValue(of({ ...parkedBlock, state: 'queued', park_reason: null }));
+      (ctx.mockApi as any).getThreadQueue = getQueue;
+      ctx.mockHttp.post.mockReturnValue(
+        of({ accepted: true, turn_id: 1, queue: { ...parkedBlock, state: 'queued', park_reason: null } }),
+      );
+      await ctx.service.sendMessage('ping');
+      await Promise.resolve();
+      expect(ctx.service.isAwaitingTurn()).toBe(true);
+      expect(getQueue).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(getQueue).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(getQueue).toHaveBeenCalledTimes(2);
+
+      fireSseMessage(ctx.sseInstances[0], { method: 'turn.started', params: { turn_id: 1 } }, '1:2');
+      expect(ctx.service.isAwaitingTurn()).toBe(false);
+      expect(ctx.service.queueState()).toBeNull();
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(getQueue).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a poll that reports parked ends the awaiting stretch', async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = await readyOn('thread-pp');
+      (ctx.mockApi as any).getThreadQueue = vi.fn().mockReturnValue(of(parkedBlock));
+      ctx.mockHttp.post.mockReturnValue(
+        of({ accepted: true, turn_id: 1, queue: { ...parkedBlock, state: 'queued', park_reason: null } }),
+      );
+      await ctx.service.sendMessage('ping');
+      await Promise.resolve();
+      expect(ctx.service.isAwaitingTurn()).toBe(true);
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(ctx.service.isParked()).toBe(true);
+      expect(ctx.service.isAwaitingTurn()).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a thread switch clears the parked state (accounting is per thread)', async () => {
+    const ctx = await readyOn('thread-a');
+    ctx.mockHttp.post.mockReturnValue(of({ accepted: true, turn_id: 1, queue: parkedBlock }));
+    await ctx.service.sendMessage('x');
+    await Promise.resolve();
+    expect(ctx.service.isParked()).toBe(true);
+    ctx.mockHttp.get.mockImplementation(() =>
+      of({ status: 'active', total_turns: 0, messages: [], total: 0 }),
+    );
+    await ctx.service.connect('thread-b');
+    expect(ctx.service.queueState()).toBeNull();
+    expect(ctx.service.isParked()).toBe(false);
+  });
+
+  it('retryParked re-queues on 200 and shows the waiting state again', async () => {
+    const ctx = await readyOn('thread-r');
+    ctx.mockHttp.post.mockReturnValue(of({ accepted: true, turn_id: 1, queue: parkedBlock }));
+    await ctx.service.sendMessage('x');
+    await Promise.resolve();
+    (ctx.mockApi as any).retryThreadQueue = vi.fn().mockReturnValue(of({ kind: 'ok', state: 'queued' }));
+    expect(await ctx.service.retryParked()).toBe('ok');
+    expect((ctx.mockApi as any).retryThreadQueue).toHaveBeenCalledWith('thread-r');
+    expect(ctx.service.isParked()).toBe(false);
+    expect(ctx.service.queueState()?.state).toBe('queued');
+    expect(ctx.service.isAwaitingTurn()).toBe(true);
+  });
+
+  it('retryParked leaves the parked bubble and toasts the server code on refusal', async () => {
+    const ctx = await readyOn('thread-x');
+    ctx.mockHttp.post.mockReturnValue(of({ accepted: true, turn_id: 1, queue: parkedBlock }));
+    await ctx.service.sendMessage('x');
+    await Promise.resolve();
+    (ctx.mockApi as any).retryThreadQueue = vi
+      .fn()
+      .mockReturnValue(of({ kind: 'refused', status: 409, code: 'claim_loss_hold' }));
+    expect(await ctx.service.retryParked()).toBe('refused');
+    expect(ctx.service.isParked()).toBe(true);
+    expect((TestBed.inject(AppToastService) as any).danger).toHaveBeenCalled();
   });
 });

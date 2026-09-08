@@ -100,6 +100,12 @@ import {
     UserCapabilities,
     VoiceCapabilities,
 } from '../models/api.model';
+import type {
+  AdminCapacity,
+  SessionQueueState,
+  SessionQueueRetryOutcome,
+  RunQueueUnparkResult,
+} from '../models/api.model';
 import {
   ThreadUploadEvent,
   ThreadUploadResponse,
@@ -3171,5 +3177,62 @@ export class ApiService {
     return this.http.get<MemoryListResponse>(
       `${this.baseUrl}/jobs/${jobId}/memories`, { params },
     ).pipe(catchError(() => of(null)));
+  }
+
+  // ---------------------------------------------------------------------------
+  // Stateless run_queue state (stateless_turn_resilience.md, step 2)
+  // ---------------------------------------------------------------------------
+
+  /** Executors, runnable depth, `desired`, and the parked worklist. Admin-only. */
+  getAdminCapacity(): Observable<AdminCapacity | null> {
+    return this.http.get<AdminCapacity>(`${this.baseUrl}/admin/capacity`).pipe(
+      catchError((error) => {
+        console.error('Failed to fetch capacity:', error);
+        return of(null);
+      }),
+    );
+  }
+
+  /** Operator verb: parked → queued (attempts reset). Null on any refusal. */
+  unparkRunQueueUnit(unitId: string): Observable<RunQueueUnparkResult | null> {
+    return this.http
+      .post<RunQueueUnparkResult>(`${this.baseUrl}/admin/run-queue/${unitId}/unpark`, {})
+      .pipe(
+        catchError((error) => {
+          console.error(`Failed to unpark ${unitId}:`, error);
+          return of(null);
+        }),
+      );
+  }
+
+  /** The thread's durable queue block — polled while a send awaits a claim. */
+  getThreadQueue(threadId: string): Observable<SessionQueueState | null> {
+    return this.http
+      .get<SessionQueueState>(`${this.baseUrl}/persistent/threads/${threadId}/queue`)
+      .pipe(catchError(() => of(null)));
+  }
+
+  /**
+   * Owner verb: a parked, retryable unit → queued. 409 carries a `{code}`
+   * detail (stop markers / claim-loss hold), 404 means "not parked".
+   */
+  retryThreadQueue(threadId: string): Observable<SessionQueueRetryOutcome> {
+    return this.http
+      .post<{ state: string }>(`${this.baseUrl}/persistent/threads/${threadId}/queue/retry`, {})
+      .pipe(
+        map((data): SessionQueueRetryOutcome => ({ kind: 'ok', state: data?.state ?? 'queued' })),
+        catchError((err: HttpErrorResponse): Observable<SessionQueueRetryOutcome> => {
+          const detail = err.error?.detail;
+          const code =
+            detail && typeof detail === 'object' && typeof detail.code === 'string'
+              ? detail.code
+              : typeof detail === 'string'
+                ? detail
+                : err.status === 404
+                  ? 'not_parked'
+                  : 'retry_failed';
+          return of({ kind: 'refused', status: err.status ?? 0, code });
+        }),
+      );
   }
 }

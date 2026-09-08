@@ -34,6 +34,7 @@ import {
 } from '../models/turn.model';
 import { TranslocoService } from '@jsverse/transloco';
 import { ApiService } from './api.service';
+import type { SessionQueueState } from '../models/api.model';
 import { ErrorMessageService } from './error-message.service';
 import { IndexedDbService } from './indexed-db.service';
 import { NotificationService } from './notification.service';
@@ -467,6 +468,9 @@ export type ConfigUpdateOutcome =
 
 /** Lane-free control-socket discovery. The server may carry additional
  * execution details, but the Cockpit discriminates only on transport. */
+/** Poll cadence for the durable queue block while a send awaits a claim. */
+export const QUEUE_POLL_MS = 5_000;
+
 type ConnectionPayload =
   | {
       state: 'ready';
@@ -477,6 +481,7 @@ type ConnectionPayload =
       pinned_runtime_generation_contract: 1;
       session_runtime_generation: string;
       controls?: ControlCapabilityMap;
+      queue?: SessionQueueState | null;
     }
   | {
       state: 'ready';
@@ -487,6 +492,7 @@ type ConnectionPayload =
       pinned_runtime_generation_contract: 1;
       session_runtime_generation: string;
       controls?: ControlCapabilityMap;
+      queue?: SessionQueueState | null;
     };
 
 /** Server-aggregated token telemetry riding the durable `session.state`
@@ -728,6 +734,24 @@ export class PersistentChatService {
       });
     });
     this.destroyRef.onDestroy(() => this._stopAwaitingClock());
+
+    // While a send awaits a claim, poll the durable queue block so a unit
+    // that gets parked (or a reload that lost the accept) is rendered from
+    // the server's truth rather than process-local state. Runs only while
+    // awaiting; a parked verdict ends the awaiting stretch and so the poll.
+    effect(() => {
+      const awaiting = this.isAwaitingTurn();
+      untracked(() => {
+        if (!awaiting) {
+          this._stopQueuePoll();
+          return;
+        }
+        if (this.queuePollTimer === null) {
+          this.queuePollTimer = setInterval(() => void this._pollQueueState(), QUEUE_POLL_MS);
+        }
+      });
+    });
+    this.destroyRef.onDestroy(() => this._stopQueuePoll());
 
     // Invariant: "Stopping…" (isInterrupting) only makes sense while a turn
     // is actually streaming. Whenever streaming ends — turn completed, the
@@ -1095,7 +1119,24 @@ export class PersistentChatService {
   /** True while an accepted send waits for its turn to start — drives the
    *  working placeholder, spinner and dots so a queued input is visibly
    *  alive instead of apparently swallowed. */
-  readonly isAwaitingTurn = computed(() => this.pendingTurnCount() > 0 && !this.isStreaming());
+  /**
+   * The thread's durable run_queue block (accept response, /connection, or the
+   * awaiting poll), thread-stamped like `usage`: a value from another thread
+   * reads as null. `parked` means the input was accepted but nothing can claim
+   * it until it is retried — never rendered as "waiting".
+   */
+  private readonly _queueState = signal<{ threadId: string; queue: SessionQueueState } | null>(null);
+  readonly queueState = computed<SessionQueueState | null>(() => {
+    const q = this._queueState();
+    if (!q || q.threadId == null) return null;
+    return q.threadId === this.threadId() ? q.queue : null;
+  });
+  readonly isParked = computed(() => this.queueState()?.state === 'parked');
+  /** A send is accepted and durably queued, but no agent has claimed it and
+   *  the unit is not parked — the only state that shows the waiting bubble. */
+  readonly isAwaitingTurn = computed(
+    () => this.pendingTurnCount() > 0 && !this.isStreaming() && !this.isParked(),
+  );
   /**
    * When the current awaiting stretch began (ms epoch); null while not
    * awaiting. Derived from isAwaitingTurn by a constructor effect, so every
@@ -1107,6 +1148,7 @@ export class PersistentChatService {
   readonly awaitingSince = signal<number | null>(null);
   private readonly awaitingNow = signal(Date.now());
   private awaitingTicker: ReturnType<typeof setInterval> | null = null;
+  private queuePollTimer: ReturnType<typeof setInterval> | null = null;
   /** Milliseconds spent in the current awaiting stretch; 0 when not awaiting.
    *  Advances once a second, and only while awaiting. */
   readonly awaitingElapsedMs = computed(() => {
@@ -1120,6 +1162,60 @@ export class PersistentChatService {
       this.awaitingTicker = null;
     }
     if (this.awaitingSince() !== null) this.awaitingSince.set(null);
+  }
+
+  private _applyQueueState(threadId: string, queue: SessionQueueState | null | undefined): void {
+    if (!queue || typeof queue !== 'object' || typeof queue.state !== 'string') return;
+    this._queueState.set({ threadId, queue });
+  }
+
+  private _stopQueuePoll(): void {
+    if (this.queuePollTimer !== null) {
+      clearInterval(this.queuePollTimer);
+      this.queuePollTimer = null;
+    }
+  }
+
+  private async _pollQueueState(): Promise<void> {
+    const tid = this.threadId();
+    if (!tid) return;
+    let queue: SessionQueueState | null = null;
+    try {
+      queue = await firstValueFrom(this.api.getThreadQueue(tid));
+    } catch {
+      // A failed poll is not news: the accept response / /connection already
+      // seeded the state, and the next tick retries. Never let a timer throw.
+      return;
+    }
+    if (this.threadId() !== tid) return;
+    this._applyQueueState(tid, queue);
+  }
+
+  /**
+   * Owner retry of a parked unit: POST /queue/retry, then show the normal
+   * waiting state (the unit is queued again; a claim lands as turn.started).
+   * A refusal (stop markers, claim-loss hold, not parked) is toasted with the
+   * server's code and leaves the parked bubble in place.
+   */
+  async retryParked(): Promise<'ok' | 'refused'> {
+    const tid = this.threadId();
+    if (!tid) return 'refused';
+    const outcome = await firstValueFrom(this.api.retryThreadQueue(tid));
+    if (this.threadId() !== tid) return 'refused';
+    if (outcome.kind === 'ok') {
+      this._applyQueueState(tid, {
+        state: outcome.state || 'queued',
+        park_reason: null,
+        parked_at: null,
+        retryable: false,
+        attempts: 0,
+        pending_input: true,
+      });
+      this.pendingTurnCount.update((c) => Math.max(c, 1));
+      return 'ok';
+    }
+    this.toast.danger(this.transloco.translate('chat.parked.retryFailed', { code: outcome.code }));
+    return 'refused';
   }
   /**
    * Single-flight guard for _flushOutbox — one POST in flight **per thread**,
@@ -3073,6 +3169,7 @@ export class PersistentChatService {
       const connection = await this._resolveConnection(threadId, openingGeneration);
       if (!this._controlPlaneAllowed(threadId, openingGeneration)) return;
       if (!this._acceptBindingRecoveryConnection(threadId, connection)) return;
+      this._applyQueueState(threadId, connection.queue ?? null);
       // GET /connection only returns 200 after the orchestrator has a
       // bound agent and the agent's /ready probe passes. That REST
       // readiness is enough to unblock the composer; the control WS
@@ -3449,6 +3546,7 @@ export class PersistentChatService {
       const connection = await this._fetchConnection(threadId);
       if (!this._controlPlaneAllowed(threadId, openingGeneration)) return;
       if (!this._acceptBindingRecoveryConnection(threadId, connection)) return;
+      this._applyQueueState(threadId, connection.queue ?? null);
       if (this._connectionHasWebSocket(connection) || this.sessionSnapshotLoaded) {
         this.markSessionReady();
       }
@@ -4932,12 +5030,15 @@ export class PersistentChatService {
     const sentGeneration = this.sessionRuntimeGeneration;
     const sentControlEpoch = this.controlWsOpeningGeneration;
     try {
-      await firstValueFrom(
-        this.http.post<{ accepted: boolean; turn_id: number }>(
+      const accepted = await firstValueFrom(
+        this.http.post<{ accepted: boolean; turn_id: number; queue?: SessionQueueState | null }>(
           `${environment.apiUrl}/persistent/threads/${tid}/input`,
           { content },
         ),
       );
+      // The accept carries the unit's durable state: a `parked` unit took the
+      // input but nothing can claim it — render that, never "waiting".
+      this._applyQueueState(tid, accepted?.queue ?? null);
       // Accepted — the reply must now stream over SSE. Arm the one-shot
       // kickstart so a dead receive path self-heals (covers the direct
       // send and the queued-flush path, both of which route through here).
@@ -5862,6 +5963,8 @@ export class PersistentChatService {
         // awaiting state. Clamped: a turn can start without a tracked
         // accept (other tab, injected input, reload mid-queue).
         this.pendingTurnCount.update((c) => Math.max(0, c - 1));
+        // A live turn means the unit is leased: any parked/queued block is stale.
+        this._queueState.set(null);
         const turnId = String(params['turn_id'] ?? makeLocalId('turn'));
         const pendingInterrupt = this.pendingInterruptRequest;
         const pendingWasActive =

@@ -860,6 +860,7 @@
       "subagentsTranscript": "Transcript",
       "subagentsStatuses": {
         "queued": "Queued",
+      "parked": "This message needs a retry",
         "running": "Running",
         "completed": "Completed",
         "parked": "Parked",
@@ -878,6 +879,36 @@
     }
   },
   "admin": {
+    "capacity": {
+      "title": "Capacity",
+      "desc": "What the stateless pool and its autoscaler see right now: executors, runnable demand, and units parked after a failure.",
+      "executors": "Executors",
+      "ready": "ready",
+      "busy": "busy",
+      "queued": "Queued",
+      "sessions": "sessions",
+      "batches": "batches",
+      "oldestQueued": "Oldest queued",
+      "desired": "Desired replicas",
+      "floor": "floor",
+      "reserve": "reserve",
+      "parked": "Parked units",
+      "none": "Nothing is parked.",
+      "unpark": "Unpark",
+      "unparked": "Unit re-queued.",
+      "unparkFailed": "Unpark failed.",
+      "loadFailed": "Could not load capacity.",
+      "observedAt": "Observed {{time}}",
+      "colTitle": "Session",
+      "colOwner": "Owner",
+      "colKind": "Kind",
+      "colReason": "Reason",
+      "colParkedAt": "Parked",
+      "colAttempts": "Attempts",
+      "colPending": "Pending input",
+      "yes": "yes",
+      "no": "no"
+    },
     "config": {
       "messages": {
         "saveEmpty": "Nothing to save — pick a config key and enter a value.",
@@ -1708,6 +1739,18 @@
       "waiting": "Waiting for an available agent…",
       "busy": "Our systems are busier than usual — this may take a few minutes. You can leave this page; the reply will be here when you return.",
       "elapsed": "Waiting for {{time}}"
+    },
+    "parked": {
+      "title": "This message couldn't be processed",
+      "retry": "Retry",
+      "retrying": "Re-queuing…",
+      "retryFailed": "Retry was refused ({{code}})",
+      "reason": {
+        "attachFailed": "The agent couldn't pick this session back up.",
+        "shutdownCancelled": "The reply was interrupted by maintenance.",
+        "stopped": "The session stopped before this message was handled.",
+        "generic": "The session hit a problem. Try again."
+      }
     },
     "queued": {
       "notSent": "Not sent",
