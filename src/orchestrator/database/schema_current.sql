@@ -17682,6 +17682,27 @@ COMMENT ON COLUMN public.run_queue.attach_failures IS 'Consecutive attach failur
 
 
 --
+-- Name: run_queue_bg_tasks; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.run_queue_bg_tasks (
+    unit_id uuid NOT NULL,
+    thread_id uuid NOT NULL,
+    task_kind text NOT NULL,
+    detail jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT run_queue_bg_tasks_detail_object CHECK ((jsonb_typeof(detail) = 'object'::text))
+);
+
+
+--
+-- Name: TABLE run_queue_bg_tasks; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.run_queue_bg_tasks IS 'Scheduling payloads only; cloud generation rows and remote markers remain the authority for completion. History preserves bounded retries per effect.';
+
+
+--
 -- Name: run_queue_enqueue_ord_seq; Type: SEQUENCE; Schema: public; Owner: -
 --
 
@@ -21505,6 +21526,14 @@ ALTER TABLE ONLY public.rollup_state
 
 
 --
+-- Name: run_queue_bg_tasks run_queue_bg_tasks_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.run_queue_bg_tasks
+    ADD CONSTRAINT run_queue_bg_tasks_pkey PRIMARY KEY (unit_id);
+
+
+--
 -- Name: run_queue run_queue_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -23187,6 +23216,13 @@ CREATE INDEX idx_projects_status ON public.projects USING btree (status);
 --
 
 CREATE INDEX idx_run_queue_affinity ON public.run_queue USING btree (last_leased_by, queued_at) WHERE (state = 'queued'::text);
+
+
+--
+-- Name: idx_run_queue_bg_tasks_generation; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_run_queue_bg_tasks_generation ON public.run_queue_bg_tasks USING btree (thread_id, task_kind, ((detail ->> 'mount_id'::text)), ((detail ->> 'generation'::text)));
 
 
 --
@@ -26748,6 +26784,22 @@ ALTER TABLE ONLY public.resource_publication_plan_events
 
 ALTER TABLE ONLY public.resource_publication_plans
     ADD CONSTRAINT resource_publication_plans_interval_revision_fkey FOREIGN KEY (source_interval_id, source_revision) REFERENCES public.resource_intervals(id, source_revision) ON DELETE RESTRICT;
+
+
+--
+-- Name: run_queue_bg_tasks run_queue_bg_tasks_thread_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.run_queue_bg_tasks
+    ADD CONSTRAINT run_queue_bg_tasks_thread_id_fkey FOREIGN KEY (thread_id) REFERENCES public.threads(id) ON DELETE CASCADE;
+
+
+--
+-- Name: run_queue_bg_tasks run_queue_bg_tasks_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.run_queue_bg_tasks
+    ADD CONSTRAINT run_queue_bg_tasks_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.run_queue(unit_id) ON DELETE CASCADE;
 
 
 --

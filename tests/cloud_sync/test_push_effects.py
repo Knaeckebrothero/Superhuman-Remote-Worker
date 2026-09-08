@@ -339,6 +339,46 @@ async def test_reconcile_adopts_once_and_resumes_from_the_predecessor(tmp_path: 
 
 
 @pytest.mark.asyncio
+async def test_repeated_recovery_retains_newly_landed_progress(tmp_path: Path):
+    sync, ws, remote = _sync(tmp_path)
+    (ws / "a.txt").write_bytes(b"alpha")
+    (ws / "b.txt").write_bytes(b"bravo")
+    coordinator = _coordinator(sync)
+    requirement = _requirement({})
+    durable = {"mount-a": {"planned": 2, "files": {}}}
+    acknowledgements = []
+
+    async def adopt():
+        return durable
+
+    async def record(mount_id, path, entry):
+        durable[mount_id]["files"][path] = entry
+        raise RuntimeError("recovery pod died after checkpoint")
+
+    async def acknowledge(mount_id, _requirement):
+        acknowledgements.append(mount_id)
+
+    with pytest.raises(CloudSyncError):
+        await coordinator.reconcile_before_pull(
+            {"mount-a": requirement},
+            before_write=_ok,
+            acknowledge=acknowledge,
+            adopt=adopt,
+            progress=record,
+        )
+    assert not acknowledgements
+    assert list(durable["mount-a"]["files"]) == ["a.txt"]
+    await coordinator.reconcile_before_pull(
+        {"mount-a": requirement}, before_write=_ok, acknowledge=acknowledge, adopt=adopt
+    )
+    assert acknowledgements == ["mount-a"]
+    assert [
+        path for path, *_ in sync.conditional_writes if not path.startswith(".srw/")
+    ] == ["a.txt", "b.txt"]
+    assert (remote / "b.txt").read_bytes() == b"bravo"
+
+
+@pytest.mark.asyncio
 async def test_reconcile_does_not_adopt_when_nothing_is_pending(tmp_path: Path):
     sync, ws, remote = _sync(tmp_path)
     coordinator = _coordinator(sync)

@@ -343,6 +343,7 @@ data:
   # Agents inherit these keys via envFrom; the orchestrator references them
   # explicitly from this same ConfigMap.
   STATELESS_SESSION_ENABLED: {{ .Values.agent.stateless.enabled | default false | quote }}
+  STATELESS_CLOUD_PUSH_RECOVERY_ENABLED: {{ and .Values.agent.stateless.enabled .Values.agent.stateless.cloudPushRecoveryEnabled | quote }}
   STATELESS_WORKER_ENABLED: {{ .Values.agent.stateless.worker.enabled | default false | quote }}
   STATELESS_WORKER_DEFAULT_ENABLED: {{ .Values.agent.stateless.worker.defaultEnabled | default false | quote }}
   COMPLETION_COMMANDS_ENABLED: {{ .Values.orchestrator.completionCommandsEnabled | default false | quote }}

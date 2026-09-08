@@ -774,8 +774,11 @@ SELECT queue.unit_id, queue.unit_kind, queue.park_reason, queue.parked_at,
        thread.id AS thread_id, thread.title, thread.user_id,
        owner.preferred_username AS owner
 FROM run_queue AS queue
+LEFT JOIN run_queue_bg_tasks AS task
+       ON task.unit_id = queue.unit_id AND queue.unit_kind = 'bg_task'
 LEFT JOIN threads AS thread
-       ON thread.id = queue.unit_id AND queue.unit_kind = 'session_turn'
+       ON (thread.id = queue.unit_id AND queue.unit_kind = 'session_turn')
+       OR (thread.id = task.thread_id AND queue.unit_kind = 'bg_task')
 LEFT JOIN users AS owner ON owner.id = thread.user_id
 WHERE queue.state = 'parked'
 ORDER BY COALESCE(queue.parked_at, queue.queued_at) DESC, queue.unit_id

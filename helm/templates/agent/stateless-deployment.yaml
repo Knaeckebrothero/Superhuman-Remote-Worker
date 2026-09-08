@@ -95,10 +95,9 @@ spec:
       # turn/batch → release the lease. The executor implements this on
       # SIGTERM itself, so there is no preStop exec hook — just a grace
       # period generous enough to finish + persist + release one unit.
-      # Executor shutdown allows shutdownTimeoutSeconds (default 300s: a
-      # measured turn-end cloud push runs 100–500 s, and the unit is held until
-      # it settles — until commit-then-effects makes the drain budget a single
-      # model call) for the in-flight unit, then a 15s interrupt/unwind window.
+      # Executor shutdown allows shutdownTimeoutSeconds (default 300s) for
+      # the in-flight unit, then a 15s interrupt/unwind window. Turn-end cloud
+      # transmission runs after lease release and can resume under a new owner.
       # The grace period is that timeout + 60s: room for authoritative
       # backend/task drain and the exact claimant-quiescence acknowledgement;
       # Kubernetes must not SIGKILL the process before that proof is durable.
@@ -155,6 +154,10 @@ spec:
             # terminationGracePeriodSeconds above.
             - name: STATELESS_SHUTDOWN_TIMEOUT_S
               value: {{ .Values.agent.stateless.shutdownTimeoutSeconds | quote }}
+            # Explicit env also rolls the pool when this capability changes;
+            # the stateless Deployment deliberately opts out of Reloader.
+            - name: STATELESS_CLOUD_PUSH_RECOVERY_ENABLED
+              value: {{ .Values.agent.stateless.cloudPushRecoveryEnabled | default false | quote }}
             - name: MCP_INTERNAL_KEY
               valueFrom:
                 secretKeyRef:

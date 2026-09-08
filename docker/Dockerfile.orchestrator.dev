@@ -82,6 +82,8 @@ RUN python -c "import orchestrator.services.infrastructure_metering.compute_acti
 # orchestrator dependency set; importing through agent.api would pull agent-only
 # checkpoint dependencies and fail only after the Pod starts.
 RUN python -c "import orchestrator.services.session_memory_executor"
+# Cloud-push admission must also work with orchestrator-only dependencies.
+RUN python -c "from orchestrator.services.cloud_push_recovery import build_cloud_push_bundle"
 
 EXPOSE 8085
 

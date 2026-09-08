@@ -1213,10 +1213,11 @@ class TestTurnError:
 
 class TestShutdownCancellation:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("behavior", ["interrupt_checkpoint", "hang"])
     async def test_timeout_before_tool_effect_abandons_owned_input_for_retry(
-        self, harness
+        self, harness, behavior
     ):
-        harness.loop_behavior = "interrupt_checkpoint"
+        harness.loop_behavior = behavior
         row = {"id": str(uuid4()), "seq": 4, "content": "unanswered"}
         harness.db.pending_rows = [row]
         claim = make_claim(token=40, input_seq=4)
@@ -1231,21 +1232,36 @@ class TestShutdownCancellation:
         await harness.executor.stop(timeout=0)
         await _finish(harness)
 
-        assert harness.interrupt_observations == [
-            {
-                "turn_id": 1,
-                "mode": "hard",
-                "target_turn_id": 1,
-                "hard_event_set": True,
-                "consumed_mode": "hard",
-            }
-        ]
-        assert harness.interrupt_order.index("signal") < harness.interrupt_order.index(
-            "close"
+        assert harness.interrupt_observations == (
+            [
+                {
+                    "turn_id": 1,
+                    "mode": "hard",
+                    "target_turn_id": 1,
+                    "hard_event_set": True,
+                    "consumed_mode": "hard",
+                }
+            ]
+            if behavior == "interrupt_checkpoint"
+            else []
         )
+        if behavior == "interrupt_checkpoint":
+            assert harness.interrupt_order.index(
+                "signal"
+            ) < harness.interrupt_order.index("close")
         assert harness.executor._lease.lost.is_set()
         assert not harness.calls["complete"]
-        assert not harness.calls["release"]
+        assert harness.calls["release"] == [
+            {
+                "unit_id": claim.unit_id,
+                "lease_token": 40,
+                "backoff_seconds": 0.0,
+                "error": True,
+            }
+        ]
+        assert not harness.calls["park"]
+        assert harness.executor._shutdown_retry_claim is None
+        assert harness.disposition_order[-2:] == ["terminate", "release"]
         assert harness.db.pending_rows == [row]
 
     @pytest.mark.asyncio
@@ -1669,7 +1685,7 @@ class TestShutdownCancellation:
         assert harness.disposition_order[-2:] == ["terminate", "park"]
 
     @pytest.mark.asyncio
-    async def test_post_effect_completion_failure_parks_instead_of_replay(
+    async def test_settled_post_effect_completion_failure_releases_under_checkpoint(
         self, harness, monkeypatch
     ):
         harness.loop_behavior = "settled_effect"
@@ -1690,15 +1706,17 @@ class TestShutdownCancellation:
             lease_token=47,
             consumed_seq=4,
         )
-        assert harness.calls["park"] == [
+        assert not harness.calls["park"]
+        assert harness.calls["release"] == [
             {
                 "unit_id": claim.unit_id,
                 "lease_token": 47,
+                "backoff_seconds": 0.0,
+                "error": True,
             }
         ]
-        assert not harness.calls["release"]
         assert not harness.has_tool_effect(claim)
-        assert harness.disposition_order[-2:] == ["terminate", "park"]
+        assert harness.disposition_order[-2:] == ["terminate", "release"]
 
     @pytest.mark.asyncio
     async def test_pre_effect_completion_failure_quiesces_and_stops_claiming(
@@ -1742,10 +1760,17 @@ class TestShutdownCancellation:
         # The fake close records the successful consumed checkpoint above;
         # this list stays empty because no complete queue transition landed.
         assert not harness.calls["complete"]
-        assert not harness.calls["release"]
+        assert harness.calls["release"] == [
+            {
+                "unit_id": claim.unit_id,
+                "lease_token": 471,
+                "backoff_seconds": 0.0,
+                "error": True,
+            }
+        ]
         assert not harness.calls["park"]
         assert harness.calls["terminate"][-1]["reason"] == (
-            "completion_cas_failed_pre_effect"
+            "release_completion_cas_failed"
         )
         assert all(task.done() for task in harness._fake_loop_tasks)
         assert pa._pending_cloud_push_task is None

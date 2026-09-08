@@ -2833,7 +2833,13 @@ class CompletionFinalizer:
                 lost.set()
                 return
 
-    async def run_drain(self, shutdown_event: asyncio.Event) -> None:
+    async def run_drain(
+        self,
+        shutdown_event: asyncio.Event,
+        *,
+        drain_commands: bool = True,
+        background_sweep: Callable[[], Awaitable[Any]] | None = None,
+    ) -> None:
         """Elect and drain until shutdown; safe under a dual-leader window."""
 
         while not shutdown_event.is_set():
@@ -2869,9 +2875,22 @@ class CompletionFinalizer:
                 self._heartbeat_leader(term, lost, shutdown_event)
             )
             try:
+                next_sweep = 0.0
                 while not shutdown_event.is_set() and not lost.is_set():
+                    if background_sweep is not None and time.monotonic() >= next_sweep:
+                        try:
+                            await background_sweep()
+                        except Exception:
+                            logger.exception(
+                                "completion background sweep failed; retrying"
+                            )
+                        next_sweep = time.monotonic() + 15.0
+                    if shutdown_event.is_set() or lost.is_set():
+                        break
                     try:
-                        command_id = await self._candidate_id()
+                        command_id = (
+                            await self._candidate_id() if drain_commands else None
+                        )
                     except Exception:
                         logger.exception(
                             "completion finalizer candidate scan failed; retrying"

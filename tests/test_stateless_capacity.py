@@ -43,6 +43,7 @@ def _demand_row(**overrides):
         "busy": 0,
         "runnable_session_turn": 0,
         "runnable_worker_batch": 0,
+        "runnable_bg_task": 0,
         "runnable_total": 0,
         "oldest_queued_age_s": None,
     }
@@ -79,10 +80,11 @@ async def test_demand_sql_uses_the_claim_predicates_verbatim():
     assert cap.BUSY_PREDICATE == "state = 'leased' AND leased_until > now()"
     assert cap.RUNNABLE_PREDICATE == "state = 'queued' AND run_after <= now()"
     assert sql.count(cap.BUSY_PREDICATE) == 1
-    # session_turn, worker_batch, total, oldest-age → four runnable reads.
-    assert sql.count(cap.RUNNABLE_PREDICATE) == 4
+    # Three kinds, total, and oldest age all use the same readiness predicate.
+    assert sql.count(cap.RUNNABLE_PREDICATE) == 5
     assert "unit_kind = 'session_turn'" in sql
     assert "unit_kind = 'worker_batch'" in sql
+    assert "unit_kind = 'bg_task'" in sql
     # Never a parked, done, or expired-lease row.
     assert "'parked'" not in sql and "'done'" not in sql
 
@@ -200,7 +202,12 @@ async def test_snapshot_reports_null_inventory_without_kubernetes():
         params=cap.CapacityParams(2, 1),
     )
     assert payload["executors"] == {"total": None, "ready": None, "busy": 2}
-    assert payload["queued"] == {"session_turn": 1, "worker_batch": 0, "total": 1}
+    assert payload["queued"] == {
+        "session_turn": 1,
+        "worker_batch": 0,
+        "bg_task": 0,
+        "total": 1,
+    }
     assert payload["oldest_queued_age_s"] == 3.5
     assert payload["desired"] == 4
     assert payload["params"] == {"min_replicas": 2, "reserve": 1}

@@ -23,6 +23,12 @@ def _render(*settings: str, show_only: str | None = None) -> list[dict]:
         str(CHART),
         "-f",
         str(CHART / "ci/test-values.yaml"),
+        # This fixture also enables autoscaling for CI coverage. Restore the
+        # chart defaults for unit rendering; each case sets its own gates.
+        "--set",
+        "agent.stateless.enabled=false",
+        "--set",
+        "agent.stateless.autoscaling.enabled=false",
     ]
     if show_only:
         command.extend(["--show-only", show_only])
@@ -67,6 +73,7 @@ def test_stateless_worker_gate_is_independent_and_default_off() -> None:
     )
 
     assert config_map["data"]["STATELESS_SESSION_ENABLED"] == "false"
+    assert config_map["data"]["STATELESS_CLOUD_PUSH_RECOVERY_ENABLED"] == "false"
     assert config_map["data"]["STATELESS_WORKER_ENABLED"] == "false"
     assert config_map["data"]["STATELESS_WORKER_DEFAULT_ENABLED"] == "false"
     assert config_map["data"]["COMPLETION_COMMANDS_ENABLED"] == "false"
@@ -74,6 +81,43 @@ def test_stateless_worker_gate_is_independent_and_default_off() -> None:
     assert config_map["data"]["COMPLETION_FINALIZER_INLINE_DELAY_SECONDS"] == "0"
     assert config_map["data"]["WORKER_BATCH_MIN_WALL_SECONDS"] == "300"
     assert config_map["data"]["LANGGRAPH_STRICT_MSGPACK"] == "true"
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
+@pytest.mark.parametrize("enabled", [False, True])
+def test_cloud_push_recovery_gate_reaches_orchestrator_and_rolls_executors(enabled):
+    value = str(enabled).lower()
+    settings = (
+        "agent.stateless.enabled=true",
+        f"agent.stateless.cloudPushRecoveryEnabled={value}",
+    )
+    config = _only_kind(
+        _render(*settings, show_only="templates/configmap.yaml"), "ConfigMap"
+    )
+    deployment = _only_kind(
+        _render(*settings, show_only="templates/agent/stateless-deployment.yaml"),
+        "Deployment",
+    )
+    env = {
+        entry["name"]: entry.get("value")
+        for entry in _stateless_agent_container(deployment)["env"]
+    }
+    assert config["data"]["STATELESS_CLOUD_PUSH_RECOVERY_ENABLED"] == value
+    assert env["STATELESS_CLOUD_PUSH_RECOVERY_ENABLED"] == value
+    orchestrator = _only_kind(
+        _render(*settings, show_only="templates/orchestrator/deployment.yaml"),
+        "Deployment",
+    )
+    env = {
+        entry["name"]: entry
+        for entry in orchestrator["spec"]["template"]["spec"]["containers"][0]["env"]
+    }
+    assert (
+        env["STATELESS_CLOUD_PUSH_RECOVERY_ENABLED"]["valueFrom"]["configMapKeyRef"][
+            "key"
+        ]
+        == "STATELESS_CLOUD_PUSH_RECOVERY_ENABLED"
+    )
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
@@ -168,11 +212,11 @@ def test_stateless_executor_grace_exceeds_shutdown_and_abort_budget() -> None:
         "Deployment",
     )
 
-    # Runtime defaults are 120s graceful shutdown + 15s abort. The remaining
+    # Chart defaults are 300s graceful shutdown + 15s abort. The remaining
     # margin lets local resource drains publish the exact claimant ACK before
     # kubelet may send SIGKILL.
     assert (
-        deployment["spec"]["template"]["spec"]["terminationGracePeriodSeconds"] == 180
+        deployment["spec"]["template"]["spec"]["terminationGracePeriodSeconds"] == 360
     )
 
 

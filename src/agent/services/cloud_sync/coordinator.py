@@ -404,6 +404,9 @@ class WorkspaceSyncCoordinator:
         before_write: Callable[[], Awaitable[None]],
         acknowledge: Callable[[str, Any], Awaitable[None]],
         adopt: Optional[Callable[[], Awaitable[dict[str, Any]]]] = None,
+        progress: Optional[
+            Callable[[str, str, dict[str, object]], Awaitable[None]]
+        ] = None,
     ) -> dict[str, list[str]]:
         """Repair/validate the prior generation before pull(N+1).
 
@@ -501,10 +504,16 @@ class WorkspaceSyncCoordinator:
             # and everything the predecessor already landed (adopted progress)
             # is skipped rather than re-uploaded.
             await before_write()
+
+            async def record_progress(path: str, entry: dict[str, object]) -> None:
+                if progress is not None:
+                    await progress(generation_id, path, entry)
+
             commit = await mount.sync.push_generation_delta(
                 requirement.baseline_manifest,
                 before_write=before_write,
                 progress=progress_by_mount.get(generation_id),
+                **({"progress_cb": record_progress} if progress is not None else {}),
             )
             repaired = CloudSyncMarker(
                 thread_id=self.thread_id,

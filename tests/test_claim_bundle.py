@@ -550,7 +550,7 @@ async def test_absent_unit_row_404(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_wrong_lane_and_non_session_kind_409(monkeypatch):
+async def test_wrong_lane_and_unknown_unit_kind_409(monkeypatch):
     from orchestrator import main as orch_main
 
     # Pinned-lane thread behind a leased session unit.
@@ -571,8 +571,8 @@ async def test_wrong_lane_and_non_session_kind_409(monkeypatch):
         )
     assert exc2.value.status_code == 409
 
-    # Non-session unit kinds carry no attach bundle.
-    row = dict(LEASED_ROW, unit_kind="bg_task")
+    # Unknown unit kinds carry no attach bundle.
+    row = dict(LEASED_ROW, unit_kind="unknown")
     db3 = FakeDB(run_queue_row=row, thread=_thread())
     _patch(monkeypatch, orch_main, db3)
     with pytest.raises(HTTPException) as exc3:
@@ -580,6 +580,51 @@ async def test_wrong_lane_and_non_session_kind_409(monkeypatch):
             UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
         )
     assert exc3.value.status_code == 409
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refused", [False, True])
+async def test_bg_task_bundle_uses_cloud_only_builder(monkeypatch, refused):
+    from orchestrator import main as orch_main
+    from orchestrator.services import cloud_push_recovery
+
+    db = FakeDB(run_queue_row=dict(LEASED_ROW, unit_kind="bg_task"), thread=_thread())
+    _patch(monkeypatch, orch_main, db)
+    result = {"unit_id": UNIT_ID, "unit_kind": "bg_task", "obsolete": True}
+    builder = AsyncMock(
+        return_value=result,
+        side_effect=(
+            cloud_push_recovery.CloudPushBundleRefused("private refusal reason")
+            if refused
+            else None
+        ),
+    )
+    monkeypatch.setattr(cloud_push_recovery, "build_cloud_push_bundle", builder)
+    attach = AsyncMock(side_effect=AssertionError("session attach is forbidden"))
+    monkeypatch.setattr(orch_main, "_assemble_session_attach_payload", attach)
+    if refused:
+        with pytest.raises(HTTPException) as exc:
+            await orch_main.internal_unit_claim_bundle(
+                UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+            )
+        assert exc.value.status_code == 403
+        assert exc.value.detail == "Lease validation failed"
+    else:
+        assert (
+            await orch_main.internal_unit_claim_bundle(
+                UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+            )
+            == result
+        )
+    builder.assert_awaited_once_with(
+        db,
+        unit_id=UNIT_ID,
+        lease_token=7,
+        pod_name=POD_NAME,
+        pod_uid=POD_UID,
+        resolve_workspace=orch_main._resolve_background_push_workspace,
+    )
+    attach.assert_not_awaited()
 
 
 @pytest.mark.asyncio

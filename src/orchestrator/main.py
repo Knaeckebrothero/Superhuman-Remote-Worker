@@ -15980,12 +15980,29 @@ async def lifespan(app: FastAPI):
         _get_completion_monitor().run(_shutdown_event),
         name="completion-monitor",
     )
-    if COMPLETION_COMMANDS_ENABLED:
+    from shared.cloud_push_tasks import enabled as cloud_push_recovery_enabled
+
+    if COMPLETION_COMMANDS_ENABLED or cloud_push_recovery_enabled():
         completion_finalizer = _get_completion_finalizer()
+
+        async def cloud_push_sweep():
+            from orchestrator.services.cloud_push_recovery import (
+                sweep_stale_cloud_pushes,
+            )
+
+            return await sweep_stale_cloud_pushes(postgres_db)
+
         completion_finalizer_task = asyncio.create_task(
-            completion_finalizer.run_drain(_shutdown_event),
+            completion_finalizer.run_drain(
+                _shutdown_event,
+                drain_commands=COMPLETION_COMMANDS_ENABLED,
+                background_sweep=cloud_push_sweep
+                if cloud_push_recovery_enabled()
+                else None,
+            ),
             name="completion-finalizer-drain",
         )
+    if COMPLETION_COMMANDS_ENABLED:
         completion_sweep_router_task = asyncio.create_task(
             _get_completion_sweep_router().run(_shutdown_event),
             name="completion-sweep-router",
@@ -47015,6 +47032,45 @@ async def thread_interrupt(
     return {"accepted": True, "agent": result}
 
 
+async def _resolve_background_push_workspace(thread: dict[str, Any]) -> dict[str, Any]:
+    """Reuse the existing attested workspace/cloud credential assembly."""
+    backend = _require_stateless_workspace(thread)
+    thread_id = str(thread["id"])
+    payload = await _agent_get_thread_workspace_locked(thread_id)
+    generation = payload.get("workspace_generation")
+    if not generation or payload.get("protected_cloud"):
+        raise HTTPException(status_code=409, detail="Background workspace unavailable")
+    if backend == "virtual":
+        override = _inject_lite_workspace_config(
+            {"workspace": {"backend": "virtual"}}, prefix=f"threads/{thread_id}/"
+        )
+        workspace = {**override["workspace"], "workspace_generation": generation}
+    elif (
+        backend == "sandbox"
+        and payload.get("workspace_provisioner") == "k8s"
+        and payload.get("status") == "ready"
+    ):
+        workspace = {
+            "backend": backend,
+            "host": payload.get("pod_ip"),
+            "port": payload.get("pod_port"),
+            "key_path": payload.get("ssh_key_path"),
+            "workspace_generation": generation,
+            "runtime_incarnation": payload.get("workspace_runtime_incarnation"),
+            "host_key_fingerprint": payload.get("workspace_ssh_host_key_fingerprint"),
+        }
+        if not all(
+            workspace.get(key)
+            for key in ("host", "runtime_incarnation", "host_key_fingerprint")
+        ):
+            raise HTTPException(
+                status_code=409, detail="Background workspace unavailable"
+            )
+    else:
+        raise HTTPException(status_code=409, detail="Background workspace unavailable")
+    return {"workspace": workspace, "cloud_sync": payload.get("cloud_sync")}
+
+
 @app.get("/internal/units/{unit_id}/claim-bundle")
 async def internal_unit_claim_bundle(
     unit_id: str,
@@ -47047,6 +47103,7 @@ async def internal_unit_claim_bundle(
     await require_internal(request)
     from shared.run_queue import (
         LANE_STATELESS,
+        UNIT_KIND_BG_TASK,
         UNIT_KIND_SESSION_TURN,
         UNIT_KIND_WORKER_BATCH,
     )
@@ -47073,6 +47130,25 @@ async def internal_unit_claim_bundle(
         # ONE generic detail for both cases — stale token and not-leased are
         # deliberately indistinguishable to the caller.
         raise HTTPException(status_code=403, detail="Lease validation failed")
+    if row["unit_kind"] == UNIT_KIND_BG_TASK:
+        from orchestrator.services.cloud_push_recovery import (
+            CloudPushBundleRefused,
+            build_cloud_push_bundle,
+        )
+
+        try:
+            return await build_cloud_push_bundle(
+                postgres_db,
+                unit_id=unit_id,
+                lease_token=lease_token,
+                pod_name=pod_name,
+                pod_uid=pod_uid,
+                resolve_workspace=_resolve_background_push_workspace,
+            )
+        except CloudPushBundleRefused:
+            raise HTTPException(
+                status_code=403, detail="Lease validation failed"
+            ) from None
     if row["unit_kind"] == UNIT_KIND_WORKER_BATCH:
         job = await postgres_db.get_job(unit_id)
         if not job or job.get("execution_lane") != LANE_STATELESS:

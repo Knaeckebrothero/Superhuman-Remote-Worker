@@ -56,6 +56,9 @@ SELECT clock_timestamp() AS observed_at,
          WHERE {RUNNABLE_PREDICATE}
            AND unit_kind = 'worker_batch') AS runnable_worker_batch,
        (SELECT count(*)::int FROM run_queue
+         WHERE {RUNNABLE_PREDICATE}
+           AND unit_kind = 'bg_task') AS runnable_bg_task,
+       (SELECT count(*)::int FROM run_queue
          WHERE {RUNNABLE_PREDICATE}) AS runnable_total,
        (SELECT GREATEST(
                    0.0,
@@ -119,6 +122,7 @@ class QueueDemand:
     runnable_worker_batch: int
     runnable_total: int
     oldest_queued_age_s: float | None
+    runnable_bg_task: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,6 +158,7 @@ async def read_demand(conn: Any) -> QueueDemand:
         busy=int(row["busy"] or 0),
         runnable_session_turn=int(row["runnable_session_turn"] or 0),
         runnable_worker_batch=int(row["runnable_worker_batch"] or 0),
+        runnable_bg_task=int(row.get("runnable_bg_task") or 0),
         runnable_total=int(row["runnable_total"] or 0),
         oldest_queued_age_s=float(age) if age is not None else None,
     )
@@ -264,6 +269,7 @@ async def capacity_snapshot(
         "queued": {
             "session_turn": demand.runnable_session_turn,
             "worker_batch": demand.runnable_worker_batch,
+            "bg_task": demand.runnable_bg_task,
             "total": demand.runnable_total,
         },
         "oldest_queued_age_s": demand.oldest_queued_age_s,

@@ -99,6 +99,13 @@ from shared.run_queue import (
     release_unit,
 )
 from shared.session_retirement import acknowledge_session_claim_quiesced
+from shared.cloud_push_tasks import (
+    PushAdoptionDeferred,
+    claim_bg_task,
+    complete_bg_task,
+    enabled as cloud_push_recovery_enabled,
+    fail_bg_task,
+)
 from shared.subagent_lifecycle import SubagentLifecycleError
 from shared.worker_queue import (
     WorkerClaim,
@@ -562,6 +569,7 @@ class StatelessTurnExecutor:
         abort_grace_seconds: float = TURN_ABORT_GRACE_SECONDS,
         warm_session_idle_ttl_seconds: float = WARM_SESSION_IDLE_TTL_SECONDS,
         worker_enabled: Optional[bool] = None,
+        bg_task_enabled: Optional[bool] = None,
         completion_commands_enabled: Optional[bool] = None,
         audit_writer: Any = _AUDIT_WRITER_UNSET,
     ) -> None:
@@ -587,6 +595,12 @@ class StatelessTurnExecutor:
             if completion_commands_enabled is None
             else bool(completion_commands_enabled)
         )
+        self._bg_task_enabled = (
+            cloud_push_recovery_enabled()
+            if bg_task_enabled is None
+            else bool(bg_task_enabled)
+        )
+        self._bg_claim: ClaimedUnit | None = None
         self._worker_preempted = asyncio.Event()
         self._worker_preempt_status: Optional[str] = None
         self._worker_terminal_report_generation: tuple[str, int] | None = None
@@ -638,6 +652,10 @@ class StatelessTurnExecutor:
         # (unit_id, token) of the claim whose turn settled (turn_done observed):
         # a cancellation after this point completes or releases, never parks.
         self._settled_claim: Optional[tuple[str, int]] = None
+        # A local shutdown abort invalidates the in-process writer before
+        # signaling the loop, but still owes a fenced queue release after
+        # quiescence. Track it separately from an actual reaper/End steal.
+        self._shutdown_retry_claim: Optional[tuple[str, int]] = None
 
     # ------------------------------------------------------------------
     # Plumbing
@@ -700,6 +718,14 @@ class StatelessTurnExecutor:
                 max(0.0, timeout - (time.monotonic() - started))
             )
         except asyncio.TimeoutError:
+            if self._bg_claim is not None:
+                # Cloud work has its own durable fence/progress. Cancellation
+                # retires that writer and requeues only the background unit.
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+                self._task = None
+                return
             logger.warning(
                 "stateless executor did not finish within %.0fs — "
                 "interrupting the in-flight turn",
@@ -712,8 +738,14 @@ class StatelessTurnExecutor:
                 # This turn has crossed no external-effect boundary. Abandon
                 # the exact local claim before signaling so a cooperative turn
                 # close cannot race through complete_unit and consume an
-                # unanswered input. The DB lease is left for the normal
-                # expiry/reaper retry path after physical quiescence.
+                # unanswered input. Even a cooperative unwind must release
+                # the DB lease before the pod disappears; otherwise the reaper
+                # creates claimant-loss debt instead of a normal retry.
+                if self._lease.unit_id is not None:
+                    self._shutdown_retry_claim = (
+                        str(self._lease.unit_id),
+                        int(self._lease.lease_token),
+                    )
                 self._lease.mark_lost()
             self._abort_turn_politely(
                 pa,
@@ -950,6 +982,33 @@ class StatelessTurnExecutor:
                     await self._sleep_interruptible(self._idle_backoff_seconds)
                     continue
 
+            bg_claim = None
+            if claim is None and worker_claim is None and self._bg_task_enabled:
+                try:
+                    bg_claim = await claim_bg_task(self._db, pod_name=self._pod_name)
+                except Exception:
+                    logger.warning("background claim poll failed", exc_info=True)
+                    await self._sleep_interruptible(self._idle_backoff_seconds)
+                    continue
+            if bg_claim is not None:
+                if self._stop.is_set():
+                    await release_unit(
+                        self._db,
+                        unit_id=bg_claim.unit_id,
+                        lease_token=bg_claim.lease_token,
+                    )
+                    break
+                idle_polls = 0
+                try:
+                    await self._serve_bg_task_claim(bg_claim)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "background queue transition failed; lease left for reaper"
+                    )
+                continue
+
             if claim is None and worker_claim is None:
                 idle_polls += 1
                 await self._expire_warm_session()
@@ -1127,6 +1186,71 @@ class StatelessTurnExecutor:
     # ------------------------------------------------------------------
     # One claim
     # ------------------------------------------------------------------
+
+    async def _serve_bg_task_claim(self, claim: ClaimedUnit) -> None:
+        """Serve cloud-only work, with an independent recorded queue lease."""
+        from agent.api.cloud_push_task import run_adopted_cloud_push
+
+        self._bg_claim = claim
+
+        async def execute():
+            await self._detach_cached_session("background_cloud_push")
+            bundle = await self._fetch_bundle(str(claim.unit_id), claim.lease_token)
+            if bundle.get("deferred"):
+                raise PushAdoptionDeferred("background push temporarily deferred")
+            await run_adopted_cloud_push(
+                self._db, claim, bundle, pod_name=self._pod_name, pod_uid=self._pod_uid
+            )
+
+        work = asyncio.create_task(execute(), name=f"cloud-push-{claim.unit_id}")
+
+        async def heartbeat():
+            while True:
+                await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+                try:
+                    alive = await heartbeat_unit(
+                        self._db, unit_id=claim.unit_id, lease_token=claim.lease_token
+                    )
+                except Exception:
+                    # Uncertain authority stops this writer; never keep writing
+                    # on an optimistic heartbeat after a database outage.
+                    alive = None
+                if alive is None:
+                    work.cancel()
+                    return
+
+        renewal = asyncio.create_task(heartbeat())
+        try:
+            await work
+            state = await complete_bg_task(self._db, claim)
+            logger.info(
+                "run_queue complete: background unit=%s state=%s", claim.unit_id, state
+            )
+        except PushAdoptionDeferred:
+            await fail_bg_task(
+                self._db,
+                claim,
+                error="background push temporarily deferred",
+                deferred=True,
+            )
+        except asyncio.CancelledError:
+            with contextlib.suppress(Exception):
+                await fail_bg_task(self._db, claim, error="background push interrupted")
+            if asyncio.current_task().cancelling():
+                raise
+        except Exception as exc:
+            # No credential-bearing exception text is persisted to the task.
+            await fail_bg_task(self._db, claim, error=type(exc).__name__)
+            logger.warning(
+                "background cloud push failed: unit=%s error=%s",
+                claim.unit_id,
+                type(exc).__name__,
+            )
+        finally:
+            renewal.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await renewal
+            self._bg_claim = None
 
     async def _serve_worker_claim(self, claim: WorkerClaim) -> None:
         """Drive one worker batch under its immutable queue lease.
@@ -2606,7 +2730,10 @@ class StatelessTurnExecutor:
             pa._turn_tool_execution_external_hook = None
             settled = self._settled_claim == (str(claim.unit_id), int(token))
             self._settled_claim = None
-            if cancelled:
+            shutdown_retry = self._shutdown_retry_claim == (unit_id, int(token))
+            if shutdown_retry:
+                self._shutdown_retry_claim = None
+            if cancelled or shutdown_retry:
                 # SIGTERM's hard-cancel is still an ownership transition. Do
                 # not leave a live exact claim to expire after this Pod object
                 # disappears: first drain every local/SFTP/background writer,
@@ -3310,30 +3437,12 @@ class StatelessTurnExecutor:
                 self._clear_claim_tool_effect(pa, claim)
                 return
             if state == "error":
-                if tool_execution_started:
-                    await self._quiesce_and_park_post_effect_claim(
-                        pa,
-                        claim,
-                        reason="completion_cas_failed",
-                    )
-                else:
-                    # The atomic interrupt close already checkpointed the
-                    # answered input's consumed_seq; only the queue state CAS
-                    # failed. Never publish a retry or keep a warm consumer
-                    # alive on that ambiguous leased/done tail.
-                    await self._quiesce_claim_before_transition(
-                        pa,
-                        reason="completion_cas_failed_pre_effect",
-                        claim=claim,
-                    )
-                    logger.critical(
-                        "pre-effect run_queue completion remained unresolved; "
-                        "stopping executor without release/park "
-                        "(unit=%s token=%d)",
-                        claim.unit_id,
-                        claim.lease_token,
-                    )
-                    self.request_stop()
+                # Close already checkpointed consumed_seq after settlement.
+                # Even a turn with tool effects is safe to retry from that
+                # boundary: its successor skips the durable answer. Never
+                # park it merely because the final queue-state CAS failed.
+                await self._release(claim, reason="completion_cas_failed")
+                self.request_stop()
                 return
             logger.info(
                 "run_queue complete: unit=%s consumed_seq=%d state=%s",
