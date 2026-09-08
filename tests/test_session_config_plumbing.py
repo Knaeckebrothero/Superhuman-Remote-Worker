@@ -24,6 +24,13 @@ import pytest
 from fastapi import HTTPException
 
 import orchestrator.main as orch_main
+
+# R1.B05 lane P: the tier constants keep their owner; main no longer
+# re-exports them.
+from orchestrator.services import session_workspace_policy
+from orchestrator.routers import (
+    agent_thread_workspace as agent_thread_workspace_routes,
+)
 from orchestrator.services.cloud.protected_reader_authority import (
     ProtectedNextcloudReaderGrantPlan,
 )
@@ -251,8 +258,8 @@ class TestSessionWorkspaceBackendOverride:
         # vm must remain a per-session opt-in, never an implicit/saved default:
         # it is excluded from SESSION_WORKSPACE_BACKENDS (the default-chain +
         # settings-PATCH set) but present in the create-time allowlist.
-        assert "vm" not in orch_main.SESSION_WORKSPACE_BACKENDS
-        assert "vm" in orch_main.SESSION_CREATE_WORKSPACE_BACKENDS
+        assert "vm" not in session_workspace_policy.SESSION_WORKSPACE_BACKENDS
+        assert "vm" in session_workspace_policy.SESSION_CREATE_WORKSPACE_BACKENDS
 
     def test_unknown_backend_rejected(self):
         with pytest.raises(orch_main.HTTPException) as exc:
@@ -339,10 +346,10 @@ class TestSessionWorkspaceBackendDefaultChain:
     platform default (virtual). Sessions are never implicitly sandbox."""
 
     def test_platform_default_is_virtual(self):
-        assert orch_main.SESSION_DEFAULT_WORKSPACE_BACKEND == "virtual"
+        assert session_workspace_policy.SESSION_DEFAULT_WORKSPACE_BACKEND == "virtual"
         assert (
-            orch_main.SESSION_DEFAULT_WORKSPACE_BACKEND
-            in orch_main.SESSION_WORKSPACE_BACKENDS
+            session_workspace_policy.SESSION_DEFAULT_WORKSPACE_BACKEND
+            in session_workspace_policy.SESSION_WORKSPACE_BACKENDS
         )
 
     def test_no_settings_falls_back_to_platform_default(self):
@@ -508,7 +515,7 @@ class TestSessionWorkspaceBackendDefaultChain:
             resolved = asyncio.run(orch_main._resolve_preference_defaults())
         assert (
             resolved["persistent_agent"]["workspace_backend"]
-            == orch_main.SESSION_DEFAULT_WORKSPACE_BACKEND
+            == session_workspace_policy.SESSION_DEFAULT_WORKSPACE_BACKEND
         )
 
     def test_fleet_management_tools_override_passes_through(self):
@@ -1888,7 +1895,12 @@ class TestColdSessionDatasourceDelivery:
             writer = asyncio.create_task(save_detach())
             await writer_entered.wait()
             cold_response = asyncio.create_task(
-                orch_main.agent_get_thread_workspace(
+                # R1.B05 moved this route to `routers/agent_thread_workspace`.
+                # It resolves its collaborators from the application handling
+                # the request, so the fake request carries the same factory the
+                # real app registers — which is what makes the `orch_main`
+                # patches above still reach the handler.
+                agent_thread_workspace_routes.agent_get_thread_workspace(
                     SimpleNamespace(
                         headers={
                             "X-Agent-ID": _ATTACH_AGENT_ID,
@@ -1896,7 +1908,14 @@ class TestColdSessionDatasourceDelivery:
                                 _ATTACH_RUNTIME_GENERATION
                             ),
                             "X-Session-Runtime-Attach-Token": _ATTACH_TOKEN,
-                        }
+                        },
+                        app=SimpleNamespace(
+                            state=SimpleNamespace(
+                                thread_workspace_delivery_dependencies_factory=(
+                                    orch_main._thread_workspace_delivery_dependencies
+                                )
+                            )
+                        ),
                     ),
                     thread_id,
                 )

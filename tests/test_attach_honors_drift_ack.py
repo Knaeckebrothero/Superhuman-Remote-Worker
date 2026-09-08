@@ -124,8 +124,16 @@ async def test_resolve_session_config_strips_the_delivered_blob_not_just_the_cap
     with (
         patch("orchestrator.main._is_experts_db_enabled", return_value=True),
         patch("orchestrator.main._user_experts_enabled", AsyncMock(return_value=True)),
+        # R1.B05 lane P: same-module sibling of the resolve once main
+        # delegates to ``services.session_config_resolution`` — patch both so
+        # the stub is reached before AND after the extraction.
         patch(
             "orchestrator.main._resolve_session_account_defaults",
+            AsyncMock(return_value={}),
+        ),
+        patch(
+            "orchestrator.services.session_config_resolution"
+            ".resolve_session_account_defaults",
             AsyncMock(return_value={}),
         ),
         patch("orchestrator.main._gather_in_scope_skills", AsyncMock(return_value={})),

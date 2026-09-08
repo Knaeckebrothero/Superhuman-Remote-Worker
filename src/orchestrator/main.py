@@ -54,7 +54,6 @@ from collections.abc import (  # noqa: E402
     Awaitable,
     Callable,
     Coroutine,
-    Iterable,
     Mapping,
 )
 from typing import Any, Literal, NamedTuple, Optional  # noqa: E402
@@ -215,6 +214,9 @@ from orchestrator.routers import job_diff as job_diff_routes  # noqa: E402
 from orchestrator.routers import job_review as job_review_routes  # noqa: E402
 from orchestrator.routers import (  # noqa: E402
     agent_cloud_stage as agent_cloud_stage_routes,
+    agent_thread_workspace as agent_thread_workspace_routes,
+    job_assignment,
+    job_assignment as job_assignment_routes,
 )
 from orchestrator.routers import (  # noqa: E402
     thread_cloud_diff as thread_cloud_diff_routes,
@@ -233,7 +235,85 @@ from orchestrator.services import (  # noqa: E402
     main_cloud_settings as main_cloud_settings_operations,
 )
 from orchestrator.services import agent_cloud_mounts  # noqa: E402
+from orchestrator.services import datasource_config  # noqa: E402
+from orchestrator.services import session_create_overrides  # noqa: E402
+
+# Retained re-export: five suites construct `main.JobStartRequest` directly.
+# The schema's owner is `orchestrator.schemas.job_runtime`; this line exists
+# only so those callers keep resolving, and goes when they are re-pointed.
+from orchestrator.schemas.job_runtime import JobStartRequest  # noqa: E402,F401
+from orchestrator.services import agent_datasource_payload  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# R1.B05 retained bridges: names this module no longer uses itself, but that
+# production callers and existing suites still resolve through `orchestrator.main`.
+# They are plain aliases — pure symbols with no application dependency (§P4) —
+# and each one goes when the batch that owns its callers re-points them.
+# ---------------------------------------------------------------------------
+from orchestrator.services.agent_toolset_probe import (  # noqa: E402,F401
+    AGENT_TOOLSET_BUDGET_S as _AGENT_TOOLSET_BUDGET_S,
+    Measurement as _Measurement,
+)
+from orchestrator.services.dispatch_credentials import (  # noqa: E402,F401
+    provider_of_model as _provider_of_model,
+)
+from orchestrator.services.grant_enforcement import (  # noqa: E402,F401
+    strip_acknowledged_grants as _strip_acknowledged_grants,
+)
+from orchestrator.services.job_create_ingress import (  # noqa: E402,F401
+    PUBLIC_JOB_CONFIG_RESERVED_KEYS as _PUBLIC_JOB_CONFIG_RESERVED_KEYS,
+    PUBLIC_JOB_CONTEXT_RESERVED_KEYS as _PUBLIC_JOB_CONTEXT_RESERVED_KEYS,
+)
+from orchestrator.services.job_start_bundle import (  # noqa: E402,F401
+    mask_repository_transport as _mask_repository_transport,
+)
+from orchestrator.services.job_workspace_authority import (  # noqa: E402,F401
+    INHERIT_WORKSPACE_MAX_WAIT_S as _INHERIT_WORKSPACE_MAX_WAIT_S,
+    PinnedK8sJobWorkspaceAuthority as _PinnedK8sJobWorkspaceAuthority,
+)
+from orchestrator.services.job_workspace_runtime import (  # noqa: E402,F401
+    container_ssh_key_path as _container_ssh_key_path,
+)
+from orchestrator.services.session_class_policy import (  # noqa: E402,F401
+    protected_cloud_officer_active as _protected_cloud_officer_active,
+)
+from orchestrator.services.session_config_resolution import (  # noqa: E402,F401
+    endpoint_violations_detail as _endpoint_violations_detail,
+)
+from orchestrator.services.session_tool_policy import (  # noqa: E402,F401
+    SESSION_TOOL_DISABLED_MARKERS as _SESSION_TOOL_DISABLED_MARKERS,
+    agent_catalog_explicitly_disabled as _agent_catalog_explicitly_disabled,
+    fleet_management_explicitly_disabled as _fleet_management_explicitly_disabled,
+    legacy_session_tool_groups as _legacy_session_tool_groups,
+    merged_session_tool_groups as _merged_session_tool_groups,
+    session_tool_group_disabled_markers as _session_tool_group_disabled_markers,
+    validated_session_fleet_tools_override as _validated_session_fleet_tools_override,
+    workflows_explicitly_disabled as _workflows_explicitly_disabled,
+)
+from orchestrator.services.session_workspace_policy import (  # noqa: E402,F401
+    default_session_workspace_backend as _default_session_workspace_backend,
+    session_ready_timeout_s as _session_ready_timeout_s,
+)
+from orchestrator.services.virtual_workspace import (  # noqa: E402,F401
+    object_store_startup_warning as _object_store_startup_warning,
+)
+from orchestrator.services import audit_usage  # noqa: E402
+from orchestrator.services import agent_toolset_probe  # noqa: E402
+from orchestrator.services import dispatch_credentials  # noqa: E402
+from orchestrator.services import grant_enforcement  # noqa: E402
+from orchestrator.services import job_datasource_selection  # noqa: E402
+from orchestrator.services import job_dispatch_credentials  # noqa: E402
+from orchestrator.services import job_start_bundle  # noqa: E402
+from orchestrator.services import job_workspace_authority  # noqa: E402
+from orchestrator.services import job_workspace_runtime  # noqa: E402
 from orchestrator.services import protected_cloud_engage  # noqa: E402
+from orchestrator.services import session_class_policy  # noqa: E402
+from orchestrator.services import session_config_resolution  # noqa: E402
+from orchestrator.services import vm_workspace_policy  # noqa: E402
+from orchestrator.services import session_attach_payload  # noqa: E402
+from orchestrator.services import stateless_workspace_scheduler  # noqa: E402
+from orchestrator.services import thread_mount_rows  # noqa: E402
+from orchestrator.services import thread_workspace_delivery  # noqa: E402
 from orchestrator.services.cloud_task_registry import (  # noqa: E402
     CloudTaskRegistry,
 )
@@ -259,9 +339,6 @@ from orchestrator.services import (  # noqa: E402
 )
 from orchestrator.services import citations as citations_operations  # noqa: E402
 from orchestrator.services import knowledge_index as knowledge_index_operations  # noqa: E402
-from orchestrator.services.datasource_config import (  # noqa: E402
-    normalize_kb_config as _normalize_kb_config,
-)
 from orchestrator.services.kb_task_registry import (  # noqa: E402
     KbDatasourceTaskRegistry,
 )
@@ -320,7 +397,6 @@ from orchestrator.schemas.agent_runtime import (  # noqa: E402
     AgentHeartbeat,
 )
 from orchestrator.schemas.job_runtime import (  # noqa: E402
-    JobStartRequest,
     JobCompleteRequest,
 )
 from orchestrator.schemas.workspaces import (  # noqa: E402
@@ -339,11 +415,6 @@ from orchestrator.routers.preferences import (  # noqa: E402
 )
 from orchestrator.services.preference_defaults import (  # noqa: E402
     resolve_preference_defaults as _resolve_app_preference_defaults,
-)
-from orchestrator.services.session_workspace_policy import (  # noqa: E402
-    SESSION_CREATE_WORKSPACE_BACKENDS,
-    SESSION_DEFAULT_WORKSPACE_BACKEND,
-    SESSION_WORKSPACE_BACKENDS,
 )
 from orchestrator.routers.tables import TablesDependencies  # noqa: E402
 from orchestrator.routers.tables import router as tables_router  # noqa: E402
@@ -412,20 +483,14 @@ from orchestrator.services.dispatch_guards import (  # noqa: E402
     resume_lane_applies,
     vm_provisioning_decision,
 )
-from orchestrator.services.job_workspace_adoption import (  # noqa: E402
-    ensure_legacy_k8s_job_runtime_authority,
-    verify_adopted_k8s_runtime_before_delivery,
-)
 from orchestrator.services.config_drift import (  # noqa: E402
     DriftItem,
     acknowledged_drift_ids,
-    acknowledged_grant_keys,
     blocking_denials,
     collect_config_drift,
     strip_acknowledged,
 )
 from orchestrator.services.datasource_policy import classify_datasource_selection  # noqa: E402
-from orchestrator.services.audit_usage import materialize_llm_usage_from_audit  # noqa: E402
 from orchestrator.services.cloud_pricing import (  # noqa: E402
     CloudCostEstimator,
     cloud_pricing_sync_loop,
@@ -479,13 +544,16 @@ from orchestrator.services.usage_ledger import (  # noqa: E402
 )
 from orchestrator.services.usage_rollup import UsageRollup, usage_rollup_loop  # noqa: E402
 from orchestrator.services.virtual_workspace import (  # noqa: E402
-    virtual_workspace_rclone_spec as _build_virtual_workspace_rclone_spec,
+    # R1.B05 lane P: main's `_virtual_workspace_rclone_spec` was already a
+    # bare pass-through to this import, so the wrapper is gone and the
+    # alias carries its name. Consumers reach the spec through the module,
+    # which keeps one patch point.
+    virtual_workspace_rclone_spec as _virtual_workspace_rclone_spec,
 )
 from orchestrator.services.workspace_binding import (  # noqa: E402
     CANVAS_WORKSPACE_GENERATION_KEY,
     ensure_virtual_thread_workspace_binding,
     remote_canvas_presentation_available,
-    virtual_thread_backing_id,
 )
 from orchestrator.services.workspace import workspace_service  # noqa: E402
 from orchestrator.services.session_runtime_admission import (  # noqa: E402
@@ -504,7 +572,6 @@ from orchestrator.services.gitea import (  # noqa: E402
 from orchestrator.services.managed_repository_authority import (  # noqa: E402
     ManagedRepositoryAuthorityError,
     authorize_job_repository_transport,
-    authorize_thread_repository_transport,
     create_managed_repository,
     ensure_managed_repository_authority,
     prepare_job_primary_repository_authority,
@@ -515,7 +582,6 @@ from orchestrator.services.managed_repository_authority import (  # noqa: E402
 from orchestrator.services.keycloak_admin import KeycloakGroupSync  # noqa: E402
 from orchestrator.services.cloud import (  # noqa: E402
     MainCloudRouter,
-    ProjectFolderHandle,
     SessionFolderHandle,
     UserId,
     build_backend,
@@ -538,9 +604,6 @@ from orchestrator.services.cloud.ro_engage import (  # noqa: E402
     revoke_ro_mount_attempt,
 )
 from orchestrator.services.llm_endpoint_probe import probe_endpoint_models  # noqa: E402
-from orchestrator.services.email_datasource import (  # noqa: E402
-    email_dispatch_config,
-)
 from orchestrator.services import discovery as discovery_service  # noqa: E402
 from orchestrator.services import family_matcher  # noqa: E402
 from orchestrator.services import readiness as readiness_service  # noqa: E402
@@ -548,9 +611,6 @@ from orchestrator.seed.llm_config import (  # noqa: E402
     ensure_subscription_proxy_endpoint,
 )
 from orchestrator.services import subscription_discovery  # noqa: E402
-from shared.subscription_routing import (  # noqa: E402
-    subscription_request_headers,
-)
 
 # Registry helpers live in src/ and stay there — the orchestrator imports
 # them here so callers don't each do lazy imports.
@@ -581,7 +641,6 @@ from shared.workspace_contract import (  # noqa: E402
     WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY as WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY,
     WORKSPACE_RUNTIME_CONTEXT_KEY,
     WorkspaceContractError,
-    configured_workspace_backend,
     resolve_workspace_contract,
     resolve_workspace_runtime,
     workspace_runtime_authority_digest,
@@ -589,26 +648,12 @@ from shared.workspace_contract import (  # noqa: E402
 
 # Datasource type → tool-category map, shared with the agent's session attach
 # path so the two boundaries can't drift (live_session_settings.md P0.2).
-from shared.datasource_policy import datasource_tool_categories  # noqa: E402
-from shared.runtime.core.session_tool_overrides import (  # noqa: E402
-    LEGACY_APPENDED_GROUPS,
-    SESSION_TOOL_OVERRIDE_NAMES,
-    session_tool_group_enablement,
-)
 from shared.runtime.core.tool_policy import (  # noqa: E402
     ToolPolicyError,
     enumerate_only_members,
-    validate_tool_override_fragment,
 )
 from shared.runtime.core.tool_report import (  # noqa: E402
-    ORIGIN_AGENT,
-    ORIGIN_AGENT_PARTIAL,
-    ORIGIN_PREDICTION,
-    ToolReportError,
-    categorize_tool_names,
     compose_tool_view,
-    layer_provenance,
-    read_agent_toolset_report,
     tool_groups_from_view,
 )
 
@@ -672,7 +717,6 @@ from orchestrator.services.runtime_actor_verification import (  # noqa: E402
 from orchestrator.services.config_resolver import (  # noqa: E402
     inject_blob_credentials,
     resolve_config,
-    unrouted_model_slots,
 )
 from orchestrator.services.default_experts import (  # noqa: E402
     DefaultExpertUnavailable,
@@ -681,11 +725,7 @@ from orchestrator.services.default_experts import (  # noqa: E402
     seed_managed_default_experts,
 )
 from shared.runtime.core.loader import (  # noqa: E402
-    INHERIT_MODEL,
-    ROLE_ROOTS,
     canonical_config_name,
-    load_and_merge_config,
-    resolve_config_path,
 )
 from orchestrator.services.session_router import SessionRouterService  # noqa: E402
 from orchestrator.services.session_tokens import SessionTokenService  # noqa: E402
@@ -697,7 +737,6 @@ from orchestrator.services.lifecycle import (  # noqa: E402
     WorkspaceInstanceManager,
 )
 from orchestrator.services.workspace_suspension import (  # noqa: E402
-    WORKSPACE_SNAPSHOT_RESTORE_REQUIRED_KEY,
     _thread_is_vm_tier,
     workspace_suspension_service,
 )
@@ -2083,47 +2122,31 @@ async def ro_reader_reconciler_loop(shutdown_event: asyncio.Event) -> None:
     logger.info("RO reader reconciler stopped")
 
 
-_stateless_workspace_ensure_tasks: dict[str, asyncio.Task[None]] = {}
+_stateless_workspace_ensure_registry = (
+    stateless_workspace_scheduler.StatelessWorkspaceEnsureRegistry()
+)
+
+
+def _stateless_workspace_schedule_dependencies() -> (
+    stateless_workspace_scheduler.StatelessWorkspaceScheduleDependencies
+):
+    """Rebuilt per call, except the registry: that is the one field which must
+    be the *same* object across builds, or single-flighting would not."""
+
+    return stateless_workspace_scheduler.StatelessWorkspaceScheduleDependencies(
+        store=postgres_db,
+        provisioner=container_provisioner,
+        suspension=workspace_suspension_service,
+        registry=_stateless_workspace_ensure_registry,
+        ensure_session_workspace=ensure_session_workspace,
+    )
 
 
 def _schedule_stateless_workspace_ensure(thread_id: str) -> asyncio.Task[None]:
-    """Single-flight a stateless workspace reconcile.
-
-    Input and resume must stay durable/fast, while the internal workspace poll
-    is allowed to observe provisioning over the already-heartbeating queue
-    lease. Repeated user input and two-second agent polls therefore converge on
-    one background create/adopt operation instead of starting task storms.
-    """
-    current = _stateless_workspace_ensure_tasks.get(thread_id)
-    if current is not None and not current.done():
-        return current
-
-    async def _ensure() -> None:
-        try:
-            # The service owns the cross-replica advisory lock because direct
-            # resume/prepare and periodic-reconcile callers share this path.
-            await ensure_session_workspace(
-                thread_id,
-                db=postgres_db,
-                provisioner=container_provisioner,
-                suspension=workspace_suspension_service,
-            )
-        except Exception:
-            logger.exception(
-                "Stateless workspace reconcile failed for thread %s", thread_id
-            )
-
-    task = asyncio.create_task(
-        _ensure(), name=f"stateless-workspace-ensure-{thread_id[:8]}"
+    """Bridge to ``services/stateless_workspace_scheduler.py`` (R1.B05)."""
+    return stateless_workspace_scheduler.schedule_stateless_workspace_ensure(
+        thread_id, dependencies=_stateless_workspace_schedule_dependencies()
     )
-    _stateless_workspace_ensure_tasks[thread_id] = task
-
-    def _forget(finished: asyncio.Task[None]) -> None:
-        if _stateless_workspace_ensure_tasks.get(thread_id) is finished:
-            _stateless_workspace_ensure_tasks.pop(thread_id, None)
-
-    task.add_done_callback(_forget)
-    return task
 
 
 async def workspace_idle_sweeper(shutdown_event: asyncio.Event) -> None:
@@ -2754,589 +2777,107 @@ async def imap_poll_loop(shutdown_event: asyncio.Event) -> None:
 # =============================================================================
 
 
-def _is_experts_db_enabled() -> bool:
-    """True when DB-backed experts / orchestrator-resolved config is on (env).
+from orchestrator.services.deployment_gates import (  # noqa: E402
+    is_experts_db_enabled as _is_experts_db_enabled,
+)
 
-    Gates whether the orchestrator resolves the full config at dispatch/attach
-    and emits a ``resolved_config`` blob. Off → the agent uses its ``from_config``
-    fallback (emergency compatibility path). Enabled by default because root
-    creation depends on persisted application expert pointers.
+
+from orchestrator.services.deployment_gates import (  # noqa: E402
+    is_skills_db_enabled as _is_skills_db_enabled,
+)
+
+
+from orchestrator.services.deployment_gates import (  # noqa: E402
+    mcp_datasources_enabled as _mcp_datasources_enabled,
+)
+
+
+from orchestrator.services.deployment_gates import (  # noqa: E402
+    datasource_defaults_on_omission as _datasource_defaults_on_omission,
+)
+
+
+from orchestrator.services.deployment_gates import (  # noqa: E402
+    datasource_scope_auto_attach_v1_enabled as _datasource_scope_auto_attach_v1_enabled,
+)
+
+
+from orchestrator.services.deployment_gates import (  # noqa: E402
+    mcp_stdio_enabled as _mcp_stdio_enabled,
+)
+
+
+def _validate_mcp_datasource(connection_url: Any, credentials: dict[str, Any]) -> None:
+    return datasource_config.validate_mcp_datasource(connection_url, credentials)
+
+
+from orchestrator.services.deployment_gates import (  # noqa: E402
+    is_protected_cloud_mode_enabled as _is_protected_cloud_mode_enabled,
+)
+
+
+from orchestrator.services.deployment_gates import (  # noqa: E402
+    require_pinned_status_identity as _require_pinned_status_identity,
+)
+
+
+def _session_config_dependencies() -> (
+    session_config_resolution.SessionConfigDependencies
+):
+    """Rebuilt per call.
+
+    Every collaborator is read from this module's namespace at call time, which
+    is the only reason an existing ``patch("orchestrator.main._x")`` still
+    steers the service: a factory that captured them at import would leave
+    those suites green and inert (§P3).
     """
-    return os.getenv("EXPERTS_DB_ENABLED", "true").lower().strip() in (
-        "true",
-        "1",
-        "yes",
-    )
 
-
-def _is_skills_db_enabled() -> bool:
-    """True when DB-backed Agent Skills are on (env). Dev on / prod off (helm
-    ``skillsDbEnabled``). Mirrors ``EXPERTS_DB_ENABLED``."""
-    return os.getenv("SKILLS_DB_ENABLED", "").lower().strip() in ("true", "1", "yes")
-
-
-def _mcp_datasources_enabled() -> bool:
-    """Whether user-added MCP server datasources are enabled."""
-    return os.getenv("MCP_DATASOURCES_ENABLED", "").lower().strip() in (
-        "true",
-        "1",
-        "yes",
-    )
-
-
-def _datasource_defaults_on_omission() -> bool:
-    """Temporary rollout gate for the root REST omission contract.
-
-    Cockpit always submits a reviewed explicit array and internal schedulers
-    call the default policy directly.  This gate protects older REST clients
-    that historically encoded "none" by omitting ``datasource_ids``.
-    """
-    return os.getenv("DATASOURCE_DEFAULTS_ON_OMISSION", "false").lower().strip() in (
-        "true",
-        "1",
-        "yes",
-    )
-
-
-def _datasource_scope_auto_attach_v1_enabled() -> bool:
-    """Coordinated rollout gate for the project-scope/auto-attach UI.
-
-    Keep this default-off until every API replica understands the additive
-    datasource contract; the Cockpit reads the corresponding capability bit
-    and leaves the new management workflow hidden while a rollout is mixed.
-    """
-    return os.getenv(
-        "DATASOURCE_SCOPE_AUTO_ATTACH_V1_ENABLED", "false"
-    ).lower().strip() in ("true", "1", "yes")
-
-
-def _mcp_stdio_enabled() -> bool:
-    """Whether MCP datasources may execute local stdio server commands."""
-    return os.getenv("MCP_STDIO_ENABLED", "").lower().strip() in (
-        "true",
-        "1",
-        "yes",
-    )
-
-
-def _validate_mcp_datasource(
-    connection_url: str | None,
-    credentials: dict[str, Any],
-) -> None:
-    """Validate an MCP datasource without reflecting credential values."""
-    if not isinstance(credentials, dict):
-        raise HTTPException(status_code=400, detail="MCP credentials must be an object")
-
-    raw_transport = credentials.get("transport") or "http"
-    if not isinstance(raw_transport, str):
-        raise HTTPException(status_code=400, detail="MCP transport must be a string")
-    transport = raw_transport.lower().strip()
-    if transport not in ("http", "sse", "stdio"):
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid MCP transport (expected http, sse, or stdio)",
-        )
-
-    if transport == "stdio":
-        if not _mcp_stdio_enabled():
-            raise HTTPException(
-                status_code=400,
-                detail="stdio MCP servers are disabled on this deployment",
-            )
-        unknown = sorted(set(credentials) - {"transport", "command", "args", "env"})
-        if unknown:
-            raise HTTPException(
-                status_code=400,
-                detail="Unknown stdio MCP credential field(s)",
-            )
-        command = credentials.get("command")
-        if not isinstance(command, str) or not command.strip() or "\x00" in command:
-            raise HTTPException(
-                status_code=400,
-                detail="stdio MCP servers require a valid credentials.command",
-            )
-        args = credentials.get("args") or []
-        if (
-            not isinstance(args, list)
-            or not all(isinstance(arg, str) for arg in args)
-            or any("\x00" in arg for arg in args)
-        ):
-            raise HTTPException(
-                status_code=400,
-                detail="MCP credentials.args must be a list of valid strings",
-            )
-        env = credentials.get("env") or {}
-        if not isinstance(env, dict) or not all(
-            isinstance(key, str)
-            and bool(key)
-            and "=" not in key
-            and "\x00" not in key
-            and isinstance(value, str)
-            and "\x00" not in value
-            for key, value in env.items()
-        ):
-            raise HTTPException(
-                status_code=400,
-                detail="MCP credentials.env must map valid names to string values",
-            )
-        return
-
-    unknown = sorted(set(credentials) - {"transport", "auth"})
-    if unknown:
-        raise HTTPException(
-            status_code=400,
-            detail="Unknown remote MCP credential field(s)",
-        )
-    value = (connection_url or "").strip()
-    if not value:
-        raise HTTPException(
-            status_code=400,
-            detail=f"{transport} MCP servers require connection_url",
-        )
-    parsed = urlparse(value)
-    if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        raise HTTPException(
-            status_code=400,
-            detail="Remote MCP connection_url must be an HTTP(S) URL",
-        )
-    if parsed.username is not None or parsed.password is not None:
-        raise HTTPException(
-            status_code=400,
-            detail="Remote MCP connection_url must not embed credentials",
-        )
-
-    auth = credentials.get("auth") or {}
-    if not isinstance(auth, dict):
-        raise HTTPException(
-            status_code=400,
-            detail="MCP credentials.auth must be an object",
-        )
-    auth_type = auth.get("type") or "none"
-    if auth_type == "bearer":
-        if set(auth) - {"type", "token"}:
-            raise HTTPException(
-                status_code=400,
-                detail="Unknown MCP bearer auth field(s)",
-            )
-        token = auth.get("token")
-        if not isinstance(token, str) or not token:
-            raise HTTPException(
-                status_code=400,
-                detail="MCP bearer auth requires a token",
-            )
-    elif auth_type == "headers":
-        if set(auth) - {"type", "headers"}:
-            raise HTTPException(
-                status_code=400,
-                detail="Unknown MCP custom-header auth field(s)",
-            )
-        headers = auth.get("headers") or {}
-        if not isinstance(headers, dict) or not all(
-            isinstance(key, str)
-            and bool(key.strip())
-            and "\r" not in key
-            and "\n" not in key
-            and isinstance(value, str)
-            and "\r" not in value
-            and "\n" not in value
-            for key, value in headers.items()
-        ):
-            raise HTTPException(
-                status_code=400,
-                detail="MCP custom headers must map valid names to string values",
-            )
-    elif auth_type in ("none", ""):
-        if set(auth) - {"type"}:
-            raise HTTPException(
-                status_code=400,
-                detail="Unknown MCP no-auth field(s)",
-            )
-    else:
-        raise HTTPException(status_code=400, detail="Invalid MCP auth type")
-
-
-def _is_protected_cloud_mode_enabled() -> bool:
-    """Whether protected cloud mode (RO-reader provisioning + capture overlay)
-    is enabled for this deployment. Dev-ON / prod-OFF via the helm
-    ``agent.protectedCloudModeEnabled`` flag
-    (knowledge-base/knowledge/design/cloud_access_unification.md §8 Phase 1)."""
-    return os.getenv("PROTECTED_CLOUD_MODE_ENABLED", "").lower().strip() in (
-        "true",
-        "1",
-        "yes",
-    )
-
-
-def _require_pinned_status_identity() -> bool:
-    """Require exact pinned lifecycle identity unless explicitly disabled."""
-
-    return os.getenv("REQUIRE_PINNED_STATUS_IDENTITY", "true").lower().strip() in (
-        "true",
-        "1",
-        "yes",
+    return session_config_resolution.SessionConfigDependencies(
+        store=postgres_db,
+        is_experts_db_enabled=_is_experts_db_enabled,
+        user_experts_enabled=_user_experts_enabled,
+        resolve_runner_grants=_resolve_runner_grants,
+        enforce_dispatch_grants=_enforce_dispatch_grants,
+        gather_in_scope_skills=_gather_in_scope_skills,
+        seed_registry_model_overrides=_seed_registry_model_overrides,
+        inject_thread_dispatch_credentials=_inject_thread_dispatch_credentials,
+        thread_project_ids=_thread_project_ids,
+        thread_has_knowledge_scope=_thread_has_knowledge_scope,
     )
 
 
 async def _resolve_default_models(user_id: str | None) -> dict[str, Any]:
-    """Effective default chat + auxiliary MODEL NAMES for a user (no transport).
-
-    Mirrors the model selection in ``_inject_dispatch_credentials`` /
-    ``_inject_thread_dispatch_credentials``: a user's pinned default wins, else
-    the system capability default. Returned as a config layer
-    (``{"llm": {"model": ...}, "auxiliary": {"model": ...}}``) that
-    ``resolve_config`` applies above the base config's placeholder model and below
-    the expert. base_url/api_key for the chosen models are injected into the
-    delivery blob, not here. Reused by job dispatch AND session attach.
-    """
-    out: dict[str, Any] = {}
-    user_settings: dict[str, Any] = {}
-    if user_id:
-        user_settings = await postgres_db.get_user_settings(str(user_id)) or {}
-    chat = user_settings.get(
-        "default_model"
-    ) or await postgres_db.resolve_default_for_capability("chat")
-    aux = user_settings.get(
-        "default_auxiliary_model"
-    ) or await postgres_db.resolve_default_for_capability("auxiliary")
-    if chat:
-        out.setdefault("llm", {})["model"] = chat
-    reasoning = user_settings.get("default_reasoning_level")
-    if reasoning:
-        # Account reasoning is a gap-filler like the account model: the mode
-        # base supplies the system floor, while an expert/request pin must win.
-        out.setdefault("llm", {})["reasoning_level"] = reasoning
-    if aux:
-        out.setdefault("auxiliary", {})["model"] = aux
-    return out
-
-
-async def _prefetch_roster_refs(
-    *,
-    expert_row: dict[str, Any] | None = None,
-    overrides: Iterable[dict[str, Any] | None] = (),
-    user_id: str | None = None,
-    project_ids: list[str] | None = None,
-) -> dict[str, dict[str, Any]]:
-    """``{expert_uuid: row}`` for every DB expert a config's ``subagents.roster``
-    names by ``$ref`` — the rows ``resolve_config(db_refs=...)`` materialises
-    (``src/core/subagent_roster.py``; the resolver itself never touches the DB,
-    and matches the keys case-insensitively).
-
-    Two trust levels, by layer. A ref inside the EXPERT ROW's fragment was
-    checked against its author at save (``_require_visible_roster_refs``) and
-    the row is the authority: fetched by id. A ref inside an OVERRIDE layer
-    (the job / thread ``config_override``, a project link's override) was
-    never save-checked against any DB row, so it is fetched with the RUNNER's
-    visibility — an override cannot pull another user's private expert into
-    a job. Whatever is missing or invisible is simply absent from the map: the
-    resolver drops that entry, logs, and records ``agent._roster_warnings``;
-    dispatch never fails a job over its roster (U1 B.3).
-
-    No database call at all when no layer names a DB ref — the common case.
-    """
-    from shared.runtime.core.subagent_roster import collect_roster_db_refs
-
-    expert_refs: set[str] = set()
-    if expert_row:
-        fragment = expert_row.get("config") or {}
-        if isinstance(fragment, str):
-            try:
-                fragment = json.loads(fragment)
-            except ValueError:
-                fragment = {}
-        expert_refs = collect_roster_db_refs(fragment)
-    override_refs: set[str] = set()
-    for layer in overrides:
-        override_refs |= collect_roster_db_refs(layer)
-    if not expert_refs and not override_refs:
-        return {}
-
-    db_refs: dict[str, dict[str, Any]] = {}
-    for ref in sorted(expert_refs):
-        row = await postgres_db.get_expert_by_id(ref)
-        if row:
-            db_refs[ref] = row
-        else:
-            logger.warning(
-                "Roster prefetch: expert fragment names unknown expert %s", ref
-            )
-    pending = sorted(override_refs - set(db_refs))
-    if pending:
-        is_admin = False
-        if user_id:
-            runner = await postgres_db.get_user(user_id)
-            is_admin = bool((runner or {}).get("is_admin"))
-        for ref in pending:
-            if user_id:
-                row = await postgres_db.get_expert_visible_by_id(
-                    ref,
-                    user_id=user_id,
-                    project_ids=list(project_ids or []),
-                    is_admin=is_admin,
-                )
-            else:
-                row = await postgres_db.get_expert_by_id(ref)
-            if row:
-                db_refs[ref] = row
-            else:
-                logger.warning(
-                    "Roster prefetch: override names expert %s that is unknown "
-                    "or not visible to user %s",
-                    ref,
-                    user_id,
-                )
-    return db_refs
-
-
-async def _resolve_session_account_defaults(
-    user_id: str | None,
-    all_user_settings: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Account-level session fallbacks, always below the selected expert."""
-    out = await _resolve_default_models(user_id)
-    if not user_id:
-        return out
-    settings = (
-        all_user_settings
-        if all_user_settings is not None
-        else (await postgres_db.get_user_settings(str(user_id)) or {})
-    )
-    persistent = (settings or {}).get("persistent_agent") or {}
-    layer: dict[str, Any] = {}
-    if persistent.get("model"):
-        layer["llm"] = {"model": persistent["model"]}
-    interactive: dict[str, Any] = {}
-    for key in ("permission_mode", "idle_timeout_minutes"):
-        if persistent.get(key) is not None:
-            interactive[key] = persistent[key]
-    if interactive:
-        layer["interactive"] = interactive
-    headless: dict[str, Any] = {}
-    if persistent.get("headless_mode"):
-        headless["mode"] = persistent["headless_mode"]
-    if persistent.get("headless_attention_sleep_minutes") is not None:
-        headless["attention_sleep_minutes"] = int(
-            persistent["headless_attention_sleep_minutes"]
-        )
-    if headless:
-        layer["headless"] = headless
-    layer["workspace"] = {"backend": _default_session_workspace_backend(persistent)}
-    return _deep_merge_dicts(out, layer)
-
-
-async def _account_defaults_layer(
-    user_id: str | None, expert_type: str
-) -> dict[str, Any]:
-    """The account fallback layer that create/dispatch feeds ``resolve_config``.
-
-    Single source for "what the caller's account contributes below the expert",
-    so the create forms can render the same resolved config the server will
-    actually build. Sessions get the full session layer — crucially including
-    ``workspace.backend``, which is ``virtual`` by default and therefore does
-    NOT match ``session_base.yaml``'s ``sandbox``; workers get only the
-    default-model floor, matching the ``base_defaults`` the job dispatcher
-    passes. Both mirror the exact calls in ``create_thread`` and the dispatcher.
-
-    Returns ``{}`` for an anonymous caller: with no account there is no layer,
-    and the framework base is already the honest answer.
-    """
-    if not user_id:
-        return {}
-    if expert_type == "session":
-        return await _resolve_session_account_defaults(user_id)
-    return await _resolve_default_models(user_id)
-
-
-async def _acknowledged_grant_strip(
-    metadata: dict[str, Any],
-    *,
-    user_id: str | None,
-    project_id: str | None,
-) -> Callable[[dict], dict] | None:
-    """Build ``resolve_config``'s ``grant_strip`` hook from a thread's
-    acknowledged grant drift, or ``None`` when there is nothing to strip (no
-    acknowledgment, or ``_resolve_runner_grants`` says admin bypass).
-
-    Shared by :func:`_resolve_session_config` (the delivered blob) and
-    :func:`_merged_session_tool_policy` (the tool-groups report), so the two
-    can never disagree about which acknowledged grants are currently still
-    violated — before this helper existed, the report used a bare
-    ``resolve_config`` call with no strip at all, so an acknowledged
-    ``catalog_authoring`` violation (say) still read "on" in the settings
-    view after the delivered blob had already dropped it. See
-    knowledge-history/done/session_config_drift_resume.md §3.3.
-    """
-    ack_grant_keys = acknowledged_grant_keys(metadata)
-    if not ack_grant_keys:
-        return None
-    grants_for_strip = await _resolve_runner_grants(
-        runner_user_id=user_id,
-        project_ids=[project_id] if project_id else [],
-    )
-    if grants_for_strip is None:
-        return None
-    return lambda fragment: _strip_acknowledged_grants(
-        fragment, grants_for_strip, ack_grant_keys
+    return await session_config_resolution.resolve_default_models(
+        user_id, dependencies=_session_config_dependencies()
     )
 
 
-async def _resolve_session_config(
-    thread: dict[str, Any],
-    metadata: dict[str, Any],
-    *,
-    config_override: dict[str, Any] | None = None,
-    status: dict[str, Any] | None = None,
-    resolve_base_when_experts_disabled: bool = False,
-) -> dict[str, Any] | None:
-    """Resolve a persistent thread's full config to a delivery blob (credential-
-    injected), or ``None`` when experts are off / resolution fails (→ the agent's
-    ``config_name`` + ``config_override`` fallback).  The session-memory outbox
-    alone may opt into bundled-base resolution while experts are off; normal
-    attach semantics remain unchanged and dormant expert rows stay excluded.
+async def _prefetch_roster_refs(*args: Any, **kwargs: Any) -> Any:
+    return await session_config_resolution.prefetch_roster_refs(
+        *args, **kwargs, dependencies=_session_config_dependencies()
+    )
 
-    The session sibling of the job-dispatch resolve. Sessions **re-resolve on
-    every (re)attach** — there is no freeze (mutable run; spec delivery table).
-    Layers: session_base + account/system fallback + DB expert
-    (``metadata.expert_id``) + thread ``config_override`` (request) → creds.
-    ``config_override`` overrides ``metadata.config_override`` for the warm-pool
-    path (it carries the attach-time lite-workspace backend).
-    """
-    experts_enabled = _is_experts_db_enabled() and await _user_experts_enabled()
-    if not experts_enabled and not resolve_base_when_experts_disabled:
-        if status is not None:
-            status["state"] = "disabled"
-        return None
-    try:
-        user_id = str(thread["user_id"]) if thread.get("user_id") else None
-        project_id = str(thread["project_id"]) if thread.get("project_id") else None
-        # The resident session-memory drain also serves deployments where the
-        # expert catalog is disabled.  Its explicit opt-in resolves only the
-        # bundled session base + account/request layers; a dormant expert id
-        # must not become active merely because an outbox worker needs fresh
-        # credentials.  Normal attach callers keep the early-return above.
-        expert_id = metadata.get("expert_id") if experts_enabled else None
-        expert_row = (
-            await postgres_db.get_expert_by_id(str(expert_id)) if expert_id else None
-        )
-        base = canonical_config_name(thread.get("config_name") or "session_base")
-        if _looks_like_uuid(base):
-            # Sentinel / cockpit-conflated expert UUID → resolve onto the real
-            # session base; the expert is delivered via expert_id, not the name.
-            base = "session_base"
-        request_override = (
-            config_override
-            if config_override is not None
-            else (metadata.get("config_override") or None)
-        )
-        base_defaults = await _resolve_session_account_defaults(user_id)
-        project_overrides = None
-        if project_id and expert_id:
-            link = await postgres_db.get_project_expert_link(
-                project_id=project_id, expert_id=str(expert_id)
-            )
-            if link:
-                project_overrides = link.get("config_override") or None
-                if isinstance(project_overrides, str):
-                    project_overrides = json.loads(project_overrides)
-        _cap: dict = {}
-        _skills_payload = await _gather_in_scope_skills(
-            user_id, [project_id] if project_id else None
-        )
-        # Per-model registry overrides must reach the matrix as explicit llm
-        # keys, else the blob bakes the family window and the admin
-        # context_window cap is silently dropped (see
-        # _seed_registry_model_overrides).
-        request_override = await _seed_registry_model_overrides(
-            request_override, user_id=user_id
-        )
-        # Grants resolved BEFORE resolve_config (not after) so the strip can run
-        # as its grant_strip hook, on the SAME `data` the delivered blob is built
-        # from — not just on the detached capture the PDP evaluates. Stripping
-        # only the capture leaves the delivered blob carrying the very
-        # capability the grant revoked (round-1 finding). None when there is
-        # nothing acknowledged, or when _resolve_runner_grants says admin.
-        # Shared with the tool-groups report — see _acknowledged_grant_strip.
-        _grant_strip = await _acknowledged_grant_strip(
-            metadata, user_id=user_id, project_id=project_id
-        )
-        resolved = resolve_config(
-            base_config_name=base,
-            base_defaults=base_defaults,
-            expert_row=expert_row,
-            project_overrides=project_overrides,
-            request_override=request_override,
-            expert_type="session",
-            capture=_cap,
-            skills=_skills_payload,
-            grant_strip=_grant_strip,
-            db_refs=await _prefetch_roster_refs(
-                expert_row=expert_row,
-                overrides=(project_overrides, request_override),
-                user_id=user_id,
-                project_ids=[project_id] if project_id else [],
-            ),
-        )
-        # Bound skills are delivered deterministically (instructions channel);
-        # strip them from the model-invoked catalog so they aren't double-offered.
-        from shared.runtime.core.skill_resolution import filter_bound_skills
 
-        filter_bound_skills(resolved)
-        # Empty session-control groups are meaningful at every layer.  Derive
-        # runtime injection markers from the fully merged config, so a safe base
-        # or expert can disable Automations & Loops without requiring the create
-        # form to redundantly submit an empty request override.
-        session_tool_markers = _session_tool_group_disabled_markers(
-            _cap["merged_fragment"]
-        )
-        if session_tool_markers:
-            resolved.setdefault("agent", {}).update(session_tool_markers)
-        # Session dispatch PEP (decision 9): the merged config — including
-        # interactive.permission_mode and any persistent_agent keys baked into
-        # config_override — must fit the runner's grants. GrantDenied escapes the
-        # generic except below (fail closed: never deliver the unvetted override).
-        # _cap["merged_fragment"] already reflects the grant_strip hook above
-        # (same `data` the delivered blob was built from); this re-check stays
-        # authoritative — it re-runs evaluate() on whatever that hook returned.
-        await _enforce_dispatch_grants(
-            _cap["merged_fragment"],
-            runner_user_id=user_id,
-            project_ids=[project_id] if project_id else [],
-        )
-        knowledge_project_ids = (
-            [project_id] if project_id else await _thread_project_ids(str(thread["id"]))
-        )
-        include_kb_profile = await _thread_has_knowledge_scope(
-            project_ids=knowledge_project_ids,
-            datasource_ids=metadata.get("datasource_ids"),
-        )
-        delivered = await inject_blob_credentials(
-            resolved,
-            lambda co: _inject_thread_dispatch_credentials(
-                co,
-                user_id=user_id,
-                project_id=project_id,
-                include_kb_profile=include_kb_profile,
-            ),
-        )
-        if status is not None:
-            status["state"] = "ok"
-        return delivered
-    except GrantDenied as gd:
-        if status is not None:
-            status["state"] = "denied"
-            # The drift collector reads these rather than re-merging the config
-            # itself — one merge implementation, so the dialog can never promise
-            # something different from what attach enforces.
-            status["grant_violations"] = list(gd.violations)
-        raise
-    except Exception:
-        logger.exception(
-            "Session resolve failed for thread %s; falling back to config_name",
-            thread.get("id"),
-        )
-        if status is not None:
-            status["state"] = "error"
-        return None
+async def _resolve_session_account_defaults(*args: Any, **kwargs: Any) -> Any:
+    return await session_config_resolution.resolve_session_account_defaults(
+        *args, **kwargs, dependencies=_session_config_dependencies()
+    )
+
+
+async def _account_defaults_layer(*args: Any, **kwargs: Any) -> Any:
+    return await session_config_resolution.account_defaults_layer(*args, **kwargs)
+
+
+async def _acknowledged_grant_strip(*args: Any, **kwargs: Any) -> Any:
+    return await session_config_resolution.acknowledged_grant_strip(
+        *args, **kwargs, dependencies=_session_config_dependencies()
+    )
+
+
+async def _resolve_session_config(*args: Any, **kwargs: Any) -> Any:
+    return await session_config_resolution.resolve_session_config(
+        *args, **kwargs, dependencies=_session_config_dependencies()
+    )
 
 
 #: TOTAL wall-clock budget for the agent toolset probe, both hops included.
@@ -3345,15 +2886,12 @@ async def _resolve_session_config(
 #: fallback would otherwise cost two full budgets, and a pod trickling bytes
 #: could exceed either without ever tripping one. The cockpit blocks its
 #: settings pane on this endpoint, so the bound has to be a real deadline.
-_AGENT_TOOLSET_BUDGET_S = 3.0
 
 #: Agent rows in these states keep a ``pod_ip`` that no longer routes.
-_AGENT_TERMINAL_STATUSES = frozenset({"offline", "failed", "completed"})
 
 #: Registered but not yet serving: nothing is bound, so there is nothing to
 #: measure and the probe would only spend budget discovering that. Kept apart
 #: from the terminal set so the reason we report is the true one.
-_AGENT_PREREADY_STATUSES = frozenset({"booting"})
 
 #: NOTE on what is deliberately NOT skipped: ``ready``. An agent stays ``ready``
 #: for up to one heartbeat interval (60s) after attach, so gating the probe on
@@ -3361,1749 +2899,176 @@ _AGENT_PREREADY_STATUSES = frozenset({"booting"})
 #: every session — the exact silently-wrong answer this endpoint removes.
 
 
-def _merged_session_tool_groups(
-    *,
-    base_config_name: str,
-    expert_row: dict[str, Any] | None,
-    project_overrides: dict[str, Any] | None,
-    request_override: dict[str, Any] | None,
-) -> dict[str, bool]:
-    """The closed session tool groups as the RESOLVED path will bind them.
-
-    SYNCHRONOUS — ``resolve_config`` parses YAML off disk and reads prompt
-    files. Call it from ``asyncio.to_thread`` so it cannot block the loop.
-
-    Runs the SAME ``resolve_config`` layering as ``_resolve_session_config``
-    minus everything that provably cannot reach ``tools``. Anything skipped
-    here that CAN move a tool group is a correctness bug, so the ledger is
-    explicit:
-
-    - ``base_defaults`` (``_resolve_session_account_defaults``) emits only
-      ``llm``/``auxiliary``/``interactive``/``headless``/``workspace``, and
-      the settings matrix its model choice feeds
-      (``src/core/loader._apply_settings_matrix``) writes only ``llm``,
-      ``limits`` and ``shell.mode``. Saves 2 round trips.
-    - ``_seed_registry_model_overrides`` only ``setdefault``s ``llm.*``.
-    - ``skills`` is written to the returned blob AFTER ``resolve_config`` takes
-      the ``capture`` deepcopy, so it cannot appear in the merged fragment.
-    - ``_enforce_dispatch_grants`` is a PDP, not a transform. Skipping it means
-      a grant-denied session still gets a resolved-shaped answer; that session
-      never attaches, and this read surface must not become a second 403.
-    - ``_thread_project_ids`` / ``_thread_has_knowledge_scope`` /
-      ``inject_blob_credentials`` all act on the post-capture delivery copy and
-      inject transport/KB-profile keys only.
-    - The attach-time ``config_override`` (warm-pool) differs from the stored
-      one only by ``workspace.*`` and datasource categories
-      (``graph``/``sql``/``mongodb``/``webdav``/``email``/``mcp``) — disjoint
-      from these groups.
-    - ``grant_strip`` — the acknowledged-grant-downgrade hook
-      ``_resolve_session_config`` passes to ``resolve_config`` — is skipped
-      HERE too, and it does NOT belong on the "safe to skip" side of this
-      ledger the way the entries above do: an acknowledged grant violation
-      CAN delete a closed group's only enabling key (``catalog_authoring`` is
-      both a closed session tool group and a key ``strip_to_grants`` drops).
-      This function has no caller today that carries a thread/metadata to
-      build the hook from, so it is left unthreaded rather than faked.
-      :func:`_merged_session_tool_policy` — whose two HTTP callers DO have a
-      thread — accepts and forwards ``grant_strip`` instead; see
-      ``_acknowledged_grant_strip``. If this function grows a caller that
-      needs a drift-aware answer, thread it through the same way rather than
-      silently reporting the pre-strip merge.
-
-    Kept, because each CAN set ``tools.*``: the base config name, the expert
-    row, the project-expert link override, and the request override (which is
-    where a live Settings toggle lands, so this stays fresh after a toggle).
-    """
-    merged, _provenance = _merged_session_tool_policy(
-        base_config_name=base_config_name,
-        expert_row=expert_row,
-        project_overrides=project_overrides,
-        request_override=request_override,
-    )
-    return session_tool_group_enablement({"tools": merged})
+from orchestrator.services.session_tool_policy import (  # noqa: E402
+    merged_session_tool_policy as _merged_session_tool_policy,
+)
 
 
-def _merged_session_tool_policy(
-    *,
-    base_config_name: str,
-    expert_row: dict[str, Any] | None,
-    project_overrides: dict[str, Any] | None,
-    request_override: dict[str, Any] | None,
-    expert_type: str = "session",
-    grant_strip: Callable[[dict], dict] | None = None,
-    db_refs: dict[str, Any] | None = None,
-    capture: dict[str, Any] | None = None,
-) -> tuple[dict[str, list[str]], dict[str, str]]:
-    """``(merged tools mapping, category -> deciding layer)``.
-
-    ``db_refs`` are the prefetched DB expert rows a ``subagents.roster``
-    names (:func:`_prefetch_roster_refs`); without them a DB ``$ref`` entry
-    drops out of the resolve. ``capture`` is the caller's dict for
-    ``resolve_config``'s ``merged_fragment`` — the tool-groups endpoints read
-    the materialised roster off it to report what a Delegation tick reaches.
-
-    SYNCHRONOUS — see :func:`_merged_session_tool_groups`, whose skip ledger
-    this shares because it runs the same resolve, with ONE exception:
-    ``grant_strip`` is NOT skipped here. A caller that holds a thread and its
-    metadata (the two tool-groups HTTP endpoints) can build the identical
-    hook ``_resolve_session_config`` passes to ``resolve_config`` — see
-    ``_acknowledged_grant_strip`` — so an acknowledged grant's downgrade
-    shows up in the reported policy instead of only in the delivered blob.
-
-    This is a *prediction* and is only ever served as one. It cannot see the
-    agent's runtime injection layer or its backend capability gate, so it is
-    structurally weaker than the agent's own report — not merely staler. D6.
-
-    Provenance exploits ``deep_merge``'s list-replacement rule: for
-    ``tools.<category>`` the most specific layer naming the category owns it
-    outright, so "which layer decided it" is the last hit down the chain.
-
-    ``expert_type`` selects which prompt/config leaf ``resolve_config`` reads and
-    was hardcoded to ``"session"`` until 2026-08-04, which is why job create had
-    no honest toolset view: asking it for a worker prediction returned a
-    session's answer, so the surface was left rendering six static rows instead.
-    """
-    if capture is None:
-        capture = {}
-    resolve_config(
-        base_config_name=base_config_name,
-        base_defaults=None,
-        expert_row=expert_row,
-        project_overrides=project_overrides,
-        request_override=request_override,
-        expert_type=expert_type,
-        capture=capture,
-        grant_strip=grant_strip,
-        db_refs=db_refs,
-    )
-    merged_fragment = capture.get("merged_fragment") or {}
-    merged = merged_fragment.get("tools")
-    merged = merged if isinstance(merged, dict) else {}
-    # ``delegate_agent`` and its control plane are ``grant: explicit`` twice
-    # over: the factory needs the names in ``tools.delegation`` AND
-    # ``delegation.enabled`` true. A prediction that reports the names while
-    # the gate is off is "5 predicted" for tools the agent will refuse to bind
-    # — the pane then offers a tick that changes nothing. Report the category
-    # as it will bind: empty (off, settable — ticking now writes the gate too).
-    _apply_delegation_gate(merged, merged_fragment.get("delegation"))
-
-    base_fragment: dict[str, Any] = {}
-    try:
-        # The same role re-rooting resolve_config just applied: a root name is
-        # answered by the role's base, a bundled expert's chain is re-rooted —
-        # otherwise provenance would blame a base layer that was never merged.
-        base_path, _ = resolve_config_path(base_config_name)
-        base_fragment = (
-            load_and_merge_config(
-                base_path,
-                role=expert_type if expert_type in ROLE_ROOTS else None,
-            )
-            or {}
-        )
-    except Exception:
-        logger.warning(
-            "Tool-group provenance could not load base config '%s'; the base "
-            "layer will read as unset",
-            base_config_name,
-        )
-
-    expert_fragment = (expert_row or {}).get("config") or {}
-    if isinstance(expert_fragment, str):
-        try:
-            expert_fragment = json.loads(expert_fragment)
-        except (json.JSONDecodeError, TypeError):
-            expert_fragment = {}
-
-    provenance = layer_provenance(
-        [
-            ("base", base_fragment),
-            ("expert", expert_fragment),
-            ("project", project_overrides),
-            ("request", request_override),
-        ]
-    )
-    return merged, provenance
+from orchestrator.services.session_tool_policy import (  # noqa: E402
+    legacy_session_tool_policy as _legacy_session_tool_policy,
+)
 
 
-def _legacy_session_tool_groups(
-    base_config_name: str,
-    request_override: dict[str, Any] | None,
-) -> dict[str, bool]:
-    """The closed groups as the LEGACY (experts-off) agent path will bind them.
-
-    SYNCHRONOUS — loads the base YAML. Call via ``asyncio.to_thread``.
-
-    This path answers the OPPOSITE of the resolved path for an unset group.
-    ``persistent_app._apply_session_tool_group_markers`` sets a disable marker
-    only on an explicit ``config_override.tools.<group> == []``, and
-    ``persistent_session._setup_tools`` then APPENDS the canonical lists for
-    every group in ``LEGACY_APPENDED_GROUPS`` whenever the marker is absent —
-    so an unset group is ENABLED regardless of the base YAML's ``[]``.
-
-    ``canvas`` is asymmetric: its branch is strip-only with no append, so it
-    additionally requires a non-empty ``tools.canvas`` in the loaded base.
-
-    Fidelity caveat: when the thread has no ``config_name`` the agent falls back
-    to the POD's boot YAML, which the orchestrator cannot observe; we proxy with
-    ``session_base``. Affects ``canvas`` only, and only when experts are off.
-    """
-    explicit = (request_override or {}).get("tools")
-    explicit = explicit if isinstance(explicit, dict) else {}
-    groups = {group: explicit.get(group) != [] for group in LEGACY_APPENDED_GROUPS}
-    canvas_names: Any = explicit.get("canvas")
-    if canvas_names is None:
-        try:
-            base_path, _ = resolve_config_path(base_config_name)
-            base_tools = (load_and_merge_config(base_path) or {}).get("tools") or {}
-            canvas_names = base_tools.get("canvas")
-        except Exception:
-            logger.warning(
-                "Legacy tool-group probe could not load base config '%s'; "
-                "reporting canvas as enabled",
-                base_config_name,
-            )
-            canvas_names = None
-        if canvas_names is None:
-            canvas_names = ["_unknown_base_assume_enabled"]
-    groups["canvas"] = bool(canvas_names)
-    # Groups the legacy agent never learned to append (today: catalog_authoring).
-    # No append branch means no "unset reads as enabled" inversion — they follow
-    # the resolved rule, so only an explicit non-empty request turns them on.
-    # Reporting otherwise would predict a write capability the agent cannot bind.
-    for group in SESSION_TOOL_OVERRIDE_NAMES:
-        groups.setdefault(group, bool(explicit.get(group)))
-    return groups
+from orchestrator.services.agent_toolset_probe import unmeasured as _unmeasured  # noqa: E402
 
 
-def _legacy_session_tool_policy(
-    base_config_name: str,
-    request_override: dict[str, Any] | None,
-) -> tuple[dict[str, list[str]], dict[str, str]]:
-    """``(predicted tools mapping, provenance)`` for the LEGACY agent path.
-
-    SYNCHRONOUS — loads the base YAML. Call via ``asyncio.to_thread``.
-
-    Same prediction status as :func:`_merged_session_tool_policy`, plus the
-    legacy path's own asymmetry: the compatibility groups are APPENDED by
-    ``persistent_session._load_tools_for_backend`` whenever no explicit ``[]``
-    disable marker is present, so an unset group is ENABLED here and DISABLED
-    on the resolved path. :func:`_legacy_session_tool_groups` is the pinned
-    statement of that rule; this reuses it rather than restating it.
-    """
-    base_tools: dict[str, Any] = {}
-    base_delegation: Any = None
-    try:
-        base_path, _ = resolve_config_path(base_config_name)
-        base_config = load_and_merge_config(base_path) or {}
-        base_tools = base_config.get("tools") or {}
-        base_delegation = base_config.get("delegation")
-    except Exception:
-        logger.warning(
-            "Legacy tool-policy probe could not load base config '%s'", base_config_name
-        )
-    override_tools = (request_override or {}).get("tools")
-    override_tools = override_tools if isinstance(override_tools, dict) else {}
-
-    merged: dict[str, list[str]] = {}
-    for key, value in {**base_tools, **override_tools}.items():
-        merged[key] = list(value) if isinstance(value, (list, tuple)) else []
-
-    # The append rule, expressed once: an enabled closed group carries its
-    # canonical names even when the base ships the key empty.
-    for group, enabled in _legacy_session_tool_groups(
-        base_config_name, request_override
-    ).items():
-        if enabled and not merged.get(group):
-            merged[group] = sorted(SESSION_TOOL_OVERRIDE_NAMES[group])
-        elif not enabled:
-            merged[group] = []
-
-    provenance = layer_provenance(
-        [("base", {"tools": base_tools}), ("request", {"tools": override_tools})]
-    )
-    for group in SESSION_TOOL_OVERRIDE_NAMES:
-        provenance.setdefault(group, "runtime")
-    # Same explicit-grant gate as the resolved path; the request layer's
-    # ``delegation`` block wins over the base's, as deep_merge would have it.
-    request_delegation = (request_override or {}).get("delegation")
-    _apply_delegation_gate(
-        merged,
-        request_delegation if isinstance(request_delegation, dict) else base_delegation,
-    )
-    return merged, provenance
+from orchestrator.services.agent_toolset_probe import origin_fields as _origin_fields  # noqa: E402
 
 
-def _apply_delegation_gate(
-    merged_tools: dict[str, list[str]], delegation_block: Any
-) -> None:
-    """Empty ``merged_tools["delegation"]`` unless ``delegation.enabled`` is
-    true — the binding rule of ``agent.tools.delegation.create_delegation_tools``,
-    restated for the prediction so the pane never shows names the factory
-    will not build. Mutates in place; no-op when nothing is named."""
-    if not merged_tools.get("delegation"):
-        return
-    enabled = (
-        delegation_block.get("enabled") if isinstance(delegation_block, dict) else None
-    )
-    if enabled is not True:
-        merged_tools["delegation"] = []
+def _agent_toolset_dependencies() -> agent_toolset_probe.AgentToolsetDependencies:
+    return agent_toolset_probe.AgentToolsetDependencies(store=postgres_db)
 
 
-class _Measurement(NamedTuple):
-    """What a running agent said, or why it could not be asked.
-
-    ``categories`` is ``None`` whenever there is nothing to measure, and
-    ``reason`` then says why in words a caller can show — "we could not measure
-    this" and "the agent has no such tools" are different facts, and conflating
-    them is D1 all over again.
-    """
-
-    categories: dict[str, list[str]] | None
-    observed_at: str | None
-    backend: dict[str, Any] | None
-    reason: str | None
-    #: True when the agent gave us bound tool NAMES but none of the structure
-    #: around them — no timestamp, no workspace capabilities, no agent-side
-    #: categorisation. Surfaced as ``origin: "agent_partial"`` so a caller
-    #: cannot read a missing ``backend`` as "this tier gates nothing".
-    partial: bool = False
-
-
-def _unmeasured(reason: str) -> "_Measurement":
-    return _Measurement(None, None, None, reason)
-
-
-def _origin_fields(m: "_Measurement") -> dict[str, Any]:
-    """The provenance block every tool-groups answer carries.
-
-    One function so the thread endpoint and the preview route cannot describe
-    their own trustworthiness differently. ``origin`` is the discriminator:
-
-    - ``agent``          full structured report; ``observed_at`` + ``backend`` set
-    - ``agent_partial``  bound names only (an image predating the route); the
-                         names are trustworthy, everything around them absent
-    - ``prediction``     no measurement at all
-
-    ``degraded_reason`` is set only on ``agent_partial`` and says what is
-    missing. It is deliberately a different key from ``prediction_reason`` —
-    "measured but thin" and "not measured" are different facts, and a caller
-    that conflates them will render a workspace-tier explanation it does not
-    have.
-    """
-    if m.categories is None:
-        return {
-            "origin": ORIGIN_PREDICTION,
-            "observed_at": None,
-            "prediction_reason": m.reason,
-            "degraded_reason": None,
-            "backend": None,
-        }
-    return {
-        "origin": ORIGIN_AGENT_PARTIAL if m.partial else ORIGIN_AGENT,
-        "observed_at": m.observed_at,
-        "prediction_reason": None,
-        "degraded_reason": m.reason if m.partial else None,
-        "backend": m.backend,
-    }
-
-
-async def _agent_toolset_measurement(thread: dict[str, Any]) -> "_Measurement":
-    """Ask the bound agent what it ACTUALLY bound.
-
-    This is the D6 seam. The orchestrator does NOT recompute the agent's
-    binding: it asks. Everything that decides the final toolset (the runtime
-    injection layer, ``filter_tools_by_backend``, ``load_tools``'s per-tool
-    fallback) lives in the agent process, and a second implementation of that
-    here would drift — which is the original bug in this series.
-
-    Hard total deadline and no retry: this backs a settings pane, and a slow
-    answer that is *labelled* a prediction beats a fast pane that stalls on a
-    dead pod.
-    """
-    agent_id = thread.get("agent_id")
-    if not agent_id:
-        return _unmeasured("no agent is attached to this session")
-    try:
-        agent = await postgres_db.get_agent(str(agent_id))
-    except Exception:
-        logger.warning("Toolset probe could not load agent %s", agent_id)
-        return _unmeasured("the bound agent could not be looked up")
-    if not agent or not agent.get("pod_ip"):
-        return _unmeasured("the bound agent has no reachable address")
-    status = agent.get("status")
-    if status in _AGENT_TERMINAL_STATUSES:
-        # A stale binding: the row keeps its pod_ip after the pod is gone, so
-        # probing it burns the whole budget on the settings pane's critical
-        # path. Observed on k3d — an ended session left `offline` + a pod_ip
-        # that no longer routes.
-        return _unmeasured(f"the bound agent is {status}")
-    if status in _AGENT_PREREADY_STATUSES:
-        return _unmeasured(f"the bound agent is still {status}")
-
-    # ONE deadline across both hops. See _AGENT_TOOLSET_BUDGET_S.
-    try:
-        return await asyncio.wait_for(
-            _agent_toolset_probe(agent), _AGENT_TOOLSET_BUDGET_S
-        )
-    except (asyncio.TimeoutError, TimeoutError):
-        logger.info("Toolset probe to agent %s exceeded its budget", agent_id)
-        return _unmeasured("the agent did not answer within the probe budget")
-
-
-async def _agent_toolset_probe(agent: dict[str, Any]) -> "_Measurement":
-    """The network half of :func:`_agent_toolset_measurement`.
-
-    Split out so ONE ``asyncio.wait_for`` bounds the whole thing — including
-    the ``/status`` fallback, which is the normal path against any agent image
-    predating ``/session/toolset``.
-    """
-    url = f"http://{agent['pod_ip']}:{agent.get('pod_port') or 8001}/session/toolset"
-    try:
-        async with httpx.AsyncClient(timeout=_AGENT_TOOLSET_BUDGET_S) as client:
-            response = await client.get(url)
-    except Exception as exc:
-        logger.info("Toolset probe to %s failed: %s", url, exc)
-        return _unmeasured("the agent did not answer the toolset probe")
-
-    if response.status_code == 404:
-        # An agent image that predates this route. Its `/status` already
-        # publishes `session.tools`, which is the same measurement with less
-        # structure — categorise it here rather than downgrade to a guess.
-        return await _agent_toolset_from_status(agent)
-    if response.status_code != 200:
-        return _unmeasured(f"the agent answered {response.status_code}")
-
-    try:
-        payload = response.json()
-    except Exception:
-        return _unmeasured("the agent's toolset answer was not JSON")
-    if not payload.get("attached"):
-        return _unmeasured("the agent is not attached to a session")
-    report = payload.get("report") or {}
-    try:
-        categories = read_agent_toolset_report(payload.get("report"))
-    except ToolReportError as exc:
-        logger.warning("Toolset probe returned an unreadable report: %s", exc)
-        return _unmeasured("the agent's toolset report could not be read")
-    backend = report.get("backend")
-    return _Measurement(
-        categories=categories,
-        observed_at=report.get("observed_at"),
-        backend=backend if isinstance(backend, dict) else None,
-        reason=None,
+async def _agent_toolset_measurement(*args: Any, **kwargs: Any) -> Any:
+    return await agent_toolset_probe.agent_toolset_measurement(
+        *args, **kwargs, dependencies=_agent_toolset_dependencies()
     )
 
 
-async def _agent_toolset_from_status(agent: dict[str, Any]) -> "_Measurement":
-    """Fallback measurement for an agent image without ``/session/toolset``.
+async def _require_supported_protected_session_class(*args: Any, **kwargs: Any) -> Any:
+    return await session_config_resolution.require_supported_protected_session_class(
+        *args, **kwargs, dependencies=_session_config_dependencies()
+    )
 
-    Still the agent's own answer — ``/status`` returns ``[t.name for t in
-    _session.tools]`` — so this stays a measurement, not a prediction. The one
-    loss is MCP tools: they are registered into the AGENT's process registry at
-    attach, so categorising a flat name list here files them under
-    ``unclassified`` instead of ``mcp``.
-    """
-    url = f"http://{agent['pod_ip']}:{agent.get('pod_port') or 8001}/status"
-    try:
-        async with httpx.AsyncClient(timeout=_AGENT_TOOLSET_BUDGET_S) as client:
-            response = await client.get(url)
-        if response.status_code != 200:
-            return _unmeasured("the agent has no toolset endpoint")
-        names = (response.json() or {}).get("tools")
-    except Exception as exc:
-        logger.info("Toolset /status fallback to %s failed: %s", url, exc)
-        return _unmeasured("the agent has no toolset endpoint")
-    if not isinstance(names, list):
-        return _unmeasured("the agent has no toolset endpoint")
-    return _Measurement(
-        categories=categorize_tool_names([n for n in names if isinstance(n, str)]),
-        observed_at=None,
-        backend=None,
-        reason=(
-            "this agent image predates GET /session/toolset, so only the bound "
-            "tool names are available — no observation time, no workspace "
-            "capabilities, and MCP tools cannot be categorised"
+
+async def _session_grant_violations(*args: Any, **kwargs: Any) -> Any:
+    return await session_config_resolution.session_grant_violations(
+        *args, **kwargs, dependencies=_session_config_dependencies()
+    )
+
+
+async def _session_endpoint_violations(*args: Any, **kwargs: Any) -> Any:
+    return await session_config_resolution.session_endpoint_violations(
+        *args, **kwargs, dependencies=_session_config_dependencies()
+    )
+
+
+from orchestrator.services.config_overrides import looks_like_uuid as _looks_like_uuid  # noqa: E402
+
+
+def _dispatch_credential_dependencies() -> (
+    dispatch_credentials.DispatchCredentialDependencies
+):
+    """Rebuilt per call. ``resolve_model`` is read from this module because
+    several suites monkeypatch ``main._resolve_model``; passing the shared
+    import instead would leave them green and inert (§P3)."""
+
+    return dispatch_credentials.DispatchCredentialDependencies(
+        store=postgres_db, logger=logger, resolve_model=_resolve_model
+    )
+
+
+async def _seed_registry_model_overrides(*args: Any, **kwargs: Any) -> Any:
+    return await dispatch_credentials.seed_registry_model_overrides(
+        *args, **kwargs, dependencies=_dispatch_credential_dependencies()
+    )
+
+
+from orchestrator.services.dispatch_credentials import (  # noqa: E402
+    nested_model_slots as _nested_model_slots,
+)
+
+
+def _job_dispatch_credential_dependencies() -> (
+    job_dispatch_credentials.DispatchCredentialDependencies
+):
+    """Composition only: every injector is lane C's, and each is bound to
+    **main's own wrapper** so the suites that patch them keep steering."""
+
+    return job_dispatch_credentials.DispatchCredentialDependencies(
+        store=postgres_db,
+        logger=logger,
+        resolve_model=_resolve_model,
+        inject_model_credentials=_inject_model_credentials,
+        inject_env_key_credentials=_inject_env_key_credentials,
+        inject_search_credentials=_inject_search_credentials,
+        inject_system_kb_embedding_profile=_inject_system_kb_embedding_profile,
+        dispatch_llm_provider_fallback=_dispatch_llm_provider_fallback,
+        nested_model_slots=_nested_model_slots,
+    )
+
+
+async def _inject_dispatch_credentials(*args: Any, **kwargs: Any) -> Any:
+    return await job_dispatch_credentials.inject_dispatch_credentials(
+        *args, **kwargs, dependencies=_job_dispatch_credential_dependencies()
+    )
+
+
+def _job_start_bundle_dependencies() -> job_start_bundle.JobStartBundleDependencies:
+    """Rebuilt per call. ``mint_worker_runtime_actor``,
+    ``authorize_job_repository_transport`` and ``inject_blob_credentials`` are
+    fields rather than imports because existing suites patch them on ``main``
+    and then drive ``_build_job_start_request`` (§P3)."""
+
+    return job_start_bundle.JobStartBundleDependencies(
+        store=postgres_db,
+        logger=logger,
+        forge=gitea_client,
+        workspace_runtime=_job_workspace_runtime_dependencies(),
+        inject_dispatch_credentials=_inject_dispatch_credentials,
+        resolve_authorized_job_datasources=_resolve_authorized_job_datasources,
+        job_project_repositories=_job_project_repositories,
+        apply_cloud_storage_override=_apply_cloud_storage_override,
+        build_datasources_payload=_build_datasources_payload,
+        build_datasource_tool_override=_build_datasource_tool_override,
+        prepare_job_primary_repository_authority=(
+            prepare_job_primary_repository_authority
         ),
-        partial=True,
+        prepare_project_repository_authority=prepare_project_repository_authority,
+        authorize_job_repository_transport=authorize_job_repository_transport,
+        mint_worker_runtime_actor=mint_worker_runtime_actor,
+        inject_blob_credentials=inject_blob_credentials,
+        grant_denied_error=GrantDenied,
+        lite_workspace_config_error=LiteWorkspaceConfigError,
+        backend_from_override=_backend_from_override,
+        inject_lite_workspace_config=_inject_lite_workspace_config,
+        is_experts_db_enabled=_is_experts_db_enabled,
+        user_experts_enabled=_user_experts_enabled,
+        enforce_dispatch_grants=_enforce_dispatch_grants,
+        grant_violations_detail=_grant_violations_detail,
+        resolve_default_models=_resolve_default_models,
+        prefetch_roster_refs=_prefetch_roster_refs,
+        seed_registry_model_overrides=_seed_registry_model_overrides,
+        gather_in_scope_skills=_gather_in_scope_skills,
+        resolve_config=resolve_config,
+        vm_workspaces_on_pod_network=vm_workspaces_on_pod_network,
     )
 
 
-async def _require_supported_protected_session_class(
-    thread: dict[str, Any], metadata: dict[str, Any]
-) -> None:
-    """Fail closed when a protected row selects an unsupported runtime class.
-
-    This check intentionally runs before Resume's ended->created CAS as well
-    as before provisioning.  Older rows can predate create-time class
-    materialization, so only the fully resolved expert/account/request stack
-    is authoritative.
-    """
-
-    if protected_cloud_marker_state(metadata) != "on":
-        return
-    class_status: dict[str, Any] = {}
-    try:
-        effective_config = await _resolve_session_config(
-            thread,
-            metadata,
-            status=class_status,
-            resolve_base_when_experts_disabled=True,
-        )
-        if effective_config is None or _protected_cloud_officer_active(
-            effective_config
-        ):
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "protected_cloud_unsupported_session_class",
-                    "message": (
-                        "Protected cloud sessions are not supported for the "
-                        "background Officer runtime."
-                    ),
-                },
-            )
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "protected_cloud_session_class_unverified",
-                "message": "Protected cloud session class could not be verified.",
-            },
-        ) from exc
-
-
-async def _session_grant_violations(thread: dict[str, Any]) -> list[str]:
-    """Pre-flight the capability grants for a session's resolved config.
-
-    Returns the violation messages (``[]`` = allowed, or enforcement off /
-    non-grant resolve error → fail-open, same as the attach path), running the
-    SAME PDP as attach (``_resolve_session_config`` → ``_enforce_dispatch_grants``)
-    but discarding the resolved blob. Lets the provisioning paths
-    (``provision_or_assign`` and ``routers/sessions._do_prepare``) reject a
-    never-startable session up front — emitting ``session.lifecycle: failed``
-    with the real reason — instead of spawning a dedicated agent pod that 403s at
-    the workspace endpoint and exits "to be rebound" (a permanent grant denial is
-    not recoverable by a rebind), leaving the cockpit to poll ``/connection``
-    until its ~5m40s ready timeout.
-    See knowledge-base/knowledge/issues/session_permission_mode_grant_denied_ready_timeout.md.
-    """
-    metadata = thread.get("metadata") or {}
-    if isinstance(metadata, str):
-        try:
-            metadata = json.loads(metadata)
-        except (json.JSONDecodeError, TypeError):
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "session_metadata_malformed",
-                    "message": "This session's stored state is invalid.",
-                },
-            )
-    protected_marker = protected_cloud_marker_state(metadata)
-    if protected_marker == "malformed":
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "protected_cloud_malformed",
-                "message": "Protected cloud session state is invalid.",
-            },
-        )
-    if protected_marker == "on" and _thread_workspace_backend(thread) != "sandbox":
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "protected_cloud_unsupported_workspace",
-                "message": "Protected cloud sessions require the Container tier.",
-            },
-        )
-    await _require_supported_protected_session_class(thread, metadata)
-    try:
-        await _resolve_session_config(thread, metadata)
-        return []
-    except GrantDenied as gd:
-        return list(gd.violations)
-
-
-async def _session_endpoint_violations(thread: dict[str, Any]) -> list[str]:
-    """Pre-flight the model-role transports for a session's resolved config.
-
-    Returns per-role reasons (``[]`` = every configured role has a usable
-    transport, or experts off / resolve error → fail-open, same as the attach
-    path). Runs the SAME resolve+inject as attach (``_resolve_session_config``,
-    which credential-injects the delivery blob) and then checks each configured
-    role (primary llm, auxiliary, embedding) against the loader's raise
-    conditions (``src/core/transport_resolution``). The reranker rides the
-    embedding endpoint, so validating embedding covers it.
-
-    Lets ``provision_or_assign`` / ``routers/sessions._do_prepare`` reject a
-    never-startable session up front — emitting ``session.lifecycle: failed``
-    with the real reason — instead of spawning a pod that crashes at agent
-    startup (e.g. the memory reranker with no reachable endpoint), releasing the
-    workspace, and hanging the cockpit on ``/connection`` until its ready
-    timeout. See knowledge-base/knowledge/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md.
-    """
-    metadata = thread.get("metadata") or {}
-    if isinstance(metadata, str):
-        try:
-            metadata = json.loads(metadata)
-        except (json.JSONDecodeError, TypeError):
-            metadata = {}
-    try:
-        delivered = await _resolve_session_config(thread, metadata)
-    except GrantDenied:
-        # The grant pre-flight owns this rejection; don't double-report.
-        return []
-    except Exception:
-        # Resolve failure → agent falls back to config_name (fail-open), same as
-        # _session_grant_violations.
-        return []
-    if not delivered:
-        return []  # experts disabled → no injection → nothing to validate
-
-    from shared.runtime.core.transport_resolution import (
-        embedding_role_violation,
-        llm_role_violation,
+async def _job_project_repositories(*args: Any, **kwargs: Any) -> Any:
+    return await job_start_bundle.job_project_repositories(
+        *args, **kwargs, dependencies=_job_start_bundle_dependencies()
     )
 
-    agent_blob = delivered.get("agent") or {}
-    env_keys = agent_blob.get("env_keys") or {}
-    # The orchestrator injects some provider keys into env_keys (e.g.
-    # OPENROUTER_API_KEY) rather than onto the role section; combine both so the
-    # key check matches what the agent's loader will actually see.
-    combined_env = dict(os.environ)
-    combined_env.update({k: v for k, v in env_keys.items() if v is not None})
 
-    violations: list[str] = []
-    for role in ("llm", "auxiliary"):
-        section = agent_blob.get(role)
-        if isinstance(section, dict):
-            reason = llm_role_violation(role, section, env=combined_env)
-            if reason:
-                violations.append(reason)
-    emb_reason = embedding_role_violation(env_keys)
-    if emb_reason:
-        violations.append(emb_reason)
-    return violations
-
-
-def _endpoint_violations_detail(violations: list[str]) -> str:
-    return "session cannot start — unusable model transport: " + "; ".join(violations)
-
-
-def _looks_like_uuid(value: Any) -> bool:
-    """True if ``value`` parses as a UUID (a cockpit-conflated expert id in the
-    config_name slot, which must not be treated as a config file name)."""
-    try:
-        UUID(str(value))
-        return True
-    except (ValueError, TypeError, AttributeError):
-        return False
-
-
-async def llm_usage_poll_loop(
-    shutdown_event: asyncio.Event,
-    *,
-    interval: float = 120.0,
-) -> None:
-    """Background loop: materialize the audit trail into usage_events (LLM cost).
-
-    Reads new ``llm_requests`` rows via ``materialize_llm_usage_from_audit`` and
-    prices them from ``usage_rates`` (seeded by ``llm_pricing_sync_loop``) — no
-    proxy in the path. Idempotent at the ledger; never raises into the lifespan.
-
-    Forward-only: the cursor anchors at the current max ``llm_requests.timestamp``
-    on startup, so the audit materializer does not backfill historical rows unless
-    an operator deliberately lowers the anchor. The cursor is a timestamp, NOT an
-    id: ``llm_requests.id`` is not monotonic with time. No-op when the ledger or
-    either pool is unavailable.
-    """
-    if usage_ledger is None or not usage_ledger.is_available:
-        logger.info("LLM usage poll loop disabled (usage ledger unavailable)")
-        return
-    if audit_db is None or audit_db.pool is None or postgres_db.pool is None:
-        logger.info("LLM usage poll loop disabled (audit/app pool unavailable)")
-        return
-
-    # Forward-only anchor: start after the newest existing row by timestamp.
-    # Falls back to wall-clock now when empty.
-    cursor = datetime.now(timezone.utc)
-    try:
-        async with audit_db.pool.acquire() as conn:
-            newest = await conn.fetchval("SELECT max(timestamp) FROM llm_requests")
-        if newest is not None:
-            cursor = newest
-    except Exception:
-        logger.warning(
-            "LLM usage anchor query failed; starting from now", exc_info=True
-        )
-    logger.info(
-        "LLM usage poll loop starting (audit source, anchor ts=%s, interval=%ss)",
-        cursor,
-        interval,
-    )
-    try:
-        while not shutdown_event.is_set():
-            try:
-                res = await materialize_llm_usage_from_audit(
-                    audit_db.pool, postgres_db.pool, usage_ledger, since_ts=cursor
-                )
-                cursor = res.get("cursor") or cursor
-            except Exception:
-                logger.exception("LLM usage poll tick failed (non-fatal)")
-            try:
-                await asyncio.wait_for(shutdown_event.wait(), timeout=interval)
-            except asyncio.TimeoutError:
-                pass
-    finally:
-        logger.info("LLM usage poll loop stopped")
-
-
-async def _seed_registry_model_overrides(
-    request_override: dict[str, Any] | None,
-    *,
-    user_id: str | None,
-) -> dict[str, Any] | None:
-    """Seed per-model registry values into the request override BEFORE
-    ``resolve_config`` bakes the settings matrix.
-
-    The blob dispatch path freezes ``limits`` (``model_max_context_tokens`` and
-    its derived ``context_threshold_tokens`` = ``0.80 × base``) at resolve time,
-    and the agent never re-derives them: ``load_config_from_resolved`` ->
-    ``load_agent_config_from_dict`` parses the frozen blob without re-running
-    ``_apply_settings_matrix``. So an admin's per-model ``context_window``
-    (Admin -> Models) must land in ``llm.model_max_context_tokens`` *before*
-    ``_apply_settings_matrix`` runs (``config_resolver.resolve_config``), or the
-    family default wins and the cap is silently ignored. See
-    ``knowledge-base/knowledge/issues/per_model_context_window_override_shadowed_in_blob_dispatch.md``.
-
-    ``resolve_config`` is pure/synchronous (no DB), so the registry lookup
-    happens here and rides the existing ``request_override`` layer: its llm keys
-    enter ``explicit_llm_keys`` (the matrix won't clobber them) and deep-merge
-    into ``data["llm"]`` (becoming the limits-derivation base).
-
-    ``setdefault`` semantics: an explicit caller pin still wins; the family
-    default — absent from the bare override pre-resolve — loses. Returns a copy
-    with a fresh ``llm`` subdict; the input (the job's persisted
-    ``config_override``) is never mutated. The legacy path does not call
-    ``resolve_config`` and is unaffected — its ``_inject_dispatch_credentials``
-    / ``_inject_model_credentials`` setdefault stays the injection mechanism
-    there (and becomes a harmless no-op on the blob path once the value is
-    baked). Carries the future per-model ``max_output_tokens`` the same way
-    (``[[reasoning_aware_max_output_tokens]]``).
-    """
-    model_id = ((request_override or {}).get("llm") or {}).get("model")
-    if not model_id:
-        return request_override
-    try:
-        meta = await _resolve_model(model_id, user_id=user_id)
-    except UnknownModelError:
-        return request_override
-    if not meta or not (meta.context_window or meta.max_output_tokens):
-        return request_override  # nothing per-model to seed (truthy rejects None/0)
-    co = dict(request_override or {})
-    llm = dict(co.get("llm") or {})
-    if meta.context_window:
-        llm.setdefault("model_max_context_tokens", meta.context_window)
-    if meta.max_output_tokens:
-        # Per-model output cap → enters explicit_llm_keys so the settings matrix
-        # won't re-bake the family value, then _resolve_max_output_tokens clamps
-        # it to the context backstop. Same shadow-avoiding path as context_window.
-        llm.setdefault("max_output_tokens", meta.max_output_tokens)
-    co["llm"] = llm
-    return co
-
-
-def _nested_model_slots(
-    config_override: dict[str, Any],
-) -> list[tuple[str, dict[str, Any], str]]:
-    """``(label, section, capability)`` for every NESTED model slot of a
-    config_override-shaped dict — the slots the top-level ``llm`` /
-    ``auxiliary`` branches of the two credential injectors never look at.
-
-    Since U1 those are ``llm.summarization``, the roster-wide
-    ``subagents.llm`` and every roster entry's ``llm`` (+ its own
-    ``summarization``); ``llm.strategic`` / ``llm.tactical`` stay for the
-    no-blob fallback path, where a pre-U1 job override still carries them and
-    the agent lifts model + transport together at its own seam (u1_plan D.5).
-    Shared by ``_inject_dispatch_credentials`` (jobs) and
-    ``_inject_thread_dispatch_credentials`` (sessions) so the two cannot
-    drift. Only mappings are returned; the callers skip a slot with no model
-    and the ``inherit`` sentinel.
-    """
-    out: list[tuple[str, Any, str]] = []
-    llm = config_override.get("llm")
-    if isinstance(llm, dict):
-        for key in ("strategic", "tactical", "summarization"):
-            out.append((f"llm.{key}", llm.get(key), "chat"))
-    subagents = config_override.get("subagents")
-    if isinstance(subagents, dict):
-        out.append(("subagents.llm", subagents.get("llm"), "chat"))
-        roster = subagents.get("roster")
-        if isinstance(roster, dict):
-            for name, entry in roster.items():
-                if not isinstance(entry, dict):
-                    continue
-                entry_llm = entry.get("llm")
-                out.append((f"subagents.roster.{name}.llm", entry_llm, "chat"))
-                if isinstance(entry_llm, dict):
-                    out.append(
-                        (
-                            f"subagents.roster.{name}.llm.summarization",
-                            entry_llm.get("summarization"),
-                            "chat",
-                        )
-                    )
-    return [(label, sect, cap) for label, sect, cap in out if isinstance(sect, dict)]
-
-
-async def _inject_dispatch_credentials(
-    job: dict[str, Any],
-    config_override: dict[str, Any] | None,
-    *,
-    include_kb_profile: bool = False,
-) -> dict[str, Any]:
-    """Resolve and inject API keys, model routing, and capability defaults.
-
-    Mutates ``config_override`` in place (creating it if None) with everything
-    the agent needs to reach its configured LLM endpoints: per-user/project
-    API keys, endpoint base_url + api_key for catalog-routed models, user-
-    preference fallbacks (default chat/auxiliary/strategic/tactical models,
-    autonomy, reasoning level, vision/whisper/tts), and the system-level
-    default chat model when no override pinned one.
-
-    Called from both first-dispatch (``_dispatch_job_to_agent``) and resume
-    (``_resume_job_on_agent``) — without this on resume, an orphaned/paused
-    job re-dispatched to a fresh agent would inherit only the bare
-    creation-time config_override (no model/api_key) and the agent would
-    silently fall back to ``OPENAI_API_KEY=not-needed``, producing 401s
-    against the user's router.
-
-    Returns the (mutated) ``config_override`` dict so callers can rebind
-    locals when the input was None.
-    """
-    job_id = str(job["id"])
-    user_id_str = str(job["user_id"]) if job.get("user_id") else None
-    project_id_str = str(job["project_id"]) if job.get("project_id") else None
-
-    resolved_keys = await postgres_db.resolve_api_keys_for_job(
-        user_id=user_id_str,
-        project_id=project_id_str,
-    )
-    user_settings: dict[str, Any] = {}
-    if user_id_str:
-        user_settings = await postgres_db.get_user_settings(user_id_str) or {}
-
-    config_override = config_override or {}
-    llm_over = config_override.setdefault("llm", {})
-    model_id = llm_over.get("model")
-    meta = None
-    if model_id:
-        try:
-            meta = await _resolve_model(model_id, user_id=user_id_str)
-        except UnknownModelError:
-            meta = None
-
-    if (
-        meta is not None
-        and meta.origin in ("custom", "system", "catalog")
-        and meta.endpoint_id
-    ):
-        # Endpoint-backed models carry their agent-side factory in meta.provider
-        # (``openai`` for the OpenAI-compatible wire, ``codex`` for the Responses-
-        # API Codex proxy). Inject it so the agent builds the right factory — the
-        # endpoint branch otherwise leaves provider unset and the agent defaults
-        # to the openai factory, which forces Chat Completions and strips gpt-5.x
-        # reasoning.
-        if meta.provider:
-            llm_over["provider"] = meta.provider
-        endpoint_row = await postgres_db.get_user_llm_endpoint(meta.endpoint_id)
-        if endpoint_row:
-            if endpoint_row.get("base_url"):
-                llm_over["base_url"] = endpoint_row["base_url"]
-            if endpoint_row.get("api_key"):
-                llm_over["api_key"] = endpoint_row["api_key"]
-            logger.info(
-                f"Dispatch: routed {model_id} to {meta.origin} endpoint "
-                f"{endpoint_row.get('label') or meta.endpoint_id}"
-            )
-    elif resolved_keys:
-        if meta is not None and meta.api_key_ref:
-            provider_for_key: str | None = meta.api_key_ref
-        else:
-            provider_for_key = _dispatch_llm_provider_fallback(job, config_override)
-        # Route to the right agent-side LLM factory. System-anchored catalog
-        # rows carry no endpoint base_url, so without an explicit provider the
-        # agent's create_llm defaults to the OpenAI factory (api.openai.com)
-        # and rejects e.g. an OpenRouter sk-or-v1 key. meta.provider already
-        # holds the factory name (_factory_provider); fall back to the
-        # key-inference result for registry misses.
-        factory_provider = meta.provider if meta is not None else provider_for_key
-        if factory_provider:
-            llm_over.setdefault("provider", factory_provider)
-        if (
-            provider_for_key
-            and provider_for_key in resolved_keys
-            and "api_key" not in llm_over
-        ):
-            llm_over["api_key"] = resolved_keys[provider_for_key]
-
-    # Per-model context window: drive the agent's working window from the
-    # catalog/admin value. Lands in llm.model_max_context_tokens (a flat llm
-    # key) so it survives the agent-side settings-matrix re-run and becomes the
-    # base for the derived limits. Truthy guard rejects None and an explicit 0.
-    if meta is not None and meta.context_window:
-        llm_over.setdefault("model_max_context_tokens", meta.context_window)
-    # Per-model output cap (params_json): flat llm key, survives the agent-side
-    # settings-matrix re-run and overrides the family settings.max_output_tokens.
-    if meta is not None and meta.max_output_tokens:
-        llm_over.setdefault("max_output_tokens", meta.max_output_tokens)
-    # Route transport headers — same contract as the nested slots below
-    # (`_inject_model_credentials`), restated here because the top-level model
-    # is credentialed by this branch rather than by that helper. Written on
-    # every dispatch, `{}` included, so a re-dispatch after a model change
-    # cannot leave the previous route's headers behind.
-    if meta is not None:
-        _llm_headers = subscription_request_headers(
-            transport_kind=meta.transport_kind,
-            subscription_sources=meta.subscription_sources,
-        )
-        _llm_headers.update(llm_over.get("extra_headers") or {})
-        llm_over["extra_headers"] = _llm_headers or None
-
-    if resolved_keys:
-        _ENV_KEY_MAP = {"vision": "VISION_API_KEY"}
-        env_keys = {
-            _ENV_KEY_MAP[p]: resolved_keys[p] for p in ("vision",) if p in resolved_keys
-        }
-        if env_keys:
-            config_override.setdefault("env_keys", {}).update(env_keys)
-        logger.info(
-            f"Dispatch: injected API keys for providers: {list(resolved_keys.keys())}"
-        )
-
-    # Resolve credentials for every OTHER slot the job pinned a model on. The
-    # top-level branch above only inspects `llm.model`; without this loop a
-    # pinned `auxiliary`, `llm.summarization`, roster-wide `subagents.llm` or
-    # roster entry `subagents.roster.<n>.llm` ships the model name with no
-    # `base_url`/`api_key`, the agent's LLM factory falls back to the parent's
-    # base_url, and the model's endpoint never gets hit — opaque 404s when it
-    # lives behind a non-default endpoint (the 2026-05-12 tactical-pin
-    # incident). A roster entry that inherits its parent's model carries the
-    # parent's model NAME here (the resolver copied it), so it is routed by
-    # that name exactly like the top level; the bare `inherit` sentinel is not
-    # a model. The legacy `llm.strategic`/`llm.tactical` blocks are kept for
-    # the no-blob fallback path only (the blob path lifts them into llm.model
-    # before injection).
-    _sections: list[tuple[str, Any, str]] = [
-        ("auxiliary", config_override.get("auxiliary"), "auxiliary")
-    ]
-    _sections.extend(_nested_model_slots(config_override))
-    for _section_name, _section, _capability in _sections:
-        if not isinstance(_section, dict):
-            continue
-        _section_model = _section.get("model")
-        if not _section_model or _section_model == INHERIT_MODEL:
-            continue
-        await _inject_model_credentials(
-            section=_section,
-            model_id=_section_model,
-            user_id=user_id_str,
-            resolved_keys=resolved_keys,
-            capability=_capability,
-        )
-        if "api_key" not in _section and "base_url" not in _section:
-            logger.warning(
-                f"Dispatch: job {job_id} pinned {_section_name} model "
-                f"{_section_model!r} but no endpoint or provider key was "
-                f"resolvable — the agent will fall back to the parent "
-                f"base_url and almost certainly 404."
-            )
-        else:
-            logger.info(
-                f"Dispatch: injected credentials for {_section_name} "
-                f"override: {_section_model}"
-            )
-
-    if job.get("user_id"):
-        aux_model = user_settings.get("default_auxiliary_model")
-        if not aux_model:
-            aux_model = await postgres_db.resolve_default_for_capability("auxiliary")
-        if aux_model:
-            aux_override = config_override.setdefault("auxiliary", {})
-            if "model" not in aux_override:
-                aux_override["model"] = aux_model
-                await _inject_model_credentials(
-                    section=aux_override,
-                    model_id=aux_model,
-                    user_id=user_id_str,
-                    resolved_keys=resolved_keys,
-                    capability="auxiliary",
-                )
-                logger.info(f"Dispatch: injected auxiliary model override: {aux_model}")
-
-        default_model = user_settings.get("default_model")
-        if default_model:
-            llm_override = config_override.setdefault("llm", {})
-            if "model" not in llm_override:
-                llm_override["model"] = default_model
-                await _inject_model_credentials(
-                    section=llm_override,
-                    model_id=default_model,
-                    user_id=user_id_str,
-                    resolved_keys=resolved_keys,
-                )
-                logger.info(f"Dispatch: injected user default_model: {default_model}")
-
-        # Per-phase account model defaults (default_strategic_model /
-        # default_tactical_model) were removed: the single top-level
-        # default_model above is the only account-level model preference. They
-        # silently shadowed an explicit per-loop/per-job top-level model (a phase
-        # pin beats the top-level in LLMConfig.get_phase_config) and were
-        # invisible/unmanageable in the UI. Explicit per-job phase pins still
-        # arrive via config_override.llm.{strategic,tactical} (the request
-        # override), credentialed by the _inject_model_credentials calls earlier
-        # in this function. See
-        # knowledge-base/knowledge/issues/loop_ran_codex_spark_not_selected_model_then_hung_on_cooldown.md (Layer 1).
-
-        default_autonomy = user_settings.get("default_autonomy")
-        if default_autonomy and "autonomy" not in config_override:
-            config_override["autonomy"] = default_autonomy
-            logger.info(f"Dispatch: injected user default_autonomy: {default_autonomy}")
-
-        default_reasoning = user_settings.get("default_reasoning_level")
-        if default_reasoning:
-            llm_override = config_override.setdefault("llm", {})
-            if "reasoning_level" not in llm_override:
-                llm_override["reasoning_level"] = default_reasoning
-                logger.info(
-                    f"Dispatch: injected user default_reasoning_level: {default_reasoning}"
-                )
-
-        for _kind, _prefix, _user_key, _capability in (
-            ("vision", "VISION", "default_vision_model", "vision"),
-            ("whisper", "WHISPER", "default_whisper_model", "whisper"),
-            ("tts", "TTS", "default_tts_model", "tts"),
-            ("citation", "CITATION_LLM", "default_citation_model", "chat"),
-        ):
-            _model = user_settings.get(_user_key)
-            if not _model:
-                _model = await postgres_db.resolve_default_for_capability(_kind)
-            if not _model:
-                continue
-            env_keys_block = config_override.setdefault("env_keys", {})
-            if f"{_prefix}_MODEL" in env_keys_block:
-                continue
-            await _inject_env_key_credentials(
-                env_keys=env_keys_block,
-                prefix=_prefix,
-                model_id=_model,
-                user_id=user_id_str,
-                resolved_keys=resolved_keys,
-                capability=_capability,
-            )
-            # The citation_engine package reads CITATION_LLM_URL (not _BASE_URL)
-            # and falls back to OPENAI_API_KEY for auth. Alias the URL key here
-            # so the upstream package picks up the dispatched endpoint.
-            if _kind == "citation" and "CITATION_LLM_BASE_URL" in env_keys_block:
-                env_keys_block.setdefault(
-                    "CITATION_LLM_URL", env_keys_block["CITATION_LLM_BASE_URL"]
-                )
-            logger.info(f"Dispatch: injected {_kind} model: {_model}")
-
-        embedding_provider = user_settings.get("embedding_provider")
-        embedding_model = user_settings.get("default_embedding_model")
-        if not embedding_model:
-            embedding_model = await postgres_db.resolve_default_for_capability(
-                "embedding"
-            )
-        if embedding_provider or embedding_model:
-            env_keys_block = config_override.setdefault("env_keys", {})
-            if embedding_provider and "EMBEDDING_PROVIDER" not in env_keys_block:
-                env_keys_block["EMBEDDING_PROVIDER"] = embedding_provider
-            if embedding_model:
-                # Resolve endpoint base_url + api_key even when EMBEDDING_MODEL
-                # was already set — _inject_env_key_credentials uses setdefault,
-                # so a pre-present MODEL must not suppress the _API_KEY (the bug
-                # that left jobs with MODEL+BASE_URL but no key:
-                # knowledge-history/done/embedding_key_missing_silently_disables_memory_and_kb.md).
-                await _inject_env_key_credentials(
-                    env_keys=env_keys_block,
-                    prefix="EMBEDDING",
-                    model_id=embedding_model,
-                    user_id=user_id_str,
-                    resolved_keys=resolved_keys,
-                    capability="embedding",
-                )
-            if (
-                embedding_provider == "openrouter"
-                and resolved_keys
-                and "openrouter" in resolved_keys
-            ):
-                env_keys_block["OPENROUTER_API_KEY"] = resolved_keys["openrouter"]
-            logger.info(
-                f"Dispatch: injected embedding: "
-                f"provider={embedding_provider}, model={embedding_model}"
-            )
-
-    # System-default fallback for the worker chat model. Runs after the
-    # user-preference block (or whenever there's no user) so jobs that
-    # arrived without an llm.model still pick up the admin-curated default
-    # from the catalog instead of falling through to the agent's YAML
-    # default — which has no base_url/api_key for self-hosted models and
-    # silently routes to api.openai.com with "not-needed".
-    llm_override_check = config_override.get("llm") or {}
-    if "model" not in llm_override_check:
-        system_chat_model = await postgres_db.resolve_default_for_capability("chat")
-        if system_chat_model:
-            llm_override = config_override.setdefault("llm", {})
-            llm_override["model"] = system_chat_model
-            await _inject_model_credentials(
-                section=llm_override,
-                model_id=system_chat_model,
-                user_id=user_id_str,
-                resolved_keys=resolved_keys,
-            )
-            logger.info(
-                f"Dispatch: injected system default chat model: {system_chat_model} "
-                f"(job {job_id})"
-            )
-
-    # System-default fallback for the embedding credential — same rationale as
-    # the chat model above. Embedding (memory + KB) was otherwise resolved ONLY
-    # inside the user-preference block, so a job whose user has no embedding
-    # preference (or no user at all) silently fell back to provider 'local' with
-    # no key, disabling memory + KB with no signal. Inject the admin-curated
-    # system embedding here so every job gets it the same way it gets its chat
-    # model. knowledge-history/done/embedding_key_missing_silently_disables_memory_and_kb.md
-    _emb_env = config_override.setdefault("env_keys", {})
-    if "EMBEDDING_API_KEY" not in _emb_env:
-        _emb_model = _emb_env.get(
-            "EMBEDDING_MODEL"
-        ) or await postgres_db.resolve_default_for_capability("embedding")
-        if _emb_model:
-            await _inject_env_key_credentials(
-                env_keys=_emb_env,
-                prefix="EMBEDDING",
-                model_id=_emb_model,
-                user_id=user_id_str,
-                resolved_keys=resolved_keys,
-                capability="embedding",
-            )
-            if _emb_env.get("EMBEDDING_API_KEY"):
-                logger.info(
-                    f"Dispatch: injected system default embedding: {_emb_model} "
-                    f"(job {job_id})"
-                )
-            else:
-                logger.error(
-                    f"Dispatch: system embedding model {_emb_model!r} resolved no "
-                    f"usable API key for job {job_id} — memory/KB will be "
-                    f"unavailable. Check the embedding endpoint (Admin → Models)."
-                )
-
-    if include_kb_profile:
-        _kb_emb_model = await _inject_system_kb_embedding_profile(_emb_env)
-        if _kb_emb_model:
-            if _emb_env.get("KB_EMBEDDING_API_KEY"):
-                logger.info(
-                    "Dispatch: injected system OKF KB embedding profile: %s (job %s)",
-                    _kb_emb_model,
-                    job_id,
-                )
-            else:
-                logger.error(
-                    "Dispatch: system OKF KB embedding model %r resolved no usable "
-                    "API key for job %s; knowledge retrieval will be unavailable.",
-                    _kb_emb_model,
-                    job_id,
-                )
-    else:
-        for key in [key for key in _emb_env if key.startswith("KB_EMBEDDING_")]:
-            del _emb_env[key]
-
-    await _inject_search_credentials(
-        config_override,
-        user_settings=user_settings,
-        user_id=user_id_str,
-        resolved_keys=resolved_keys,
+async def _prepare_job_repository_before_claim(*args: Any, **kwargs: Any) -> Any:
+    return await job_start_bundle.prepare_job_repository_before_claim(
+        *args, **kwargs, dependencies=_job_start_bundle_dependencies()
     )
 
-    return config_override
+
+async def _build_job_start_request(*args: Any, **kwargs: Any) -> Any:
+    return await job_start_bundle.build_job_start_request(
+        *args, **kwargs, dependencies=_job_start_bundle_dependencies()
+    )
 
 
-async def _job_project_repositories(
-    project_id: str | None,
-) -> list[dict[str, Any]] | None:
-    """Return the raw internal project-repository payload for dispatch."""
-
-    if not project_id:
-        return None
-    repos = await postgres_db.get_project_repositories(str(project_id))
-    return [
-        {
-            "id": str(repository["id"]),
-            "project_id": str(repository["project_id"]),
-            "name": repository["name"],
-            "role": repository["role"],
-            "repo_url": repository.get("repo_url"),
-            "read_only": repository["read_only"],
-            "branch": repository.get("branch", "main"),
-            "clone_path": repository.get("clone_path"),
-            "credentials": repository.get("credentials"),
-            "is_managed": bool(repository.get("is_managed")),
-        }
-        for repository in repos
-    ] or None
+from orchestrator.services.job_start_bundle import (  # noqa: E402
+    redispatch_livelock_trip as _redispatch_livelock_trip,
+)
 
 
-async def _prepare_job_repository_before_claim(job: Mapping[str, Any]) -> bool:
-    """Adopt/prove historical managed Git authority before processing CAS.
-
-    This is intentionally separate from runtime bundle assembly: the latter
-    occurs after a pinned job has been claimed, while migration 0176 requires
-    a proven scoped key at the claim boundary so an old replica cannot claim
-    and dispatch a credential-bearing URL during a rolling upgrade.
-    """
-
-    try:
-        await prepare_job_primary_repository_authority(postgres_db, gitea_client, job)
-        if job.get("project_id"):
-            repositories = await postgres_db.get_project_repositories(
-                str(job["project_id"])
-            )
-            for repository in repositories:
-                if not repository.get("is_managed"):
-                    continue
-                role = str(repository.get("role") or "")
-                if role in {"knowledge", "jobs"}:
-                    continue
-                await prepare_project_repository_authority(
-                    postgres_db, gitea_client, repository
-                )
-        return True
-    except ManagedRepositoryAuthorityError as exc:
-        logger.warning(
-            "Repository authority is not ready for job %s (%s)",
-            job.get("id"),
-            exc.code,
-        )
-        return False
-    except Exception as exc:
-        # This seam runs before the processing/lease CAS. An unavailable
-        # database or forge must leave the job unclaimed rather than turn an
-        # optional authority-tier outage into a credential-bearing dispatch
-        # or a route-local 500. Log only the exception class: transport
-        # exceptions can contain repository URLs in their message text.
-        logger.warning(
-            "Repository authority preparation failed for job %s (%s)",
-            job.get("id"),
-            type(exc).__name__,
-        )
-        return False
+from orchestrator.services.job_start_bundle import (  # noqa: E402
+    PinnedJobMutationTarget as _PinnedJobMutationTarget,
+)
 
 
-def _mask_repository_transport(url: str | None) -> str:
-    """Describe a repository URL for a log line without leaking userinfo."""
-    if not url:
-        return "none"
-    from urllib.parse import urlsplit
-
-    try:
-        parts = urlsplit(str(url))
-    except ValueError:
-        return "unparseable"
-    host = parts.hostname or "?"
-    port = f":{parts.port}" if parts.port else ""
-    return f"{parts.scheme}://{host}{port}{parts.path}"
-
-
-async def _build_job_start_request(
-    job: dict,
-    *,
-    persist_dispatch_state: bool = True,
-) -> "JobStartRequest | None":
-    """Build the canonical credential-complete worker start bundle.
-
-    Both the pinned push dispatcher and stateless claim-bundle endpoint use
-    this exact seam. It deliberately performs no delivery or assignment;
-    callers retain their lane-specific authority. Pinned dispatch preserves
-    the historical status/cache writes on a refused bundle. Stateless claim
-    assembly disables those writes because credential resolution can outlive
-    its queue lease; the final exact-token recheck then makes the whole build
-    read-only from a stale claimant's point of view.
-    """
-    job_id = str(job["id"])
-    _log_token = bind_log_context(job_id=job_id)
-    try:
-        # Extract upload IDs from context if present
-        job_context = job.get("context") or {}
-        if isinstance(job_context, str):
-            job_context = json.loads(job_context)
-        upload_id = job_context.get("upload_id")
-        config_upload_id = job_context.get("config_upload_id")
-        instructions_upload_id = job_context.get("instructions_upload_id")
-        instructions = job_context.get("instructions")
-        git_remote_url = job_context.get("git_remote_url")
-
-        # Parse config_override if stored as string
-        config_override = job.get("config_override")
-        if isinstance(config_override, str):
-            config_override = json.loads(config_override)
-
-        # Build remaining context (fields not extracted as dedicated params)
-        extracted_keys = {
-            "upload_id",
-            "config_upload_id",
-            "instructions_upload_id",
-            "instructions",
-            "git_remote_url",
-        }
-        remaining_context = {
-            k: v for k, v in job_context.items() if k not in extracted_keys
-        }
-
-        # Pass worktree_path to agent via context (for git worktree creation)
-        if job.get("worktree_path"):
-            remaining_context["worktree_path"] = job["worktree_path"]
-
-        # Resolve project repositories if this is a project job
-        repositories_payload = None
-        if job.get("project_id"):
-            try:
-                repositories_payload = await _job_project_repositories(
-                    str(job["project_id"])
-                )
-            except Exception as e:
-                logger.warning(
-                    f"Dispatch: failed to resolve project repos for job {job_id}: {e}"
-                )
-
-            # Legacy compatibility only: pre-migration project jobs stored a
-            # branch but no per-job remote. A newly-created root whose isolated
-            # repo provisioning failed has no branch; never attach that job to
-            # the old shared jobs repo as an accidental fallback.
-            if repositories_payload and not git_remote_url and job.get("branch_name"):
-                jobs_repo = next(
-                    (r for r in repositories_payload if r["role"] == "jobs"), None
-                )
-                if jobs_repo and jobs_repo.get("repo_url"):
-                    git_remote_url = jobs_repo["repo_url"]
-
-        # Reauthorize the complete materialized set immediately before any
-        # credential payload is built. Scope/link/membership revocation fails
-        # the job as one data contract; it is never silently reduced.
-        try:
-            resolved_ds = await _resolve_authorized_job_datasources(job)
-        except HTTPException:
-            logger.warning(
-                "Dispatch: connector_unavailable for job %s", job_id, exc_info=True
-            )
-            if persist_dispatch_state:
-                await postgres_db.update_job_status(
-                    job_id,
-                    status="failed",
-                    error_message="connector_unavailable",
-                )
-            return None
-
-        has_knowledge_scope = bool(job.get("project_id")) or any(
-            str(ds.get("type") or "").lower() == "kb" for ds in (resolved_ds or [])
-        )
-        _apply_cloud_storage_override(resolved_ds, job_context)
-        datasources_payload = _build_datasources_payload(resolved_ds)
-
-        # Apply datasource-driven tool override (inject/strip db tool categories)
-        if resolved_ds:
-            config_override = _build_datasource_tool_override(
-                resolved_ds, config_override
-            )
-
-        # Resolve exactly one runtime from the persisted assignment. Runtime
-        # context order is never authority: a ready opposite-tier residue is
-        # reported but cannot overwrite the selected backend.
-        config_override, workspace_decision = _inject_matching_workspace_config(
-            job, config_override, replace_endpoint=True
-        )
-        workspace_runtime_projection = workspace_decision.safe_projection()
-        remaining_context[WORKSPACE_RUNTIME_CONTEXT_KEY] = workspace_runtime_projection
-        if not workspace_decision.ready:
-            msg = (
-                "Workspace contract refused dispatch: "
-                f"{workspace_decision.reason or workspace_decision.state}"
-            )
-            logger.error("Dispatch: job %s refused — %s", job_id, msg)
-            if persist_dispatch_state and workspace_decision.state in {
-                "invalid",
-                "failed",
-                "mismatch",
-            }:
-                await postgres_db.update_job_status(
-                    job_id=job_id, status="failed", error_message=msg
-                )
-            return None
-
-        managed_repository_credentials: list[dict[str, Any]] | None = None
-        if workspace_decision.effective_backend in {"sandbox", "vm"}:
-            try:
-                (
-                    git_remote_url,
-                    repositories_payload,
-                    managed_repository_credentials,
-                ) = await authorize_job_repository_transport(
-                    postgres_db,
-                    gitea_client,
-                    job,
-                    repositories_payload,
-                    backend=workspace_decision.effective_backend,
-                )
-            except ManagedRepositoryAuthorityError as exc:
-                logger.warning(
-                    "Dispatch: repository authority unavailable for job %s (%s)",
-                    job_id,
-                    exc.code,
-                )
-                return None
-
-        if workspace_decision.effective_backend == "vm":
-            if not vm_workspaces_on_pod_network():
-                if git_remote_url and not git_remote_url.startswith("ssh://srw-repo-"):
-                    git_remote_url = externalize_gitea_url(git_remote_url)
-                for repository in repositories_payload or []:
-                    if not repository.get("is_managed") and repository.get("repo_url"):
-                        repository["repo_url"] = externalize_gitea_url(
-                            repository["repo_url"]
-                        )
-            logger.info(
-                "Dispatch: injected attested VM workspace config for job %s",
-                job_id,
-            )
-        elif workspace_decision.effective_backend == "sandbox":
-            container_ctx = _get_container_context(job)
-            logger.info(
-                "Dispatch: injected attested sandbox workspace config for job %s "
-                "(provisioner=%s)",
-                job_id,
-                container_ctx.get("provisioner", "k8s"),
-            )
-        if workspace_decision.effective_backend in {"sandbox", "vm"}:
-            logger.info(
-                "Dispatch: repository transport for job %s: %s (%d managed "
-                "credential(s))",
-                job_id,
-                _mask_repository_transport(git_remote_url),
-                len(managed_repository_credentials or []),
-            )
-
-        # Sticky sudo denial (vm_upgrade denied / resumed without VM): block
-        # sudo with the operator's reason instead of re-freezing into a new
-        # approval loop.
-        config_override = _apply_sticky_sudo_denial(job, config_override)
-
-        # Inject lite workspace config (virtual/none — no SSH, no provisioning).
-        # The user's config_override already names the backend; here we attach
-        # the object-store mounts (virtual) with deployment-sourced credentials,
-        # in-flight only. A repository datasource needs a real workspace to
-        # clone into, so reject the combination up front (§4/§7).
-        # Defense-in-depth: the submit-time guard already rejects an explicitly
-        # selected repo, and create_job filters repos out of an *inherited*
-        # lite selection — but this re-checks the fully resolved set, covering
-        # resume / VM-resume and any future path that could attach a repo the
-        # submit guard never saw.
-        if _backend_from_override(config_override) in LITE_BACKENDS:
-            repo_names = _repository_datasource_names(resolved_ds)
-            if repo_names:
-                msg = (
-                    "workspace.backend is a lite tier (virtual/none) but a "
-                    f"connector requiring a shell is attached ({', '.join(repo_names)}). "
-                    "Repository and credential connectors need a full workspace — use "
-                    "backend='sandbox' or 'vm'."
-                )
-                logger.error("Dispatch: job %s rejected — %s", job_id, msg)
-                if persist_dispatch_state:
-                    await postgres_db.update_job_status(
-                        job_id=job_id, status="failed", error_message=msg
-                    )
-                return None
-            try:
-                config_override = _inject_lite_workspace_config(
-                    config_override, prefix=f"jobs/{job_id}/"
-                )
-            except LiteWorkspaceConfigError as exc:
-                logger.error("Dispatch: job %s lite-config error: %s", job_id, exc)
-                if persist_dispatch_state:
-                    await postgres_db.update_job_status(
-                        job_id=job_id, status="failed", error_message=str(exc)
-                    )
-                return None
-            logger.info(
-                "Dispatch: job %s using lite workspace (backend=%s, no pod)",
-                job_id,
-                config_override["workspace"]["backend"],
-            )
-
-        # Override workspace_path with worktree_path for subjobs on shared backends
-        worktree_path = job.get("worktree_path")
-        if worktree_path and config_override:
-            ws = config_override.get("workspace", {})
-            remote = ws.get("remote", {})
-            if remote:
-                remote["workspace_path"] = worktree_path
-                logger.info(
-                    f"Dispatch: using worktree path {worktree_path} for job {job_id}"
-                )
-
-        # Backstop: never dispatch a workspace-backed job with no SSH remote.
-        # A sandbox/vm backend without a `remote` block hard-fails the agent at
-        # init_workspace (0 tokens, no log) — the failure mode from
-        # knowledge-base/knowledge/issues/subjob_inherits_stale_workspace_container_snapshot.md. The
-        # auto-assign dispatcher now resolves inherited workspaces up front, but
-        # this guards every other dispatch path (manual assign, future callers):
-        # fail fast with a diagnosable message instead of a cryptic agent crash.
-        # `remote` is only ever injected into config_override (VM/container
-        # blocks above); lite tiers (virtual/none) set an explicit backend and
-        # legitimately have no remote, so they're exempt.
-        _ws_final = (config_override or {}).get("workspace", {})
-        _backend_final = _ws_final.get("backend")
-        if _backend_final not in LITE_BACKENDS and not _ws_final.get("remote"):
-            msg = (
-                "Workspace backend requires SSH credentials but none were "
-                f"resolved at dispatch (backend={_backend_final or 'sandbox (default)'}). "
-                "For a subjob this usually means the parent's workspace container/VM "
-                "was not ready; it should be held until ready rather than dispatched."
-            )
-            logger.error("Dispatch: job %s refused — %s", job_id, msg)
-            if persist_dispatch_state:
-                await postgres_db.update_job_status(
-                    job_id=job_id, status="failed", error_message=msg
-                )
-            return None
-
-        # Orchestrator-resolved config (supersedes agent-side Decision 6): when
-        # experts are enabled, resolve the full config here with the same loader
-        # the agent uses, freeze the secret-free copy into jobs.resolved_config,
-        # and deliver a credential-injected blob. The agent hydrates it and skips
-        # local resolution. On ANY failure we fall back to config_name +
-        # config_override below — the blob's absence is always safe.
-        resolved_config: dict[str, Any] | None = None
-        if _is_experts_db_enabled():
-            try:
-                expert_row = None
-                if job.get("expert_id"):
-                    expert_row = await postgres_db.get_expert_by_id(
-                        str(job["expert_id"])
-                    )
-                _base_name = canonical_config_name(
-                    job.get("config_name") or "worker_base"
-                )
-                # Default-model floor (model names only): the base config carries
-                # a placeholder model; the effective default is the user's pinned
-                # model else the system capability default. Resolution applies it
-                # below the expert; inject_blob_credentials adds the transport.
-                _base_defaults = await _resolve_default_models(job.get("user_id"))
-                _cap: dict = {}
-                _skills_payload = await _gather_in_scope_skills(
-                    str(job["user_id"]) if job.get("user_id") else None,
-                    [str(job["project_id"])] if job.get("project_id") else None,
-                )
-                # Per-model registry overrides (context_window; later
-                # max_output_tokens) must reach the matrix as explicit llm keys,
-                # else the blob bakes the family window and the admin cap is
-                # silently dropped (see _seed_registry_model_overrides).
-                _req_override = await _seed_registry_model_overrides(
-                    config_override,
-                    user_id=str(job["user_id"]) if job.get("user_id") else None,
-                )
-                _resolved = resolve_config(
-                    base_config_name=_base_name,
-                    base_defaults=_base_defaults,
-                    expert_row=expert_row,
-                    request_override=_req_override,
-                    expert_type="worker",
-                    capture=_cap,
-                    skills=_skills_payload,
-                    db_refs=await _prefetch_roster_refs(
-                        expert_row=expert_row,
-                        overrides=(config_override,),
-                        user_id=str(job["user_id"]) if job.get("user_id") else None,
-                        project_ids=[str(job["project_id"])]
-                        if job.get("project_id")
-                        else [],
-                    ),
-                )
-                # Bound skills are delivered deterministically (instructions channel);
-                # strip them from the model-invoked catalog so they aren't double-offered.
-                from shared.runtime.core.skill_resolution import filter_bound_skills
-
-                filter_bound_skills(_resolved)
-                # Dispatch PEP (decision 9): the merged config must fit the runner's
-                # grants. GrantDenied is caught BELOW the generic fallback so a denial
-                # is never downgraded to the unchecked config_override (fail closed).
-                if await _user_experts_enabled():
-                    await _enforce_dispatch_grants(
-                        _cap["merged_fragment"],
-                        runner_user_id=str(job["user_id"])
-                        if job.get("user_id")
-                        else None,
-                        project_ids=[str(job["project_id"])]
-                        if job.get("project_id")
-                        else [],
-                        runner_kind=str(job.get("runner_kind") or "user"),
-                    )
-                resolved_config = await inject_blob_credentials(
-                    _resolved,
-                    lambda co: _inject_dispatch_credentials(
-                        job,
-                        co,
-                        include_kb_profile=has_knowledge_scope,
-                    ),
-                )
-                if persist_dispatch_state:
-                    await postgres_db.store_resolved_config(
-                        job_id, redact_config_override(resolved_config)
-                    )
-                logger.info(
-                    "Dispatch: resolved config for job %s (expert_id=%s)",
-                    job_id,
-                    job.get("expert_id"),
-                )
-            except GrantDenied as gd:
-                logger.warning("Dispatch denied for job %s: %s", job_id, gd)
-                if persist_dispatch_state:
-                    await postgres_db.update_job_status(
-                        job_id,
-                        status="failed",
-                        error_message=_grant_violations_detail(gd.violations),
-                    )
-                return None
-            except Exception:
-                logger.exception(
-                    "Dispatch: resolve_config failed for job %s; falling back "
-                    "to config_name + config_override",
-                    job_id,
-                )
-                resolved_config = None
-
-        # Resolve API keys, model routing, and capability defaults.
-        # Same helper drives both first-dispatch and resume so an orphaned
-        # job re-dispatched to a fresh agent doesn't lose its credentials.
-        # (Still injected into config_override for the no-blob fallback path.)
-        config_override = await _inject_dispatch_credentials(
-            job,
-            config_override,
-            include_kb_profile=has_knowledge_scope,
-        )
-        # Log injected env-key NAMES (never values) so a missing credential —
-        # e.g. EMBEDDING_API_KEY, which silently disables memory + KB — is
-        # greppable at dispatch (embedding_key_missing_silently_disables_memory_and_kb.md).
-        logger.info(
-            "Dispatch: job %s injected env_key names=%s",
-            job_id,
-            sorted((config_override.get("env_keys") or {}).keys()),
-        )
-
-        # Fail fast on a pinned model with no resolvable transport rather than
-        # letting the agent silently fall back to api.openai.com and 401/404 with
-        # an opaque error (eec20eeb). Only the blob path is validated; the
-        # no-blob fallback keeps its legacy behaviour.
-        if resolved_config:
-            _unrouted = unrouted_model_slots(resolved_config)
-            if _unrouted:
-                msg = (
-                    "Pinned model(s) have no resolvable endpoint or provider after "
-                    f"dispatch resolution: {', '.join(_unrouted)}. Set the model's "
-                    "endpoint/provider key (Admin → Providers / Models) or pin a "
-                    "different model."
-                )
-                logger.error(
-                    "Dispatch: job %s has unroutable model slot(s) — %s",
-                    job_id,
-                    _unrouted,
-                )
-                if persist_dispatch_state:
-                    await postgres_db.update_job_status(
-                        job_id, status="failed", error_message=msg
-                    )
-                return None
-
-        # Build job start request. resolved_config and config_override are
-        # mutually exclusive on the wire: a delivered blob is complete, so we
-        # send config_override=None to keep the agent from flat-merging an
-        # override on top of the resolved layers (the degradation we set out to
-        # fix).
-        runtime_actor = await mint_worker_runtime_actor(
-            postgres_db,
-            project_id=str(job["project_id"]) if job.get("project_id") else None,
-            user_id=str(job["user_id"]) if job.get("user_id") else None,
-        )
-        job_start = JobStartRequest(
-            job_id=job_id,
-            description=job["description"],
-            upload_id=upload_id,
-            config_upload_id=config_upload_id,
-            instructions_upload_id=instructions_upload_id,
-            instructions=instructions,
-            document_path=job.get("document_path"),
-            config_name=canonical_config_name(job.get("config_name") or "worker_base"),
-            config_override=None if resolved_config else config_override,
-            resolved_config=resolved_config,
-            git_remote_url=git_remote_url,
-            context=remaining_context if remaining_context else None,
-            datasources=datasources_payload,
-            repositories=repositories_payload,
-            managed_repository_credentials=managed_repository_credentials,
-            branch_name=job.get("branch_name"),
-            project_id=str(job["project_id"]) if job.get("project_id") else None,
-            runtime_actor=runtime_actor.to_payload(),
-            workspace_runtime=workspace_runtime_projection,
-            workspace_provisioner=(
-                (str(_get_container_context(job).get("provisioner") or "") or None)
-                if workspace_decision.effective_backend == "sandbox"
-                else (
-                    str(_get_vm_context(job).get("provisioner") or "vm")
-                    if workspace_decision.effective_backend == "vm"
-                    else None
-                )
-            ),
-        )
-
-        return job_start
-
-    except Exception as e:
-        logger.error(
-            "Dispatch: failed to build start bundle for job %s: %s",
-            job_id,
-            e,
-            exc_info=True,
-        )
-        return None
-    finally:
-        reset_log_context(_log_token)
-
-
-def _redispatch_livelock_trip(job: Mapping[str, Any]) -> Mapping[str, Any] | None:
-    """Return the hidden active lease-recovery trip, if this row has one."""
-
-    context = job.get("context") or {}
-    if isinstance(context, str):
-        try:
-            context = json.loads(context)
-        except (json.JSONDecodeError, TypeError):
-            return None
-    recovery = context.get("_lease_recovery") if isinstance(context, Mapping) else None
-    if isinstance(recovery, Mapping) and recovery.get("state") == "tripped":
-        return recovery
-    return None
-
-
-class _PinnedJobMutationTarget(NamedTuple):
-    agent: dict[str, Any]
-    recipient: PinnedJobRecipient
-
-
-_FRESH_PINNED_RECIPIENT_ATTESTATION_ATTEMPTS = 8
-_FRESH_PINNED_RECIPIENT_ATTESTATION_DELAY_S = 0.25
+from orchestrator.services.job_start_bundle import (  # noqa: E402
+    FRESH_PINNED_RECIPIENT_ATTESTATION_ATTEMPTS as _FRESH_PINNED_RECIPIENT_ATTESTATION_ATTEMPTS,
+)
+from orchestrator.services.job_start_bundle import (  # noqa: E402
+    FRESH_PINNED_RECIPIENT_ATTESTATION_DELAY_S as _FRESH_PINNED_RECIPIENT_ATTESTATION_DELAY_S,
+)
 
 
 async def _prepare_pinned_job_mutation_target(
@@ -7056,6 +5021,32 @@ async def _acknowledge_retiring_failed_attach(
     return receipt is not None or await _settled_readback()
 
 
+def _session_attach_payload_dependencies() -> (
+    session_attach_payload.SessionAttachPayloadDependencies
+):
+    """Rebuilt per call, reading every collaborator from this module."""
+
+    return session_attach_payload.SessionAttachPayloadDependencies(
+        store=postgres_db,
+        GrantDenied=GrantDenied,
+        LiteWorkspaceConfigError=LiteWorkspaceConfigError,
+        await_protected_cloud_runtime_ready=_await_protected_cloud_runtime_ready,
+        build_datasource_tool_override=_build_datasource_tool_override,
+        build_datasources_payload=_build_datasources_payload,
+        build_protected_cloud_mount=_build_protected_cloud_mount,
+        inject_lite_workspace_config=_inject_lite_workspace_config,
+        mint_thread_runtime_actor=mint_thread_runtime_actor,
+        protected_mount_selection_identity=_protected_mount_selection_identity,
+        require_pinned_status_identity=_require_pinned_status_identity,
+        resolve_authorized_thread_datasources=_resolve_authorized_thread_datasources,
+        resolve_session_config=_resolve_session_config,
+        revalidate_thread_project_ids=_revalidate_thread_project_ids,
+        ro_mount_matches_protected_selection=_ro_mount_matches_protected_selection,
+        thread_accepts_runtime=_thread_accepts_runtime,
+        thread_project_ids=_thread_project_ids,
+    )
+
+
 async def _assemble_session_attach_payload(
     thread_id: str,
     *,
@@ -7063,386 +5054,19 @@ async def _assemble_session_attach_payload(
     config_name: Optional[str] = None,
     runtime_agent_id: str | None = None,
 ) -> Optional[dict[str, Any]]:
-    """Assemble the session-attach payload for a thread — the ONE assembly.
+    """Bridge to ``services/session_attach_payload.py`` (R1.B05 root lane).
 
-    Factored out of ``_send_session_attach_locked`` so the stateless-lane
-    claim bundle (``GET /internal/units/{unit_id}/claim-bundle``) and the
-    legacy pinned-lane sender deliver identical attach payloads under
-    identical fail-closed rules: lite workspace config injection, datasource
-    reauthorization (the attach boundary owns the authoritative re-read),
-    and ``_resolve_session_config`` grant/error handling.
-
-    ``project_ids``/``datasources`` are deliberately NOT parameters: they are
-    mutable authorization grants recomputed here from the thread's current
-    state, never trusted from callers. Returns the payload dict, or ``None``
-    on ANY refusal — callers must treat ``None`` as "do not attach" and must
-    not distinguish refusal reasons (no enumeration oracle; details go to the
-    server log only). Call under ``postgres_db.thread_datasource_lock`` to
-    serialize with live connector-selection updates.
+    Retained with the pre-extraction signature: ``_send_session_attach_locked``
+    and ``internal_unit_claim_bundle`` are B06's, and several suites patch this
+    name. Goes when B06 migrates those callers.
     """
-    # Lite tiers (virtual/none) carry no SSH endpoint. For `virtual` we attach
-    # the object-store mounts here — deployment-sourced credentials, in-flight
-    # only (never persisted to the thread row), keyed under threads/<id>/.
-    # A misconfigured `virtual` deployment refuses the attach with a clear log.
-    try:
-        config_override = _inject_lite_workspace_config(
-            config_override, prefix=f"threads/{thread_id}/"
-        )
-    except LiteWorkspaceConfigError as exc:
-        logger.error("Session attach: thread %s lite-config error: %s", thread_id, exc)
-        return None
-
-    # Orchestrator-resolved config for the warm-pool agent: this is the expert
-    # delivery channel the warm path lacked (the 3-minute-stall bug). Re-resolve
-    # on every attach (no freeze). None when experts are off / resolve fails →
-    # the agent uses the config_name + config_override fallback below.
-    resolved_config: dict[str, Any] | None = None
-    _sess_status: dict[str, Any] = {}
-    try:
-        _thread = await postgres_db.get_thread(thread_id)
-    except Exception:
-        logger.exception(
-            "Session attach: failed to load thread %s; refusing (fail closed)",
-            thread_id,
-        )
-        return None
-    if not _thread:
-        logger.warning("Session attach: thread %s vanished; refusing", thread_id)
-        return None
-    if not _thread_accepts_runtime(_thread):
-        logger.info(
-            "Session attach: thread %s lifecycle %r is not preparable; refusing",
-            thread_id,
-            _thread.get("status"),
-        )
-        return None
-
-    _meta = _thread.get("metadata") or {}
-    if isinstance(_meta, str):
-        try:
-            _meta = json.loads(_meta)
-        except (json.JSONDecodeError, TypeError):
-            logger.warning(
-                "Session attach: malformed metadata for thread %s; refusing",
-                thread_id,
-            )
-            return None
-    protected_marker = protected_cloud_marker_state(_meta)
-    if protected_marker == "malformed":
-        logger.warning(
-            "Session attach: malformed protected marker for thread %s; refusing",
-            thread_id,
-        )
-        return None
-    if protected_marker == "on" and not await _await_protected_cloud_runtime_ready(
+    return await session_attach_payload.assemble_session_attach_payload(
         thread_id,
-        timeout_s=0,
-        allow_schedule=False,
-    ):
-        logger.info(
-            "Session attach: thread %s refused — protected cloud runtime not ready",
-            thread_id,
-        )
-        return None
-
-    # Datasource selections are mutable authorization grants, not frozen
-    # capabilities. The caller may have resolved a payload before this function
-    # re-fetched the thread; a concurrent A -> B/[] settings update must not let
-    # that stale payload survive. Reauthorize the current metadata selection,
-    # resolve its credentials here, and rebuild connector tool categories from
-    # that same result. The generic denial deliberately avoids an enumeration
-    # oracle; datasource credentials never reach this log path.
-    try:
-        # Acknowledged-but-still-unavailable project drift is narrowed out
-        # INSIDE _revalidate_thread_project_ids now (only while it stays
-        # denied), so an already-acknowledged revoked/deleted project does
-        # not spuriously 403 here — while a RECOVERED acknowledged project
-        # returns automatically (spec §3.2).
-        project_ids = await _revalidate_thread_project_ids(
-            _thread, await _thread_project_ids(thread_id)
-        )
-        resolved_datasources = await _resolve_authorized_thread_datasources(
-            _thread,
-            _meta.get("datasource_ids"),
-            target_project_ids=project_ids,
-        )
-        from orchestrator.services.job_delivery import apply_review_delivery_branch
-
-        resolved_datasources = apply_review_delivery_branch(_meta, resolved_datasources)
-        datasources = _build_datasources_payload(resolved_datasources)
-        config_override = _build_datasource_tool_override(
-            resolved_datasources, config_override
-        )
-    except HTTPException:
-        logger.warning(
-            "Session attach denied for thread %s: its current knowledge/data "
-            "scope is no longer available",
-            thread_id,
-        )
-        return None
-    except Exception:
-        logger.exception(
-            "Session attach: access revalidation failed for thread %s; "
-            "refusing (fail closed)",
-            thread_id,
-        )
-        return None
-
-    try:
-        if _thread:
-            resolved_config = await _resolve_session_config(
-                _thread, _meta, config_override=config_override, status=_sess_status
-            )
-    except GrantDenied as gd:
-        logger.warning("Session attach denied for thread %s: %s", thread_id, gd)
-        return None
-    except Exception:
-        logger.exception(
-            "Session attach: resolve failed for thread %s; using fallback", thread_id
-        )
-    # Fail closed: a resolution ERROR (experts on, resolve threw) must not deliver
-    # the unvetted config_override — the grant check never ran. The 'disabled' state
-    # (experts off) intentionally falls through to the legacy fallback below.
-    if _sess_status.get("state") == "error":
-        logger.warning(
-            "Session attach: resolve errored for thread %s; refusing (fail closed)",
-            thread_id,
-        )
-        return None
-
-    # Control-inbox scalar persistence is first-class on ``threads``. Overlay
-    # materialized values at the final delivery edge for BOTH resolution modes
-    # so a handoff cannot resurrect an older config value. Narration remains
-    # NULL for legacy rows whose value is inherited through an expert/account
-    # layer that migration SQL cannot resolve; those rows keep the resolved
-    # value until creation/control materializes one.
-    interactive_scalars = {
-        "permission_mode": str(_thread.get("permission_mode") or "supervised"),
-    }
-    if _thread.get("narration_mode") is not None:
-        interactive_scalars["narration_mode"] = str(_thread["narration_mode"])
-    if resolved_config is not None:
-        resolved_config = dict(resolved_config)
-        resolved_agent = dict(resolved_config.get("agent") or {})
-        resolved_interactive = dict(resolved_agent.get("interactive") or {})
-        resolved_interactive.update(interactive_scalars)
-        resolved_agent["interactive"] = resolved_interactive
-        resolved_config["agent"] = resolved_agent
-    else:
-        config_override = _deep_merge_dicts(
-            dict(config_override or {}), {"interactive": interactive_scalars}
-        )
-
-    try:
-        runtime_actor = await mint_thread_runtime_actor(
-            postgres_db,
-            thread_id=thread_id,
-            project_ids=project_ids,
-            agent_id=runtime_agent_id,
-        )
-    except Exception:
-        logger.exception(
-            "Session attach: runtime actor mint failed for thread %s; "
-            "refusing (fail closed)",
-            thread_id,
-        )
-        return None
-
-    # Complete every protected reader/selection await before the final
-    # lifecycle read.  Callers hold ``thread_datasource_lock`` across this
-    # helper, so the selected thread_mount row cannot change between this
-    # exact snapshot and the synchronous post-read checks below.
-    prepared_protected_selection: tuple[str, ...] | None = None
-    if protected_marker == "on":
-        prepared_runtime_authority = thread_runtime_authority(_thread)
-        if prepared_runtime_authority is None:
-            logger.info(
-                "Session attach: thread %s refused — no runtime authority at "
-                "protected-selection prepare (status=%r generation=%r)",
-                thread_id,
-                (_thread or {}).get("status"),
-                (_thread or {}).get("runtime_generation"),
-            )
-            return None
-        ro_row, mount_rows = await asyncio.gather(
-            postgres_db.get_ro_mount_by_thread(thread_id),
-            postgres_db.list_thread_mounts(thread_id),
-        )
-        from orchestrator.services.cloud_staging import select_protected_mount
-
-        prepared_protected_selection = _protected_mount_selection_identity(
-            select_protected_mount(mount_rows)
-        )
-        if (
-            prepared_protected_selection is None
-            or not _ro_mount_matches_protected_selection(
-                ro_row,
-                mount_rows,
-                thread_id=thread_id,
-                user_id=str(_thread.get("user_id") or ""),
-                runtime_generation=prepared_runtime_authority.generation,
-            )
-        ):
-            logger.info(
-                "Session attach: thread %s refused — ro-mount does not match the "
-                "protected selection",
-                thread_id,
-            )
-            return None
-        if _build_protected_cloud_mount(ro_row, thread_id=thread_id) is None:
-            logger.info(
-                "Session attach: thread %s refused — protected cloud mount could "
-                "not be built",
-                thread_id,
-            )
-            return None
-
-    # Config/datasource/repository assembly crosses several awaits. End may
-    # commit during any of them, so the response-side credential boundary owns
-    # one authoritative final lifecycle read. Nothing after this read may
-    # await before the payload is returned.
-    final_thread = await postgres_db.get_thread(thread_id)
-    if not _thread_accepts_runtime(final_thread):
-        logger.info(
-            "Session attach: lifecycle changed before payload delivery "
-            "(thread=%s status=%r)",
-            thread_id,
-            (final_thread or {}).get("status"),
-        )
-        return None
-    final_meta = thread_metadata_object(final_thread)
-    final_marker = protected_cloud_marker_state(final_meta)
-    if final_marker == "malformed":
-        logger.info(
-            "Session attach: thread %s refused — protected-cloud marker malformed",
-            thread_id,
-        )
-        return None
-    if final_marker != protected_marker:
-        logger.info(
-            "Session attach: thread %s refused — protected-cloud marker changed "
-            "mid-assembly (%r -> %r)",
-            thread_id,
-            protected_marker,
-            final_marker,
-        )
-        return None
-    if final_marker == "on" and prepared_protected_selection is None:
-        logger.info(
-            "Session attach: thread %s refused — protected marker on but no "
-            "prepared selection",
-            thread_id,
-        )
-        return None
-    final_runtime_authority = thread_runtime_authority(final_thread)
-    if final_runtime_authority is None and (
-        final_marker != "off" or _require_pinned_status_identity()
-    ):
-        logger.info(
-            "Session attach: thread %s refused — no final runtime authority "
-            "(status=%r generation=%r marker=%r require_pinned=%s)",
-            thread_id,
-            (final_thread or {}).get("status"),
-            (final_thread or {}).get("runtime_generation"),
-            final_marker,
-            _require_pinned_status_identity(),
-        )
-        return None
-    final_workspace = final_meta.get("workspace_container") or {}
-    final_binding = final_meta.get("_workspace_binding") or {}
-    if not isinstance(final_workspace, dict) or not isinstance(final_binding, dict):
-        logger.info(
-            "Session attach: thread %s refused — workspace_container/_workspace_binding "
-            "are not objects (types %s/%s)",
-            thread_id,
-            type(final_workspace).__name__,
-            type(final_binding).__name__,
-        )
-        return None
-    final_workspace_generation = final_binding.get("generation")
-    final_workspace_runtime = (
-        final_workspace.get("_docker_workspace_lease_id")
-        if final_workspace.get("provisioner") == "docker"
-        else final_workspace.get(WORKSPACE_RUNTIME_INCARNATION_KEY)
+        config_override=config_override,
+        config_name=config_name,
+        runtime_agent_id=runtime_agent_id,
+        dependencies=_session_attach_payload_dependencies(),
     )
-    final_workspace_backend = declared_thread_workspace_backend(final_thread)
-    if (
-        final_binding.get("kind") == "virtual"
-        and final_workspace_backend in LITE_BACKENDS
-    ):
-        # A virtual binding generation fences the durable object-store
-        # namespace; it is not a physical runtime identity.  The attach
-        # contract deliberately represents lite workspaces as (None, None),
-        # while sandbox/VM workspaces carry an exact generation+incarnation
-        # pair.  Never let physical residue hide behind a lite declaration.
-        if final_workspace_runtime:
-            logger.info(
-                "Session attach: thread %s refused — lite workspace (binding "
-                "kind=virtual backend=%r) carries a physical "
-                "runtime_incarnation=%r",
-                thread_id,
-                final_workspace_backend,
-                final_workspace_runtime,
-            )
-            return None
-        final_workspace_generation = None
-    elif bool(final_workspace_generation) != bool(final_workspace_runtime):
-        logger.info(
-            "Session attach: thread %s refused — workspace identity pair "
-            "incomplete (generation=%r from _workspace_binding, "
-            "runtime_incarnation=%r from workspace_container, binding kind=%r "
-            "backend=%r). NOTE: the two halves are read from DIFFERENT metadata "
-            "objects — see the vault note on the stateless attach livelock "
-            "before changing this gate.",
-            thread_id,
-            final_workspace_generation,
-            final_workspace_runtime,
-            final_binding.get("kind"),
-            final_workspace_backend,
-        )
-        return None
-    try:
-        final_workspace_generation = (
-            str(UUID(str(final_workspace_generation)))
-            if final_workspace_generation
-            else None
-        )
-        final_workspace_runtime = (
-            str(UUID(str(final_workspace_runtime))) if final_workspace_runtime else None
-        )
-    except (TypeError, ValueError):
-        logger.info(
-            "Session attach: thread %s refused — workspace generation/incarnation "
-            "not valid UUIDs (generation=%r runtime_incarnation=%r)",
-            thread_id,
-            final_workspace_generation,
-            final_workspace_runtime,
-        )
-        return None
-
-    return {
-        "thread_id": thread_id,
-        # Exact post-0185 contract. The maintenance gate drains old writers;
-        # every admitted pinned lifecycle write must carry this identity.
-        "pinned_status_identity_contract": 1,
-        "pinned_runtime_generation_contract": 1,
-        "session_runtime_generation": (
-            final_runtime_authority.generation
-            if final_runtime_authority is not None
-            else None
-        ),
-        # Non-secret physical identity used by the dual agent's monotonic
-        # pre-setup claim. If actor binding fails before workspace setup, it
-        # can echo this exact tuple while proving that setup never began.
-        "workspace_generation": final_workspace_generation,
-        "workspace_runtime_incarnation": final_workspace_runtime,
-        "config_override": None if resolved_config else config_override,
-        "resolved_config": resolved_config,
-        "project_ids": project_ids,
-        "datasources": datasources,
-        "config_name": config_name,
-        "runtime_actor": runtime_actor.to_payload(),
-    }
 
 
 class _PinnedSessionMutationTarget(NamedTuple):
@@ -7912,515 +5536,117 @@ async def _send_session_attach_locked(
         return True
 
 
-class LiteWorkspaceConfigError(Exception):
-    """A ``virtual`` tier was requested but this deployment has no object store.
-
-    Raised by :func:`_inject_lite_workspace_config`; dispatch fails the job and
-    session-attach refuses, both with the actionable message carried here.
-    """
+from orchestrator.services.workspace_tier_policy import (  # noqa: E402
+    LiteWorkspaceConfigError as LiteWorkspaceConfigError,
+)
 
 
-def _backend_from_override(config_override: Any) -> Optional[str]:
-    """Extract ``workspace.backend`` from a (dict | JSON-string | None) override.
-
-    Mirrors the parsing the dispatch path already does for ``config_override``
-    so every caller reads the backend the same way.
-    """
-    try:
-        return configured_workspace_backend(config_override)
-    except WorkspaceContractError:
-        return None
+from orchestrator.services.workspace_tier_policy import (  # noqa: E402
+    backend_from_override as _backend_from_override,
+)
 
 
-def _thread_workspace_backend(thread: Any) -> Optional[str]:
-    """Extract the selected workspace backend from a thread row's stored
-    ``metadata.config_override.workspace.backend`` (handles JSON-string metadata).
-
-    Used by the session-start paths to size the readiness budget for a VM-backed
-    thread on resume, where the caller may not carry the config_override.
-    """
-    return declared_thread_workspace_backend(thread)
+from orchestrator.services.workspace_tier_policy import (  # noqa: E402
+    thread_workspace_backend as _thread_workspace_backend,
+)
 
 
-def _stateless_session_class_refusal(config: Any) -> str | None:
-    """Return why this session class still requires its pinned wake plane."""
-    if not isinstance(config, dict):
-        return "session class configuration is malformed"
-    officer = config.get("officer")
-    if officer is None:
-        return None
-    if not isinstance(officer, dict):
-        return "session class configuration is malformed"
-    for field, reason in (
-        ("conference", "conference sessions still use pinned lifecycle wakes"),
-        ("enabled", "officer sessions still use the pinned watchdog and wake drain"),
-    ):
-        if field not in officer or officer[field] is False:
-            continue
-        if officer[field] is True:
-            return reason
-        return "session class configuration is malformed"
-    return None
+from orchestrator.services.session_class_policy import (  # noqa: E402
+    session_class_pinned_refusal as _stateless_session_class_refusal,
+)
 
 
-def _materialized_session_class_override(
-    effective_config: Any,
-) -> dict[str, bool]:
-    """Freeze lifecycle-affecting class bits into the request layer.
-
-    Experts and account defaults are deliberately mutable for ordinary config,
-    but ``officer`` and ``conference`` select a pinned-only background wake
-    plane.  Materializing both booleans at creation makes that topology choice
-    stable across later expert/account edits and gives every synchronous
-    stateless admission boundary an authoritative value in thread metadata.
-    """
-    if not isinstance(effective_config, dict):
-        raise HTTPException(status_code=400, detail="Session config is malformed")
-    officer = effective_config.get("officer")
-    if officer is None:
-        officer = {}
-    if not isinstance(officer, dict):
-        raise HTTPException(status_code=400, detail="Officer config is malformed")
-    for field in ("enabled", "conference"):
-        if field in officer and type(officer[field]) is not bool:
-            raise HTTPException(
-                status_code=400,
-                detail=f"officer.{field} must be a boolean",
-            )
-    return {
-        "enabled": officer.get("enabled") is True,
-        "conference": officer.get("conference") is True,
-    }
+from orchestrator.services.session_class_policy import (  # noqa: E402
+    materialized_session_class_override as _materialized_session_class_override,
+)
 
 
-def _protected_cloud_officer_active(effective_config: Any) -> bool:
-    """Whether an effective/resolved config selects the officer ceiling.
-
-    Create-time merged fragments carry ``officer`` at the root; delivered
-    resolved blobs carry it under ``agent``.  Accept both exact shapes without
-    truthiness coercion so expert/account defaults are checked just like an
-    explicit request override.  Conference-only sessions keep the ordinary
-    interactive tool plane (``officer.enabled`` is false) and are therefore
-    not rejected by this officer-specific boundary.
-    """
-
-    if not isinstance(effective_config, dict):
-        raise ValueError("session class configuration is malformed")
-    candidate = effective_config
-    if "agent" in effective_config:
-        candidate = effective_config.get("agent")
-        if not isinstance(candidate, dict):
-            raise ValueError("session class configuration is malformed")
-    officer = candidate.get("officer")
-    if officer is None:
-        return False
-    if not isinstance(officer, dict):
-        raise ValueError("session class configuration is malformed")
-    enabled = officer.get("enabled", False)
-    if type(enabled) is not bool:
-        raise ValueError("session class configuration is malformed")
-    return enabled is True
+from orchestrator.services.session_class_policy import (  # noqa: E402
+    require_stateless_workspace as _require_stateless_workspace,
+)
 
 
-def _require_stateless_workspace(thread: dict[str, Any]) -> str:
-    """Require an exact stateless-supported workspace and session class.
-
-    Lite workspaces remain supported. Sandbox support is intentionally narrow:
-    the row must carry the orchestrator-owned Kubernetes lifecycle evidence,
-    and a ready endpoint must be paired with its backing generation, pinned SSH
-    identity, and runtime incarnation. VM, Docker and unknown/future states fail
-    closed. Officer/conference sessions remain pinned until their background
-    wake machinery becomes queue-aware.
-    """
-    backend, refusal_reason = stateless_session_workspace_check(thread)
-    if refusal_reason is not None:
-        logger.warning(
-            "Stateless session refused before attach: thread=%s "
-            "workspace_backend=%r reason=%s",
-            thread.get("id"),
-            backend,
-            refusal_reason,
-        )
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "Stateless execution requires an attested Kubernetes sandbox "
-                "or a supported lite workspace (virtual/none); this session's "
-                f"workspace is unavailable ({refusal_reason})"
-            ),
-        )
-    return backend
+from orchestrator.services.session_class_policy import (  # noqa: E402
+    require_stateless_end_workspace as _require_stateless_end_workspace,
+)
 
 
-def _require_stateless_end_workspace(thread: dict[str, Any]) -> str:
-    """Require work admission or an exact in-progress End authority.
-
-    ``retiring_process_zero`` is deliberately excluded from the ordinary
-    stateless workspace gate: no new turn, control, upload, or Resume may use a
-    runtime after terminal cleanup has begun.  End itself must nevertheless be
-    able to retry that durable transition.  Admit only the exact intermediate
-    status on an ended thread with a structurally valid pending retirement
-    authority; every other refusal still uses the ordinary fail-closed gate.
-    """
-
-    backend, refusal_reason = stateless_session_workspace_check(thread)
-    if refusal_reason is None:
-        return backend
-
-    metadata = thread_metadata_object(thread)
-    workspace = metadata.get("workspace_container")
-    if (
-        refusal_reason == "workspace_status_unavailable"
-        and thread.get("status") == "ended"
-        and isinstance(workspace, dict)
-        and workspace.get("status") == "retiring_process_zero"
-    ):
-        from shared.session_retirement import stateless_retirement_authority
-
-        try:
-            retirement = stateless_retirement_authority(metadata)
-        except RuntimeError as exc:
-            raise HTTPException(
-                status_code=503,
-                detail="Stateless retirement authority is malformed",
-            ) from exc
-        if retirement is not None:
-            return backend
-
-    return _require_stateless_workspace(thread)
+from orchestrator.services.workspace_tier_policy import (  # noqa: E402
+    is_lite_config_override as _is_lite_config_override,
+)
 
 
-def _session_ready_timeout_s(backend: Optional[str]) -> int:
-    """Readiness-probe budget for the session-start paths (``provision_or_assign``
-    and ``_do_prepare``'s ``wait_for_ready``).
+def _execution_lane_dependencies() -> session_class_policy.ExecutionLaneDependencies:
+    """The pool gate is passed as a **callable**, not a value: it is an
+    import-time constant B11 owns, and a suite that rebinds it on ``main`` must
+    still steer the service (§P1)."""
 
-    A ``vm`` tier pays a cold KubeVirt CDI import + guest boot (minutes) far
-    beyond the sandbox-container default, so VM-backed sessions get a much larger
-    budget; every other tier keeps the fast default. Both are env-tunable. Sized
-    just above the agent's own VM attach-poll budget (``VM_UPGRADE_POLL_TIMEOUT``,
-    900 s) so the agent gives up first with the truthful reason.
-    """
-    if backend == "vm":
-        return int(os.environ.get("VM_WS_READY_TIMEOUT_S", "960"))
-    return int(os.environ.get("WS_READY_TIMEOUT_S", "180"))
+    return session_class_policy.ExecutionLaneDependencies(
+        stateless_session_enabled=lambda: STATELESS_SESSION_ENABLED,
+        container_provisioner=container_provisioner,
+        virtual_workspace_rclone_spec=_virtual_workspace_rclone_spec,
+    )
 
 
-def _is_lite_config_override(config_override: Any) -> bool:
-    """True if ``config_override`` selects a lite (``virtual``/``none``) backend.
-
-    Lite tiers have no git/workspace, so the orchestrator's git-graft lifecycle
-    subjobs (scholar/critic/curator) can neither hand their ``output/`` back to
-    the parent nor read the parent's deliverables — that handoff is entirely
-    Gitea-branch-based (see ``_graft_subjob_output``). They are therefore skipped
-    for lite jobs; the main agent researches/curates inline. A lite-compatible
-    handoff (object-store copy instead of git graft) is deferred to v2
-    (no_workspace_agent_mode.md §8).
-    """
-    return _backend_from_override(config_override) in LITE_BACKENDS
+def _resolve_thread_execution_lane(*args: Any, **kwargs: Any) -> Any:
+    return session_class_policy.resolve_thread_execution_lane(
+        *args, **kwargs, dependencies=_execution_lane_dependencies()
+    )
 
 
-def _resolve_thread_execution_lane(
-    *,
-    workspace_backend: str | None,
-    effective_config: dict[str, Any],
-) -> Literal["pinned", "stateless"]:
-    """Resolve topology-neutral session admission with pinned fallback.
-
-    The public create contract does not expose the execution plane. When the
-    default-off pool gate is enabled, an ordinary supported workspace uses the
-    stateless lane; unsupported infrastructure and pinned-only session classes
-    retain the existing dedicated-agent path.
-    """
-
-    class_refusal = _stateless_session_class_refusal(effective_config)
-    if class_refusal is not None:
-        return "pinned"
-
-    if not STATELESS_SESSION_ENABLED:
-        return "pinned"
-
-    if workspace_backend == "sandbox":
-        if container_provisioner.is_available and container_provisioner.in_cluster:
-            return "stateless"
-        return "pinned"
-
-    if workspace_backend == "virtual":
-        virtual_spec = _virtual_workspace_rclone_spec()
-        if virtual_spec and virtual_spec.get("type") != "memory":
-            return "stateless"
-        return "pinned"
-
-    if workspace_backend == "none":
-        return "stateless"
-
-    return "pinned"
-
-
-def _default_session_workspace_backend(user_settings: dict[str, Any] | None) -> str:
-    """The owner's saved default session tier, else the platform default.
-
-    ``user_settings`` is the ``settings.persistent_agent`` sub-object. Unknown
-    or absent values fall back to the platform default rather than erroring —
-    the PATCH validator (``UserSettingsUpdate``) keeps stored values sane, this
-    just guards legacy/hand-edited rows.
-    """
-    backend = (user_settings or {}).get("workspace_backend")
-    if backend in SESSION_WORKSPACE_BACKENDS:
-        return backend
-    return SESSION_DEFAULT_WORKSPACE_BACKEND
-
-
-def _validated_session_workspace_override(
-    config_override: Any,
-) -> Optional[dict[str, Any]]:
-    """Extract + validate the ``workspace`` sub-dict from a New Session request's
-    ``config_override`` (the cockpit 'Backend' selector + Advanced→Workspace
-    fragment). Returns the workspace dict for ``create_thread`` to merge, or
-    ``None`` when no workspace fragment was sent.
-
-    ``create_thread`` provisions a lite tier (no pod), a sandbox container, or —
-    when the caller explicitly selects it and passes the operator gate — a
-    KubeVirt ``vm`` (see the VM branch in ``create_thread``'s provisioning fork).
-    ``vm`` is accepted here but validated against
-    ``SESSION_CREATE_WORKSPACE_BACKENDS`` (not the default-chain set) so it stays
-    a per-session opt-in; the operator gate (``_check_vm_permission``) and the
-    ``vm_workspace`` PDP grant are enforced downstream in ``create_thread``.
-    Unknown backends are rejected. A workspace fragment with no ``backend`` (e.g.
-    word-limit tweaks only) passes through untouched, and the VM sizing sub-dict
-    (``vm.{cpu_cores,memory}``) rides along via the caller's merge.
-
-    Raises ``HTTPException(400)`` on a disallowed/invalid backend.
-    """
-    ws = config_override.get("workspace") if isinstance(config_override, dict) else None
-    if not isinstance(ws, dict) or not ws:
-        return None
-    backend = ws.get("backend")
-    if backend is not None and backend not in SESSION_CREATE_WORKSPACE_BACKENDS:
-        raise HTTPException(
-            status_code=400, detail=f"Invalid workspace backend '{backend}'"
-        )
-    return ws
+from orchestrator.services.session_workspace_policy import (  # noqa: E402
+    validated_session_workspace_override as _validated_session_workspace_override,
+)
 
 
 # Reasoning-effort vocabulary accepted at session create. The superset across
 # families — the family capability clamps to what the chosen model actually
 # supports at attach (loader._clamp_reasoning_level), so over-asking degrades
 # gracefully; garbage fails loud here instead of being silently dropped.
-_SESSION_REASONING_LEVELS = frozenset({"none", "low", "medium", "high", "xhigh", "max"})
 
 
-def _validated_reasoning_level(value: Any) -> str:
-    level = str(value or "").strip().lower()
-    if level not in _SESSION_REASONING_LEVELS:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"reasoning_level must be one of {sorted(_SESSION_REASONING_LEVELS)}"
-            ),
-        )
-    return level
+from orchestrator.services.session_create_overrides import (  # noqa: E402
+    validated_reasoning_level as _validated_reasoning_level,
+)
 
 
-_SESSION_OFFICER_OVERRIDE_KEYS = frozenset(
-    {
-        "enabled",
-        "sleep_min_minutes",
-        "sleep_max_minutes",
-        "max_concurrent_workers",
-        "max_actions_per_wake",
-        "daily_token_ceiling",
-        "slots",
-        "conference",
-    }
+from orchestrator.services.session_create_overrides import (  # noqa: E402
+    SESSION_OFFICER_OVERRIDE_KEYS as _SESSION_OFFICER_OVERRIDE_KEYS,
 )
 
 # These values authorize unattended work or bound its money spend. They are
 # owned by the durable Officer Post and must never be accepted from the generic
 # session-create/config surfaces. Explicit commission carries them through the
 # non-model-selectable ``_officer_post_config_snapshot`` seam below.
-_OFFICER_POST_OWNED_CREATE_KEYS = frozenset(
-    {"auto_pull", "worker_spend_ceiling_daily", "slots"}
+from orchestrator.services.session_create_overrides import (  # noqa: E402
+    OFFICER_POST_OWNED_CREATE_KEYS as _OFFICER_POST_OWNED_CREATE_KEYS,
 )
 
 
-def _validated_session_officer_override(
-    config_override: Any,
-) -> Optional[dict[str, Any]]:
-    """Extract + validate the ``officer`` sub-dict from a New Session request's
-    ``config_override`` (centurion.md §4/§8).
+from orchestrator.services.session_create_overrides import (  # noqa: E402
+    validated_session_officer_override as _validated_session_officer_override,
+)
 
-    The officer flag MUST land in thread metadata — the orchestrator's officer
-    machinery (watchdog, wake-drain claim, sweeper exemptions, the wake-filing
-    endpoint's 409 gate) is SQL over ``threads.metadata`` and cannot see
-    resolved expert config. ``create_thread`` rebuilds ``config_override``
-    from validated fragments only, so without this validator the officer block
-    is silently dropped (found by the S1 k3d smoke). Admits exactly the known
-    officer keys: ``enabled`` coerced to a real bool, everything else
-    non-negative ints. Auto-pull and spend authority are deliberately absent:
-    they are Post-owned and reach a commissioned runtime only through the
-    server-private snapshot seam. Raises HTTPException(400) on unknown keys or
-    bad types.
-    """
-    officer = (
-        config_override.get("officer") if isinstance(config_override, dict) else None
+
+def _validated_post_owned_officer_create_fragment(*args: Any, **kwargs: Any) -> Any:
+    return session_create_overrides.validated_post_owned_officer_create_fragment(
+        *args, **kwargs, validated_officer_post_patch=_validated_officer_post_patch
     )
-    if not isinstance(officer, dict) or not officer:
-        return None
-    unknown = set(officer) - _SESSION_OFFICER_OVERRIDE_KEYS
-    if unknown:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unknown officer override keys: {sorted(unknown)}",
-        )
-    cleaned: dict[str, Any] = {}
-    if "enabled" in officer:
-        cleaned["enabled"] = officer["enabled"] in (True, "true", "True", 1)
-    if "conference" in officer:
-        # Conference embodiment (centurion.md §2/S9): identity attachment
-        # (charter injection) without officer lifecycle — enabled stays false
-        # on conference threads, so the watchdog/drain never touch them.
-        cleaned["conference"] = officer["conference"] in (True, "true", "True", 1)
-    if "slots" in officer:
-        raw_slots = officer["slots"]
-        if isinstance(raw_slots, dict) and any(
-            isinstance(spec, dict) and "spend_ceiling_daily" in spec
-            for spec in raw_slots.values()
-        ):
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "officer slot spend ceilings are owned by the Officer Post; "
-                    "use the project Officer endpoint"
-                ),
-            )
-        # Typed worker roster (officer_slots.py). Validated hard at provision
-        # so a typo'd kit fails HERE with a 400, not silently at the
-        # officer's first dispatch.
-        from orchestrator.services.officer_slots import validate_slots_spec
-
-        try:
-            cleaned["slots"] = validate_slots_spec(officer["slots"])
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-    for key in sorted(
-        _SESSION_OFFICER_OVERRIDE_KEYS
-        - {
-            "enabled",
-            "slots",
-            "conference",
-        }
-    ):
-        if key in officer:
-            try:
-                cleaned[key] = max(0, int(officer[key]))
-            except (TypeError, ValueError) as exc:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"officer.{key} must be an integer",
-                ) from exc
-    return cleaned or None
 
 
-def _validated_post_owned_officer_create_fragment(
-    snapshot: Any,
-) -> dict[str, Any] | None:
-    """Derive the Post-owned runtime fields from a server-private snapshot.
-
-    ``ThreadCreateRequest._officer_post_config_snapshot`` is a Pydantic
-    ``PrivateAttr`` and therefore cannot be populated by JSON or by a model.
-    Explicit commission sets it only after the owner/release checks and after
-    the durable Post update.  Materialize safe absent values as well so an
-    account/expert default cannot re-introduce unattended or spend authority
-    while the commission request is resolved.
-    """
-    if snapshot is None:
-        return None
-    if not isinstance(snapshot, dict):
-        raise RuntimeError("Officer Post config snapshot must be an object")
-    officer = snapshot.get("officer") or {}
-    if not isinstance(officer, dict):
-        raise HTTPException(status_code=400, detail="Officer Post config is malformed")
-
-    post_body = {
-        key: officer[key] for key in _OFFICER_POST_OWNED_CREATE_KEYS if key in officer
-    }
-    fragment, _policy, _effects = _validated_officer_post_patch(post_body)
-    cleaned = dict(fragment.get("officer") or {})
-    cleaned.setdefault("auto_pull", False)
-    cleaned.setdefault("worker_spend_ceiling_daily", None)
-    cleaned.setdefault("slots", None)
-    return cleaned
+from orchestrator.services.session_create_overrides import (  # noqa: E402
+    effective_officer_post_owned_refusal as _effective_officer_post_owned_refusal,
+)
 
 
-def _effective_officer_post_owned_refusal(effective_config: Any) -> str | None:
-    """Return the Post-owned field inherited by an untrusted Officer create."""
-    if not isinstance(effective_config, dict):
-        return None
-    officer = effective_config.get("officer")
-    if not isinstance(officer, dict):
-        return None
-    if "auto_pull" in officer:
-        auto_pull = officer.get("auto_pull")
-        if type(auto_pull) is not bool or auto_pull:
-            return "auto_pull"
-    if officer.get("worker_spend_ceiling_daily") is not None:
-        return "worker_spend_ceiling_daily"
-    slots = officer.get("slots")
-    if isinstance(slots, dict) and any(
-        isinstance(spec, dict) and "spend_ceiling_daily" in spec
-        for spec in slots.values()
-    ):
-        return "slots.*.spend_ceiling_daily"
-    return None
+from orchestrator.services.session_tool_policy import (  # noqa: E402
+    validated_tool_overrides as _validated_tool_overrides,
+)
 
 
-_SESSION_TOOL_DISABLED_MARKERS = {
-    "orchestrator": "_fleet_management_disabled",
-    "job_control": "_job_control_disabled",
-    "job_inspection": "_job_inspection_disabled",
-    "agent_catalog": "_agent_catalog_disabled",
-    "workflows": "_workflows_disabled",
-    "canvas": "_canvas_disabled",
-}
-
-
-def _validated_tool_overrides(
-    config_override: Any,
-) -> dict[str, list[str]]:
-    """Validate a request's ``tools`` mapping, or 400.
-
-    The one vocabulary for every write boundary — session create, session
-    runtime update, job create.  Every category is checked against the
-    registry, and anything the boundary will not honour is **rejected**, not
-    dropped: the predecessor honoured four hand-curated groups and silently
-    discarded the other eight the New Session form renders, so unticking
-    ``research`` or ``shell`` was accepted and never applied.  Same rationale
-    as ``_validated_reasoning_level`` — garbage fails loud here instead of
-    disappearing.
-
-    This is a shape-and-vocabulary gate.  Capability grants
-    (``_enforce_session_create_grants`` / ``_enforce_job_create_grants``) stay
-    the authorization decision point; nothing here duplicates them.
-    """
-    try:
-        return validate_tool_override_fragment(config_override)
-    except ToolPolicyError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
-def _with_validated_tool_overrides(
-    config_override: dict[str, Any] | None,
-) -> dict[str, Any] | None:
-    """Return ``config_override`` with its ``tools`` mapping validated in place.
-
-    Assignment, not filtering: :func:`_validated_tool_overrides` raises on
-    anything it will not honour, so what comes back covers every category the
-    caller wrote — normalised to the canonical ``list[str]`` the PDP and the
-    loader both read.
-    """
-    if not isinstance(config_override, dict) or "tools" not in config_override:
-        return config_override
-    return {**config_override, "tools": _validated_tool_overrides(config_override)}
+from orchestrator.services.session_tool_policy import (  # noqa: E402
+    with_validated_tool_overrides as _with_validated_tool_overrides,
+)
 
 
 async def _emit_session_provisioning_failure(
@@ -8510,971 +5736,232 @@ async def _provision_commissioned_officer(
         )
 
 
-def _validated_session_fleet_tools_override(
-    config_override: Any,
-) -> Optional[list[str]]:
-    """Extract the New Session Fleet Management tool toggle."""
-    return _validated_tool_overrides(config_override).get("orchestrator")
+from orchestrator.services.virtual_workspace import (  # noqa: E402
+    check_object_store_config as _check_object_store_config,
+)
 
 
-def _fleet_management_explicitly_disabled(
-    config_override: dict[str, Any] | None,
-) -> bool:
-    tools = (config_override or {}).get("tools")
-    return isinstance(tools, dict) and tools.get("orchestrator") == []
+from orchestrator.services.workspace_tier_policy import (  # noqa: E402
+    inject_lite_workspace_config as _inject_lite_workspace_config,
+)
 
 
-def _agent_catalog_explicitly_disabled(
-    config_override: dict[str, Any] | None,
-) -> bool:
-    tools = (config_override or {}).get("tools")
-    return isinstance(tools, dict) and tools.get("agent_catalog") == []
+from orchestrator.services.job_datasource_selection import (  # noqa: E402
+    repository_datasource_names as _repository_datasource_names,
+)
 
 
-def _workflows_explicitly_disabled(
-    config_override: dict[str, Any] | None,
-) -> bool:
-    tools = (config_override or {}).get("tools")
-    return isinstance(tools, dict) and tools.get("workflows") == []
+def _job_datasource_selection_dependencies() -> (
+    job_datasource_selection.JobDatasourceSelectionDependencies
+):
+    """``revalidate_selection`` is deliberately bound to **main's own wrapper**,
+    not to the service function: it is consumed by a *different* function in
+    that module, so this cannot recurse, and binding the service directly would
+    destroy a patch seam live tests use."""
 
-
-def _session_tool_group_disabled_markers(
-    config_override: dict[str, Any] | None,
-) -> dict[str, bool]:
-    tools = (config_override or {}).get("tools")
-    if not isinstance(tools, dict):
-        return {}
-    return {
-        marker: True
-        for group, marker in _SESSION_TOOL_DISABLED_MARKERS.items()
-        if tools.get(group) == []
-    }
-
-
-def _virtual_workspace_rclone_spec() -> Optional[dict[str, Any]]:
-    """The deployment's object-store spec for the ``virtual`` tier, or None.
-
-    Built from env wired by Helm (``virtualWorkspace.*``):
-
-    - ``VIRTUAL_WORKSPACE_RCLONE_TYPE`` — rclone backend (``s3`` or, for a
-      non-durable dev store, ``memory``). Empty ⇒ tier disabled (None).
-    - ``VIRTUAL_WORKSPACE_RCLONE_ROOT`` — bucket or ``bucket/subpath``.
-    - For ``s3``: discrete fields rather than a JSON blob, mirroring the
-      snapshot S3 wiring. ``VIRTUAL_WORKSPACE_S3_ACCESS_KEY_ID`` /
-      ``_SECRET_ACCESS_KEY`` are the (Secret-held) credentials; ``_ENDPOINT`` /
-      ``_REGION`` / ``_PROVIDER`` are non-secret config. Each ``config`` key
-      becomes ``RCLONE_CONFIG_*`` env in the agent, so secrets never reach argv.
-
-    Returns the ``{type, config, root}`` shape the agent's
-    ``object_store_from_spec`` consumes as ``rclone_spec`` (§4/§5). ``config``
-    holds rclone backend key/values; for ``memory`` it is empty.
-    """
-    return _build_virtual_workspace_rclone_spec()
-
-
-def _object_store_startup_warning(
-    env: Optional[Mapping[str, str]] = None,
-) -> Optional[str]:
-    """One consolidated warning when EITHER object-store seam is unconfigured.
-
-    Reads the same env the features read, so it reflects the real resolved
-    config whether the store is external or the chart-bundled Garage:
-    ``S3_ENDPOINT`` (snapshots / suspend-resume / IDE persistence / VM S3
-    extract) and ``VIRTUAL_WORKSPACE_RCLONE_TYPE`` (the virtual/default session
-    tier). Emits one loud line naming whichever seam is degraded: the two
-    almost always point at the SAME store, so a half-configured deployment is
-    usually a mistake, and — with instant-landing making ``virtual`` the
-    default session backend — a snapshots-only config silently breaks the
-    default UX. Returns None only when BOTH seams have a durable store. Replaces
-    the scattered, late per-feature failures (``LiteWorkspaceConfigError`` at
-    dispatch, silent snapshot no-ops) with one signal at startup. See
-    knowledge-history/done/s3_object_store_bundled_fallback.md item 3.
-    """
-    env = os.environ if env is None else env
-    s3_endpoint = (env.get("S3_ENDPOINT") or "").strip()
-    rclone_type = (env.get("VIRTUAL_WORKSPACE_RCLONE_TYPE") or "").strip()
-
-    bullets: list[str] = []
-    if not s3_endpoint:
-        bullets.append(
-            "workspace snapshots + suspend/resume, IDE session persistence, and "
-            "VM-lifecycle S3 extract are disabled (S3_ENDPOINT unset)"
-        )
-    if rclone_type != "s3":
-        if rclone_type == "memory":
-            bullets.append(
-                "virtual/instant sessions run but are NON-DURABLE (in-process "
-                "'memory' store — files vanish on pod restart)"
-            )
-        else:
-            bullets.append(
-                "virtual/instant sessions FAIL at dispatch "
-                "(LiteWorkspaceConfigError) — if your deployment uses them"
-            )
-
-    if not bullets:
-        return None
-
-    return (
-        "Object store not fully configured — "
-        + "; ".join(bullets)
-        + ". Fix: point at an external S3 (S3_ENDPOINT / VIRTUAL_WORKSPACE_S3_*) "
-        "or enable the chart-bundled store (garage.enabled=true). "
-        "See knowledge-history/done/s3_object_store_bundled_fallback.md."
+    return job_datasource_selection.JobDatasourceSelectionDependencies(
+        store=postgres_db,
+        authorize_thread_datasource_selection=_authorize_thread_datasource_selection,
+        backend_from_override=_backend_from_override,
+        revalidate_selection=_revalidate_job_datasource_selection,
     )
 
 
-def _check_object_store_config(
-    env: Optional[Mapping[str, str]] = None,
-) -> Optional[str]:
-    """Warn (return the message) or fail-closed (raise) on an incomplete
-    object-store config.
-
-    Default (``OBJECT_STORE_REQUIRED`` unset/falsey) is warn-only, matching the
-    platform's degrade-open convention. When ``OBJECT_STORE_REQUIRED`` is set
-    (``true``/``1``/``yes``) and either seam lacks a durable store, raises
-    ``RuntimeError`` so the orchestrator refuses to start — crash-looping until
-    the operator fixes it — for deployments that prefer fail-closed over silent
-    degradation. Returns None when both seams have a durable store.
-    """
-    env = os.environ if env is None else env
-    msg = _object_store_startup_warning(env)
-    if msg and (env.get("OBJECT_STORE_REQUIRED") or "").lower().strip() in (
-        "true",
-        "1",
-        "yes",
-    ):
-        raise RuntimeError(
-            msg + " OBJECT_STORE_REQUIRED is set, so the orchestrator refuses "
-            "to start with an incomplete object-store config."
-        )
-    return msg
-
-
-def _inject_lite_workspace_config(
-    config_override: Optional[dict[str, Any]], *, prefix: str
-) -> Optional[dict[str, Any]]:
-    """Enrich ``config_override.workspace`` for the lite tiers (``virtual``/``none``).
-
-    No-op for any other backend. For ``virtual`` it attaches the object-store
-    ``mounts`` (credentials sourced from deployment env and injected *in-flight*
-    only — never persisted to the job/thread row, matching how dispatch keeps
-    API keys inline). For ``none`` it strips any stray mounts. Both force
-    ``git_versioning`` off (§8 — lite tiers have no git).
-
-    ``prefix`` is the object-store key prefix for this owner
-    (``jobs/<id>/`` for jobs, ``threads/<id>/`` for sessions).
-
-    Raises:
-        LiteWorkspaceConfigError: ``virtual`` requested but no object store is
-            configured for this deployment.
-    """
-    backend = _backend_from_override(config_override)
-    if backend not in LITE_BACKENDS:
-        return config_override
-
-    config_override = config_override or {}
-    ws = config_override.setdefault("workspace", {})
-    ws["backend"] = backend
-    ws["git_versioning"] = False
-
-    if backend == "virtual":
-        spec = _virtual_workspace_rclone_spec()
-        if spec is None:
-            raise LiteWorkspaceConfigError(
-                "workspace.backend='virtual' needs an object store, but this "
-                "deployment has none configured. Set virtualWorkspace.rclone.type "
-                "(+ .root) and, for s3, virtualWorkspace.s3.* plus the "
-                "VIRTUAL_WORKSPACE_S3_ACCESS_KEY_ID / _SECRET_ACCESS_KEY secrets "
-                "— or use backend='none' for a no-file-tools agent, or "
-                "'sandbox'/'vm' for a full workspace."
-            )
-        ws["mounts"] = [
-            {
-                "name": "workspace",
-                "rclone_spec": spec,
-                "prefix": prefix,
-                "access": "read_write",
-            }
-        ]
-    else:  # "none" — no file tools, so no object-store mounts
-        ws.pop("mounts", None)
-
-    return config_override
-
-
-def _repository_datasource_names(datasources: Any) -> list[str]:
-    """Names of repository and credential sources requiring a shell workspace.
-
-    Repositories need a clone target and credentials need a command environment;
-    the lite tiers provide neither (§4/§7).
-    Returns a (possibly empty) list of human-readable names for the error.
-    """
-    names: list[str] = []
-    for ds in datasources or []:
-        if not isinstance(ds, dict):
-            continue
-        if (ds.get("type") or "").lower() in {"repository", "credentials"}:
-            names.append(str(ds.get("name") or ds.get("id") or "?"))
-    return names
-
-
-async def _inherit_parent_datasource_ids(
-    *, thread_id: str | None, parent_job_id: str | None
-) -> list[str]:
-    """Datasource IDs a parented subjob inherits when it passes no explicit
-    selection (delegation keeps working without force-attaching anything).
-
-    Prefers the parent thread's persisted selection
-    (``threads.metadata.datasource_ids``), then the parent job's
-    immutable datasource-selection snapshot. Returns [] when neither parent
-    actually exists/yields a selection; database and policy failures propagate.
-    """
-    if thread_id:
-        thread = await postgres_db.get_thread(thread_id)
-        if thread:
-            meta = thread.get("metadata") or {}
-            if isinstance(meta, str):
-                try:
-                    meta = json.loads(meta)
-                except (json.JSONDecodeError, TypeError):
-                    meta = {}
-            # Presence is authoritative, including an explicit empty list.
-            # Falling through on ``[]`` would resurrect the parent job's
-            # connectors and make a deliberate opt-out impossible.
-            if "datasource_ids" in meta:
-                ids = meta.get("datasource_ids") or []
-                return [str(x) for x in ids]
-    if parent_job_id:
-        parent = await postgres_db.get_job(parent_job_id)
-        if parent is None:
-            return []
-        selected, _policy_revisions = await _revalidate_job_datasource_selection(parent)
-        return selected
-    return []
-
-
-async def _filter_implicit_lite_datasource_ids(
-    datasource_ids: list[str], workspace_backend: str | None
-) -> list[str]:
-    """Drop sources requiring a shell from an implicit/default lite selection.
-
-    Explicit selections fail loudly in the central policy service. Inherited
-    and automatic choices are creation-time seeds, so lite tiers keep the
-    usable connectors while omitting repositories and credential environments.
-    Missing IDs remain in the list and therefore still fail closed when the
-    complete set is authorized.
-    """
-    if workspace_backend not in LITE_BACKENDS or not datasource_ids:
-        return datasource_ids
-    rows = await postgres_db.get_datasource_policy_rows(datasource_ids)
-    repositories = {
-        str(row["id"])
-        for row in rows
-        if str(row.get("type") or "").lower() in {"repository", "credentials"}
-    }
-    return [value for value in datasource_ids if str(value) not in repositories]
-
-
-async def _datasource_selection_provenance(
-    *,
-    datasource_ids: list[str],
-    policy_revisions: dict[str, int],
-    origin: str,
-    effective_work_owner_id: str | None,
-    actor: dict[str, Any] | None,
-    project_ids: list[str],
-    creation_path: str,
-) -> dict[str, Any]:
-    """Build the credential-free audit stamp materialized with work."""
-    return {
-        "origin": origin,
-        "creation_path": creation_path,
-        "effective_work_owner_id": effective_work_owner_id,
-        "initiating_actor_id": str(actor.get("id"))
-        if actor and actor.get("id")
-        else None,
-        "project_ids": list(project_ids),
-        "datasource_ids": list(datasource_ids),
-        "policy_revisions": dict(policy_revisions),
-        "materialized_at": datetime.now(timezone.utc).isoformat(),
-    }
-
-
-async def _revalidate_job_datasource_selection(
-    job: dict[str, Any],
-) -> tuple[list[str], dict[str, int]]:
-    """Reauthorize a job and return the exact connector policy snapshot."""
-    job_id = str(job["id"])
-    selected = await postgres_db.list_job_datasource_ids(job_id)
-    job_context = job.get("context") or {}
-    if isinstance(job_context, str):
-        try:
-            job_context = json.loads(job_context)
-        except (json.JSONDecodeError, TypeError) as exc:
-            raise HTTPException(
-                status_code=403,
-                detail="One or more selected connectors are unavailable",
-            ) from exc
-    materialized = (
-        job_context.get("datasource_selection")
-        if isinstance(job_context, dict)
-        else None
-    )
-    raw_ids = None
-    if isinstance(materialized, dict):
-        # ``datasource_ids`` is the shipped provenance key.  Accept the
-        # feature-document name too so both writers share the same immutable
-        # materialization contract during rollout.
-        raw_ids = materialized.get("selected_ids", materialized.get("datasource_ids"))
-    try:
-        if not isinstance(raw_ids, list):
-            raise ValueError
-        snapshot_ids = [str(UUID(str(value))) for value in raw_ids]
-        junction_ids = [str(UUID(str(value))) for value in selected]
-        if len(snapshot_ids) != len(set(snapshot_ids)):
-            raise ValueError
-    except (TypeError, ValueError) as exc:
-        raise HTTPException(
-            status_code=403,
-            detail="One or more selected connectors are unavailable",
-        ) from exc
-    if set(snapshot_ids) != set(junction_ids) or len(snapshot_ids) != len(junction_ids):
-        raise HTTPException(
-            status_code=403,
-            detail="One or more selected connectors are unavailable",
-        )
-    selected = snapshot_ids
-    owner_id = str(job["user_id"]) if job.get("user_id") else None
-    actor = await postgres_db.get_user(owner_id) if owner_id else None
-    config_override = job.get("config_override") or {}
-    if isinstance(config_override, str):
-        try:
-            config_override = json.loads(config_override)
-        except (json.JSONDecodeError, TypeError):
-            config_override = {}
-    return await _authorize_thread_datasource_selection(
-        actor,
-        selected,
-        workspace_backend=_backend_from_override(config_override),
-        target_project_ids=([str(job["project_id"])] if job.get("project_id") else []),
-        effective_work_owner_id=owner_id,
-        trusted_system_inheritance=owner_id is None,
-        legacy_job_id=job_id,
+async def _inherit_parent_datasource_ids(*args: Any, **kwargs: Any) -> Any:
+    return await job_datasource_selection.inherit_parent_datasource_ids(
+        *args, **kwargs, dependencies=_job_datasource_selection_dependencies()
     )
 
 
-def _require_exact_datasource_resolution(
-    selected_ids: list[str],
-    policy_revisions: dict[str, int],
-    resolved: list[dict[str, Any]] | None,
-) -> list[dict[str, Any]]:
-    """Fail closed unless resolution matches the authorized snapshot exactly.
-
-    This is the last gate before credential payload construction.  A deleted
-    connector, a revision change, duplicate resolver rows, or any silent
-    reduction is one unavailable data contract rather than a partial attach.
-    """
-    unavailable = HTTPException(
-        status_code=403,
-        detail="One or more selected connectors are unavailable",
+async def _filter_implicit_lite_datasource_ids(*args: Any, **kwargs: Any) -> Any:
+    return await job_datasource_selection.filter_implicit_lite_datasource_ids(
+        *args, **kwargs, dependencies=_job_datasource_selection_dependencies()
     )
-    try:
-        expected_ids = [str(UUID(str(value))) for value in selected_ids]
-        expected_revisions = {
-            str(UUID(str(datasource_id))): int(revision)
-            for datasource_id, revision in policy_revisions.items()
-        }
-        rows = list(resolved or [])
-        actual_ids = [str(UUID(str(row["id"]))) for row in rows]
-        actual_revisions = {
-            str(UUID(str(row["id"]))): int(row.get("policy_revision") or 0)
-            for row in rows
-        }
-    except (KeyError, TypeError, ValueError) as exc:
-        raise unavailable from exc
-
-    if (
-        len(expected_ids) != len(set(expected_ids))
-        or len(actual_ids) != len(set(actual_ids))
-        or len(rows) != len(expected_ids)
-        or set(actual_ids) != set(expected_ids)
-        or set(expected_revisions) != set(expected_ids)
-        or actual_revisions != expected_revisions
-    ):
-        raise unavailable
-    return rows
 
 
-async def _resolve_authorized_job_datasources(
-    job: dict[str, Any],
-) -> list[dict[str, Any]]:
-    """Authorize and exactly resolve a job's immutable connector snapshot."""
-    selected, policy_revisions = await _revalidate_job_datasource_selection(job)
-    resolved = await postgres_db.resolve_datasources_for_job(
-        str(job["id"]),
-        project_id=(str(job["project_id"]) if job.get("project_id") else None),
+from orchestrator.services.job_datasource_selection import (  # noqa: E402
+    datasource_selection_provenance as _datasource_selection_provenance,
+)
+
+
+async def _revalidate_job_datasource_selection(*args: Any, **kwargs: Any) -> Any:
+    return await job_datasource_selection.revalidate_job_datasource_selection(
+        *args, **kwargs, dependencies=_job_datasource_selection_dependencies()
     )
-    return _require_exact_datasource_resolution(selected, policy_revisions, resolved)
 
 
-async def _revalidate_job_datasource_ids(job: dict[str, Any]) -> list[str]:
-    """Reauthorize a job's materialized set before credential delivery."""
-    selected, _revisions = await _revalidate_job_datasource_selection(job)
-    return selected
+from orchestrator.services.job_datasource_selection import (  # noqa: E402
+    require_exact_datasource_resolution as _require_exact_datasource_resolution,
+)
 
 
-def _job_needs_vm(job: dict) -> bool:
-    """Whether the authoritative contract assigns the VM tier."""
-
-    try:
-        return resolve_workspace_contract(job).assigned_backend == "vm"
-    except WorkspaceContractError:
-        # Malformed/ambiguous jobs are refused by the bundle resolver. Never
-        # guess a tier here merely because one runtime happens to be ready.
-        return False
+async def _resolve_authorized_job_datasources(*args: Any, **kwargs: Any) -> Any:
+    return await job_datasource_selection.resolve_authorized_job_datasources(
+        *args, **kwargs, dependencies=_job_datasource_selection_dependencies()
+    )
 
 
-def _get_vm_context(job: dict) -> dict:
-    """Extract the vm sub-dict from job context."""
-    ctx = job.get("context") or {}
-    if isinstance(ctx, str):
-        try:
-            ctx = json.loads(ctx)
-        except (json.JSONDecodeError, TypeError):
-            ctx = {}
-    return ctx.get("vm", {})
+async def _revalidate_job_datasource_ids(*args: Any, **kwargs: Any) -> Any:
+    return await job_datasource_selection.revalidate_job_datasource_ids(
+        *args, **kwargs, dependencies=_job_datasource_selection_dependencies()
+    )
 
 
-def _get_infra_transient_context(job: dict) -> dict:
-    """Extract the infra_transient sub-dict from job context.
-
-    The attempt counter lives in ``context``, NOT in ``freeze_data``: the
-    sweeper clears ``freeze_data`` to make the job dispatchable again, so a
-    counter kept there would reset to zero on every retry and the give-up
-    ceiling would never be reached. Mirrors ``context.llm_outage``.
-    """
-    ctx = job.get("context") or {}
-    if isinstance(ctx, str):
-        try:
-            ctx = json.loads(ctx)
-        except (json.JSONDecodeError, TypeError):
-            ctx = {}
-    value = ctx.get("infra_transient")
-    return value if isinstance(value, dict) else {}
+from orchestrator.services.job_workspace_runtime import job_needs_vm as _job_needs_vm  # noqa: E402
 
 
-async def _fail_vm_parked_job(job_id: str, vm_error: str) -> None:
-    """Fail a job whose VM provisioning parked terminally.
+from orchestrator.services.job_workspace_runtime import (  # noqa: E402
+    get_vm_context as _get_vm_context,
+)
 
-    A parked VM context alone leaves the job in 'created' with nothing
-    scheduled to ever change its state — an invisible wedge that stalls any
-    loop whose current_job never turns terminal. Failing the job makes the
-    park visible (cockpit/API) and lets loop failure handling advance. See
-    knowledge-base/knowledge/issues/vm_ssh_readiness_probe_unroutable_from_orchestrator.md.
-    """
-    await postgres_db.update_job_status(
-        job_id,
-        status="failed",
-        error_message=(
-            f"VM provisioning failed: {vm_error}. "
-            "To retry, clear context.vm and re-queue the job."
+
+from orchestrator.services.job_workspace_runtime import (  # noqa: E402
+    get_infra_transient_context as _get_infra_transient_context,
+)
+
+
+def _job_workspace_runtime_dependencies() -> (
+    job_workspace_runtime.JobWorkspaceRuntimeDependencies
+):
+    """``vm_mode`` and the worker gate are **callables** — one is a provisioner
+    attribute that changes at runtime, the other an import-time B11 flag."""
+
+    return job_workspace_runtime.JobWorkspaceRuntimeDependencies(
+        store=postgres_db,
+        vm_mode=lambda: vm_provisioner.mode,
+        workspace_provisioner=container_provisioner,
+        vm_workspaces_on_pod_network=vm_workspaces_on_pod_network,
+        stateless_worker_enabled=lambda: STATELESS_WORKER_ENABLED,
+        backend_from_override=_backend_from_override,
+    )
+
+
+async def _fail_vm_parked_job(*args: Any, **kwargs: Any) -> Any:
+    return await job_workspace_runtime.fail_vm_parked_job(
+        *args, **kwargs, dependencies=_job_workspace_runtime_dependencies()
+    )
+
+
+def _job_needs_sandbox(*args: Any, **kwargs: Any) -> Any:
+    return job_workspace_runtime.job_needs_sandbox(
+        *args, **kwargs, dependencies=_job_workspace_runtime_dependencies()
+    )
+
+
+def _resolve_requested_job_execution_lane(*args: Any, **kwargs: Any) -> Any:
+    return job_workspace_runtime.resolve_requested_job_execution_lane(
+        *args, **kwargs, dependencies=_job_workspace_runtime_dependencies()
+    )
+
+
+from orchestrator.services.job_workspace_runtime import (  # noqa: E402
+    get_container_context as _get_container_context,
+)
+
+
+from orchestrator.services.job_workspace_runtime import (  # noqa: E402
+    stateless_worker_workspace_owner as _stateless_worker_workspace_owner,
+)
+
+
+def _job_workspace_authority_dependencies() -> (
+    job_workspace_authority.JobWorkspaceAuthorityDependencies
+):
+    """Four fields are bound to **main's own wrappers** on purpose:
+    ``resolve_inherited_workspace``, ``fail_subjob_and_unblock_parent`` and
+    ``workspace_runtime_unchanged_before_delivery`` are each consumed by a
+    *different* function in that module, and `test_pinned_job_recipient.py`
+    patches the last of them on ``main`` and then calls a sibling directly."""
+
+    return job_workspace_authority.JobWorkspaceAuthorityDependencies(
+        store=postgres_db,
+        logger=logger,
+        workspace_provisioner=container_provisioner,
+        vm_provisioner=vm_provisioner,
+        vm_mode=lambda: vm_provisioner.mode,
+        ensure_workspace=ensure_session_workspace,
+        workspace_suspension=workspace_suspension_service,
+        handle_scholar_completion=_handle_scholar_completion,
+        handle_delegation_child_completion=_handle_delegation_child_completion,
+        resolve_inherited_workspace=_resolve_subjob_inherited_workspace,
+        fail_subjob_and_unblock_parent=_fail_subjob_and_unblock_parent,
+        workspace_runtime_unchanged_before_delivery=(
+            _workspace_runtime_unchanged_before_delivery
         ),
     )
 
 
-def _job_needs_sandbox(job: dict) -> bool:
-    """Check if a job needs a sandbox workspace container.
-
-    Returns True if:
-    - config_override.workspace.backend == "sandbox" (or legacy "container"), OR
-    - backend is not explicitly set to "vm" AND a workspace
-      provisioner is available (k8s ContainerProvisioner OR DockerProvisioner).
-
-    Returns False if the job already has a ready VM or container inherited
-    from a parent job (worktree sharing — no new container needed).
-    """
-    try:
-        contract = resolve_workspace_contract(job)
-    except WorkspaceContractError:
-        return False
-    if contract.assigned_backend != "sandbox":
-        return False
-    decision = resolve_workspace_runtime(job, vm_mode=vm_provisioner.mode)
-    # An opposite-tier VM must never suppress sandbox provisioning.
-    return decision.effective_backend != "sandbox"
-
-
-def _resolve_requested_job_execution_lane(
-    requested_lane: Literal["pinned", "stateless"] | None,
-    *,
-    default_stateless: bool,
-    needs_vm: bool,
-    needs_sandbox: bool,
-) -> Literal["pinned", "stateless"] | None:
-    """Apply the default-off, pod-network-workspace worker admission gate.
-
-    ``None`` is preserved unless a capable omitted root opts into defaulting,
-    so Postgres can still distinguish authoritative child-lane inheritance.
-    """
-    same_cluster_vm = needs_vm and vm_workspaces_on_pod_network()
-    if needs_vm and not same_cluster_vm:
-        # External VMs still require the registered agent's mesh sidecar. The
-        # shared executor Deployment deliberately has no tailnet identity.
-        return "pinned"
-    if requested_lane is None and default_stateless:
-        if STATELESS_WORKER_ENABLED and (
-            same_cluster_vm
-            or (
-                container_provisioner.is_available
-                and container_provisioner.in_cluster
-                and needs_sandbox
-            )
-        ):
-            return "stateless"
-        return None
-    if requested_lane != "stateless":
-        return requested_lane
-    if not STATELESS_WORKER_ENABLED:
-        raise HTTPException(
-            status_code=409, detail="Stateless worker admission is disabled"
-        )
-    if not same_cluster_vm and not (
-        container_provisioner.is_available and container_provisioner.in_cluster
-    ):
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Stateless workers require an in-cluster Kubernetes "
-                "workspace provisioner"
-            ),
-        )
-    if not (needs_sandbox or same_cluster_vm):
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "Stateless workers currently require a Kubernetes sandbox or "
-                "same-cluster VM workspace"
-            ),
-        )
-    return "stateless"
-
-
-def _get_container_context(job: dict) -> dict:
-    """Extract the workspace_container sub-dict from job context."""
-    ctx = job.get("context") or {}
-    if isinstance(ctx, str):
-        try:
-            ctx = json.loads(ctx)
-        except (json.JSONDecodeError, TypeError):
-            ctx = {}
-    return ctx.get("workspace_container", {})
-
-
-def _stateless_worker_workspace_owner(job: dict) -> WorkspaceOwner:
-    """Resolve whose Kubernetes workspace a stateless worker must attest."""
-
-    ctx = job.get("context") or {}
-    if isinstance(ctx, str):
-        try:
-            ctx = json.loads(ctx)
-        except (json.JSONDecodeError, TypeError):
-            ctx = {}
-    parent_id = job.get("parent_job_id")
-    if parent_id and ctx.get("inherits_parent_workspace"):
-        return WorkspaceOwner.job(str(parent_id))
-    return WorkspaceOwner.job(str(job["id"]))
-
-
-@dataclass(frozen=True, slots=True)
-class _PinnedK8sJobWorkspaceAuthority:
-    """One exact server-attested Kubernetes workspace delivery tuple."""
-
-    owner: WorkspaceOwner
-    attestation: WorkspaceRuntimeAttestation
-
-
-async def _attest_pinned_k8s_job_workspace(
-    job: dict[str, Any],
-) -> tuple[dict[str, Any], _PinnedK8sJobWorkspaceAuthority | None]:
-    """Replace a pinned job's Kubernetes endpoint with a fresh attestation."""
-
-    decision = resolve_workspace_runtime(job, vm_mode=vm_provisioner.mode)
-    if not decision.ready or decision.effective_backend != "sandbox":
-        return job, None
-    workspace = _get_container_context(job)
-    provisioner = str(workspace.get("provisioner") or "").strip().lower()
-    if provisioner == "docker":
-        return job, None
-    if provisioner != "k8s":
-        raise WorkspaceRuntimeAuthorityError(
-            "sandbox workspace provisioner authority is unavailable"
-        )
-    try:
-        expected_runtime = str(
-            UUID(str(workspace.get(WORKSPACE_RUNTIME_INCARNATION_KEY)))
-        )
-        stored_port = int(workspace.get("port") or 30022)
-    except (TypeError, ValueError) as exc:
-        raise WorkspaceRuntimeAuthorityError(
-            "sandbox workspace runtime authority is malformed"
-        ) from exc
-
-    owner = _stateless_worker_workspace_owner(job)
-    attestation = await container_provisioner.attest_workspace_runtime(owner)
-    if attestation.runtime_incarnation != expected_runtime:
-        raise WorkspaceRuntimeAuthorityError(
-            "sandbox workspace runtime changed before delivery"
-        )
-    stored_host = workspace.get("host")
-    stored_ip = workspace.get("pod_ip")
-    if (
-        (stored_host and str(stored_host) != attestation.host)
-        or (stored_ip and str(stored_ip) != attestation.pod_ip)
-        or stored_port != attestation.port
-    ):
-        raise WorkspaceRuntimeAuthorityError(
-            "sandbox workspace endpoint changed before delivery"
-        )
-
-    exact_workspace = copy.deepcopy(workspace)
-    exact_workspace.update(
-        {
-            "status": "ready",
-            "provisioner": "k8s",
-            "host": attestation.host,
-            "pod_ip": attestation.pod_ip,
-            "port": attestation.port,
-            WORKSPACE_RUNTIME_INCARNATION_KEY: attestation.runtime_incarnation,
-        }
+async def _attest_pinned_k8s_job_workspace(*args: Any, **kwargs: Any) -> Any:
+    return await job_workspace_authority.attest_pinned_k8s_job_workspace(
+        *args, **kwargs, dependencies=_job_workspace_authority_dependencies()
     )
-    context = job.get("context") or {}
-    if isinstance(context, str):
-        try:
-            context = json.loads(context)
-        except (json.JSONDecodeError, TypeError) as exc:
-            raise WorkspaceRuntimeAuthorityError(
-                "sandbox workspace context is malformed"
-            ) from exc
-    if not isinstance(context, Mapping):
-        raise WorkspaceRuntimeAuthorityError("sandbox workspace context is malformed")
-    exact_job = copy.deepcopy(job)
-    exact_context = copy.deepcopy(dict(context))
-    exact_context["workspace_container"] = exact_workspace
-    exact_job["context"] = exact_context
-    return exact_job, _PinnedK8sJobWorkspaceAuthority(owner, attestation)
 
 
 async def _pinned_k8s_job_workspace_authority_is_current(
-    durable_job: dict[str, Any],
-    authority: _PinnedK8sJobWorkspaceAuthority | None,
-) -> bool:
-    """Revalidate the exact workspace tuple at the final network boundary."""
-
-    if not await _workspace_runtime_unchanged_before_delivery(durable_job):
-        return False
-    if authority is None:
-        return True
-    try:
-        latest = await postgres_db.get_job(str(durable_job["id"]))
-        if latest is None:
-            return False
-        expected_owner = _stateless_worker_workspace_owner(latest)
-        if expected_owner != authority.owner:
-            return False
-        confirmed = await container_provisioner.attest_workspace_runtime(expected_owner)
-        return confirmed == authority.attestation
-    except Exception:
-        return False
-
-
-async def _attest_stateless_worker_workspace(
-    owner: WorkspaceOwner,
-) -> WorkspaceRuntimeAttestation:
-    """Return one exact worker workspace identity or a generic claim refusal."""
-
-    try:
-        return await container_provisioner.attest_workspace_runtime(owner)
-    except WorkspaceRuntimeAuthorityError as exc:
-        logger.warning(
-            "Stateless worker workspace attestation refused for %s %s: %s",
-            owner.kind,
-            owner.id,
-            exc,
-        )
-    except Exception as exc:
-        logger.warning(
-            "Stateless worker workspace attestation failed for %s %s: %s",
-            owner.kind,
-            owner.id,
-            exc,
-            exc_info=True,
-        )
-    raise HTTPException(
-        status_code=409,
-        detail="Stateless worker workspace authority unavailable",
+    *args: Any, **kwargs: Any
+) -> Any:
+    return await job_workspace_authority.pinned_k8s_job_workspace_authority_is_current(
+        *args, **kwargs, dependencies=_job_workspace_authority_dependencies()
     )
 
 
-async def _attest_stateless_worker_vm_workspace(
-    owner: WorkspaceOwner,
-) -> WorkspaceRuntimeAttestation:
-    """Return one exact same-cluster VM identity or a generic refusal."""
-
-    try:
-        if owner.kind != "job":
-            raise WorkspaceRuntimeAuthorityError(
-                "stateless worker VM owner is not a job"
-            )
-        return await vm_provisioner.attest_workspace_runtime(owner.id)
-    except WorkspaceRuntimeAuthorityError as exc:
-        logger.warning(
-            "Stateless worker VM workspace attestation refused for %s %s: %s",
-            owner.kind,
-            owner.id,
-            exc,
-        )
-    except Exception as exc:
-        logger.warning(
-            "Stateless worker VM workspace attestation failed for %s %s: %s",
-            owner.kind,
-            owner.id,
-            exc,
-            exc_info=True,
-        )
-    raise HTTPException(
-        status_code=409,
-        detail="Stateless worker workspace authority unavailable",
+async def _attest_stateless_worker_workspace(*args: Any, **kwargs: Any) -> Any:
+    return await job_workspace_authority.attest_stateless_worker_workspace(
+        *args, **kwargs, dependencies=_job_workspace_authority_dependencies()
     )
 
 
-def _container_ssh_key_path(container_ctx: dict) -> str:
-    """Resolve the private-key path shipped to a managed sandbox worker.
-
-    The key itself is never persisted in job state. The path must therefore be
-    reconstructed on every start and resume, using the same rules in both
-    paths. Docker and Kubernetes mount the shared key at different defaults.
-    """
-    override = os.environ.get("SSH_KEY_PATH", "").strip()
-    if override:
-        return override
-    if container_ctx.get("provisioner") == "docker":
-        return "/run/secrets/ssh/id_ed25519"
-    return "/run/secrets/vm-ssh-key"
-
-
-def _inject_container_workspace_config(
-    config_override: dict | None,
-    container_ctx: dict,
-    *,
-    replace_endpoint: bool = False,
-) -> dict:
-    """Inject a complete managed-sandbox SSH configuration.
-
-    ``replace_endpoint`` is used on resume because a recreated pod may have a
-    new address. Managed username/key fields are always refreshed because they
-    are in-flight deployment configuration and are deliberately not written
-    back to ``jobs.config_override``.
-    """
-    container_host = container_ctx.get("host") or container_ctx.get("pod_ip")
-    if container_ctx.get("status") != "ready" or not container_host:
-        return config_override or {}
-
-    config_override = config_override or {}
-    workspace = config_override.setdefault("workspace", {})
-    workspace["backend"] = "sandbox"
-    remote = workspace.setdefault("remote", {})
-
-    if replace_endpoint or not remote.get("host"):
-        remote["host"] = container_host
-    if replace_endpoint or not remote.get("port"):
-        remote["port"] = container_ctx.get("port", 22)
-    # These are properties of the orchestrator-managed sandbox image and agent
-    # deployment, not user/job settings. Always refresh them so a stale
-    # persisted remote block cannot point a resumed worker at an obsolete mount.
-    remote["username"] = "agent-host"
-    remote["key_path"] = _container_ssh_key_path(container_ctx)
-    if not remote.get("workspace_path"):
-        remote["workspace_path"] = "/home/agent-host/workspace"
-
-    # Managed sandboxes freeze on sudo so an operator can approve a VM upgrade.
-    config_override.setdefault("shell", {}).setdefault("sudo_action", "freeze")
-    return config_override
-
-
-def _inject_vm_workspace_config(
-    config_override: dict | None,
-    vm_ctx: dict,
-    *,
-    replace_endpoint: bool = False,
-) -> dict:
-    """Inject only the authoritative VM endpoint into a worker config."""
-
-    if vm_ctx.get("status") != "ready" or not vm_ctx.get("ssh_host"):
-        return config_override or {}
-    config_override = config_override or {}
-    workspace = config_override.setdefault("workspace", {})
-    workspace["backend"] = "vm"
-    remote = workspace.setdefault("remote", {})
-    if replace_endpoint or not remote.get("host"):
-        remote["host"] = vm_ctx["ssh_host"]
-    if replace_endpoint or not remote.get("port"):
-        remote["port"] = vm_ctx.get("ssh_port", 22)
-    remote.setdefault("username", "agent-host")
-    remote.setdefault("key_path", "/run/secrets/vm-ssh-key")
-    remote.setdefault("workspace_path", "/home/agent-host/workspace")
-    remote.setdefault(
-        "connect_timeout", int(os.environ.get("VM_REMOTE_CONNECT_TIMEOUT_S", "10"))
+async def _attest_stateless_worker_vm_workspace(*args: Any, **kwargs: Any) -> Any:
+    return await job_workspace_authority.attest_stateless_worker_vm_workspace(
+        *args, **kwargs, dependencies=_job_workspace_authority_dependencies()
     )
-    remote.setdefault(
-        "max_retries", int(os.environ.get("VM_REMOTE_CONNECT_MAX_RETRIES", "6"))
+
+
+from orchestrator.services.job_workspace_runtime import (  # noqa: E402
+    inject_container_workspace_config as _inject_container_workspace_config,
+)
+
+
+from orchestrator.services.job_workspace_runtime import (  # noqa: E402
+    inject_vm_workspace_config as _inject_vm_workspace_config,
+)
+
+
+def _inject_matching_workspace_config(*args: Any, **kwargs: Any) -> Any:
+    return job_workspace_runtime.inject_matching_workspace_config(
+        *args, **kwargs, dependencies=_job_workspace_runtime_dependencies()
     )
-    remote.setdefault("retry_timeouts_as_booting", True)
-    config_override.setdefault("shell", {})["sudo_action"] = "allow"
-    return config_override
 
 
-def _inject_matching_workspace_config(
-    job: Mapping[str, Any],
-    config_override: dict | None,
-    *,
-    replace_endpoint: bool = False,
-) -> tuple[dict, Any]:
-    """Apply exactly one runtime selected by the server-owned tier contract."""
-
-    decision = resolve_workspace_runtime(job, vm_mode=vm_provisioner.mode)
-    config = copy.deepcopy(config_override or {})
-    if not decision.ready:
-        return config, decision
-    if decision.effective_backend == "vm":
-        config = _inject_vm_workspace_config(
-            config,
-            _get_vm_context(dict(job)),
-            replace_endpoint=replace_endpoint,
-        )
-    elif decision.effective_backend == "sandbox":
-        config = _inject_container_workspace_config(
-            config,
-            _get_container_context(dict(job)),
-            replace_endpoint=replace_endpoint,
-        )
-    return config, decision
-
-
-async def _workspace_runtime_unchanged_before_delivery(job: dict[str, Any]) -> bool:
-    """Recheck the selected runtime after slow bundle assembly.
-
-    Provisioner callbacks can race config/model/credential resolution.  Refetch
-    the durable job at the last network boundary and require the exact selected
-    runtime authority to match what the bundle was built from.  Opposite-tier
-    residue is deliberately excluded from the digest, so it is observable but
-    can neither block nor replace the assigned runtime.
-    """
-
-    expected = workspace_runtime_authority_digest(job, vm_mode=vm_provisioner.mode)
-    if expected is None:
-        return False
-    fresh = await postgres_db.get_job(str(job["id"]))
-    if fresh is None:
-        return False
-    context = fresh.get("context") or {}
-    if isinstance(context, str):
-        try:
-            context = json.loads(context)
-        except (json.JSONDecodeError, TypeError):
-            return False
-    if isinstance(context, dict) and context.get("inherits_parent_workspace"):
-        action, _reason = await _resolve_subjob_inherited_workspace(fresh)
-        if action != "proceed":
-            return False
-    if (
-        workspace_runtime_authority_digest(fresh, vm_mode=vm_provisioner.mode)
-        != expected
-    ):
-        return False
-    return await verify_adopted_k8s_runtime_before_delivery(
-        postgres_db, container_provisioner, fresh
+async def _workspace_runtime_unchanged_before_delivery(
+    *args: Any, **kwargs: Any
+) -> Any:
+    return await job_workspace_authority.workspace_runtime_unchanged_before_delivery(
+        *args, **kwargs, dependencies=_job_workspace_authority_dependencies()
     )
 
 
 # Job context key holding each remote tier's live workspace, by tier name.
-_WORKSPACE_CONTEXT_KEYS = {"vm": "vm", "sandbox": "workspace_container"}
+from orchestrator.services.job_workspace_runtime import (  # noqa: E402
+    WORKSPACE_CONTEXT_KEYS as _WORKSPACE_CONTEXT_KEYS,
+)
 
 
-def _resume_missing_workspace(job: dict) -> Optional[str]:
-    """Which remote workspace a resume would ship without an address, if any.
-
-    Returns ``'vm'`` / ``'sandbox'`` when the job's backend needs a remote
-    workspace but its context holds no live one, else ``None``.
-
-    ``_resume_job_on_agent`` injects ``workspace.remote`` only when the context
-    says the workspace is ready, and neither of its two injection blocks has an
-    else. So resuming a job whose workspace never came up — or was reaped —
-    silently skips injection while config_override still names the backend, and
-    the agent dies at ``init_workspace`` with "no workspace.remote config was
-    provided" (src/agent.py:1896). Job 4435994d hit exactly this.
-
-    Nothing in the resume path provisions; only the dispatcher does. So callers
-    must hand such a job to the dispatcher rather than push it at an agent.
-    This is the resume-side sibling of the dispatch backstop in
-    ``_dispatch_job_to_agent``, which *fails* the job instead — correct there,
-    because the dispatcher was supposed to have resolved the workspace already,
-    but wrong here: an explicit Resume means "re-provision it".
-
-    Uses the same ``_job_needs_vm`` / ``_job_needs_sandbox`` predicates the
-    dispatcher uses to decide what to provision, so resume and dispatch agree
-    on what a job needs. Keep the readiness conditions in step with the two
-    injection blocks in ``_resume_job_on_agent``.
-    """
-
-    try:
-        contract = resolve_workspace_contract(job)
-    except WorkspaceContractError:
-        # No tier can be shed safely when authority itself is ambiguous. The
-        # shared bundle resolver will refuse it rather than choosing one.
-        return None
-    if contract.assigned_backend in LITE_BACKENDS:
-        return None
-    decision = resolve_workspace_runtime(job, vm_mode=vm_provisioner.mode)
-    return None if decision.ready else contract.assigned_backend
+def _resume_missing_workspace(*args: Any, **kwargs: Any) -> Any:
+    return job_workspace_runtime.resume_missing_workspace(
+        *args, **kwargs, dependencies=_job_workspace_runtime_dependencies()
+    )
 
 
-def _scholar_provision_parent_id(job: dict) -> str | None:
-    """Parent id a provisioning-scholar subjob should provision the shared,
-    parent-owned workspace under, or None for a normal job.
-
-    A scholar spawned before its parent had any workspace carries
-    ``context.provisions_parent_workspace = <parentId>`` (stamped by
-    ``_spawn_scholar_subjob``). It provisions the ONE pod ``workspace-<parentId>``
-    under the parent's identity and rides it, rather than self-provisioning a
-    throwaway pod (Phase 1,
-    knowledge-base/knowledge/issues/scholar_selfprovisioned_workspace_misclassified_as_inherited.md).
-    """
-    ctx = job.get("context") or {}
-    if isinstance(ctx, str):
-        try:
-            ctx = json.loads(ctx)
-        except (json.JSONDecodeError, ValueError):
-            return None
-    pid = ctx.get("provisions_parent_workspace")
-    return str(pid) if pid else None
+from orchestrator.services.job_workspace_runtime import (  # noqa: E402
+    scholar_provision_parent_id as _scholar_provision_parent_id,
+)
 
 
-def _scholar_should_provision_parent_container(config_override: Any) -> bool:
-    """True if a scholar spawned with no parent workspace should provision the
-    parent's SHARED container workspace (Phase 1) rather than self-provision.
-
-    Backend gate only: container/sandbox (or unset → default sandbox) qualifies;
-    VM/remote and lite (virtual/none) parents keep today's behavior. The dispatch
-    seam additionally enforces a k8s in-cluster provisioner before acting on the
-    marker, so a non-k8s deployment falls through to the self-provision path.
-    """
-    backend = _backend_from_override(config_override)
-    if backend in ("vm", "remote"):
-        return False
-    if backend in LITE_BACKENDS:
-        return False
-    return True
+def _scholar_should_provision_parent_container(*args: Any, **kwargs: Any) -> Any:
+    return job_workspace_runtime.scholar_should_provision_parent_container(
+        *args, **kwargs, dependencies=_job_workspace_runtime_dependencies()
+    )
 
 
 # Bounded wait for a subjob to inherit its parent's provisioned workspace.
@@ -9482,474 +5969,35 @@ def _scholar_should_provision_parent_container(config_override: Any) -> bool:
 # spawned (a scholar is created ~3s after its parent, mid-provisioning), so we
 # resolve from the parent's live row every dispatch tick. This bounds how long
 # we wait before giving up with a diagnosable failure instead of stranding the job.
-_INHERIT_WORKSPACE_MAX_WAIT_S = int(
-    os.environ.get("WORKSPACE_INHERIT_MAX_WAIT_S", "600")
+
+
+async def _resolve_subjob_inherited_workspace(*args: Any, **kwargs: Any) -> Any:
+    return await job_workspace_authority.resolve_subjob_inherited_workspace(
+        *args, **kwargs, dependencies=_job_workspace_authority_dependencies()
+    )
+
+
+async def _prepare_job_workspace_runtime(*args: Any, **kwargs: Any) -> Any:
+    return await job_workspace_authority.prepare_job_workspace_runtime(
+        *args, **kwargs, dependencies=_job_workspace_authority_dependencies()
+    )
+
+
+async def _fail_subjob_and_unblock_parent(*args: Any, **kwargs: Any) -> Any:
+    return await job_workspace_authority.fail_subjob_and_unblock_parent(
+        *args, **kwargs, dependencies=_job_workspace_authority_dependencies()
+    )
+
+
+async def _provision_parent_workspace_for_scholar(*args: Any, **kwargs: Any) -> Any:
+    return await job_workspace_authority.provision_parent_workspace_for_scholar(
+        *args, **kwargs, dependencies=_job_workspace_authority_dependencies()
+    )
+
+
+from orchestrator.services.job_workspace_runtime import (  # noqa: E402
+    apply_sticky_sudo_denial as _apply_sticky_sudo_denial,
 )
-
-
-async def _resolve_subjob_inherited_workspace(job: dict) -> tuple[str, str | None]:
-    """Refresh a subjob's inherited workspace from its parent's LIVE context.
-
-    Subjobs that share a parent's workspace (scholar research,
-    verification/critic) persist only ``inherits_parent_workspace`` and a
-    parent-inheritance workspace contract. We re-read the parent's current
-    workspace here and overlay it onto the in-memory ``job['context']``. The
-    live runtime is never copied into the child row: doing so both creates a
-    stale snapshot and claims the parent's Kubernetes authority under the
-    child's identity. The subjob rides the parent's pod via its
-    ``worktree_path``; it must never provision its own.
-
-    Returns one of:
-      ``("proceed", None)`` — not an inheriting subjob, or the parent workspace
-        is ready and now overlaid; let normal dispatch continue.
-      ``("wait", None)`` — inheriting, parent workspace still provisioning;
-        caller should skip this tick and retry.
-      ``("fail", message)`` — inheriting, but the parent workspace is gone/failed
-        or the wait budget is exhausted; caller should fail the job.
-    """
-    parent_id = job.get("parent_job_id")
-    if not parent_id:
-        return ("proceed", None)
-
-    ctx = job.get("context") or {}
-    if isinstance(ctx, str):
-        try:
-            ctx = json.loads(ctx)
-        except (json.JSONDecodeError, ValueError):
-            return ("proceed", None)
-
-    # Discriminate INHERITED from SELF-PROVISIONED. Both eventually carry a
-    # workspace_container/vm on their context — an inheriting subjob copies its
-    # parent's at spawn; a self-provisioned subjob (parent had no workspace when
-    # it was spawned) writes its OWN once its pod comes up. Only true inheritors
-    # carry the explicit inherits_parent_workspace flag, stamped by
-    # _spawn_scholar_subjob / _trigger_verification_on_complete when they copy the
-    # parent snapshot. Gating on key *presence* (as this once did) misread a
-    # self-provisioned scholar as inheriting and waited the full budget on a
-    # parent workspace that never exists, then failed. See
-    # knowledge-base/knowledge/issues/scholar_selfprovisioned_workspace_misclassified_as_inherited.md.
-    if not ctx.get("inherits_parent_workspace"):
-        return ("proceed", None)
-
-    adoption = await ensure_legacy_k8s_job_runtime_authority(
-        postgres_db, container_provisioner, job
-    )
-    if adoption.retryable:
-        logger.warning(
-            "Dispatcher: subjob %s parent workspace needs live Kubernetes "
-            "adoption (%s); waiting without dispatch",
-            job.get("id"),
-            adoption.reason,
-        )
-        return ("wait", None)
-    if adoption.reason == "authority_ambiguous":
-        return ("fail", "Inherited workspace authority is ambiguous.")
-
-    try:
-        parent = (
-            adoption.authority_job
-            if adoption.owner is not None and adoption.owner.id == str(parent_id)
-            else await postgres_db.get_job(str(parent_id))
-        )
-    except Exception as e:
-        logger.warning(
-            "Dispatcher: subjob %s — failed to read parent %s for workspace "
-            "resolution: %s (waiting)",
-            job.get("id"),
-            parent_id,
-            e,
-        )
-        return ("wait", None)
-
-    if not parent:
-        return (
-            "fail",
-            f"Parent job {parent_id} no longer exists; cannot inherit its workspace.",
-        )
-
-    parent_ctx = parent.get("context") or {}
-    if isinstance(parent_ctx, str):
-        try:
-            parent_ctx = json.loads(parent_ctx)
-        except (json.JSONDecodeError, ValueError):
-            parent_ctx = {}
-    parent_container = parent_ctx.get("workspace_container") or {}
-    parent_vm = parent_ctx.get("vm") or {}
-    try:
-        parent_contract = resolve_workspace_contract(parent)
-    except WorkspaceContractError as exc:
-        return ("fail", f"Parent workspace contract is invalid ({exc.code}).")
-    # Resolve against a temporary overlay only. A waiting child keeps its
-    # original durable-looking snapshot untouched; a genuine pre-0175 child
-    # can still inherit the newly adopted parent UID without teaching the pure
-    # resolver to trust its old endpoint.
-    resolved_child_ctx = dict(ctx)
-    if parent_contract.assigned_backend == "sandbox":
-        resolved_child_ctx["workspace_container"] = parent_container
-        resolved_child_ctx.pop("vm", None)
-    elif parent_contract.assigned_backend == "vm":
-        resolved_child_ctx["vm"] = parent_vm
-        resolved_child_ctx.pop("workspace_container", None)
-    try:
-        child_contract = resolve_workspace_contract(
-            {**job, "context": resolved_child_ctx}
-        )
-    except WorkspaceContractError as exc:
-        return ("fail", f"Child workspace contract is invalid ({exc.code}).")
-    if parent_contract.assigned_backend != child_contract.assigned_backend:
-        return (
-            "fail",
-            "Parent and child workspace assignments differ; refusing cross-tier "
-            f"inheritance ({parent_contract.assigned_backend} -> "
-            f"{child_contract.assigned_backend}).",
-        )
-    inherited_backend = child_contract.assigned_backend
-
-    # Parent's workspace is ready → overlay the live context and dispatch. All
-    # downstream machinery (_job_needs_sandbox/_job_needs_vm, the dispatch-time
-    # injectors) then keys off the ready context and injects workspace.remote.
-    if inherited_backend == "sandbox" and parent_container.get("status") == "ready":
-        ctx["workspace_container"] = parent_container
-        ctx.pop("vm", None)
-        job["context"] = ctx
-        logger.info(
-            "Dispatcher: subjob %s inheriting parent %s sandbox runtime — "
-            "resolved live at dispatch",
-            job.get("id"),
-            parent_id,
-        )
-        return ("proceed", None)
-    if inherited_backend == "vm" and parent_vm.get("status") == "ready":
-        ctx["vm"] = parent_vm
-        ctx.pop("workspace_container", None)
-        job["context"] = ctx
-        logger.info(
-            "Dispatcher: subjob %s inheriting parent %s VM runtime — resolved "
-            "live at dispatch",
-            job.get("id"),
-            parent_id,
-        )
-        return ("proceed", None)
-
-    # Parent workspace is dead (reaped/failed) or the parent itself reached a
-    # terminal state — no point waiting on a workspace that will never be ready.
-    dead_states = ("failed", "deleted")
-    parent_status = parent.get("status")
-    if (
-        (
-            inherited_backend == "sandbox"
-            and parent_container.get("status") in dead_states
-        )
-        or (inherited_backend == "vm" and parent_vm.get("status") in dead_states)
-        or parent_status in ("failed", "cancelled", "completed")
-    ):
-        return (
-            "fail",
-            (
-                f"Parent job {parent_id} workspace is unavailable (parent "
-                f"status={parent_status}, container="
-                f"{parent_container.get('status')}, vm={parent_vm.get('status')}); "
-                "subjob cannot inherit it."
-            ),
-        )
-
-    # Still provisioning — bounded wait keyed on the subjob's age, re-anchored
-    # on the outage's scheduled wake for a resumed subjob: an outage-paused
-    # subjob re-dispatched hours after spawn has long exhausted a created_at
-    # budget, and would insta-fail on any transiently non-ready parent
-    # workspace at resume. Anchor = max(created_at, llm_outage.next_retry_at)
-    # — the same next-wake philosophy as the outage reset window.
-    # knowledge-base/knowledge/features/llm_outage_subjob_resilience.md (#5)
-    ref: datetime | None = None
-    created_at = job.get("created_at")
-    if isinstance(created_at, datetime):
-        ref = (
-            created_at if created_at.tzinfo else created_at.replace(tzinfo=timezone.utc)
-        )
-    wake_raw = (ctx.get("llm_outage") or {}).get("next_retry_at")
-    if isinstance(wake_raw, str):
-        try:
-            wake = datetime.fromisoformat(wake_raw)
-            if wake.tzinfo is None:
-                wake = wake.replace(tzinfo=timezone.utc)
-            if ref is None or wake > ref:
-                ref = wake
-        except ValueError:
-            pass
-    age_s = 0.0
-    if ref is not None:
-        age_s = (datetime.now(timezone.utc) - ref).total_seconds()
-    if age_s > _INHERIT_WORKSPACE_MAX_WAIT_S:
-        return (
-            "fail",
-            (
-                f"Timed out after {int(age_s)}s waiting for parent job "
-                f"{parent_id} workspace to become ready (container="
-                f"{parent_container.get('status')}, vm={parent_vm.get('status')})."
-            ),
-        )
-    return ("wait", None)
-
-
-async def _prepare_job_workspace_runtime(
-    job: dict[str, Any],
-) -> tuple[str, dict[str, Any], str | None]:
-    """Converge historical K8s authority before any dispatch decision.
-
-    Automatic dispatch, direct/manual start, resume and stateless claim bundles
-    all enter here. Inherited jobs delegate adoption to their exact parent
-    owner through ``_resolve_subjob_inherited_workspace``.
-    """
-
-    context = job.get("context") or {}
-    if isinstance(context, str):
-        try:
-            context = json.loads(context)
-        except (TypeError, ValueError):
-            context = {}
-    if isinstance(context, dict) and context.get("inherits_parent_workspace"):
-        action, reason = await _resolve_subjob_inherited_workspace(job)
-        return action, job, reason
-
-    adoption = await ensure_legacy_k8s_job_runtime_authority(
-        postgres_db, container_provisioner, job
-    )
-    if adoption.retryable:
-        return "wait", job, adoption.reason
-    if (
-        adoption.owner is not None
-        and adoption.owner.id == str(job.get("id"))
-        and adoption.authority_job is not None
-    ):
-        job = dict(adoption.authority_job)
-    return "proceed", job, adoption.reason
-
-
-async def _fail_subjob_and_unblock_parent(job: dict, message: str) -> None:
-    """Fail a subjob at dispatch time AND unblock the parent it was holding.
-
-    The dispatcher can decide a subjob will never run (e.g. it cannot inherit its
-    parent's workspace). Marking it ``failed`` is not enough: a parent held in
-    ``waiting`` by ``_spawn_scholar_subjob`` — or a delegation parent — is only
-    transitioned back to ``created`` by the completion-side unblock handlers,
-    which run inside ``complete_job``, a path a dispatch-time failure never
-    reaches. Without this the parent strands in ``waiting`` forever (secondary
-    bug in
-    knowledge-base/knowledge/issues/scholar_selfprovisioned_workspace_misclassified_as_inherited.md).
-    Mirror ``complete_job``'s terminal-subjob unblock here so any dispatch-path
-    failure is self-healing, not just today's inherit-timeout.
-    """
-    job_id = str(job["id"])
-    stateless_worker = job.get("execution_lane") == "stateless"
-    updated = await postgres_db.update_job_status(
-        job_id,
-        status="failed",
-        error_message=message,
-        expected_status=(str(job.get("status")) if stateless_worker else None),
-    )
-    if stateless_worker and not updated:
-        # The dispatcher row is a stale snapshot. A control verb may have
-        # cancelled/completed the child while workspace inheritance was being
-        # resolved; never overwrite that winner or unblock the parent from a
-        # failure disposition that did not commit.
-        logger.info(
-            "Dispatcher: skipped stale stateless subjob failure for %s "
-            "(expected_status=%s)",
-            job_id,
-            job.get("status"),
-        )
-        return
-    # The unblock handlers classify the outcome from job['status']; the in-memory
-    # row still holds the pre-fail status, so sync it before delegating. Each
-    # handler is a no-op for the wrong subjob type (scholar_target / creation_order
-    # guards), so calling both is safe.
-    job["status"] = "failed"
-    for handler in (_handle_scholar_completion, _handle_delegation_child_completion):
-        try:
-            await handler(job, [])
-        except Exception as e:
-            logger.error(
-                "Dispatcher: subjob %s failed but could not unblock its parent "
-                "via %s: %s",
-                job_id,
-                handler.__name__,
-                e,
-                exc_info=True,
-            )
-
-
-async def _provision_parent_workspace_for_scholar(job: dict, parent_id: str) -> str:
-    """Drive the PARENT's shared workspace container toward ready on a scholar's
-    behalf, then promote the scholar to a normal inheriting subjob.
-
-    Phase 1 (knowledge-base/knowledge/issues/scholar_selfprovisioned_workspace_misclassified_as_inherited.md):
-    a scholar spawned before its parent had any workspace provisions the parent's
-    ONE shared pod (``workspace-<parentId>``, owner = parent) instead of a
-    throwaway pod of its own, so the parent and later the critic ride the same
-    pod. ``create_workspace`` keys the pod name and the context write-back on the
-    owner, so provisioning under ``WorkspaceOwner.job(parent_id)`` lands the ready
-    host/pod_ip on the PARENT's row automatically — no copy-back needed.
-
-    Returns:
-      ``"wait"``     — parent workspace still provisioning; retry next tick.
-      ``"promoted"`` — parent workspace ready; the scholar row now inherits it and
-                       dispatches via the normal inherit path on its next tick.
-      ``"fail"``     — provisioning failed; the scholar was failed and its parent
-                       unblocked via ``_fail_subjob_and_unblock_parent``.
-    """
-    scholar_id = str(job["id"])
-    parent = await postgres_db.get_job(parent_id)
-    if not parent:
-        await _fail_subjob_and_unblock_parent(
-            job,
-            f"Parent job {parent_id} no longer exists; cannot provision its "
-            "shared workspace for the research phase.",
-        )
-        return "fail"
-
-    parent_ctx = parent.get("context") or {}
-    if isinstance(parent_ctx, str):
-        try:
-            parent_ctx = json.loads(parent_ctx)
-        except (json.JSONDecodeError, ValueError):
-            parent_ctx = {}
-    parent_container = parent_ctx.get("workspace_container") or {}
-
-    parent_co = parent.get("config_override") or {}
-    if isinstance(parent_co, str):
-        try:
-            parent_co = json.loads(parent_co)
-        except (json.JSONDecodeError, ValueError):
-            parent_co = {}
-    ws_cfg = (parent_co.get("workspace") or {}).get("container") or {}
-
-    res = await ensure_workspace(
-        WorkspaceOwner.job(parent_id),
-        provisioner=container_provisioner,
-        suspension=workspace_suspension_service,
-        current_status=parent_container.get("status"),
-        ws_config={
-            k: ws_cfg[k]
-            for k in ("cpu", "memory", "cpu_limit", "memory_limit", "image")
-            if k in ws_cfg
-        },
-    )
-    if res.outcome is EnsureOutcome.FAILED:
-        # create_workspace records the concrete failure in the parent's
-        # context before returning False — surface it on the job row instead
-        # of punting operators to the orchestrator logs (the dispatcher's own
-        # sandbox arm already does this; see the EnsureOutcome.FAILED branch
-        # in _try_dispatch_pending_jobs).
-        reason = None
-        try:
-            refreshed_parent = await postgres_db.get_job(parent_id)
-            refreshed_ctx = (refreshed_parent or {}).get("context") or {}
-            if isinstance(refreshed_ctx, str):
-                refreshed_ctx = json.loads(refreshed_ctx)
-            reason = (refreshed_ctx.get("workspace_container") or {}).get("error")
-        except Exception:
-            logger.warning(
-                "Dispatcher: could not refresh failed parent workspace context "
-                "for scholar %s (parent %s)",
-                scholar_id,
-                parent_id,
-                exc_info=True,
-            )
-        detail = (
-            f"Shared parent workspace failed: {reason}"
-            if reason
-            else (
-                "Shared parent workspace could not be created for the research "
-                "phase (see orchestrator logs for image/resource/RBAC details)."
-            )
-        )
-        await _fail_subjob_and_unblock_parent(job, detail)
-        return "fail"
-    if res.outcome is EnsureOutcome.PENDING:
-        logger.info(
-            "Dispatcher: scholar %s provisioning shared parent workspace "
-            "workspace-%s (status=%s) — waiting",
-            scholar_id,
-            parent_id[:12],
-            res.status,
-        )
-        return "wait"
-
-    # READY — promote the scholar to inherit the now-ready shared workspace so
-    # the normal inherit path (fresh parent resolver overlay + worktree injection)
-    # dispatches it. The child row must not copy the parent's live runtime
-    # authority; doing so looks like an unreserved runtime bind for the child.
-    fresh_parent = await postgres_db.get_job(parent_id)
-    fresh_ctx = (fresh_parent or {}).get("context") or {}
-    if isinstance(fresh_ctx, str):
-        try:
-            fresh_ctx = json.loads(fresh_ctx)
-        except (json.JSONDecodeError, ValueError):
-            fresh_ctx = {}
-    ready_container = fresh_ctx.get("workspace_container") or parent_container
-
-    worktree_path = (
-        "/home/agent-host/workspace/worktrees/"
-        f"{scholar_id[:8]}-{job.get('config_name') or 'scholar'}"
-    )
-    await postgres_db.merge_job_context(
-        scholar_id,
-        {"inherits_parent_workspace": True},
-    )
-    async with postgres_db.acquire() as conn:
-        await conn.execute(
-            "UPDATE jobs SET worktree_path = $1 WHERE id = $2::uuid",
-            worktree_path,
-            scholar_id,
-        )
-    logger.info(
-        "Dispatcher: scholar %s promoted to inherit shared parent workspace "
-        "workspace-%s (host=%s)",
-        scholar_id,
-        parent_id[:12],
-        ready_container.get("host") or ready_container.get("pod_ip"),
-    )
-    return "promoted"
-
-
-def _apply_sticky_sudo_denial(job: dict, config_override: dict | None) -> dict | None:
-    """Flip the agent's sudo gate to a reasoned block when the job carries a
-    sudo/VM-upgrade denial (``context.sudo_denial``, written by
-    ``_resume_job_without_vm_internal``).
-
-    Without this, the agent resuming from its checkpoint replays the gated
-    command, hits ``sudo_action="freeze"`` again, and re-freezes into a brand
-    new approval loop the operator just declined. Applies to non-VM backends
-    only — a VM owns its own sudo gate, and reaching one means the upgrade was
-    approved after all.
-
-    Returns the (possibly newly created) config_override.
-    """
-    ctx = job.get("context") or {}
-    if isinstance(ctx, str):
-        try:
-            ctx = json.loads(ctx)
-        except (json.JSONDecodeError, TypeError):
-            ctx = {}
-    denial = ctx.get("sudo_denial")
-    if not isinstance(denial, dict):
-        return config_override
-    if ((config_override or {}).get("workspace") or {}).get("backend") == "vm":
-        return config_override
-    config_override = config_override or {}
-    shell_cfg = config_override.setdefault("shell", {})
-    shell_cfg["sudo_action"] = "block"
-    decided_by = denial.get("decided_by") or "the operator"
-    reason = denial.get("reason") or ""
-    shell_cfg["sudo_block_message"] = (
-        "Command blocked: sudo was "
-        + ("denied" if denial.get("denied", True) else "waived (resume without VM)")
-        + f" for this job by {decided_by}"
-        + (f" — {reason}" if reason else "")
-        + ". Do not re-attempt sudo; use a rootless alternative or record the "
-        "limitation in your results."
-    )
-    return config_override
 
 
 # =============================================================================
@@ -9963,75 +6011,32 @@ def _apply_sticky_sudo_denial(job: dict, config_override: dict | None) -> dict |
 # =============================================================================
 
 
-class GrantDenied(Exception):
-    """A merged config exceeds the runner's grants (dispatch PEP). Must NOT be
-    swallowed by a resolve fallback (fail closed)."""
-
-    def __init__(self, violations: list[str]):
-        self.violations = violations
-        super().__init__("; ".join(violations))
+from orchestrator.services.grant_enforcement import GrantDenied as GrantDenied  # noqa: E402
 
 
-async def _user_experts_enabled() -> bool:
-    """Runtime kill-switch (decision 8). Absent row = enabled (fail-open for fresh
-    installs). When disabled, DB-expert creation + grant enforcement are off."""
-    try:
-        row = await postgres_db.get_system_setting("user_experts")
-    except Exception:
-        logger.exception("user_experts read failed; fail-open")
-        return True
-    value = (row or {}).get("value") or {}
-    return not (isinstance(value, dict) and value.get("enabled") is False)
+def _grant_enforcement_dependencies() -> grant_enforcement.GrantEnforcementDependencies:
+    """Rebuilt per call, reading every collaborator from this module."""
+
+    return grant_enforcement.GrantEnforcementDependencies(
+        store=postgres_db,
+        user_experts_enabled=_user_experts_enabled,
+        resolve_runner_grants=_resolve_runner_grants,
+        enforce_dispatch_grants=_enforce_dispatch_grants,
+        check_vm_permission=_check_vm_permission,
+    )
 
 
-def _grant_violations_detail(violations: list[str]) -> str:
-    return "config exceeds your capability grants: " + "; ".join(violations)
+async def _user_experts_enabled(*args: Any, **kwargs: Any) -> Any:
+    return await grant_enforcement.user_experts_enabled(
+        *args, **kwargs, dependencies=_grant_enforcement_dependencies()
+    )
 
 
-_PUBLIC_JOB_CONTEXT_RESERVED_KEYS = {
-    "automation_id",
-    "automation_name",
-    "automation_trigger",
-    "cloud_baseline",
-    "delegation_results",
-    "datasource_selection",
-    "delegation_timed_out",
-    "git_remote_url",
-    "graft_output_path",
-    # Completion finalization is the only writer. Accepting this manifest at
-    # creation turns the Gitea service into a confused deputy because its
-    # repository/revision coordinates would otherwise arrive in caller data.
-    "evidence_manifest",
-    # Pull-request evidence and immutable contract provenance are minted only
-    # by server-owned repository/admission paths.
-    "pull_request",
-    "deliverable_contract_provenance",
-    "prior_deliverable_contract",
-    "required_pr_repositories",
-    "required_deliverables",
-    "lifecycle_marker",
-    "loop_campaign_id",
-    "loop_campaign_index",
-    "loop_id",
-    "loop_iteration",
-    "loop_remaining",
-    "loop_role",
-    "loop_seq_index",
-    "parent_job_id",
-    "runner_kind",
-    "runner_source",
-    "scholar_target",
-    "snapshot",
-    # The verification ledger is server-owned end to end: the server assigns
-    # finding ids, computes the verdict from the open set, and reads the round
-    # count for the cap. A caller-seeded ledger plants phantom findings into
-    # the first critic's brief and can trip the cap/no-progress escalation on
-    # round one, so it is stripped alongside its `verification_target` pair.
-    "verification_rounds",
-    "verification_target",
-    "vm",
-    "workspace_container",
-}
+from orchestrator.services.grant_enforcement import (  # noqa: E402
+    grant_violations_detail as _grant_violations_detail,
+)
+
+
 from orchestrator.services.config_overrides import (  # noqa: E402
     deep_merge_dicts as _deep_merge_dicts,
     validated_config_name as _validated_config_name,
@@ -10070,486 +6075,108 @@ from orchestrator.services.job_admission_scope import (  # noqa: E402
 )
 from orchestrator.services.job_create_ingress import (  # noqa: E402
     _SERVER_OWNED_OFFICER_CONTEXT_KEYS as _SERVER_OWNED_OFFICER_CONTEXT_KEYS,
-    _SERVER_OWNED_RAW_CREATE_CONTEXT_KEYS,
     _SERVER_OWNED_REPOSITORY_CONTEXT_KEYS as _SERVER_OWNED_REPOSITORY_CONTEXT_KEYS,
     _strip_raw_repository_authority as _strip_raw_repository_authority,
 )
 
 
-_PUBLIC_JOB_CONFIG_RESERVED_KEYS = {
-    "lifecycle_marker",
-    "parent_job_id",
-    "runner_kind",
-    "runner_source",
-}
+from orchestrator.services.job_create_ingress import (  # noqa: E402
+    strip_public_job_reserved_markers as _strip_public_job_reserved_markers,
+)
 
 
-def _strip_public_job_reserved_markers(job: "JobCreate") -> None:
-    """Remove system-only job markers from public create payloads."""
-    job.parent_job_id = None
-    job.creation_order = None
-    job.worktree_path = None
-    job.delegation_context = None
-    # thread_id is derived, never submitted. Only the internal path may set it,
-    # and there it is authenticated: prepare_job_admission_scope
-    # fetches the thread and 403s when it is missing or owned by someone else.
-    # The public path never validated it — harmless while the value was merely
-    # a datasource-inheritance hint whose lookup failures are swallowed, but
-    # once it is PERSISTED as created_by_thread_id and woken on, an unchecked
-    # body field lets a caller name a victim's live session and have a
-    # completion payload POSTed into it (/api/input on the agent pod is
-    # unauthenticated). Stripping is also what keeps a bogus-but-well-formed
-    # UUID a no-op instead of a ForeignKeyViolationError → HTTP 500.
-    job.thread_id = None
-    if isinstance(job.context, dict):
-        job.context = {
-            key: value
-            for key, value in job.context.items()
-            if key not in _PUBLIC_JOB_CONTEXT_RESERVED_KEYS
-        }
-    if isinstance(job.config_override, dict):
-        job.config_override = {
-            key: value
-            for key, value in job.config_override.items()
-            if key not in _PUBLIC_JOB_CONFIG_RESERVED_KEYS
-        }
+from orchestrator.services.job_create_ingress import (  # noqa: E402
+    strip_raw_officer_claim_context as _strip_raw_officer_claim_context,
+)
 
 
-def _strip_raw_officer_claim_context(job: "JobCreate") -> None:
-    """Remove server-owned context from public and internal raw bodies.
-
-    ``ticket=`` is the sole caller-selectable claim input. The final Officer
-    admission transaction writes these context keys after resolving the ticket
-    and locking the post; internal transport authentication does not make a
-    model-authored context dictionary authoritative. Completion finalization
-    similarly records ``evidence_manifest`` later via ``merge_job_context``;
-    no job-creation body can seed repository/revision authority.
-    """
-
-    if isinstance(job.context, dict):
-        job.context = {
-            key: value
-            for key, value in job.context.items()
-            if key not in _SERVER_OWNED_RAW_CREATE_CONTEXT_KEYS
-        }
+async def _grant_project_ids(*args: Any, **kwargs: Any) -> Any:
+    return await grant_enforcement.grant_project_ids(*args, **kwargs)
 
 
-async def _grant_project_ids(user: dict) -> list[str]:
-    """Project scope ids for grant resolution. user_visible_project_ids returns
-    'all' for admins (who bypass anyway) — treat as no project constraint."""
-    vis = await user_visible_project_ids(user, postgres_db)  # security/access.py
-    return [] if vis == "all" else [str(p) for p in vis]
-
-
-async def _scan_raw_request_fragment(request: Request) -> None:
-    """Slice-2 hardening (decision 10): scan the RAW request bytes for duplicate
-    or non-ASCII keys (parser-differential + unicode-confusable defenses) that the
-    parsed body has already silently collapsed. 422 on offence. Best-effort — if
-    the body can't be re-read the parsed-dict hard-deny scan still ran."""
-    from shared.runtime.core.expert_resolution import scan_fragment_text
-
-    try:
-        raw = (await request.body()).decode("utf-8")
-    except Exception:
-        return
-    if not raw.strip():
-        return
-    offending = scan_fragment_text(raw)
-    if offending:
-        raise HTTPException(
-            status_code=422,
-            detail="config rejected (malformed, duplicate/non-ASCII, or credential "
-            "keys): " + "; ".join(offending),
-        )
-
-
-async def _resolve_user_save_grants(user: dict[str, Any]) -> dict[str, Any] | None:
-    """Resolve save-time grants for `user`, or ``None`` on an admin bypass.
-
-    Split out of the body of ``_enforce_save_grants`` so its refuse-outright
-    policy and ``_strip_save_grants``'s strip-and-report policy (the
-    ``duplicate_expert`` route only, decision 2026-08-04) resolve grants via
-    one path and cannot drift into two admin checks."""
-    if user.get("is_admin"):
-        return None
-    from orchestrator.services.grants_service import resolve_grants_for
-
-    return await resolve_grants_for(
-        postgres_db, user_id=str(user["id"]), project_ids=await _grant_project_ids(user)
+async def _resolve_user_save_grants(*args: Any, **kwargs: Any) -> Any:
+    return await grant_enforcement.resolve_user_save_grants(
+        *args, **kwargs, dependencies=_grant_enforcement_dependencies()
     )
 
 
-async def _enforce_save_grants(config: dict[str, Any], *, user: dict[str, Any]) -> None:
-    """Save-time PEP (decision 9): the author's grants must cover the raw fragment.
-    422 naming offending keys. Admins bypass."""
-    grants = await _resolve_user_save_grants(user)
-    if grants is None:
-        return
-    from shared.runtime.core.capability_grants import evaluate
-
-    violations = evaluate(config, grants)
-    if violations:
-        raise HTTPException(
-            status_code=422, detail=_grant_violations_detail(violations)
-        )
+async def _enforce_save_grants(*args: Any, **kwargs: Any) -> Any:
+    return await grant_enforcement.enforce_save_grants(*args, **kwargs)
 
 
-async def _strip_save_grants(
-    config: dict[str, Any], *, user: dict[str, Any]
-) -> tuple[dict[str, Any], list[str]]:
-    """``duplicate_expert``'s save-time grants policy (2026-08-04 decision,
-    knowledge-base/knowledge/superpowers/plans/2026-08-04-expert-write-gate-holes.md, task 3):
-    strip what the copier's grants forbid from the source config instead of
-    refusing the fork outright, and report the grant keys that were dropped.
-    ``_enforce_save_grants`` above is unchanged and still refuses for the
-    other four expert-write routes — measured against the real PDP with
-    default grants, refusing here blocked 7 of the 11 shipped experts,
-    including the one the route's own docstring names ("start from scholar").
-
-    Admins bypass exactly as ``_enforce_save_grants`` does: unmodified config,
-    nothing dropped.
-
-    THE SAFETY PROPERTY, not optional: ``evaluate`` is re-run on the STRIPPED
-    result, and any violation that survives is refused with the same 422
-    ``_enforce_save_grants`` raises. This is what makes an incomplete or wrong
-    entry in ``capability_grants.strip_to_grants`` merely a false refusal,
-    never a permitted escape.
-    """
-    grants = await _resolve_user_save_grants(user)
-    if grants is None:
-        return config, []
-    from shared.runtime.core.capability_grants import evaluate, strip_to_grants
-
-    stripped, dropped = strip_to_grants(config, grants)
-    residual = evaluate(stripped, grants)
-    if residual:
-        raise HTTPException(status_code=422, detail=_grant_violations_detail(residual))
-    return stripped, dropped
+async def _strip_save_grants(*args: Any, **kwargs: Any) -> Any:
+    return await grant_enforcement.strip_save_grants(*args, **kwargs)
 
 
-async def _enforce_expert_save_prelude(request: Request) -> None:
-    """Kill-switch (403) + raw dup/non-ASCII key scan (422): the two save-time
-    checks shared by every expert-write route regardless of how its grants
-    half is enforced. ``_enforce_expert_save`` below runs this then
-    ``_enforce_save_grants``; ``duplicate_expert`` runs this then
-    ``_strip_save_grants`` instead, so the kill-switch and the scan cannot be
-    forgotten while that one route's grants policy differs from the other
-    four."""
-    if not await _user_experts_enabled():
-        raise HTTPException(
-            status_code=403,
-            detail="User-defined experts are disabled by the administrator",
-        )
-    await _scan_raw_request_fragment(request)
-
-
-async def _enforce_expert_save(
-    request: Request, config: dict[str, Any], *, user: dict[str, Any]
-) -> None:
-    """Combined save-time gate: kill-switch (403) + raw dup/non-ASCII key scan
-    (422) + capability-grant enforcement (422). Admins bypass grants, not the
-    kill-switch."""
-    await _enforce_expert_save_prelude(request)
-    await _enforce_save_grants(config, user=user)
-
-
-async def _resolve_runner_grants(
-    *,
-    runner_user_id: str | None,
-    project_ids: list[str],
-    runner_kind: str = "user",
-) -> dict[str, Any] | None:
-    """Resolve effective dispatch grants for the job runner.
-
-    ``None`` means admin bypass. Lifecycle subjobs keep the owner's capability
-    grants but run with an elevated autonomy ceiling so system verification and
-    research jobs do not pause on the owner's review ceiling.
-    """
-    user = await postgres_db.get_user(runner_user_id) if runner_user_id else None
-    if user and user.get("is_admin"):
-        return None
-    from orchestrator.services.grants_service import resolve_grants_for
-
-    grants = await resolve_grants_for(
-        postgres_db, user_id=runner_user_id, project_ids=project_ids
+async def _enforce_expert_save_prelude(*args: Any, **kwargs: Any) -> Any:
+    return await grant_enforcement.enforce_expert_save_prelude(
+        *args, **kwargs, dependencies=_grant_enforcement_dependencies()
     )
-    if runner_kind == "lifecycle":
-        grants = dict(grants)
-        grants["autonomy_ceiling"] = "full"
-    return grants
 
 
-async def _enforce_dispatch_grants(
-    merged: dict,
-    *,
-    runner_user_id: str | None,
-    project_ids: list[str],
-    runner_kind: str = "user",
-) -> None:
-    """Authoritative dispatch PEP: merged config must fit runner grants."""
-    from shared.runtime.core.capability_grants import evaluate
-
-    grants = await _resolve_runner_grants(
-        runner_user_id=runner_user_id,
-        project_ids=project_ids,
-        runner_kind=runner_kind,
+async def _enforce_expert_save(*args: Any, **kwargs: Any) -> Any:
+    return await grant_enforcement.enforce_expert_save(
+        *args, **kwargs, dependencies=_grant_enforcement_dependencies()
     )
-    if grants is None:
-        return
-    violations = evaluate(merged, grants)
-    if violations:
-        raise GrantDenied(violations)
 
 
-def _strip_acknowledged_grants(
-    fragment: dict[str, Any], grants: dict[str, Any], acknowledged: set[str]
-) -> dict[str, Any]:
-    """Drop acknowledged grant violations from a merged config fragment.
-
-    A violation the user did NOT acknowledge is left in place, so
-    ``_enforce_dispatch_grants`` still denies on all of it — acknowledging one
-    grant must never smuggle a different one through.
-
-    ``strip_to_grants`` is advisory by contract; the authoritative re-check is
-    the ``_enforce_dispatch_grants`` call that runs on the resulting capture.
-
-    Sync and pure (no grant resolution here) so it can run as
-    ``resolve_config``'s ``grant_strip`` hook, applied to the fully-merged
-    ``data`` before the delivered blob is built from it — not just to the
-    detached ``capture["merged_fragment"]`` copy the PDP evaluates. Stripping
-    only the capture leaves the delivered blob carrying the very capability
-    the grant revoked (round-1 finding: acknowledging ``shell_tools`` stopped
-    the denial but the agent still hydrated ``tools.shell=True``).
-    """
-    from shared.runtime.core.capability_grants import evaluate, strip_to_grants
-
-    violations = evaluate(fragment, grants)
-    if not violations:
-        return fragment
-    flagged = {v.split(":", 1)[0] for v in violations}
-    if not flagged <= acknowledged:
-        # Something drifted that was never acknowledged. Leave the fragment
-        # untouched and let the dispatch PEP fail closed on all of it.
-        return fragment
-    stripped, _dropped = strip_to_grants(fragment, grants)
-    return stripped
+async def _resolve_runner_grants(*args: Any, **kwargs: Any) -> Any:
+    return await grant_enforcement.resolve_runner_grants(
+        *args, **kwargs, dependencies=_grant_enforcement_dependencies()
+    )
 
 
-async def _enforce_session_create_grants(
-    fragment: dict, *, user_id: str | None, project_ids: list[str]
-) -> None:
-    """Create/update-time PEP for sessions (Layer 2): run the SAME PDP as attach
-    (``_enforce_dispatch_grants``) on the requested config and translate a denial
-    into HTTP 422 — so a never-startable config (e.g. a ``permission_mode`` above
-    the owner's ceiling) is rejected synchronously at the API instead of being
-    accepted and then failing later at provisioning with an opaque ready timeout.
-    Admin owner bypasses (inside ``_enforce_dispatch_grants``).
-    See knowledge-base/knowledge/issues/session_permission_mode_grant_denied_ready_timeout.md.
-    """
-    try:
-        await _enforce_dispatch_grants(
-            fragment, runner_user_id=user_id, project_ids=project_ids
-        )
-    except GrantDenied as gd:
-        raise HTTPException(
-            status_code=422, detail=_grant_violations_detail(gd.violations)
-        ) from gd
+async def _enforce_dispatch_grants(*args: Any, **kwargs: Any) -> Any:
+    return await grant_enforcement.enforce_dispatch_grants(
+        *args, **kwargs, dependencies=_grant_enforcement_dependencies()
+    )
 
 
-async def _enforce_job_create_grants(
-    config_override: dict | None, *, user_id: str | None, project_ids: list[str]
-) -> None:
-    """Submit-time PEP for jobs — the session counterpart above, for the job path.
-
-    Without it, an over-reaching ``config_override`` (autonomy past the ceiling,
-    an ungranted model, shell tools) is accepted at create and only denied at
-    dispatch, which marks the job ``failed``. A session agent that created the
-    job has already reported success by then, so the failure surfaces as a dead
-    job rather than a refused request.
-
-    Scoped to the OVERRIDE only: an expert's own fragment is resolved
-    server-side after this point and is already PDP-checked at expert save
-    (``_enforce_expert_save``). Grant scoping is the request's project rather
-    than the fully resolved job scope, so this can allow something dispatch
-    later denies — it fails callers early, it never grants.
-    ``_enforce_dispatch_grants`` on the full merged config stays authoritative.
-
-    No-ops for a userless system child (no principal whose grants to resolve).
-    """
-    if not user_id or not config_override:
-        return
-    try:
-        await _enforce_dispatch_grants(
-            config_override, runner_user_id=user_id, project_ids=project_ids
-        )
-    except GrantDenied as gd:
-        raise HTTPException(
-            status_code=422, detail=_grant_violations_detail(gd.violations)
-        ) from gd
+async def _enforce_session_create_grants(*args: Any, **kwargs: Any) -> Any:
+    return await grant_enforcement.enforce_session_create_grants(
+        *args, **kwargs, dependencies=_grant_enforcement_dependencies()
+    )
 
 
-async def _check_vm_permission(
-    user: dict | None,
-    *,
-    job_needs_vm: bool,
-) -> None:
-    """Enforce admin VM-workspace controls.
+async def _enforce_job_create_grants(*args: Any, **kwargs: Any) -> Any:
+    return await grant_enforcement.enforce_job_create_grants(
+        *args, **kwargs, dependencies=_grant_enforcement_dependencies()
+    )
 
-    Raises HTTPException(403) when either:
-      - The global kill-switch `system_settings['vm_workspaces']` is set
-        to `{"enabled": false}` (blocks everyone, including admins).
-      - The user is a non-admin without `can_use_vm=True`.
 
-    No-op when ``job_needs_vm`` is False. Absent/malformed setting row is
-    treated as enabled (fail-open for fresh installs).
-    """
-    if not job_needs_vm:
-        return
-    row: dict | None = None
-    try:
-        row = await postgres_db.get_system_setting("vm_workspaces")
-    except Exception:
-        # DB read failure is non-fatal for the gate — defer to per-user check.
-        logger.exception("Failed to read vm_workspaces kill-switch; fail-open")
-    value = (row or {}).get("value") or {}
-    if isinstance(value, dict) and value.get("enabled") is False:
-        raise HTTPException(
-            status_code=403,
-            detail="VM workspaces are globally disabled by the administrator",
-        )
-    if user and user.get("is_admin"):
-        return
-    if not user or not await postgres_db.user_can_use_vm(user):
-        raise HTTPException(
-            status_code=403,
-            detail="User is not permitted to use VM workspaces",
-        )
+def _vm_permission_dependencies() -> vm_workspace_policy.VmPermissionDependencies:
+    return vm_workspace_policy.VmPermissionDependencies(store=postgres_db)
+
+
+async def _check_vm_permission(*args: Any, **kwargs: Any) -> Any:
+    return await vm_workspace_policy.check_vm_permission(
+        *args, **kwargs, dependencies=_vm_permission_dependencies()
+    )
 
 
 async def _enforce_workspace_upgrade_grants_for_config(
-    *,
-    owner_id: Any,
-    config_override: dict | None,
-    target_tier: str,
-) -> None:
-    """Sec-1 — shared upgrade-authorization gate core (server-side, fail-closed).
-
-    Parameterized by the raw ``(owner_id, config_override)`` so BOTH the session
-    path (``thread.metadata.config_override``) and the worker path (the
-    ``jobs.config_override`` column) reuse one PEP — see the thin
-    ``_enforce_workspace_upgrade_grants`` (session) /
-    ``_enforce_job_workspace_upgrade_grants`` (worker, §4.3 W2) wrappers.
-
-    Re-runs the dispatch PDP (``capability_grants.evaluate``) on the POST-UPGRADE
-    config — the stored ``config_override`` with ``workspace.backend`` flipped to
-    ``target_tier`` — exactly as ``_enforce_dispatch_grants`` does at dispatch,
-    just re-run at upgrade time:
-
-    - ``target_tier='vm'`` trips the ``vm_workspace`` grant requirement, and
-      additionally keeps the operator gate (the global ``vm_workspaces``
-      kill-switch + per-user ``can_use_vm`` via ``_check_vm_permission``).
-    - ``target_tier='sandbox'`` is NOT gated by the backend (the PDP gates only
-      ``vm`` and explicitly-declared tool flags), so it passes by default —
-      matching "sandbox is the ungated default tier" — unless the config already
-      declares a gated tool (e.g. ``tools.shell``) the owner lacks, in which case
-      dispatch would have rejected it too.
-
-    Raises ``HTTPException(403)`` on violation. No new grant key, no
-    sandbox-specific rule — identical to dispatch-time enforcement.
-    """
-    # owner_id comes back from asyncpg as a UUID object; get_user (and
-    # _enforce_dispatch_grants below) expect a string — coerce once, matching the
-    # str(user["id"]) convention used elsewhere.
-    owner_id = str(owner_id) if owner_id is not None else None
-    owner = await postgres_db.get_user(owner_id) if owner_id else None
-
-    # vm keeps its operator gate (global kill-switch + can_use_vm), on top of the
-    # vm_workspace grant the PDP enforces below.
-    if target_tier == "vm":
-        await _check_vm_permission(owner, job_needs_vm=True)
-
-    if not isinstance(config_override, dict):
-        config_override = {}
-    # Post-upgrade config = the frozen override with the backend flipped. A
-    # shallow merge of the workspace sub-dict suffices — the PDP only reads
-    # workspace.backend plus declared tool/autonomy flags.
-    post_upgrade = {
-        **config_override,
-        "workspace": {
-            **(config_override.get("workspace") or {}),
-            "backend": target_tier,
-        },
-    }
-    project_ids = await _grant_project_ids(owner) if owner else []
-    try:
-        await _enforce_dispatch_grants(
-            post_upgrade, runner_user_id=owner_id, project_ids=project_ids
-        )
-    except GrantDenied as exc:
-        raise HTTPException(
-            status_code=403, detail=_grant_violations_detail(exc.violations)
-        ) from exc
-
-
-async def _enforce_workspace_upgrade_grants(
-    thread: dict,
-    *,
-    target_tier: str,
-) -> None:
-    """Session wrapper over the shared Sec-1 gate — extracts the owner +
-    ``config_override`` from a thread row (``metadata.config_override``) and
-    delegates to ``_enforce_workspace_upgrade_grants_for_config``."""
-    metadata = thread.get("metadata") or {}
-    if isinstance(metadata, str):
-        try:
-            metadata = json.loads(metadata)
-        except (json.JSONDecodeError, TypeError):
-            metadata = {}
-    await _enforce_workspace_upgrade_grants_for_config(
-        owner_id=thread.get("user_id"),
-        config_override=metadata.get("config_override") or {},
-        target_tier=target_tier,
+    *args: Any, **kwargs: Any
+) -> Any:
+    return await grant_enforcement.enforce_workspace_upgrade_grants_for_config(
+        *args, **kwargs, dependencies=_grant_enforcement_dependencies()
     )
 
 
-async def _enforce_job_workspace_upgrade_grants(
-    job: dict,
-    *,
-    target_tier: str,
-) -> None:
-    """Worker wrapper over the shared Sec-1 gate (§4.3 W2). Jobs carry
-    ``config_override`` as a top-level JSONB column (not under ``metadata``) and
-    ``user_id`` as the owner — extract those and delegate to the shared core."""
-    config_override = job.get("config_override") or {}
-    if isinstance(config_override, str):
-        try:
-            config_override = json.loads(config_override)
-        except (json.JSONDecodeError, TypeError):
-            config_override = {}
-    await _enforce_workspace_upgrade_grants_for_config(
-        owner_id=job.get("user_id"),
-        config_override=config_override,
-        target_tier=target_tier,
+async def _enforce_workspace_upgrade_grants(*args: Any, **kwargs: Any) -> Any:
+    return await grant_enforcement.enforce_workspace_upgrade_grants(
+        *args, **kwargs, dependencies=_grant_enforcement_dependencies()
     )
 
 
-def _vm_needs_release(vm_ctx: dict | None) -> bool:
-    """True when a VM context still owns cluster resources worth reclaiming.
+async def _enforce_job_workspace_upgrade_grants(*args: Any, **kwargs: Any) -> Any:
+    return await grant_enforcement.enforce_job_workspace_upgrade_grants(
+        *args, **kwargs, dependencies=_grant_enforcement_dependencies()
+    )
 
-    Shared by the thread and job branches of ``_archive_and_cleanup_workspace``
-    so the two cannot drift apart again. They had: the job side used this
-    denylist, the thread side an allowlist of
-    ``("provisioning", "created", "ready")``. Every other status fell through on
-    the thread side, so ``release_thread_vm`` never ran and each suspended VM
-    leaked a 20 GiB rootdisk DataVolume plus its Headscale node — permanently,
-    since kept-disk GC is jobs-only and the controller orphan backstop ships
-    off. See knowledge-base/knowledge/issues/vm_reliability_assessment.md P1-7.
 
-    A falsy context means the entity never had a VM, which must NOT count as
-    "needs release" — the absent status would otherwise pass the denylist and
-    fire a spurious teardown.
-    """
-    return bool(vm_ctx) and vm_ctx.get("status") not in ("deleted", "deleting")
+from orchestrator.services.vm_workspace_policy import (  # noqa: E402
+    vm_needs_release as _vm_needs_release,
+)
 
 
 async def _archive_and_cleanup_workspace(
@@ -13170,566 +8797,39 @@ async def _suspend_thread_resources_inner(thread_id: str) -> None:
         logger.exception("Persistent pod cleanup failed for thread %s", thread_id)
 
 
-def _provider_of_model(model: str) -> str | None:
-    """Sync prefix-based provider heuristic for legacy dispatch paths.
-
-    Catalog rows carry ``provider_ref`` explicitly; this helper exists for
-    the small set of code paths that don't have a row in hand and only
-    need the factory name (aux-model key injection, vision-model key
-    lookup, dispatcher provider-key inference). Returns None on any miss
-    so callers fall through to their config_name / env-var heuristics.
-
-    The legacy ``resolve_builtin`` lookup that this replaced was the entry
-    point for the YAML fallback path — removed in chunk 6 of the
-    models_yaml_removal work.
-    """
-    if not model:
-        return None
-    name = model.lower()
-    for prefix in ("openrouter/", "groq/"):
-        if name.startswith(prefix):
-            return prefix.rstrip("/")
-    if name.startswith("codex/"):
-        return "codex"
-    if name.startswith("openai/"):
-        return "openai"
-    if name.startswith(("claude-",)):
-        return "anthropic"
-    if name.startswith("gemini-") or name.startswith("gemma-"):
-        return "google"
-    if name.startswith(("gpt-", "o1", "o3", "o4", "text-embedding-")):
-        return "openai"
-    return None
-
-
-async def _inject_model_credentials(
-    *,
-    section: dict,
-    model_id: str,
-    user_id: str | None,
-    resolved_keys: dict[str, str] | None,
-    capability: str = "chat",
-) -> None:
-    """Populate a config-override section with the right base_url + api_key
-    for a given model ID.
-
-    For endpoint-backed models (``origin`` in {``custom``, ``system``}):
-    looks up the endpoint row and inlines its ``base_url`` + ``api_key``.
-    Custom endpoints are user-scoped; system endpoints are helm-seeded or
-    managed via Admin → Providers. Both live in llm_endpoints.
-
-    For built-ins: injects the named provider's key from ``resolved_keys``
-    (the user > project > env resolution chain). No base_url injection —
-    the agent's own registry handles env-driven base URLs for local models.
-
-    Endpoint-backed models use the endpoint row as the transport authority. That
-    intentionally replaces stale persisted transports when a session or paused
-    job is rehydrated.
-    """
-    meta = None
-    try:
-        meta = await _resolve_model(model_id, user_id=user_id, capability=capability)
-    except UnknownModelError:
-        meta = None
-
-    transport_complete = "base_url" in section and "api_key" in section
-
-    # Per-model context window (chat capability only — auxiliary/vision sections
-    # carry their own windows and aren't derived this way). Set before the
-    # endpoint/provider branches so it also reaches endpoint-backed (self-hosted)
-    # models. setdefault keeps a caller-pinned value; truthy guard skips None/0.
-    if capability == "chat" and meta is not None and meta.context_window:
-        section.setdefault("model_max_context_tokens", meta.context_window)
-    # Per-model output cap (chat slot — strategic/tactical reasoning models are
-    # where output truncation bites); overrides the family value, ctx-clamped.
-    if capability == "chat" and meta is not None and meta.max_output_tokens:
-        section.setdefault("max_output_tokens", meta.max_output_tokens)
-
-    # Inject the agent-side factory name so the section always routes to the
-    # correct LLM factory — e.g. an OpenRouter row → _create_openrouter_llm
-    # (openrouter.ai), not the OpenAI default at api.openai.com. meta.provider
-    # already holds the factory name ("openai" for endpoint-backed rows).
-    # This must happen for endpoint rows too: a session hot-swap deep-merges
-    # the enriched override into the existing config, so leaving `provider`
-    # unset keeps the PREVIOUS model's factory (e.g. minimax via openrouter →
-    # gpt-5.5 endpoint row kept routing through _create_openrouter_llm).
-    if meta is not None and meta.provider:
-        section["provider"] = meta.provider
-
-    # Transport headers the resolved route needs. Only the subscription proxy
-    # uses this today: its Claude executor decides thinking visibility from the
-    # inbound Anthropic-Beta header, so a Claude-Code-served model without it
-    # returns empty thinking blocks (billed, unreadable). Written on every
-    # injection — including as `{}` — for the same reason `provider` is: a
-    # session hot-swap deep-merges this section over the previous model's, and
-    # a header left behind would describe the model that is no longer running.
-    # Caller-pinned values still win.
-    if meta is not None:
-        _route_headers = subscription_request_headers(
-            transport_kind=meta.transport_kind,
-            subscription_sources=meta.subscription_sources,
-        )
-        _route_headers.update(section.get("extra_headers") or {})
-        # `None`, not `{}`, when nothing applies: the agent-side deep_merge
-        # treats None as "clear this field", so a swap away from a Claude
-        # account actually drops the header instead of inheriting it. Same
-        # sentinel the provider/base_url/api_key swap path uses.
-        section["extra_headers"] = _route_headers or None
-
-    if transport_complete and not (meta is not None and meta.endpoint_id):
-        return
-
-    if (
-        meta is not None
-        and meta.origin in ("custom", "system", "catalog")
-        and meta.endpoint_id
-    ):
-        endpoint_row = await postgres_db.get_user_llm_endpoint(meta.endpoint_id)
-        if endpoint_row:
-            if endpoint_row.get("base_url"):
-                section["base_url"] = endpoint_row["base_url"]
-            if endpoint_row.get("api_key"):
-                section["api_key"] = endpoint_row["api_key"]
-        return
-
-    provider = meta.api_key_ref if meta is not None else _provider_of_model(model_id)
-    if meta is None and provider:
-        section.setdefault("provider", provider)
-    if (
-        provider
-        and resolved_keys
-        and provider in resolved_keys
-        and "api_key" not in section
-    ):
-        section["api_key"] = resolved_keys[provider]
-
-
-async def _inject_env_key_credentials(
-    *,
-    env_keys: dict,
-    prefix: str,
-    model_id: str,
-    user_id: str | None,
-    resolved_keys: dict[str, str] | None,
-    capability: str = "chat",
-) -> None:
-    """Populate ``env_keys`` with ``{PREFIX}_MODEL/_BASE_URL/_API_KEY``.
-
-    Sibling of ``_inject_model_credentials`` for capabilities that travel as
-    flat env vars (vision, whisper, tts, ...) rather than structured config
-    sections. Endpoint-backed models (origin in {'custom','system','catalog'}
-    with an endpoint_id) contribute the inline base_url+api_key from the
-    endpoint row; built-ins and system-anchored catalog rows resolve the
-    api_key via ``resolved_keys[provider]``. All writes are setdefault so
-    caller / earlier overrides win.
-    """
-    env_keys.setdefault(f"{prefix}_MODEL", model_id)
-
-    meta = None
-    try:
-        meta = await _resolve_model(model_id, user_id=user_id, capability=capability)
-    except UnknownModelError:
-        meta = None
-
-    if (
-        meta is not None
-        and meta.origin in ("custom", "system", "catalog")
-        and meta.endpoint_id
-    ):
-        endpoint_row = await postgres_db.get_user_llm_endpoint(meta.endpoint_id)
-        if endpoint_row:
-            base_url = endpoint_row.get("base_url")
-            api_key = endpoint_row.get("api_key")
-            if base_url and not api_key:
-                # The endpoint is configured but its stored key didn't decrypt
-                # (get_user_llm_endpoint -> _decrypt_stored already logged the
-                # cause) or is empty. Surface it loudly and do NOT emit a
-                # half-credential (base_url without api_key) that silently
-                # degrades the agent to a keyless 'local' provider — the failure
-                # mode in knowledge-history/done/embedding_key_missing_silently_disables_memory_and_kb.md.
-                logger.error(
-                    "Dispatch: %s endpoint %s resolved a base_url but no usable "
-                    "api_key (decrypt failed or empty) — not injecting "
-                    "%s_BASE_URL/_API_KEY; re-add the key in Admin → Models.",
-                    prefix,
-                    meta.endpoint_id,
-                    prefix,
-                )
-                return
-            if base_url:
-                env_keys.setdefault(f"{prefix}_BASE_URL", base_url)
-            if api_key:
-                env_keys.setdefault(f"{prefix}_API_KEY", api_key)
-        return
-
-    provider = meta.api_key_ref if meta is not None else _provider_of_model(model_id)
-    if provider and resolved_keys and provider in resolved_keys:
-        env_keys.setdefault(f"{prefix}_API_KEY", resolved_keys[provider])
-
-
-async def _inject_search_credentials(
-    config_override: dict[str, Any],
-    *,
-    user_settings: dict[str, Any],
-    user_id: str | None,
-    resolved_keys: dict[str, str],
-) -> dict[str, Any]:
-    """Inject catalog-resolved search/fetch adapters into research config.
-
-    Transport credentials stay in the per-dispatch override and are stripped
-    before persistence by ``redact_config_override``. Adapter selection comes
-    only from parsed ``params_json`` returned by the shared capability resolver.
-    """
-
-    from orchestrator.services.capability_credentials import (
-        resolve_capability_credentials,
+async def _inject_model_credentials(*args: Any, **kwargs: Any) -> Any:
+    return await dispatch_credentials.inject_model_credentials(
+        *args, **kwargs, dependencies=_dispatch_credential_dependencies()
     )
 
-    research = config_override.setdefault("research", {})
-    resolved: dict[str, Any] = {}
-    for capability in ("search", "fetch"):
-        creds = await resolve_capability_credentials(
-            capability=capability,
-            user_settings=user_settings,
-            user_id=user_id,
-            resolved_keys=resolved_keys,
-            postgres_db=postgres_db,
-        )
-        if creds is None:
-            research.pop(capability, None)
-            continue
-        ops_value = creds.params.get("ops")
-        ops = (
-            [str(op) for op in ops_value if isinstance(op, str)]
-            if isinstance(ops_value, list)
-            else []
-        )
-        if not creds.provider or not ops:
-            research.pop(capability, None)
-            logger.warning(
-                "Dispatch: %s model %r has no valid params_json.provider/ops; "
-                "web tools for that capability are disabled",
-                capability,
-                creds.model,
-            )
-            continue
 
-        resolved[capability] = creds
-        research[capability] = {
-            "provider": creds.provider,
-            "base_url": creds.base_url,
-            "api_key": creds.api_key,
-            "ops": ops,
-        }
-        logger.info(
-            "Dispatch: injected %s provider %s (%s)",
-            capability,
-            creds.provider,
-            creds.model,
-        )
-
-    primary = resolved.get("search")
-    fallback = await resolve_capability_credentials(
-        capability="search",
-        setting_key="default_search_fallback_model",
-        user_settings=user_settings,
-        user_id=user_id,
-        resolved_keys=resolved_keys,
-        postgres_db=postgres_db,
-    )
-    fallback_ops_value = fallback.params.get("ops") if fallback is not None else None
-    fallback_ops = (
-        [str(op) for op in fallback_ops_value if isinstance(op, str)]
-        if isinstance(fallback_ops_value, list)
-        else []
-    )
-    different_row = bool(
-        primary is not None
-        and fallback is not None
-        and primary.catalog_id
-        and fallback.catalog_id
-        and primary.catalog_id != fallback.catalog_id
-    )
-    if (
-        primary is None
-        or fallback is None
-        or not different_row
-        or not fallback.provider
-        or "search" not in fallback_ops
-    ):
-        research.pop("search_fallback", None)
-    else:
-        research["search_fallback"] = {
-            "provider": fallback.provider,
-            "base_url": fallback.base_url,
-            "api_key": fallback.api_key,
-            "ops": fallback_ops,
-        }
-        logger.info(
-            "Dispatch: injected search fallback provider %s (%s)",
-            fallback.provider,
-            fallback.model,
-        )
-
-    if not research:
-        config_override.pop("research", None)
-    return config_override
-
-
-async def _inject_system_kb_embedding_profile(env_keys: dict[str, Any]) -> str | None:
-    """Inject the stable, system-owned embedding profile for knowledge bases.
-
-    The OKF datasource indexer runs in the orchestrator and therefore embeds
-    every repository with the admin-curated *system* embedding model. Agent
-    memory may instead use a user's embedding preference. Shipping the system
-    profile under a separate prefix lets KnowledgeStore query with the exact
-    model/transport used by the indexer without changing RecallStore semantics.
-
-    ``KB_EMBEDDING_*`` is intentionally authoritative: callers cannot pin a
-    different profile in ``config_override``, and persisted non-secret values
-    are refreshed after an administrator changes the system default.
-    """
-    prefix = "KB_EMBEDDING_"
-    for key in [key for key in env_keys if key.startswith(prefix)]:
-        del env_keys[key]
-
-    model_id = await postgres_db.resolve_default_for_capability("embedding")
-    if not model_id:
-        # Dev/compose compatibility: the central indexer historically used the
-        # orchestrator's EMBEDDING_* environment when no catalog pin existed.
-        # Materialize that *effective* profile into KB_* too; otherwise the
-        # indexer would use this env model while an agent fell back to its
-        # per-user model and filtered every indexed chunk out.
-        from shared.runtime.services.embedding_service import EmbeddingService
-
-        fallback = EmbeddingService()
-        if not fallback.api_key:
-            return None
-        env_keys.update(
-            {
-                "KB_EMBEDDING_PROVIDER": fallback.provider,
-                "KB_EMBEDDING_MODEL": fallback.model,
-                "KB_EMBEDDING_BASE_URL": fallback.base_url,
-                "KB_EMBEDDING_API_KEY": fallback.api_key,
-                "KB_EMBEDDING_DIMENSIONS": str(fallback.expected_dimensions),
-            }
-        )
-        return fallback.model
-
-    # Built-in/catalog transports use system_api_keys. Do not reuse the job's
-    # already-resolved key map here: it includes project/user overrides and
-    # would recreate the same per-user profile skew this path prevents.
-    system_keys = await postgres_db.resolve_api_keys_for_job(
-        user_id=None,
-        project_id=None,
-    )
-    await _inject_env_key_credentials(
-        env_keys=env_keys,
-        prefix="KB_EMBEDDING",
-        model_id=model_id,
-        user_id=None,
-        resolved_keys=system_keys,
-        capability="embedding",
+async def _inject_env_key_credentials(*args: Any, **kwargs: Any) -> Any:
+    return await dispatch_credentials.inject_env_key_credentials(
+        *args, **kwargs, dependencies=_dispatch_credential_dependencies()
     )
 
-    try:
-        meta = await _resolve_model(model_id, user_id=None, capability="embedding")
-    except UnknownModelError:
-        meta = None
-    env_keys["KB_EMBEDDING_PROVIDER"] = (
-        meta.provider if meta is not None and meta.provider else "local"
-    )
-    if meta is not None:
-        # Non-secret registry identity travels with the transport so central
-        # indexing and agent-side query filtering derive the same vector stamp.
-        # Prefer the concrete endpoint UUID; provider-key catalog rows fall
-        # back to their registry/key-reference identity (never the key value).
-        profile_anchor = meta.endpoint_id or meta.api_key_ref or meta.model_id
-        env_keys["KB_EMBEDDING_PROFILE_ID"] = f"{meta.origin}:{profile_anchor}"
-    env_keys["KB_EMBEDDING_DIMENSIONS"] = str(
-        os.environ.get("KB_EMBEDDING_DIMENSIONS")
-        or os.environ.get("EMBEDDING_DIMENSIONS")
-        or "4096"
-    )
-    return model_id
 
-
-async def _inject_thread_dispatch_credentials(
-    config_override: dict[str, Any],
-    *,
-    user_id: str | None,
-    project_id: str | None = None,
-    user_settings: dict[str, Any] | None = None,
-    include_kb_profile: bool = False,
-) -> dict[str, Any]:
-    """Resolve + inject LLM / auxiliary / embedding credentials into a thread's
-    ``config_override`` IN PLACE (creating sections as needed). Returns the dict.
-
-    The persistent-session sibling of the worker-job ``_inject_dispatch_credentials``.
-    Secrets travel **in-flight only** — at thread create, and re-injected at session
-    attach/resume (the agent workspace endpoint + the resume dispatcher) — and are
-    stripped via ``redact_config_override`` before persistence, so
-    ``threads.metadata.config_override`` never stores plaintext keys.
-
-    Re-injection-safe: endpoint-backed model transports are refreshed from the
-    endpoint row, while provider-key models keep caller-supplied transports.
-    ``_inject_env_key_credentials`` is ``setdefault``-based, so running this on a
-    stripped copy repopulates the removed secrets without clobbering surviving
-    model choices.
-    """
-    user_settings = user_settings or {}
-
-    # Drop None-valued keys in the model sections before injecting. A prior
-    # hot-swap persists explicit ``provider/base_url/api_key = None`` sentinels
-    # (they make the live agent's deep_merge CLEAR the previous model's
-    # transport); in a stored copy those Nones would block the setdefault-based
-    # injection below. Treat them as absent so the transport is repopulated.
-    for _sect_name in ("llm", "auxiliary"):
-        _sect = config_override.get(_sect_name)
-        if isinstance(_sect, dict):
-            for _k in [_k for _k, _v in _sect.items() if _v is None]:
-                del _sect[_k]
-
-    resolved_keys = await postgres_db.resolve_api_keys_for_job(
-        user_id=user_id,
-        project_id=project_id,
+async def _inject_search_credentials(*args: Any, **kwargs: Any) -> Any:
+    return await dispatch_credentials.inject_search_credentials(
+        *args, **kwargs, dependencies=_dispatch_credential_dependencies()
     )
 
-    # Chat model. Fall back to the system default chat pin so the agent never
-    # boots on its YAML default (which has no transport → api.openai.com 401).
-    llm_section = config_override.get("llm") or {}
-    if not llm_section.get("model"):
-        system_chat_model = await postgres_db.resolve_default_for_capability("chat")
-        if system_chat_model:
-            llm_section["model"] = system_chat_model
-            logger.info(
-                "Thread dispatch: injected system default chat model: %s",
-                system_chat_model,
-            )
-    if llm_section.get("model"):
-        await _inject_model_credentials(
-            section=llm_section,
-            model_id=llm_section["model"],
-            user_id=user_id,
-            resolved_keys=resolved_keys,
-        )
-        config_override["llm"] = llm_section
 
-    # Auxiliary slot (title generation, memory extraction, knowledge curation).
-    aux_section = config_override.get("auxiliary") or {}
-    if not aux_section.get("model"):
-        aux_model = user_settings.get("default_auxiliary_model")
-        if not aux_model:
-            aux_model = await postgres_db.resolve_default_for_capability("auxiliary")
-        if aux_model:
-            aux_section["model"] = aux_model
-            logger.info("Thread dispatch: injected auxiliary model: %s", aux_model)
-    if aux_section.get("model"):
-        await _inject_model_credentials(
-            section=aux_section,
-            model_id=aux_section["model"],
-            user_id=user_id,
-            resolved_keys=resolved_keys,
-            capability="auxiliary",
-        )
-        config_override["auxiliary"] = aux_section
-
-    # Nested model slots (U1): `llm.summarization`, the roster-wide
-    # `subagents.llm` and every roster entry's `llm` — the same slots and the
-    # same helper as the job injector, so a session's roster children reach
-    # their endpoints too. None sentinels are stripped per slot for the same
-    # reason as the top-level sections above; an inheriting entry carries its
-    # parent's model NAME and is routed by it, the bare `inherit` sentinel is
-    # not a model.
-    for _label, _section, _capability in _nested_model_slots(config_override):
-        for _k in [_k for _k, _v in _section.items() if _v is None]:
-            del _section[_k]
-        _model = _section.get("model")
-        if not _model or _model == INHERIT_MODEL:
-            continue
-        await _inject_model_credentials(
-            section=_section,
-            model_id=_model,
-            user_id=user_id,
-            resolved_keys=resolved_keys,
-            capability=_capability,
-        )
-        logger.info("Thread dispatch: injected credentials for %s: %s", _label, _model)
-
-    # Embedding capability travels as flat env vars. Source provider/model from
-    # the (possibly stripped) persisted block first so re-injection on resume is
-    # stable, then user settings, then the system default. Unconditionally call
-    # the env-key injector when a model is known: it is setdefault-based, so it
-    # re-adds the stripped EMBEDDING_API_KEY without clobbering surviving
-    # EMBEDDING_MODEL / EMBEDDING_BASE_URL.
-    env_keys_block = config_override.setdefault("env_keys", {})
-    embedding_provider = env_keys_block.get("EMBEDDING_PROVIDER") or user_settings.get(
-        "embedding_provider"
-    )
-    embedding_model = env_keys_block.get("EMBEDDING_MODEL") or user_settings.get(
-        "default_embedding_model"
-    )
-    if not embedding_model:
-        embedding_model = await postgres_db.resolve_default_for_capability("embedding")
-    if embedding_provider:
-        env_keys_block.setdefault("EMBEDDING_PROVIDER", embedding_provider)
-    if embedding_model:
-        await _inject_env_key_credentials(
-            env_keys=env_keys_block,
-            prefix="EMBEDDING",
-            model_id=embedding_model,
-            user_id=user_id,
-            resolved_keys=resolved_keys,
-            capability="embedding",
-        )
-    if (
-        embedding_provider == "openrouter"
-        and resolved_keys
-        and "openrouter" in resolved_keys
-    ):
-        env_keys_block.setdefault("OPENROUTER_API_KEY", resolved_keys["openrouter"])
-    if include_kb_profile:
-        await _inject_system_kb_embedding_profile(env_keys_block)
-    else:
-        for key in [key for key in env_keys_block if key.startswith("KB_EMBEDDING_")]:
-            del env_keys_block[key]
-    if not env_keys_block:
-        config_override.pop("env_keys", None)
-
-    await _inject_search_credentials(
-        config_override,
-        user_settings=user_settings,
-        user_id=user_id,
-        resolved_keys=resolved_keys,
+async def _inject_system_kb_embedding_profile(*args: Any, **kwargs: Any) -> Any:
+    return await dispatch_credentials.inject_system_kb_embedding_profile(
+        *args, **kwargs, dependencies=_dispatch_credential_dependencies()
     )
 
-    return config_override
+
+async def _inject_thread_dispatch_credentials(*args: Any, **kwargs: Any) -> Any:
+    return await dispatch_credentials.inject_thread_dispatch_credentials(
+        *args, **kwargs, dependencies=_dispatch_credential_dependencies()
+    )
 
 
-def _dispatch_llm_provider_fallback(
-    job: dict, config_override: dict | None
-) -> str | None:
-    """Legacy dispatcher provider detection, used only when the model ID
-    can't be resolved through the registry.
-
-    Mirrors the pre-registry behavior: explicit ``llm.provider`` wins,
-    then the known built-in model catalog, then a config-name heuristic
-    (only ``anthropic`` today), finally ``openai``.
-    """
-    if config_override:
-        llm = config_override.get("llm", {})
-        if llm.get("provider"):
-            return llm["provider"].lower()
-        model = llm.get("model")
-        if model:
-            prov = _provider_of_model(model)
-            if prov is not None:
-                return prov
-
-    config_name = canonical_config_name(job.get("config_name") or "worker_base")
-    if config_name and "anthropic" in config_name.lower():
-        return "anthropic"
-    return "openai"
+from orchestrator.services.dispatch_credentials import (  # noqa: E402
+    dispatch_llm_provider_fallback as _dispatch_llm_provider_fallback,
+)
 
 
 async def _try_dispatch_pending_jobs() -> None:
@@ -16234,7 +11334,18 @@ async def lifespan(app: FastAPI):
 
     # LLM usage materialization (Slice 4c): materialize audit llm_requests into
     # usage ledger rows. Self-disables when audit/app pools or the ledger are absent.
-    llm_usage_task = asyncio.create_task(llm_usage_poll_loop(_shutdown_event))
+    # R1.B05 lane C moved the loop body beside the work it drives
+    # (`services/audit_usage.py`, like the pricing and metering loops).
+    # B11 still owns the scheduling; only the call shape changed.
+    llm_usage_task = asyncio.create_task(
+        audit_usage.llm_usage_poll_loop(
+            _shutdown_event,
+            audit_db=audit_db,
+            app_store=postgres_db,
+            usage_ledger=usage_ledger,
+            logger=logger,
+        )
+    )
 
     # Usage rollup (Phase 6 / D-1): re-aggregate closed days from the auditdb
     # usage_events firehose into the app-DB usage_daily mirror + advance the
@@ -16501,6 +11612,10 @@ app.state.main_cloud_settings_dependencies_factory = (
     lambda: _main_cloud_settings_dependencies()
 )
 app.state.expert_catalog_state = ExpertCatalogState()
+app.state.thread_workspace_delivery_dependencies_factory = (
+    lambda: _thread_workspace_delivery_dependencies()
+)
+app.state.job_assignment_dependencies_factory = lambda: _job_assignment_dependencies()
 app.state.expert_catalog_dependencies_factory = lambda: _expert_catalog_dependencies()
 app.state.tables_dependencies = TablesDependencies(db=postgres_db)
 app.state.preferences_dependencies = PreferencesDependencies(
@@ -16786,6 +11901,8 @@ app.include_router(job_review_routes.router)
 app.include_router(agent_cloud_stage_routes.router)
 app.include_router(thread_cloud_diff_routes.router)
 app.include_router(main_cloud_settings_routes.router)
+app.include_router(agent_thread_workspace_routes.router)
+app.include_router(job_assignment_routes.router)
 
 
 def _resolve_submitted_job_origin(
@@ -33342,362 +28459,78 @@ async def _complete_job_legacy(
 # =============================================================================
 
 
-def _build_datasource_tool_override(
-    datasources: list[dict[str, Any]], config_override: dict[str, Any] | None
-) -> dict[str, Any]:
-    """Inject/strip database tool categories based on attached datasources.
+def _datasource_payload_dependencies() -> (
+    agent_datasource_payload.DatasourcePayloadDependencies
+):
+    """The two connector gates are **callables**: they are deployment env
+    reads, and a suite that rebinds them on ``main`` must still steer."""
 
-    For each known datasource type, if a datasource is attached, the corresponding
-    tool category is injected. If not attached, the category is set to an empty list.
-    This ensures the agent only has database tools for databases that are actually
-    connected.
-
-    Args:
-        datasources: List of resolved datasource dicts (from resolve_datasources_for_job)
-        config_override: Existing config override dict (may be None)
-
-    Returns:
-        Updated config override dict with tool categories adjusted
-    """
-    override = dict(config_override or {})
-    tools_override = dict(override.get("tools", {}))
-    # Shared single source of truth with the agent's session attach path
-    # (they previously disagreed on read-write managed connectors). Email is
-    # tier-keyed inside the shared map (EMAIL_TIER_TOOLS keyed by
-    # config.access, clamped by project_read_only) — no extra handling here.
-    enabled_datasources = [
-        datasource
-        for datasource in datasources
-        if _mcp_datasource_runtime_allowed(datasource)
-    ]
-    tools_override.update(datasource_tool_categories(enabled_datasources))
-    override["tools"] = tools_override
-    return override
-
-
-def _apply_cloud_storage_override(
-    resolved_ds: list[dict[str, Any]], job_context: dict[str, Any]
-) -> None:
-    """Apply job-level cloud_storage_read_only override to WebDAV datasources.
-
-    If the job's context contains cloud_storage_read_only, it overrides the
-    project-level read_only setting on any webdav datasource in the resolved list.
-    Mutates resolved_ds in place.
-    """
-    override = job_context.get("cloud_storage_read_only")
-    if override is None:
-        return
-    for ds in resolved_ds:
-        if ds["type"] == "webdav":
-            ds["project_read_only"] = bool(override)
-
-
-def _build_datasources_payload(
-    resolved_ds: list[dict[str, Any]],
-) -> list[dict[str, Any]] | None:
-    """Build the datasources payload for sending to the agent.
-
-    Strips internal fields (id, job_id, created_at, updated_at) that the
-    agent doesn't need. For read-only managed connectors, credentials are
-    withheld (tools hold them internally).
-
-    Args:
-        resolved_ds: List of resolved datasource dicts from the database
-
-    Returns:
-        List of datasource dicts for the agent, or None if empty
-    """
-    if not resolved_ds:
-        return None
-
-    managed_types = {"postgresql", "neo4j", "mongodb", "webdav", "email"}
-    payload = []
-    email_forwarded = False
-    for ds in resolved_ds:
-        creds = ds.get("credentials") or {}
-        if isinstance(creds, str):
-            import json as json_module
-
-            try:
-                creds = json_module.loads(creds)
-            except (json.JSONDecodeError, ValueError):
-                creds = {}
-
-        is_read_only = ds.get("project_read_only", False)
-        ds_type = ds["type"]
-        if not _mcp_datasource_runtime_allowed(ds):
-            continue
-
-        # Read-only managed connectors: withhold credentials (tools hold them).
-        # Email is exempt — its tools need a live IMAP login at every tier;
-        # read-only is expressed as the access floor on entry['config'] instead.
-        if ds_type in managed_types and is_read_only and ds_type != "email":
-            creds = {}
-
-        # External OKF KBs are centrally indexed and read-only in Slice 4 v1.
-        # The agent needs the stable index id + display metadata, never the
-        # remote URL or repository credentials.
-        if ds_type == "kb":
-            creds = {}
-            is_read_only = True
-
-        entry = {
-            "type": ds_type,
-            "name": ds["name"],
-            "description": ds.get("description"),
-            "connection_url": None if ds_type == "kb" else ds.get("connection_url"),
-            "credentials": creds,
-            "project_read_only": is_read_only,
-        }
-        if ds_type == "kb":
-            entry["datasource_id"] = str(ds["id"])
-            # stored=True keeps the native-project marker in the payload: the
-            # agent's binding builder needs it to collapse a project's own KB
-            # row into the writable native binding instead of adding a second,
-            # read-only binding for the same notes.
-            entry["config"] = _normalize_kb_config(ds.get("config"), stored=True)
-        if ds_type == "repository":
-            # Repository identity is server-owned runtime authority.  Keep the
-            # raw database ``id`` out of the payload, but carry its exact value
-            # under the dedicated internal key consumed by the clone/tool
-            # binding.  ``resolved_ds`` comes from the authorization query;
-            # callers and models never select this field.
-            datasource_id = ds.get("id")
-            if datasource_id is not None:
-                entry["datasource_id"] = str(datasource_id)
-            # The clone reads config["forge"] to resolve the forge API base;
-            # without it every repository records forge="" and repo_open_pr
-            # can never be used. _datasource_row_to_dict already parsed the
-            # JSONB, so this is a real dict. No secrets live in config —
-            # credentials travel in `creds`.
-            entry["config"] = ds.get("config") or {}
-        if ds_type == "email":
-            # v1: one mailbox per job/session — the agent keys connections by
-            # type, so a second email datasource would silently shadow the
-            # first (knowledge-base/knowledge/features/email_datasource.md, open questions).
-            if email_forwarded:
-                logger.warning(
-                    "Skipping additional email datasource %r: only one email "
-                    "datasource per job/session is supported",
-                    ds.get("name"),
-                )
-                continue
-            email_forwarded = True
-            entry["config"] = email_dispatch_config(
-                ds.get("config"),
-                project_read_only=bool(is_read_only),
-                owner_can_autonomous_send=bool(
-                    ds.get("_owner_can_autonomous_send", False)
-                ),
-            )
-        if ds.get("cli_hint"):
-            entry["cli_hint"] = ds["cli_hint"]
-        if ds.get("default_branch"):
-            entry["default_branch"] = ds["default_branch"]
-        if ds_type == "repository" and ds.get("require_default_branch") is True:
-            entry["require_default_branch"] = True
-
-        payload.append(entry)
-
-    return payload or None
-
-
-def _mcp_datasource_runtime_allowed(datasource: dict[str, Any]) -> bool:
-    """Apply deployment gates to a resolved datasource without exposing secrets."""
-    if datasource.get("type") != "mcp":
-        return True
-    if not _mcp_datasources_enabled():
-        return False
-    credentials = datasource.get("credentials") or {}
-    if isinstance(credentials, str):
-        try:
-            credentials = json.loads(credentials)
-        except (json.JSONDecodeError, ValueError):
-            credentials = {}
-    transport = (
-        credentials.get("transport", "http")
-        if isinstance(credentials, dict)
-        else "http"
+    return agent_datasource_payload.DatasourcePayloadDependencies(
+        logger=logger,
+        mcp_datasources_enabled=_mcp_datasources_enabled,
+        mcp_stdio_enabled=_mcp_stdio_enabled,
     )
-    return str(transport).lower() != "stdio" or _mcp_stdio_enabled()
 
 
-@app.post("/api/jobs/{job_id}/assign/{agent_id}")
+def _build_datasource_tool_override(*args: Any, **kwargs: Any) -> Any:
+    return agent_datasource_payload.build_datasource_tool_override(
+        *args, **kwargs, dependencies=_datasource_payload_dependencies()
+    )
+
+
+from orchestrator.services.agent_datasource_payload import (  # noqa: E402
+    apply_cloud_storage_override as _apply_cloud_storage_override,
+)
+
+
+def _build_datasources_payload(*args: Any, **kwargs: Any) -> Any:
+    return agent_datasource_payload.build_datasources_payload(
+        *args, **kwargs, dependencies=_datasource_payload_dependencies()
+    )
+
+
+def _mcp_datasource_runtime_allowed(*args: Any, **kwargs: Any) -> Any:
+    return agent_datasource_payload.mcp_datasource_runtime_allowed(
+        *args, **kwargs, dependencies=_datasource_payload_dependencies()
+    )
+
+
+def _job_assignment_dependencies() -> job_assignment.JobAssignmentDependencies:
+    """Rebuilt per call; the completion-control operations are B08's four
+    injected callables, the same boundary B04 established rather than a
+    second control authority."""
+
+    return job_assignment.JobAssignmentDependencies(
+        store=postgres_db,
+        logger=logger,
+        require_admin=_require_admin,
+        vm_mode=lambda: vm_provisioner.mode,
+        completion_commands_enabled=lambda: COMPLETION_COMMANDS_ENABLED,
+        prepare_job_workspace_runtime=_prepare_job_workspace_runtime,
+        prepare_job_repository_before_claim=_prepare_job_repository_before_claim,
+        resume_missing_workspace=_resume_missing_workspace,
+        guard_completion_control=_guard_completion_control,
+        claim_completion_control=_claim_completion_control,
+        abort_completion_control_claim=_abort_completion_control_claim,
+        completion_resume_guard_kwargs=_completion_resume_guard_kwargs,
+        dispatch_job_to_agent=_dispatch_job_to_agent,
+        resume_job_on_agent=_resume_job_on_agent,
+        trigger_dispatch=_trigger_dispatch,
+    )
+
+
 async def assign_job_to_agent(
     request: Request, job_id: str, agent_id: str
 ) -> dict[str, str]:
-    """Administrative scheduling override for a job.
+    """Bridge to ``routers/job_assignment.py`` (R1.B05 lane J).
 
-    **Admin only** (P4c). Normal callers should rely on automatic dispatch.
-    If the managed workspace is not live, this endpoint sheds stale workspace
-    state and queues normal provisioning instead of dispatching an incomplete
-    SSH configuration. The requested agent is not reserved in that case.
-
-    With a live workspace, validates the agent and delegates to the shared
-    start/resume helper. Accepts 'created', 'failed', or 'paused' jobs.
+    Kept without a decorator: the route is declared on that router, and
+    ``tests/test_job_access.py`` calls this name positionally with three
+    arguments.
     """
-    await _require_admin(request)
-    try:
-        job = await postgres_db.get_job(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
-
-        if job.get("execution_lane", "pinned") != "pinned":
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "Stateless jobs are claimed from the run queue and cannot "
-                    "be assigned directly to a registered agent"
-                ),
-            )
-
-        if job["status"] not in ("created", "failed", "paused"):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Job cannot be assigned (status: {job['status']})",
-            )
-
-        await _guard_completion_control(job_id, source="manual_assign")
-
-        workspace_action, job, workspace_reason = await _prepare_job_workspace_runtime(
-            job
-        )
-        if workspace_action != "proceed":
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "workspace_runtime_adoption_pending",
-                    "message": (
-                        "Live Kubernetes workspace authority is not yet available; "
-                        "no agent was reserved"
-                    ),
-                    "retryable": workspace_action == "wait",
-                    "failure": workspace_reason,
-                },
-            )
-
-        workspace_decision = resolve_workspace_runtime(job, vm_mode=vm_provisioner.mode)
-        if workspace_decision.contract is None or workspace_decision.state == "invalid":
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "workspace_contract_invalid",
-                    "message": (
-                        "Job workspace authority is ambiguous; no agent was reserved"
-                    ),
-                    "state": workspace_decision.state,
-                    "failure": workspace_decision.reason,
-                },
-            )
-
-        missing_workspace = _resume_missing_workspace(job)
-        if missing_workspace:
-            if COMPLETION_COMMANDS_ENABLED:
-                control_claim = await _claim_completion_control(
-                    {**job, "id": job_id}, source="manual_assign_workspace"
-                )
-                try:
-                    queued = await postgres_db.prepare_pinned_job_for_workspace_resume(
-                        job_id,
-                        _WORKSPACE_CONTEXT_KEYS[missing_workspace],
-                        expected_status=str(job["status"]),
-                        completion_control_claim_id=str(control_claim.claim_id),
-                    )
-                except Exception:
-                    await _abort_completion_control_claim(control_claim)
-                    raise
-                if not queued:
-                    await _abort_completion_control_claim(control_claim)
-                    raise HTTPException(
-                        status_code=409,
-                        detail="Job changed while it was being queued for provisioning",
-                    )
-            else:
-                await postgres_db.shed_workspace_context(
-                    job_id, _WORKSPACE_CONTEXT_KEYS[missing_workspace]
-                )
-            if job["status"] != "created" and not COMPLETION_COMMANDS_ENABLED:
-                queued = await postgres_db.queue_job_for_resume(
-                    job_id,
-                    **_completion_resume_guard_kwargs(),
-                )
-                if not queued:
-                    raise HTTPException(
-                        status_code=409,
-                        detail="Job changed while it was being queued for provisioning",
-                    )
-            _trigger_dispatch()
-            return {
-                "status": "queued",
-                "job_id": job_id,
-                "message": (
-                    f"No live {missing_workspace} workspace; queued for automatic "
-                    "provisioning and assignment. The requested agent was not reserved."
-                ),
-            }
-
-        agent = await postgres_db.get_agent(agent_id)
-        if not agent:
-            raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found")
-
-        if agent["status"] != "ready":
-            raise HTTPException(
-                status_code=400,
-                detail=f"Agent is not ready (status: {agent['status']})",
-            )
-
-        if not agent.get("pod_ip"):
-            raise HTTPException(
-                status_code=400,
-                detail="Agent has no pod IP configured",
-            )
-
-        if not await _prepare_job_repository_before_claim(job):
-            raise HTTPException(
-                status_code=409,
-                detail="Job repository authority is not ready",
-            )
-        if not await postgres_db.claim_job_for_agent(
-            job_id,
-            agent_id,
-            completion_commands_enabled=COMPLETION_COMMANDS_ENABLED,
-            allow_failed=True,
-        ):
-            raise HTTPException(
-                status_code=409,
-                detail="Job changed while it was being assigned",
-            )
-
-        # Use resume path for paused jobs that actually ran, start path for
-        # new/failed — and for paused-but-never-started jobs, whose resume
-        # would skip task-brief seeding (fresh_job_dispatched_as_resume_
-        # skips_seeding.md).
-        if resume_lane_applies(
-            job, has_checkpoint=await postgres_db.job_has_checkpoint(job_id)
-        ):
-            success = await _resume_job_on_agent(job, agent)
-        else:
-            if job["status"] == "paused":
-                logger.info(
-                    "Assign: job %s is paused with no checkpoint to resume "
-                    "from (never started, or pruned at a terminal state) — "
-                    "dispatching via the fresh /job/start lane",
-                    job_id,
-                )
-            success = await _dispatch_job_to_agent(job, agent)
-
-        if not success:
-            raise HTTPException(
-                status_code=502,
-                detail="Failed to dispatch job to agent",
-            )
-
-        return {"status": "assigned", "agent_id": agent_id, "job_id": job_id}
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
+    return await job_assignment.assign_job_to_agent(
+        request, job_id, agent_id, dependencies=_job_assignment_dependencies()
+    )
 
 
 # =============================================================================
@@ -35112,10 +29945,46 @@ async def agent_terminalize_session_subagent_thread(
     return result
 
 
+# ---------------------------------------------------------------------------
+# R1.B05 root lane — thread mount rows and cold-session workspace delivery
+#
+# The implementations live in ``services/thread_mount_rows.py``,
+# ``services/thread_workspace_delivery.py`` and
+# ``routers/agent_thread_workspace.py``. The wrappers below keep the
+# pre-extraction signatures because main code owned by later batches still
+# calls them, and because they are what the dependency factories inject: a test
+# that patches ``main._thread_project_ids`` must still steer every service that
+# consumes it, which only holds while the factory reads the name from this
+# module at call time.
+#
+# Owners of the remaining callers:
+#   B06 create/resume/attach — _thread_project_ids, _should_skip_session_folder,
+#                              _build_thread_mount_rows,
+#                              _assemble_session_attach_payload
+#   B04 cloud stage/mounts   — _require_pinned_workspace_credential_owner,
+#                              _slugify_mount_name, _cloud_workspace_driver
+#   B09 background push      — _agent_get_thread_workspace_locked
+# ---------------------------------------------------------------------------
+
+
+def _thread_mount_dependencies() -> thread_mount_rows.ThreadMountDependencies:
+    """Rebuilt per call: ``postgres_db`` and ``main_cloud_router`` are rebound
+    during ``lifespan``, and the two payload collaborators belong to B06 and to
+    B05's job-preparation lane."""
+
+    return thread_mount_rows.ThreadMountDependencies(
+        store=postgres_db,
+        cloud_router=main_cloud_router,
+        resolve_user_identity_cached=resolve_user_identity_cached,
+        externalize_gitea_url=externalize_gitea_url,
+        resolve_authorized_thread_datasources=_resolve_authorized_thread_datasources,
+        build_datasources_payload=_build_datasources_payload,
+        cloud_workspace_driver=_cloud_workspace_driver,
+    )
+
+
 def _slugify_mount_name(name: str) -> str:
-    """Workspace-safe slug for a mount's target_path."""
-    out = "".join(ch.lower() if ch.isalnum() else "_" for ch in name).strip("_")
-    return out or "project"
+    return thread_mount_rows.slugify_mount_name(name)
 
 
 def _cloud_workspace_driver() -> str:
@@ -35123,276 +29992,35 @@ def _cloud_workspace_driver() -> str:
 
 
 def _should_skip_session_folder(mounts: list[dict[str, Any]]) -> bool:
-    """Phase 4 (cloud_collaboration_model.md §9): is the legacy per-session
-    cloud folder redundant for this thread?
-
-    If at least one ``thread_mounts`` row has a working ``webdav_url`` —
-    any kind (``project``, ``project_default``, ``repo``) — the thread
-    already has a user-visible cloud surface. Provisioning a per-session
-    folder on top would create a parallel sync target the user has no
-    reason to use.
-
-    Returns False when no mount can be observed (no rows, or every row
-    failed to resolve a transport). That falls through to legacy
-    session-folder provisioning so the thread never ends up with zero
-    cloud surfaces — important for unattached sessions and for transient
-    backend failures during mount resolution.
-    """
-    if _cloud_workspace_driver() == "rclone_mount":
-        # The rclone driver falls back to mounting the regular session folder
-        # when a user-home/project mount cannot be represented safely. Keep that
-        # fallback provisioned instead of treating a WebDAV URL as proof that
-        # the runtime can mount the surface.
-        return False
-
-    for m in mounts:
-        if m.get("webdav_url"):
-            return True
-    return False
+    return thread_mount_rows.should_skip_session_folder(
+        mounts, dependencies=_thread_mount_dependencies()
+    )
 
 
 def _project_ids_from_mounts(mounts: list[dict[str, Any]]) -> list[str]:
-    """Pick out project ``source_ref``s from a list of mount rows.
-
-    Both ``project`` (non-default, mounted under ``projects/<slug>/``) and
-    ``project_default`` (default project, mounted at workspace root via the
-    user's cloud home) rows contribute — the default project is still a
-    project attachment for datasource resolution and visibility.
-    """
-    out: list[str] = []
-    for m in mounts:
-        if m.get("mount_kind") not in {"project", "project_default"}:
-            continue
-        ref = m.get("source_ref")
-        if ref:
-            out.append(str(ref))
-    return out
+    return thread_mount_rows.project_ids_from_mounts(mounts)
 
 
 async def _thread_project_ids(thread_id: str) -> list[str]:
-    """Derive the project-attachment list for a thread from ``thread_mounts``.
-
-    Replaces the legacy ``threads.metadata.project_ids`` JSONB read. Phase 1
-    of cloud_collaboration_model.md §9. Both ``mount_kind='project'`` and
-    ``project_default`` rows contribute — see ``_project_ids_from_mounts``,
-    which is what actually filters; ``repo`` rows are the shape excluded here.
-    (This line used to claim ``project_default`` was excluded too. It never
-    was, and reading it that way sends you looking for a bug that isn't there
-    — see knowledge-base/knowledge/issues/session_contacts_never_register_on_default_project.md.)
-
-    **Lazy backfill (transitional):** threads that predate the migration
-    have ``metadata.project_ids`` set but no ``thread_mounts`` rows. Newer
-    single-project threads also retain ``threads.project_id`` as their
-    durable logical scope even when cloud mount construction is unavailable.
-    When no mount rows exist, materialize either source on the spot where
-    possible and return the logical IDs even if the cloud transport cannot be
-    built. Connector authorization must not depend on cloud availability.
-    """
-    mounts = await postgres_db.list_thread_mounts(thread_id)
-    ids = _project_ids_from_mounts(mounts)
-    if ids:
-        return ids
-
-    # ---- lazy backfill from metadata.project_ids ----
-    thread = await postgres_db.get_thread(thread_id)
-    if not thread:
-        return []
-    metadata = thread.get("metadata") or {}
-    if isinstance(metadata, str):
-        try:
-            metadata = json.loads(metadata)
-        except (json.JSONDecodeError, TypeError):
-            metadata = {}
-    fallback_ids = list(
-        dict.fromkeys(
-            [
-                *([str(thread["project_id"])] if thread.get("project_id") else []),
-                *(str(value) for value in (metadata.get("project_ids") or [])),
-            ]
-        )
+    return await thread_mount_rows.thread_project_ids(
+        thread_id, dependencies=_thread_mount_dependencies()
     )
-    if not fallback_ids:
-        return []
-    try:
-        rows = await _build_thread_mount_rows(fallback_ids)
-        if rows:
-            await postgres_db.replace_thread_mounts(thread_id, rows)
-            logger.info(
-                "Thread %s: backfilled %d thread_mounts row(s) from "
-                "durable project scope",
-                thread_id,
-                len(rows),
-            )
-            return _project_ids_from_mounts(
-                await postgres_db.list_thread_mounts(thread_id)
-            )
-    except Exception as e:
-        # Don't let a backfill failure prevent the caller from getting the
-        # project_ids — fall back to the durable logical scope. The next
-        # access retries the backfill.
-        logger.warning(
-            "Thread %s: thread_mounts backfill failed (%s); "
-            "returning durable project scope",
-            thread_id,
-            e,
-        )
-    return fallback_ids
 
 
 async def _build_default_project_mount_row(
     project_id: str, project: dict[str, Any]
 ) -> Optional[dict[str, Any]]:
-    """Shape a ``project_default`` mount row for a default project.
-
-    Resolves the project's owner on the cloud backend and queries their
-    personal home Space. The mount targets the workspace root (``target_path
-    = ""``) — the agent's workspace and the user's cloud home become two
-    views of the same surface. Phase 2 of cloud_collaboration_model.md §9.
-
-    Also stashes the owner's Keycloak ``sub`` on the row (``target_user_sub``)
-    so the agent can mint a user-scoped token via RFC 8693 token-exchange
-    at WebDAV-call time. Without that, the agent's service-account
-    bearer token gets a 404 on PROPFIND against the user's Personal Space
-    (owned by exactly one user, not shared with the service account).
-
-    Returns ``None`` when the user-home can't be resolved (no owner, owner
-    missing from the cloud backend, no webdav URL, no keycloak_sub on the
-    owner, backend down). The caller treats ``None`` as "fall back to the
-    legacy session folder" so a transient resolution failure never leaves
-    the thread with zero mounts.
-    """
-    backend = (
-        main_cloud_router.for_project_optional(project)
-        if project.get("main_cloud_backend")
-        else main_cloud_router.for_owner()
+    return await thread_mount_rows.build_default_project_mount_row(
+        project_id, project, dependencies=_thread_mount_dependencies()
     )
-    # An unresolvable installation authority is one more "can't resolve the
-    # user-home" case, which this function is documented to report as None so
-    # the caller falls back to the legacy session folder — not an exception
-    # that strands the thread with zero mounts.
-    if backend is None or not backend.is_initialized:
-        return None
-    members = await postgres_db.get_project_members(project_id)
-    owner = next((m for m in members if m.get("role") == "owner"), None)
-    if not owner:
-        return None
-    owner_email = owner.get("email")
-    if not owner_email:
-        return None
-    owner_user = await postgres_db.get_user(str(owner["user_id"]))
-    target_user_sub = (owner_user or {}).get("keycloak_sub")
-    if not target_user_sub:
-        # Owner has never completed an SSO login, so we don't have their
-        # Keycloak sub yet. Token-exchange impersonation needs a real sub —
-        # bail out and let the caller fall back to the legacy session folder.
-        return None
-    # Identity args come from the member row (email + display_name); the
-    # users row fetched above only vouches for the keycloak_sub.
-    owner_identity = {
-        "id": owner["user_id"],
-        "email": owner_email,
-        "display_name": owner.get("display_name"),
-    }
-    resolved = await resolve_user_identity_cached(postgres_db, owner_identity, backend)
-    if not resolved:
-        return None
-    home = await backend.get_user_home(resolved)
-    if not home or not home.webdav_url:
-        return None
-    return {
-        "mount_kind": "project_default",
-        "target_path": "",
-        "source_kind": "user_home",
-        "source_ref": project_id,
-        "backend_id": backend.backend_id,
-        "backend_instance_id": backend.backend_instance_id,
-        "cloud_handle": home.handle.to_db(),
-        "webdav_url": home.webdav_url,
-        "target_user_sub": target_user_sub,
-    }
 
 
 async def _build_thread_mount_rows(
     project_ids: list[str],
 ) -> list[dict[str, Any]]:
-    """Resolve mount-row payloads for the given project_ids.
-
-    Each row carries everything ``replace_thread_mounts`` needs. Default
-    projects (Phase 2) produce a ``project_default`` row that mounts the
-    owner's cloud home at the workspace root; non-default projects produce
-    a ``project`` row that mounts at ``projects/<slug>/``. Projects whose
-    cloud transport can't be resolved are skipped — the mount-row entry is
-    not partially filled, the caller observes a missing row.
-
-    Multi-project collisions (two attached projects whose slugified names
-    are identical, including case-insensitive matches since the slugifier
-    lowercases) are resolved by suffixing ``-2``, ``-3``, ... on the
-    target_path so the ``UNIQUE (thread_id, target_path)`` constraint at
-    persistence time always holds.
-    """
-    rows: list[dict[str, Any]] = []
-    used_paths: set[str] = set()
-    seen_project_ids: set[str] = set()
-    for project_id in project_ids:
-        if project_id in seen_project_ids:
-            continue
-        seen_project_ids.add(project_id)
-        project = await postgres_db.get_project(project_id)
-        if not project:
-            continue
-        if project.get("is_default"):
-            try:
-                default_row = await _build_default_project_mount_row(
-                    project_id, project
-                )
-            except Exception as e:
-                logger.warning(
-                    "Project %s (default): failed to resolve user-home mount row: %s",
-                    project_id,
-                    e,
-                )
-                continue
-            if default_row:
-                rows.append(default_row)
-                used_paths.add(default_row.get("target_path", ""))
-            continue
-        backend_id = project.get("main_cloud_backend")
-        handle_str = project.get("main_cloud_folder_handle")
-        webdav_url: str | None = None
-        if backend_id and handle_str:
-            try:
-                backend = main_cloud_router.for_project(project)
-                if backend.is_initialized:
-                    handle = ProjectFolderHandle.from_db(
-                        handle_str, backend=backend.backend_id
-                    )
-                    webdav_url = backend.get_project_folder_webdav_url(handle)
-            except Exception as e:
-                logger.warning(
-                    "Project %s: failed to resolve webdav URL for thread mount: %s",
-                    project_id,
-                    e,
-                )
-        base_path = f"projects/{_slugify_mount_name(project.get('name', ''))}"
-        target_path = base_path
-        suffix = 2
-        while target_path in used_paths:
-            target_path = f"{base_path}-{suffix}"
-            suffix += 1
-        used_paths.add(target_path)
-        rows.append(
-            {
-                "mount_kind": "project",
-                "target_path": target_path,
-                "source_kind": "project_folder",
-                "source_ref": project_id,
-                "backend_id": backend_id,
-                "backend_instance_id": project.get("main_cloud_backend_instance_id"),
-                "cloud_handle": handle_str,
-                "webdav_url": webdav_url,
-            }
-        )
-    return rows
+    return await thread_mount_rows.build_thread_mount_rows(
+        project_ids, dependencies=_thread_mount_dependencies()
+    )
 
 
 async def _resolve_thread_datasources(
@@ -35401,18 +30029,12 @@ async def _resolve_thread_datasources(
     *,
     project_ids: list[str] | None = None,
 ) -> list[dict[str, Any]] | None:
-    """Resolve and build datasource payload for a thread.
-
-    ``project_ids`` is the canonical input — derived from ``thread_mounts``
-    by the caller. ``metadata`` still carries the explicit ``datasource_ids``
-    list.
-    """
-    resolved = await _resolve_authorized_thread_datasources(
+    return await thread_mount_rows.resolve_thread_datasources(
         thread,
-        metadata.get("datasource_ids"),
-        target_project_ids=project_ids,
+        metadata,
+        project_ids=project_ids,
+        dependencies=_thread_mount_dependencies(),
     )
-    return _build_datasources_payload(resolved) if resolved else None
 
 
 async def _resolve_thread_repositories(
@@ -35420,48 +30042,50 @@ async def _resolve_thread_repositories(
     *,
     externalize_urls: bool = False,
 ) -> list[dict[str, Any]] | None:
-    """Resolve raw project repositories for an internal thread agent.
+    return await thread_mount_rows.resolve_thread_repositories(
+        project_ids,
+        externalize_urls=externalize_urls,
+        dependencies=_thread_mount_dependencies(),
+    )
 
-    Public project repository endpoints redact credentials and externalize
-    Gitea URLs. Session checkout needs the same internal/raw payload that worker
-    job dispatch receives, but only across the internal agent boundary. VM
-    sessions still need Gitea URLs rewritten to the ingress-routable host,
-    matching worker dispatch.
-    """
-    if not project_ids:
-        return None
 
-    payload: list[dict[str, Any]] = []
-    for project_id in project_ids:
-        try:
-            repos = await postgres_db.get_project_repositories(str(project_id))
-        except Exception as e:
-            logger.warning(
-                "Failed to resolve project repos for thread project %s: %s",
-                project_id,
-                e,
-            )
-            continue
-        for r in repos:
-            repo_url = r.get("repo_url")
-            if externalize_urls and repo_url:
-                repo_url = externalize_gitea_url(repo_url)
-            payload.append(
-                {
-                    "id": str(r["id"]),
-                    "project_id": str(r["project_id"]),
-                    "name": r["name"],
-                    "role": r["role"],
-                    "repo_url": repo_url,
-                    "read_only": r["read_only"],
-                    "branch": r.get("branch", "main"),
-                    "clone_path": r.get("clone_path"),
-                    "credentials": r.get("credentials"),
-                    "is_managed": bool(r.get("is_managed")),
-                }
-            )
+def _thread_workspace_delivery_dependencies() -> (
+    thread_workspace_delivery.ThreadWorkspaceDeliveryDependencies
+):
+    """Rebuilt per call. Every callable is read from this module's namespace so
+    an existing ``patch("orchestrator.main._x")`` still steers the service."""
 
-    return payload or None
+    return thread_workspace_delivery.ThreadWorkspaceDeliveryDependencies(
+        store=postgres_db,
+        cloud_router=main_cloud_router,
+        gitea_client=gitea_client,
+        container_provisioner=container_provisioner,
+        GrantDenied=GrantDenied,
+        LiteWorkspaceConfigError=LiteWorkspaceConfigError,
+        backend_from_override=_backend_from_override,
+        build_agent_cloud_mount=_build_agent_cloud_mount,
+        build_agent_cloud_sync=_build_agent_cloud_sync,
+        build_protected_cloud_mount=_build_protected_cloud_mount,
+        cloud_workspace_driver=_cloud_workspace_driver,
+        grant_violations_detail=_grant_violations_detail,
+        inject_lite_workspace_config=_inject_lite_workspace_config,
+        inject_thread_dispatch_credentials=_inject_thread_dispatch_credentials,
+        protected_cloud_delivery_state=_protected_cloud_delivery_state,
+        protected_workspace_wait_payload=_protected_workspace_wait_payload,
+        require_pinned_status_identity=_require_pinned_status_identity,
+        resolve_session_config=_resolve_session_config,
+        resolve_thread_datasources=_resolve_thread_datasources,
+        resolve_thread_repositories=_resolve_thread_repositories,
+        revalidate_thread_project_ids=_revalidate_thread_project_ids,
+        ro_mount_matches_protected_selection=_ro_mount_matches_protected_selection,
+        schedule_stateless_workspace_ensure=_schedule_stateless_workspace_ensure,
+        thread_accepts_runtime=_thread_accepts_runtime,
+        thread_project_ids=_thread_project_ids,
+        thread_workspace_backend=_thread_workspace_backend,
+        virtual_workspace_rclone_spec=_virtual_workspace_rclone_spec,
+        vm_workspaces_on_pod_network=vm_workspaces_on_pod_network,
+        require_internal=require_internal,
+    )
 
 
 def _agent_canvas_workspace_capabilities(
@@ -35469,52 +30093,8 @@ def _agent_canvas_workspace_capabilities(
     workspace_context: dict[str, Any],
     vm_context: dict[str, Any],
 ) -> tuple[bool, bool, bool]:
-    """Return file/live/browser bits for the internal agent attach payload."""
-
-    vm_is_active = bool(
-        isinstance(vm_context, dict)
-        and vm_context.get("status") == "ready"
-        and vm_context.get("ssh_host")
-    )
-    canvas_presentation_available = bool(
-        not vm_is_active
-        and remote_canvas_presentation_available(metadata, workspace_context)
-    )
-    # Port presentation is deliberately narrower than file presentation. The
-    # positive bit is computed by the orchestrator from its default-off
-    # deployment gate and the same attested workspace binding; the agent never
-    # infers it from a backend label or endpoint reachability.
-    from orchestrator.services.canvas_apps import canvas_live_preview_enabled
-
-    canvas_live_apps_available = bool(
-        canvas_presentation_available and canvas_live_preview_enabled()
-    )
-    from orchestrator.services.ssh_helpers import orchestrator_can_reach
-
-    selected_context = vm_context if vm_is_active else workspace_context
-    selected_host = (
-        selected_context.get("ssh_host")
-        or selected_context.get("host")
-        or selected_context.get("pod_ip")
-    )
-    shared_browser_enabled = os.getenv(
-        "CANVAS_SHARED_BROWSER_ENABLED", ""
-    ).strip().lower() in {"1", "true", "yes", "on"}
-    try:
-        selected_target_reachable = bool(
-            selected_host and orchestrator_can_reach(str(selected_host))
-        )
-    except Exception:
-        selected_target_reachable = False
-    canvas_shared_browser_available = bool(
-        canvas_presentation_available
-        and shared_browser_enabled
-        and selected_target_reachable
-    )
-    return (
-        canvas_presentation_available,
-        canvas_live_apps_available,
-        canvas_shared_browser_available,
+    return thread_workspace_delivery.agent_canvas_workspace_capabilities(
+        metadata, workspace_context, vm_context
     )
 
 
@@ -35526,112 +30106,15 @@ async def _attest_pinned_thread_k8s_workspace(
     binding: Mapping[str, Any],
     workspace_backend: str | None,
 ) -> WorkspaceRuntimeAttestation | None:
-    """Return exact Kubernetes SSH authority for a pinned session attach."""
-
-    if (
-        thread.get("execution_lane") == "stateless"
-        or workspace_backend != "sandbox"
-        or workspace.get("status") != "ready"
-    ):
-        return None
-    provisioner = str(workspace.get("provisioner") or "").strip().lower()
-    if provisioner == "docker":
-        return None
-    if provisioner != "k8s":
-        raise HTTPException(
-            status_code=503,
-            detail="Workspace provisioner authority is unavailable",
-        )
-    try:
-        expected_runtime = str(
-            UUID(str(workspace.get(WORKSPACE_RUNTIME_INCARNATION_KEY)))
-        )
-        binding_generation = str(UUID(str(binding.get("generation"))))
-    except (TypeError, ValueError) as exc:
-        raise HTTPException(
-            status_code=503,
-            detail="Workspace runtime authority is malformed",
-        ) from exc
-    if (
-        binding.get("kind") != "remote"
-        or workspace.get("_canvas_workspace_generation") != binding_generation
-    ):
-        raise HTTPException(
-            status_code=503,
-            detail="Workspace backing authority is unavailable",
-        )
-    try:
-        attestation = await container_provisioner.attest_workspace_runtime(
-            WorkspaceOwner.session(thread_id)
-        )
-    except Exception as exc:
-        raise HTTPException(
-            status_code=503,
-            detail="Workspace runtime attestation is unavailable",
-        ) from exc
-    try:
-        stored_port = int(workspace.get("port") or workspace.get("pod_port") or 30022)
-    except (TypeError, ValueError) as exc:
-        raise HTTPException(
-            status_code=503,
-            detail="Workspace endpoint authority is malformed",
-        ) from exc
-    if (
-        attestation.runtime_incarnation != expected_runtime
-        or binding.get("backing_id") != attestation.backing_id
-        or binding.get("ssh_host_key_fingerprint")
-        != attestation.ssh_host_key_fingerprint
-        or str(workspace.get("pod_ip") or "") != attestation.pod_ip
-        or stored_port != attestation.port
-    ):
-        raise HTTPException(
-            status_code=409,
-            detail="Workspace authority changed during attach",
-        )
-
-    refreshed = await postgres_db.get_thread(thread_id)
-    if refreshed is None:
-        raise HTTPException(status_code=404, detail="Thread not found")
-    refreshed_metadata = thread_metadata_object(refreshed)
-    if (
-        refreshed.get("execution_lane") == "stateless"
-        or _thread_workspace_backend(refreshed) != "sandbox"
-        or refreshed_metadata.get("workspace_container") != workspace
-        or refreshed_metadata.get("_workspace_binding") != binding
-    ):
-        raise HTTPException(
-            status_code=409,
-            detail="Workspace authority changed during attach",
-        )
-    return attestation
-
-
-@app.get("/api/agents/threads/{thread_id}/workspace")
-async def agent_get_thread_workspace(
-    request: Request, thread_id: str
-) -> dict[str, Any]:
-    """Agent polls workspace container status for a thread. **Internal**
-    (P4b) — requires ``X-Internal-Key``. Ingress strips this path.
-
-    Returns workspace_container metadata from the thread,
-    allowing the agent to wait for the workspace to be ready.
-    """
-    await require_internal(request)
-    request_headers = getattr(request, "headers", {})
-    presented_agent_id = request_headers.get("X-Agent-ID")
-    presented_runtime_generation = request_headers.get("X-Session-Runtime-Generation")
-    presented_attach_token = request_headers.get("X-Session-Runtime-Attach-Token")
-    # This response is a credential-delivery boundary for cold/dedicated
-    # sessions.  Use the same lock as live selection replacement and do every
-    # authoritative read + response build beneath it.  Once an A -> B/[] save
-    # commits, no later cold response can deliver the old A payload.
-    async with postgres_db.thread_datasource_lock(thread_id):
-        return await _agent_get_thread_workspace_locked(
-            thread_id,
-            presented_agent_id=presented_agent_id,
-            presented_runtime_generation=presented_runtime_generation,
-            presented_attach_token=presented_attach_token,
-        )
+    return await thread_workspace_delivery.attest_pinned_thread_k8s_workspace(
+        thread_id,
+        thread,
+        metadata,
+        workspace,
+        binding,
+        workspace_backend,
+        dependencies=_thread_workspace_delivery_dependencies(),
+    )
 
 
 async def _require_pinned_workspace_credential_owner(
@@ -35642,112 +30125,14 @@ async def _require_pinned_workspace_credential_owner(
     *,
     expected_protected_ro_row: Mapping[str, Any] | None = None,
 ) -> str | None:
-    """Fence pinned workspace credentials to the reciprocal runtime owner."""
-
-    if str(thread.get("execution_lane") or "") != "pinned":
-        return None
-    raw_metadata = thread.get("metadata")
-    if isinstance(raw_metadata, str):
-        try:
-            identity_metadata = json.loads(raw_metadata)
-        except (json.JSONDecodeError, TypeError):
-            identity_metadata = None
-    elif raw_metadata is None:
-        identity_metadata = {}
-    else:
-        identity_metadata = raw_metadata
-    # Protected rows do not participate in the mixed-version grace period:
-    # their response carries the live lower-mount credential. Any malformed
-    # authority is protected-by-default and likewise requires an exact owner.
-    protected_identity_required = (
-        not isinstance(identity_metadata, dict)
-        or protected_cloud_marker_state(identity_metadata) != "off"
+    return await thread_workspace_delivery.require_pinned_workspace_credential_owner(
+        thread,
+        presented_agent_id,
+        presented_runtime_generation,
+        presented_attach_token,
+        expected_protected_ro_row=expected_protected_ro_row,
+        dependencies=_thread_workspace_delivery_dependencies(),
     )
-    exact_identity_required = bool(
-        protected_identity_required or _require_pinned_status_identity()
-    )
-    if (
-        not presented_agent_id
-        or not presented_runtime_generation
-        or (exact_identity_required and not presented_attach_token)
-    ):
-        if exact_identity_required:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "pinned_status_identity_required",
-                    "message": (
-                        "Pinned workspace credentials require agent, runtime "
-                        "generation, and process attach identity."
-                    ),
-                },
-            )
-        return None
-    try:
-        parsed_agent_id = str(UUID(str(presented_agent_id)))
-        parsed_runtime_generation = str(UUID(str(presented_runtime_generation)))
-        parsed_attach_token = (
-            str(UUID(str(presented_attach_token))) if presented_attach_token else None
-        )
-    except (TypeError, ValueError) as exc:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "pinned_runtime_identity_mismatch",
-                "message": "Pinned workspace runtime ownership changed.",
-            },
-        ) from exc
-    expected_authority = thread_runtime_authority(thread)
-    expected_ro: dict[str, str | None] = {
-        "mount_id": None,
-        "engage_attempt": None,
-        "grant_handle": None,
-        "reader_id": None,
-        "webdav_url": None,
-    }
-    if expected_protected_ro_row is not None:
-        try:
-            expected_ro = {
-                "mount_id": str(UUID(str(expected_protected_ro_row["id"]))),
-                "engage_attempt": str(
-                    UUID(str(expected_protected_ro_row["engage_attempt"]))
-                ),
-                "grant_handle": str(expected_protected_ro_row["grant_handle"]),
-                "reader_id": str(expected_protected_ro_row["reader_id"]),
-                "webdav_url": str(expected_protected_ro_row["webdav_url"]),
-            }
-        except (KeyError, TypeError, ValueError) as exc:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "pinned_runtime_identity_mismatch",
-                    "message": "Pinned workspace runtime ownership changed.",
-                },
-            ) from exc
-    if (
-        expected_authority is None
-        or expected_authority.generation != parsed_runtime_generation
-        or str(thread.get("agent_id") or "") != parsed_agent_id
-        or not await postgres_db.pinned_thread_agent_is_reciprocal(
-            str(thread.get("id") or ""),
-            parsed_agent_id,
-            expected_runtime_generation=parsed_runtime_generation,
-            expected_attach_token=parsed_attach_token,
-            expected_ro_mount_id=expected_ro["mount_id"],
-            expected_ro_engage_attempt=expected_ro["engage_attempt"],
-            expected_ro_grant_handle=expected_ro["grant_handle"],
-            expected_ro_reader_id=expected_ro["reader_id"],
-            expected_ro_webdav_url=expected_ro["webdav_url"],
-        )
-    ):
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "pinned_runtime_identity_mismatch",
-                "message": "Pinned workspace runtime ownership changed.",
-            },
-        )
-    return parsed_agent_id
 
 
 async def _agent_get_thread_workspace_locked(
@@ -35757,731 +30142,13 @@ async def _agent_get_thread_workspace_locked(
     presented_runtime_generation: str | None = None,
     presented_attach_token: str | None = None,
 ) -> dict[str, Any]:
-    """Build a cold-session payload from state fetched under the DS lock."""
-    thread = await postgres_db.get_thread(thread_id)
-    if not thread:
-        raise HTTPException(status_code=404, detail="Thread not found")
-    if not _thread_accepts_runtime(thread):
-        raise HTTPException(
-            status_code=409,
-            detail=thread_runtime_refusal_detail(thread),
-        )
-    await _require_pinned_workspace_credential_owner(
-        thread,
-        presented_agent_id,
-        presented_runtime_generation,
-        presented_attach_token,
-    )
-    raw_metadata = thread.get("metadata")
-    metadata = raw_metadata if raw_metadata is not None else {}
-    if isinstance(metadata, str):
-        try:
-            metadata = json.loads(metadata)
-        except (json.JSONDecodeError, TypeError):
-            return _protected_workspace_wait_payload(
-                state="failed", error_code="malformed_protected_marker"
-            )
-    if not isinstance(metadata, dict):
-        return _protected_workspace_wait_payload(
-            state="failed", error_code="malformed_protected_marker"
-        )
-    entry_protected_marker = protected_cloud_marker_state(metadata)
-    if entry_protected_marker != "off":
-        protected_state = await _protected_cloud_delivery_state(thread, metadata)
-        if protected_state[0] != "ready":
-            return _protected_workspace_wait_payload(
-                state=protected_state[0], error_code=protected_state[1]
-            )
-    ws = metadata.get("workspace_container") or {}
-    vm = metadata.get("vm") or {}
-    binding = metadata.get("_workspace_binding") or {}
-    # Keep the durable workspace snapshot separate from response-local
-    # readiness redaction below.  The final credential-boundary read must
-    # detect a real U1 -> U2 change, not mistake locally cleared coordinates
-    # (restoring/non-ready/stale probe) for a concurrent database write.
-    authority_ws = ws
-    authority_vm = vm
-    authority_binding = binding
-    workspace_backend = _thread_workspace_backend(thread)
-    if thread.get("execution_lane") == "stateless" and workspace_backend == "sandbox":
-        workspace_status = str(ws.get("status") or "")
-        restore_marker_present = WORKSPACE_SNAPSHOT_RESTORE_REQUIRED_KEY in ws
-        raw_restore_required = ws.get(WORKSPACE_SNAPSHOT_RESTORE_REQUIRED_KEY)
-        if restore_marker_present and type(raw_restore_required) is not bool:
-            # This response carries SSH/cloud credentials. A malformed
-            # present-only lifecycle sentinel is neither "no debt" nor safe
-            # restore intent; refuse it before probing or scheduling effects.
-            raise HTTPException(
-                status_code=503,
-                detail="Stateless snapshot restore authority is malformed",
-            )
-        snapshot_restore_required = raw_restore_required is True
-        if snapshot_restore_required:
-            # Container creation publishes its attested endpoint before a
-            # snapshot restore has finished extracting into that endpoint.
-            # The durable restore-intent bit is therefore part of readiness:
-            # never hand a claimant an empty/partial tree while extraction is
-            # still running (or after it failed).  The serialized lifecycle
-            # owner clears this bit only after a successful reattach/extract.
-            _schedule_stateless_workspace_ensure(thread_id)
-            ws = {
-                **ws,
-                "status": "restoring",
-                "pod_ip": None,
-                "host": None,
-                "port": None,
-                "pod_port": None,
-                "_canvas_workspace_generation": None,
-                WORKSPACE_RUNTIME_INCARNATION_KEY: None,
-            }
-        elif workspace_status == "ready":
-            # This internal poll is the physical attach credential boundary. A
-            # cached Ready row is only evidence about the Pod UID that authored
-            # it; a 404 or same-name replacement must not hand its stale SSH
-            # endpoint to the claimant. Unknown control-plane health also fails
-            # closed locally, but does not recreate anything until
-            # absence/drift is confirmed.
-            expected_runtime: str | None
-            try:
-                expected_runtime = str(
-                    UUID(str(ws.get(WORKSPACE_RUNTIME_INCARNATION_KEY)))
-                )
-            except (TypeError, ValueError):
-                expected_runtime = None
-            if expected_runtime is None:
-                exact_pod_live: bool | None = False
-            else:
-                exact_pod_live = await container_provisioner.workspace_pod_live(
-                    WorkspaceOwner.session(thread_id),
-                    expected_runtime_incarnation=expected_runtime,
-                )
-            if exact_pod_live is True:
-                # The Kubernetes read crossed an await point while workspace
-                # lifecycle writers remained free to replace/invalidate the
-                # row. Re-read and compare the complete endpoint attestation;
-                # a delayed True for U1 must never authorize credentials after
-                # durable state has moved to U2/non-ready.
-                refreshed_thread = await postgres_db.get_thread(thread_id)
-                if refreshed_thread is None:
-                    raise HTTPException(status_code=404, detail="Thread not found")
-                refreshed_metadata = thread_metadata_object(refreshed_thread)
-                refreshed_ws = refreshed_metadata.get("workspace_container") or {}
-                refreshed_binding = refreshed_metadata.get("_workspace_binding") or {}
-                refreshed_backend = _thread_workspace_backend(refreshed_thread)
-                if (
-                    refreshed_thread.get("execution_lane") != "stateless"
-                    or refreshed_backend != "sandbox"
-                ):
-                    raise HTTPException(
-                        status_code=409,
-                        detail="Workspace authority changed during attach",
-                    )
-                if refreshed_ws != ws or refreshed_binding != binding:
-                    logger.info(
-                        "Stateless workspace attestation changed during probe: "
-                        "thread=%s old_runtime=%s new_runtime=%s",
-                        thread_id,
-                        expected_runtime,
-                        refreshed_ws.get(WORKSPACE_RUNTIME_INCARNATION_KEY),
-                    )
-                    thread = refreshed_thread
-                    metadata = refreshed_metadata
-                    ws = refreshed_ws
-                    vm = metadata.get("vm") or {}
-                    binding = refreshed_binding
-                    authority_ws = refreshed_ws
-                    authority_vm = vm
-                    authority_binding = refreshed_binding
-                    workspace_backend = refreshed_backend
-                    refreshed_status = str(ws.get("status") or "")
-                    if refreshed_status in {
-                        "",
-                        "none",
-                        "deleted",
-                        "failed",
-                        "suspended",
-                        "restoring",
-                        "created",
-                        "creating",
-                        "pending",
-                    }:
-                        _schedule_stateless_workspace_ensure(thread_id)
-                    ws = {
-                        **ws,
-                        "status": (
-                            "creating"
-                            if refreshed_status == "ready"
-                            else refreshed_status
-                        ),
-                        "pod_ip": None,
-                        "host": None,
-                        "port": None,
-                        "pod_port": None,
-                        "_canvas_workspace_generation": None,
-                        WORKSPACE_RUNTIME_INCARNATION_KEY: None,
-                    }
-                    # The refreshed U2/non-ready row has not been probed by
-                    # this request. Do not reuse U1's result or start a Ready-U2
-                    # ensure; the next poll will attest U2 directly.
-                    exact_pod_live = None
-            if exact_pod_live is not True:
-                if exact_pod_live is False:
-                    _schedule_stateless_workspace_ensure(thread_id)
-                logger.info(
-                    "Stateless workspace attestation pending: thread=%s probe=%r",
-                    thread_id,
-                    exact_pod_live,
-                )
-                # Response-local invalidation only. The single-flight ensure
-                # owns durable lifecycle writes; meanwhile the agent keeps this
-                # leased claim alive and polls again instead of accepting stale
-                # SSH bytes.
-                ws = {
-                    **ws,
-                    "status": "creating",
-                    "pod_ip": None,
-                    "host": None,
-                    "port": None,
-                    "pod_port": None,
-                    "_canvas_workspace_generation": None,
-                    WORKSPACE_RUNTIME_INCARNATION_KEY: None,
-                }
-        elif workspace_status in {
-            "",
-            "none",
-            "deleted",
-            "failed",
-            "suspended",
-            "restoring",
-            "created",
-            "creating",
-            "pending",
-        }:
-            # A claimant can arrive after the original input-side ensure has
-            # failed, or after a lifecycle sweep changed stale Ready evidence
-            # to deleted. The durable input already exists, so this polling
-            # boundary is the retry trigger; no second user action is required.
-            # The required-runtime lifecycle arm also re-adopts a live
-            # in-progress pod whose original readiness waiter was interrupted.
-            _schedule_stateless_workspace_ensure(thread_id)
-            ws = {
-                **ws,
-                "pod_ip": None,
-                "host": None,
-                "port": None,
-                "pod_port": None,
-                "_canvas_workspace_generation": None,
-                WORKSPACE_RUNTIME_INCARNATION_KEY: None,
-            }
-    pinned_k8s_attestation = await _attest_pinned_thread_k8s_workspace(
+    return await thread_workspace_delivery.agent_get_thread_workspace_locked(
         thread_id,
-        thread,
-        metadata,
-        ws,
-        binding,
-        workspace_backend,
+        presented_agent_id=presented_agent_id,
+        presented_runtime_generation=presented_runtime_generation,
+        presented_attach_token=presented_attach_token,
+        dependencies=_thread_workspace_delivery_dependencies(),
     )
-    if pinned_k8s_attestation is not None:
-        ws = {
-            **ws,
-            "host": pinned_k8s_attestation.host,
-            "pod_ip": pinned_k8s_attestation.pod_ip,
-            "port": pinned_k8s_attestation.port,
-            WORKSPACE_RUNTIME_INCARNATION_KEY: (
-                pinned_k8s_attestation.runtime_incarnation
-            ),
-        }
-    workspace_generation: str | None = None
-    workspace_runtime_incarnation: str | None = None
-    workspace_ssh_host_key_fingerprint: str | None = None
-    if isinstance(binding, dict):
-        try:
-            candidate_generation = str(UUID(str(binding.get("generation"))))
-        except (TypeError, ValueError):
-            candidate_generation = ""
-        if (
-            workspace_backend == "virtual"
-            and binding.get("kind") == "virtual"
-            and candidate_generation
-        ):
-            # A virtual generation is authoritative only for the deployment's
-            # current durable object-store namespace.  Kind + UUID alone are
-            # historical evidence: after an object-store rotation they could
-            # attest bytes under the old ``threads/<id>/`` backing while this
-            # claimant is attached to the new one.
-            virtual_spec = _virtual_workspace_rclone_spec()
-            if (
-                isinstance(virtual_spec, dict)
-                and virtual_spec.get("type") != "memory"
-                and binding.get("backing_id")
-                == virtual_thread_backing_id(thread_id, virtual_spec)
-            ):
-                workspace_generation = candidate_generation
-        elif (
-            workspace_backend != "virtual"
-            and binding.get("kind") == "remote"
-            and ws.get("status") == "ready"
-            and str(ws.get("_canvas_workspace_generation") or "")
-            == candidate_generation
-        ):
-            # A remote binding alone is historical evidence. Pair it with the
-            # exact ready endpoint generation before cloud sync may call those
-            # workspace bytes the source of an acknowledged generation.
-            try:
-                # Kubernetes publishes its Pod UID. Static Docker workspaces
-                # have no Pod incarnation; their durable allocation lease UUID
-                # is the exact runtime-incarnation authority. Both are paired
-                # with the backing generation and host-key pin before any SSH
-                # process-zero proof can be accepted.
-                runtime_identity = (
-                    ws.get("_docker_workspace_lease_id")
-                    if ws.get("provisioner") == "docker"
-                    else ws.get(WORKSPACE_RUNTIME_INCARNATION_KEY)
-                )
-                candidate_runtime_incarnation = str(UUID(str(runtime_identity)))
-            except (TypeError, ValueError):
-                candidate_runtime_incarnation = None
-            if thread.get("execution_lane") == "stateless":
-                # For a movable claimant the complete ready authority is one
-                # indivisible tuple. The fingerprint is the use-side fence:
-                # stable Service DNS must not carry U1 authority onto a U2 pod
-                # between this response and Paramiko's key exchange.
-                if (
-                    candidate_runtime_incarnation is not None
-                    and remote_canvas_presentation_available(metadata, ws)
-                ):
-                    workspace_generation = candidate_generation
-                    workspace_runtime_incarnation = candidate_runtime_incarnation
-                    workspace_ssh_host_key_fingerprint = binding[
-                        "ssh_host_key_fingerprint"
-                    ]
-            else:
-                workspace_generation = candidate_generation
-                workspace_runtime_incarnation = candidate_runtime_incarnation
-                # Protected pinned sessions carry cloud credentials and staged
-                # write authority. Bind their SSH use side to the same exact
-                # host key as stateless claimants; stable Service/Docker
-                # coordinates alone cannot distinguish a replacement runtime.
-                if (
-                    entry_protected_marker == "on"
-                    and candidate_runtime_incarnation is not None
-                    and remote_canvas_presentation_available(metadata, ws)
-                ):
-                    workspace_ssh_host_key_fingerprint = binding[
-                        "ssh_host_key_fingerprint"
-                    ]
-    if pinned_k8s_attestation is not None:
-        # The attestation identifies physical backing by PVC/Pod UID. Pinned
-        # session consumers (shell ownership, cloud staging and retirement)
-        # use the separately stored binding generation, already paired with
-        # this exact attested backing and rechecked at the response boundary.
-        workspace_generation = str(UUID(str(binding["generation"])))
-        workspace_runtime_incarnation = pinned_k8s_attestation.runtime_incarnation
-        workspace_ssh_host_key_fingerprint = (
-            pinned_k8s_attestation.ssh_host_key_fingerprint
-        )
-    if (
-        entry_protected_marker == "on"
-        and workspace_backend not in {"virtual", "none"}
-        and ws.get("status") == "ready"
-        and (
-            workspace_generation is None
-            or workspace_runtime_incarnation is None
-            or workspace_ssh_host_key_fingerprint is None
-        )
-    ):
-        return _protected_workspace_wait_payload(
-            state="failed", error_code="workspace_runtime_identity_unavailable"
-        )
-    if (
-        thread.get("execution_lane") == "stateless"
-        and workspace_backend == "virtual"
-        and workspace_generation is None
-    ):
-        # A virtual workspace is durable only through its orchestrator-owned
-        # object-store binding.  Never hand a stateless claimant cloud
-        # credentials with an unbound/ambiguous source namespace: the
-        # generation fence could otherwise bless bytes from no authoritative
-        # workspace incarnation.
-        raise HTTPException(
-            status_code=503,
-            detail="Stateless virtual workspace binding is unavailable",
-        )
-    (
-        canvas_presentation_available,
-        canvas_live_apps_available,
-        canvas_shared_browser_available,
-    ) = _agent_canvas_workspace_capabilities(metadata, ws, vm)
-    # Phase 1: project attachment + cloud mounts now live on thread_mounts.
-    # Acknowledged-but-still-unavailable project drift is narrowed out
-    # INSIDE _revalidate_thread_project_ids now, same as the warm-attach
-    # call site — otherwise a cold-started session dies here on exactly the
-    # drift the owner already acknowledged at resume — while a RECOVERED
-    # acknowledged project returns automatically (spec §3.2).
-    project_ids = await _revalidate_thread_project_ids(
-        thread, await _thread_project_ids(thread_id)
-    )
-    datasources_payload = await _resolve_thread_datasources(
-        thread, metadata, project_ids=project_ids
-    )
-    mount_rows = await postgres_db.list_thread_mounts(thread_id)
-    suppress_disposable_cloud = bool(
-        thread.get("execution_lane") == "stateless" and workspace_backend == "none"
-    )
-    if suppress_disposable_cloud:
-        # ScratchBackend has no file tools and promises no durable workspace.
-        # Do not advertise either the structured or legacy cloud surface: a
-        # stateless claimant must not turn that explicitly disposable tier
-        # into an accidental session-folder mirror. Pinned sessions retain
-        # their historical cloud payload until that lane is retired/migrated.
-        cloud_mount_cfg = None
-        cloud_sync_cfg = None
-    else:
-        cloud_mount_cfg = await _build_agent_cloud_mount(
-            thread,
-            mount_rows=mount_rows,
-            metadata=metadata,
-        )
-        if cloud_mount_cfg:
-            cloud_sync_cfg = None
-        elif metadata.get("protected_cloud"):
-            # Protected thread with no engageable protected mount (flag off,
-            # VM tier, or a refused/absent grant): NO live sync fallback of
-            # any kind (fail-closed; agent sees degraded-cloud state, never a
-            # live write path on a thread the user marked protected).
-            cloud_sync_cfg = None
-        elif _cloud_workspace_driver() == "rclone_mount":
-            # rclone requested but unavailable/unsupported: fall back to the
-            # regular session folder only. Do not eagerly clone thread_mounts
-            # such as a default user home; that is the startup failure this
-            # driver is meant to avoid.
-            cloud_sync_cfg = _build_agent_cloud_sync(thread, mount_rows=[])
-        else:
-            cloud_sync_cfg = _build_agent_cloud_sync(thread, mount_rows=mount_rows)
-    # Issue 13 follow-up: if the main cloud is up but this thread resolved NO
-    # sync target (session-folder provisioning failed upstream, or user-home /
-    # project-mount resolution produced nothing usable), the agent would
-    # otherwise run unsynced with no signal. Flag it so the agent surfaces the
-    # same degraded-sync state it shows for a failed initial pull, instead of
-    # silently skipping cloud sync for the session's whole life.
-    try:
-        _cloud_up = main_cloud_router.active.is_initialized
-    except Exception:
-        _cloud_up = False
-    cloud_sync_degraded = bool(
-        not suppress_disposable_cloud
-        and _cloud_up
-        and not cloud_mount_cfg
-        and not cloud_sync_cfg
-        and (metadata.get("protected_cloud") or not thread.get("nc_session_folder"))
-    )
-    # Re-inject credentials in-flight: the persisted config_override is stripped
-    # of secrets (redact_config_override at create/hot-swap). This endpoint is
-    # the agent's key source on resume — its attach fallback in persistent_app.py
-    # reads ``config_override`` from here. require_internal + ingress-stripped, so
-    # plaintext stays on the agent trust boundary. Models/providers survive
-    # stripping, so user_settings isn't needed to repopulate the keys.
-    co = metadata.get("config_override") or {}
-    include_kb_profile = bool(project_ids) or any(
-        str(datasource.get("type") or "").lower() == "kb"
-        for datasource in datasources_payload or []
-    )
-    if co or include_kb_profile:
-        co = await _inject_thread_dispatch_credentials(
-            co,
-            user_id=str(thread["user_id"]) if thread.get("user_id") else None,
-            project_id=str(thread["project_id"]) if thread.get("project_id") else None,
-            include_kb_profile=include_kb_profile,
-        )
-    # Orchestrator-resolved config for cold/dedicated attach: the agent prefers
-    # this fully-resolved, credential-injected blob over the config_override
-    # merge above (which stays for the fallback). None when experts are off.
-    # Session dispatch PEP (fail closed): a grant denial or resolve error must not
-    # fall through to the unvetted config_override — refuse the attach (403).
-    _sess_status: dict[str, Any] = {}
-    try:
-        session_resolved = await _resolve_session_config(
-            thread, metadata, status=_sess_status
-        )
-    except GrantDenied as gd:
-        raise HTTPException(
-            status_code=403, detail=_grant_violations_detail(gd.violations)
-        )
-    if _sess_status.get("state") == "error":
-        raise HTTPException(
-            status_code=403,
-            detail="capability grants could not be verified for this session config",
-        )
-    # Lite (virtual/none) sessions run with no workspace pod. Attach the
-    # object-store mounts in-flight here — the same enrichment
-    # _send_session_attach does for the idle-pool path — so a DEDICATED session
-    # agent (provisioned when no pool agent is free) can build its lite backend
-    # from this response. Without it _attach_session would poll for a workspace
-    # pod that never exists and the agent would exit cleanly (the lite session
-    # boot gap, no_workspace_agent_mode). No-op for sandbox/vm.
-    try:
-        co = _inject_lite_workspace_config(co, prefix=f"threads/{thread_id}/") or co
-        # The resolved blob is the agent's PREFERRED hydration source, loaded via
-        # load_agent_config_from_dict(resolved["agent"]) WITHOUT a config_override
-        # merge (persistent_app._attach_session). Its agent.workspace already
-        # carries the lite backend but NOT the in-flight object-store mounts —
-        # attach them there, else create_lite_backend raises "requires
-        # workspace.mounts" and the lite session can't boot.
-        if isinstance(session_resolved, dict) and _backend_from_override(co) in (
-            LITE_BACKENDS
-        ):
-            agent_ws = session_resolved.setdefault("agent", {}).setdefault(
-                "workspace", {}
-            )
-            agent_ws.update(co.get("workspace") or {})
-    except LiteWorkspaceConfigError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-
-    repositories_payload = await _resolve_thread_repositories(project_ids)
-    git_remote_url = ws.get("git_remote_url")
-    managed_repository_credentials: list[dict[str, Any]] | None = None
-    runtime_repository_backend: str | None = None
-    if vm.get("status") == "ready" and vm.get("ssh_host"):
-        runtime_repository_backend = "vm"
-    elif ws.get("status") == "ready" and (ws.get("pod_ip") or ws.get("host")):
-        runtime_repository_backend = "sandbox"
-    if runtime_repository_backend is not None:
-        try:
-            (
-                git_remote_url,
-                repositories_payload,
-                managed_repository_credentials,
-            ) = await authorize_thread_repository_transport(
-                postgres_db,
-                gitea_client,
-                thread,
-                repositories_payload,
-                backend=runtime_repository_backend,
-            )
-        except ManagedRepositoryAuthorityError as exc:
-            logger.warning(
-                "Thread repository authority unavailable at attach: thread=%s code=%s",
-                thread_id,
-                exc.code,
-            )
-            raise HTTPException(
-                status_code=503,
-                detail="Workspace repository authority is unavailable",
-            ) from exc
-    if runtime_repository_backend == "vm" and not vm_workspaces_on_pod_network():
-        for repository in repositories_payload or []:
-            if not repository.get("is_managed") and repository.get("repo_url"):
-                repository["repo_url"] = externalize_gitea_url(repository["repo_url"])
-    if not await postgres_db.managed_repository_authorities_are_current(
-        managed_repository_credentials
-    ):
-        raise HTTPException(
-            status_code=503,
-            detail="Workspace repository authority changed during attach",
-        )
-    if pinned_k8s_attestation is not None:
-        latest = await postgres_db.get_thread(thread_id)
-        if latest is None:
-            raise HTTPException(status_code=404, detail="Thread not found")
-        latest_metadata = thread_metadata_object(latest)
-        confirmed = await _attest_pinned_thread_k8s_workspace(
-            thread_id,
-            latest,
-            latest_metadata,
-            latest_metadata.get("workspace_container") or {},
-            latest_metadata.get("_workspace_binding") or {},
-            _thread_workspace_backend(latest),
-        )
-        if confirmed != pinned_k8s_attestation:
-            raise HTTPException(
-                status_code=409,
-                detail="Workspace authority changed during attach",
-            )
-    # Complete protected-reader and exact selected-mount validation before the
-    # final lifecycle read. The endpoint holds ``thread_datasource_lock`` for
-    # this whole function, so selection cannot change after this snapshot;
-    # marker/lifecycle can still change through independent terminal writers
-    # and are checked synchronously after the final read below.
-    prepared_protected_mount: dict[str, Any] | None = None
-    if entry_protected_marker == "on":
-        prepared_runtime_authority = thread_runtime_authority(thread)
-        if prepared_runtime_authority is None:
-            return _protected_workspace_wait_payload(state="engaging")
-        prepared_ro_row, prepared_mount_rows = await asyncio.gather(
-            postgres_db.get_ro_mount_by_thread(thread_id),
-            postgres_db.list_thread_mounts(thread_id),
-        )
-        if not _ro_mount_matches_protected_selection(
-            prepared_ro_row,
-            prepared_mount_rows,
-            thread_id=thread_id,
-            user_id=str(thread.get("user_id") or ""),
-            runtime_generation=prepared_runtime_authority.generation,
-        ):
-            return _protected_workspace_wait_payload(state="engaging")
-        prepared_protected_mount = (
-            _build_protected_cloud_mount(prepared_ro_row, thread_id=thread_id)
-            if prepared_ro_row
-            else None
-        )
-        if prepared_protected_mount is None:
-            return _protected_workspace_wait_payload(state="engaging")
-
-    # Everything above this point crosses policy, workspace, repository and
-    # cloud awaits. This is the actual credential-delivery boundary and the
-    # final await before returning coordinates.
-    final_thread = await postgres_db.get_thread(thread_id)
-    if not _thread_accepts_runtime(final_thread):
-        raise HTTPException(
-            status_code=409,
-            detail=thread_runtime_refusal_detail(final_thread),
-        )
-    # This is deliberately the last await before any credential-bearing
-    # response. A delayed old runtime A that crosses End -> Resume -> B sees
-    # the successor binding here and is refused without learning B's bytes.
-    await _require_pinned_workspace_credential_owner(
-        final_thread,
-        presented_agent_id,
-        presented_runtime_generation,
-        presented_attach_token,
-        expected_protected_ro_row=(
-            prepared_ro_row if entry_protected_marker == "on" else None
-        ),
-    )
-    final_raw_metadata = final_thread.get("metadata")
-    final_metadata = final_raw_metadata if final_raw_metadata is not None else {}
-    if isinstance(final_metadata, str):
-        try:
-            final_metadata = json.loads(final_metadata)
-        except (json.JSONDecodeError, TypeError):
-            return _protected_workspace_wait_payload(
-                state="failed", error_code="malformed_protected_marker"
-            )
-    if not isinstance(final_metadata, dict):
-        return _protected_workspace_wait_payload(
-            state="failed", error_code="malformed_protected_marker"
-        )
-    final_ws = final_metadata.get("workspace_container") or {}
-    final_vm = final_metadata.get("vm") or {}
-    final_binding = final_metadata.get("_workspace_binding") or {}
-    if (
-        final_ws != authority_ws
-        or final_vm != authority_vm
-        or final_binding != authority_binding
-    ):
-        # Workspace U1 -> U2 is independent of the thread generation. Never
-        # splice U1 coordinates/credentials into a response authorized by a
-        # final read of U2; the agent retries from one coherent snapshot.
-        raise HTTPException(
-            status_code=409,
-            detail={"code": "workspace_runtime_identity_changed"},
-        )
-    final_protected_marker = protected_cloud_marker_state(final_metadata)
-    if final_protected_marker == "malformed":
-        return _protected_workspace_wait_payload(
-            state="failed", error_code="malformed_protected_marker"
-        )
-    if final_protected_marker != entry_protected_marker:
-        # A settings/lifecycle writer crossed this expensive credential build.
-        # Return no coordinates from either snapshot; the next poll starts
-        # from one authoritative marker instead of splicing the two states.
-        return _protected_workspace_wait_payload(state="engaging")
-    if final_protected_marker == "on":
-        # All DB/cloud validation already completed under the selection lock;
-        # only the exact prepared mount may cross the response boundary.
-        if prepared_protected_mount is None:
-            return _protected_workspace_wait_payload(state="engaging")
-        cloud_mount_cfg = prepared_protected_mount
-        cloud_sync_cfg = None
-        cloud_sync_degraded = False
-    final_runtime_authority = thread_runtime_authority(final_thread)
-    if final_runtime_authority is None and (
-        final_protected_marker != "off" or _require_pinned_status_identity()
-    ):
-        raise HTTPException(
-            status_code=409,
-            detail={"code": "pinned_runtime_generation_unavailable"},
-        )
-
-    return {
-        "status": ws.get("status", "none"),
-        "pinned_status_identity_contract": 1,
-        "pinned_runtime_generation_contract": 1,
-        "session_runtime_generation": (
-            final_runtime_authority.generation
-            if final_runtime_authority is not None
-            else None
-        ),
-        # Internal claim/attach identity, never exposed by owner-facing thread
-        # routes. Durable cloud generations bind their source bytes to this
-        # orchestrator-owned workspace incarnation and recheck it before each
-        # external PUT.
-        "workspace_generation": workspace_generation,
-        # Separate from the backing generation: a PVC-backed workspace keeps
-        # its generation across pod replacement, while this Kubernetes Pod UID
-        # changes and fences the prior runtime's shell ownership record.
-        "workspace_runtime_incarnation": workspace_runtime_incarnation,
-        # Internal stateless-attach authority only. It is emitted iff the exact
-        # ready generation/runtime tuple above is accepted, and is consumed as
-        # an exact Paramiko host-key pin before any SFTP, exec, or tmux claim.
-        "workspace_ssh_host_key_fingerprint": (workspace_ssh_host_key_fingerprint),
-        "workspace_provisioner": (
-            str(vm.get("provisioner") or "vm")
-            if vm.get("status") == "ready" and vm.get("ssh_host")
-            else (str(ws.get("provisioner") or "") or None)
-        ),
-        # K8s provisioner uses pod_ip; Docker provisioner uses host — normalize
-        "pod_ip": ws.get("pod_ip") or ws.get("host"),
-        "pod_name": ws.get("pod_name"),
-        "pod_port": ws.get("pod_port") or ws.get("port"),
-        "namespace": ws.get("namespace"),
-        "git_remote_url": git_remote_url,
-        "managed_repository_credentials": managed_repository_credentials,
-        # Public capability only. A ready endpoint without a paired trusted
-        # binding must not cause the agent to advertise Canvas tools which can
-        # never work.
-        "canvas_presentation_available": canvas_presentation_available,
-        "canvas_live_apps_available": canvas_live_apps_available,
-        "canvas_shared_browser_available": canvas_shared_browser_available,
-        # SSH key path (set by Docker provisioner in dev mode)
-        "ssh_key_path": os.environ.get("SSH_KEY_PATH"),
-        # VM fields (take precedence when present)
-        "vm_status": vm.get("status"),
-        "vm_ssh_host": vm.get("ssh_host"),
-        "vm_ssh_port": vm.get("ssh_port"),
-        "vm_name": vm.get("vm_name"),
-        # Config overrides (model, temperature, etc.) — secrets re-injected above
-        "config_override": co,
-        # Orchestrator-resolved config blob (preferred over config_override when present)
-        "resolved_config": session_resolved,
-        # Project scoping
-        "project_ids": project_ids,
-        # Resolved datasources for the thread
-        "datasources": datasources_payload,
-        # Raw project repository payload for internal session tools. Public
-        # repository routes intentionally redact clone credentials.
-        "repositories": repositories_payload,
-        # Nextcloud session folder (legacy; preserved one release for back-compat)
-        "nc_session_folder": (
-            None
-            if suppress_disposable_cloud or final_protected_marker != "off"
-            else final_thread.get("nc_session_folder")
-        ),
-        # Structured cloud-sync config (backend + webdav URL + auth).
-        # Agent consumes this via ``src.services.cloud_sync.build_workspace_sync``.
-        "cloud_sync": cloud_sync_cfg,
-        # Structured lazy cloud mount config. Mutually exclusive with
-        # cloud_sync for the same thread response.
-        "cloud_mount": cloud_mount_cfg,
-        # True when cloud is up but no sync target resolved (Issue 13 follow-up).
-        "cloud_sync_degraded": cloud_sync_degraded,
-        # Protected Cloud Mode marker (F-C1): tells the agent to fail-close
-        # the legacy nc_session_folder sync shim and any cloud_sync
-        # consumption rather than falling back to a live WebDAV mount.
-        "protected_cloud": final_protected_marker != "off",
-        "protected_cloud_state": ("ready" if final_protected_marker == "on" else None),
-        "protected_cloud_error_code": None,
-    }
 
 
 class AgentThreadStatusRequest(BaseModel):

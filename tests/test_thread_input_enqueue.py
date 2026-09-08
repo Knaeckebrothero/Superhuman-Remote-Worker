@@ -589,7 +589,9 @@ async def test_stateless_workspace_ensure_scheduler_is_single_flight(monkeypatch
 
     ensure.side_effect = _ensure
     monkeypatch.setattr(orch_main, "ensure_session_workspace", ensure)
-    orch_main._stateless_workspace_ensure_tasks.pop(THREAD_ID, None)
+    # R1.B05 moved the module dict into an application-owned registry; the
+    # single-flight property under test is unchanged.
+    orch_main._stateless_workspace_ensure_registry.discard(THREAD_ID)
 
     first = orch_main._schedule_stateless_workspace_ensure(THREAD_ID)
     await started.wait()
@@ -600,7 +602,7 @@ async def test_stateless_workspace_ensure_scheduler_is_single_flight(monkeypatch
     release.set()
     await first
     await asyncio.sleep(0)
-    assert THREAD_ID not in orch_main._stateless_workspace_ensure_tasks
+    assert orch_main._stateless_workspace_ensure_registry.get(THREAD_ID) is None
 
 
 @pytest.mark.asyncio

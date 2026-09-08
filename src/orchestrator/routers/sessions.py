@@ -46,6 +46,13 @@ from orchestrator.services.session_provisioning_state import (
     agent_pod_provisioning_in_progress,
 )
 from orchestrator.services.session_router import SessionRouteAuthorityError
+
+# R1.B05 moved these three out of `main`; they are pure, so this router
+# reaches their owners directly instead of going back through the
+# application module.
+from orchestrator.services import session_tool_policy
+from orchestrator.services import session_workspace_policy
+from orchestrator.services import workspace_tier_policy
 from orchestrator.services.session_runtime_admission import (
     ThreadRuntimeAuthority,
     pinned_binding_invalid_detail,
@@ -325,11 +332,9 @@ async def prepare_session(
     # registry rather than the key it arrived under. Same one validator as
     # every other boundary. The cockpit posts `{}`, so nothing it sends is
     # affected; this closes the API-direct path.
-    from orchestrator.main import (
-        _with_validated_tool_overrides,
-    )  # late import: avoid circular
-
-    validated_override = _with_validated_tool_overrides(body.config_override)
+    validated_override = session_tool_policy.with_validated_tool_overrides(
+        body.config_override
+    )
 
     # Fire-and-forget the actual work in a background task. Progress reaches
     # the cockpit via SSE. Idempotency is enforced by the advisory lock
@@ -556,15 +561,11 @@ async def _do_prepare(
         # beyond the sandbox default; size the budget from the thread's stored
         # backend and tag the lifecycle event so the cockpit shows the VM copy.
         # (knowledge-base/knowledge/features/session_create_on_vm.md)
-        from orchestrator.main import (  # type: ignore
-            _session_ready_timeout_s,
-            _thread_workspace_backend,
-        )
 
         thread = await db.get_thread(thread_id)
         if not same_thread_runtime_authority(thread, runtime_authority):
             return
-        _backend = _thread_workspace_backend(thread)
+        _backend = workspace_tier_policy.thread_workspace_backend(thread)
         _vm_tag = {"backend": "vm"} if _backend == "vm" else {}
         _emit("booting", **_vm_tag)
         binding: PinnedSessionBinding | None = await db.get_pinned_session_binding(
@@ -578,7 +579,7 @@ async def _do_prepare(
                 _emit("failed", reason="session binding is not authoritative")
             return
 
-        ready_timeout_s = _session_ready_timeout_s(_backend)
+        ready_timeout_s = session_workspace_policy.session_ready_timeout_s(_backend)
         if not await wait_for_ready(
             pod_ip=binding.pod_ip,
             pod_port=binding.pod_port,

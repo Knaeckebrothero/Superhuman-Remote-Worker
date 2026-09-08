@@ -1,4 +1,19 @@
-"""Dispatch-time delivery of catalog-resolved search/fetch providers."""
+"""Dispatch-time delivery of catalog-resolved search/fetch providers.
+
+R1.B05 lane C re-pointed these from ``orchestrator.main._inject_search_credentials``
+to ``orchestrator.services.dispatch_credentials.inject_search_credentials``. The
+injector's only main-local callers were the two dispatch-credential composers,
+both of which move in this batch, so the main name has no caller left and these
+cases must exercise the service directly rather than a bridge that is about to
+be deleted.
+
+The ``resolve_capability_credentials`` patch still targets the attribute on
+``orchestrator.services.capability_credentials`` — the module that owns it — and
+the injector still resolves it through a function-local import, so the patch is
+reached from the new home exactly as it was from the old one. Each case asserts
+the stub actually ran (R1.B05 §P3: a patch that silently does nothing while the
+test passes is the dangerous failure).
+"""
 
 from __future__ import annotations
 
@@ -10,7 +25,21 @@ import pytest
 os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
 
 import orchestrator.main  # noqa: E402
+from orchestrator.services import dispatch_credentials  # noqa: E402
 from orchestrator.services.capability_credentials import CapabilityCredentials  # noqa: E402
+
+
+def _deps() -> dispatch_credentials.DispatchCredentialDependencies:
+    """The dependency object a main factory builds, read at call time.
+
+    ``postgres_db`` and ``logger`` are rebound during ``lifespan``, so they are
+    resolved per invocation rather than captured at import (R1.B05 §P1).
+    """
+    return dispatch_credentials.DispatchCredentialDependencies(
+        store=orchestrator.main.postgres_db,
+        logger=orchestrator.main.logger,
+        resolve_model=orchestrator.main._resolve_model,
+    )
 
 
 @pytest.mark.asyncio
@@ -42,14 +71,16 @@ async def test_injects_primary_search_and_fetch_sections():
     with patch(
         "orchestrator.services.capability_credentials.resolve_capability_credentials",
         AsyncMock(side_effect=resolve),
-    ):
-        result = await orchestrator.main._inject_search_credentials(
+    ) as resolver:
+        result = await dispatch_credentials.inject_search_credentials(
             config,
             user_settings={"default_search_model": "searxng"},
             user_id="user-1",
             resolved_keys={},
+            dependencies=_deps(),
         )
 
+    assert resolver.await_count == 3  # search, fetch, fallback — the patch was reached
     assert result["research"] == {
         "search": {
             "provider": "searxng",
@@ -77,14 +108,16 @@ async def test_removes_stale_sections_when_nothing_resolves():
     with patch(
         "orchestrator.services.capability_credentials.resolve_capability_credentials",
         AsyncMock(return_value=None),
-    ):
-        await orchestrator.main._inject_search_credentials(
+    ) as resolver:
+        await dispatch_credentials.inject_search_credentials(
             config,
             user_settings={},
             user_id="user-1",
             resolved_keys={},
+            dependencies=_deps(),
         )
 
+    assert resolver.await_count == 3
     assert "research" not in config
 
 
@@ -101,14 +134,16 @@ async def test_malformed_provider_params_degrade_without_credentials():
     with patch(
         "orchestrator.services.capability_credentials.resolve_capability_credentials",
         AsyncMock(return_value=creds),
-    ):
-        await orchestrator.main._inject_search_credentials(
+    ) as resolver:
+        await dispatch_credentials.inject_search_credentials(
             config,
             user_settings={},
             user_id="user-1",
             resolved_keys={},
+            dependencies=_deps(),
         )
 
+    assert resolver.await_count == 3
     assert "research" not in config
 
 
@@ -140,14 +175,16 @@ async def test_different_catalog_row_is_injected_as_search_fallback():
     with patch(
         "orchestrator.services.capability_credentials.resolve_capability_credentials",
         AsyncMock(side_effect=resolve),
-    ):
-        await orchestrator.main._inject_search_credentials(
+    ) as resolver:
+        await dispatch_credentials.inject_search_credentials(
             config,
             user_settings={},
             user_id="user-1",
             resolved_keys={},
+            dependencies=_deps(),
         )
 
+    assert resolver.await_count == 3
     assert config["research"]["search_fallback"] == {
         "provider": "searxng",
         "base_url": "http://searxng.svc:8080",
@@ -175,12 +212,14 @@ async def test_same_catalog_row_is_not_injected_as_its_own_fallback():
     with patch(
         "orchestrator.services.capability_credentials.resolve_capability_credentials",
         AsyncMock(side_effect=resolve),
-    ):
-        await orchestrator.main._inject_search_credentials(
+    ) as resolver:
+        await dispatch_credentials.inject_search_credentials(
             config,
             user_settings={},
             user_id="user-1",
             resolved_keys={},
+            dependencies=_deps(),
         )
 
+    assert resolver.await_count == 3
     assert "search_fallback" not in config["research"]

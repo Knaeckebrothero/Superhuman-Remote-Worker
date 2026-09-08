@@ -20,6 +20,7 @@ from urllib.parse import urlparse
 
 from fastapi import HTTPException
 
+from orchestrator.services.deployment_gates import mcp_stdio_enabled
 from shared.runtime.utils.ssh_key import (
     InvalidSSHKeyError,
     validate_private_key as _validate_ssh_private_key,
@@ -198,3 +199,154 @@ def validate_kb_repository_auth(
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# MCP server connectors
+#
+# Moved verbatim from ``orchestrator.main`` (R1.B05 lane P). The stdio branch
+# consults ``deployment_gates.mcp_stdio_enabled`` on every call rather than
+# taking the answer as an argument: the gate is a pure ``os.getenv`` read, and
+# every caller of this validator already steers it with the environment.
+#
+# The refusal shape is the contract. Every rejection here is
+# ``HTTPException(400)`` with a message that names the offending FIELD and
+# never echoes a credential value -- ``detail`` strings are what the API
+# renders, so they move with the code rather than being re-derived.
+# ---------------------------------------------------------------------------
+
+
+def validate_mcp_datasource(
+    connection_url: str | None,
+    credentials: dict[str, Any],
+) -> None:
+    """Validate an MCP datasource without reflecting credential values."""
+    if not isinstance(credentials, dict):
+        raise HTTPException(status_code=400, detail="MCP credentials must be an object")
+
+    raw_transport = credentials.get("transport") or "http"
+    if not isinstance(raw_transport, str):
+        raise HTTPException(status_code=400, detail="MCP transport must be a string")
+    transport = raw_transport.lower().strip()
+    if transport not in ("http", "sse", "stdio"):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid MCP transport (expected http, sse, or stdio)",
+        )
+
+    if transport == "stdio":
+        if not mcp_stdio_enabled():
+            raise HTTPException(
+                status_code=400,
+                detail="stdio MCP servers are disabled on this deployment",
+            )
+        unknown = sorted(set(credentials) - {"transport", "command", "args", "env"})
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail="Unknown stdio MCP credential field(s)",
+            )
+        command = credentials.get("command")
+        if not isinstance(command, str) or not command.strip() or "\x00" in command:
+            raise HTTPException(
+                status_code=400,
+                detail="stdio MCP servers require a valid credentials.command",
+            )
+        args = credentials.get("args") or []
+        if (
+            not isinstance(args, list)
+            or not all(isinstance(arg, str) for arg in args)
+            or any("\x00" in arg for arg in args)
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="MCP credentials.args must be a list of valid strings",
+            )
+        env = credentials.get("env") or {}
+        if not isinstance(env, dict) or not all(
+            isinstance(key, str)
+            and bool(key)
+            and "=" not in key
+            and "\x00" not in key
+            and isinstance(value, str)
+            and "\x00" not in value
+            for key, value in env.items()
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="MCP credentials.env must map valid names to string values",
+            )
+        return
+
+    unknown = sorted(set(credentials) - {"transport", "auth"})
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail="Unknown remote MCP credential field(s)",
+        )
+    value = (connection_url or "").strip()
+    if not value:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{transport} MCP servers require connection_url",
+        )
+    parsed = urlparse(value)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise HTTPException(
+            status_code=400,
+            detail="Remote MCP connection_url must be an HTTP(S) URL",
+        )
+    if parsed.username is not None or parsed.password is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="Remote MCP connection_url must not embed credentials",
+        )
+
+    auth = credentials.get("auth") or {}
+    if not isinstance(auth, dict):
+        raise HTTPException(
+            status_code=400,
+            detail="MCP credentials.auth must be an object",
+        )
+    auth_type = auth.get("type") or "none"
+    if auth_type == "bearer":
+        if set(auth) - {"type", "token"}:
+            raise HTTPException(
+                status_code=400,
+                detail="Unknown MCP bearer auth field(s)",
+            )
+        token = auth.get("token")
+        if not isinstance(token, str) or not token:
+            raise HTTPException(
+                status_code=400,
+                detail="MCP bearer auth requires a token",
+            )
+    elif auth_type == "headers":
+        if set(auth) - {"type", "headers"}:
+            raise HTTPException(
+                status_code=400,
+                detail="Unknown MCP custom-header auth field(s)",
+            )
+        headers = auth.get("headers") or {}
+        if not isinstance(headers, dict) or not all(
+            isinstance(key, str)
+            and bool(key.strip())
+            and "\r" not in key
+            and "\n" not in key
+            and isinstance(value, str)
+            and "\r" not in value
+            and "\n" not in value
+            for key, value in headers.items()
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="MCP custom headers must map valid names to string values",
+            )
+    elif auth_type in ("none", ""):
+        if set(auth) - {"type"}:
+            raise HTTPException(
+                status_code=400,
+                detail="Unknown MCP no-auth field(s)",
+            )
+    else:
+        raise HTTPException(status_code=400, detail="Invalid MCP auth type")

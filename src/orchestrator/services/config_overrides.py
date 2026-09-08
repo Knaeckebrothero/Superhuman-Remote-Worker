@@ -3,9 +3,18 @@
 These are the existing HTTP-compatible helpers, independent of application
 startup. Merge copies only traversed mappings; None deletes a key and a list
 replaces its predecessor. Do not substitute the loader's deep-copy merge.
+
+:func:`looks_like_uuid` was moved here from ``orchestrator.main`` (R1.B05 lane
+P). Its three unrelated callers — session config resolution, the expert catalog
+service and the two tool-groups endpoints — all ask exactly one question:
+"is this ``config_name`` slot actually holding an expert UUID?" That is the
+same question :func:`validated_config_name` answers from the other side, so the
+config-name vocabulary lives in one module rather than being re-derived beside
+each caller.
 """
 
 from typing import Any
+from uuid import UUID
 
 from fastapi import HTTPException
 
@@ -50,3 +59,13 @@ def validated_config_name(config_name: str | None) -> str | None:
         return validate_config_name(config_name)
     except InvalidConfigNameError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def looks_like_uuid(value: Any) -> bool:
+    """True if ``value`` parses as a UUID (a cockpit-conflated expert id in the
+    config_name slot, which must not be treated as a config file name)."""
+    try:
+        UUID(str(value))
+        return True
+    except (ValueError, TypeError, AttributeError):
+        return False

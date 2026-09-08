@@ -24,8 +24,18 @@ async def test_grant_denied_records_violations_in_status():
         # lookups that are irrelevant to this test (it only cares about the
         # except-block wiring below the grant call). Stub them so the resolve
         # reaches _enforce_dispatch_grants without needing a live DB.
+        # R1.B05 lane P: account defaults are a SAME-MODULE sibling of the
+        # resolve, so once main delegates to
+        # ``services.session_config_resolution`` only the second patch is
+        # reached. Both are listed so the stub steers either way; the first
+        # entry is the transitional one the integrator drops.
         patch(
             "orchestrator.main._resolve_session_account_defaults",
+            AsyncMock(return_value={}),
+        ),
+        patch(
+            "orchestrator.services.session_config_resolution"
+            ".resolve_session_account_defaults",
             AsyncMock(return_value={}),
         ),
         patch(

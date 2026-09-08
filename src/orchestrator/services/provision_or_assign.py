@@ -50,8 +50,10 @@ async def provision_or_assign(
     for its duplicate-rejection check — holding it across the wait
     deadlocks both for the asyncpg query timeout (~60s).
     """
+    from orchestrator.services.workspace_tier_policy import (
+        backend_from_override as _backend_from_override,
+    )
     from orchestrator.main import (  # noqa: E402  (late import — see module docstring)
-        _backend_from_override,
         _await_protected_cloud_runtime_ready,
         _endpoint_violations_detail,
         _find_idle_persistent_agent,

@@ -817,7 +817,8 @@ async def test_internal_workspace_stale_ready_is_local_nonready_and_single_fligh
 
     probe = AsyncMock(return_value=False)
     ensure = AsyncMock(side_effect=_ensure)
-    orch_main._stateless_workspace_ensure_tasks.pop(THREAD_ID, None)
+    # R1.B05 moved the module dict into an application-owned registry.
+    orch_main._stateless_workspace_ensure_registry.discard(THREAD_ID)
     with (
         patch.object(orch_main.container_provisioner, "workspace_pod_live", probe),
         patch.object(orch_main, "ensure_session_workspace", ensure),
@@ -826,7 +827,8 @@ async def test_internal_workspace_stale_ready_is_local_nonready_and_single_fligh
             _stateless_sandbox_thread()
         )
         await started.wait()
-        task = orch_main._stateless_workspace_ensure_tasks[THREAD_ID]
+        task = orch_main._stateless_workspace_ensure_registry.get(THREAD_ID)
+        assert task is not None
         second = await _internal_workspace_response_for_lite_thread(
             _stateless_sandbox_thread()
         )
@@ -845,7 +847,7 @@ async def test_internal_workspace_stale_ready_is_local_nonready_and_single_fligh
         await task
         await asyncio.sleep(0)
 
-    assert THREAD_ID not in orch_main._stateless_workspace_ensure_tasks
+    assert orch_main._stateless_workspace_ensure_registry.get(THREAD_ID) is None
 
 
 @pytest.mark.asyncio
