@@ -2177,7 +2177,59 @@ class ApplicationE2EHarness:
                 label=f"{workload} rollout readiness",
             )
         self._verify_deployed_images(ledger)
+        self._attest_cloud_backend_after_rollout(ledger, profile)
         self._mark_layer(ledger, "helm-workloads")
+
+    def _attest_cloud_backend_after_rollout(
+        self, ledger: dict[str, Any], profile: ApplicationE2EProfile
+    ) -> None:
+        """Restart the orchestrator once the cloud backend is actually up.
+
+        The orchestrator attests its main-cloud installation **once**, during
+        `lifespan`, and there is no retry: if the backend was not reachable at
+        that moment it logs "installation authority is unavailable" and every
+        cloud effect stays disabled for the life of the process. The admin
+        reload endpoint cannot recover it either — `reload_active_main_cloud_instance`
+        returns `None` when no durable instance exists, which the route reports
+        as a 409 telling the caller to retry something that can never succeed.
+
+        On this stack the backend loses that race every time: bundled Nextcloud
+        installs itself on first boot and its protected-effect sidecars then
+        wait for the front controllers to appear, so it is minutes behind the
+        orchestrator. Nothing in the chart makes the orchestrator wait for it —
+        deliberately, since the cloud tier is optional and must not gate the
+        API.
+
+        The rollouts above have already settled by the time this runs, so one
+        restart is enough, and it is the same recovery an operator performs
+        when a backend comes up late.
+        """
+        if not profile.cloud_enabled:
+            return
+        self.runner.run(
+            self._kubectl(
+                ledger,
+                "-n",
+                NAMESPACE,
+                "rollout",
+                "restart",
+                "deployment/srw-e2e-orchestrator",
+            ),
+            label="orchestrator restart for main-cloud attestation",
+        )
+        self.runner.run(
+            self._kubectl(
+                ledger,
+                "-n",
+                NAMESPACE,
+                "rollout",
+                "status",
+                "deployment/srw-e2e-orchestrator",
+                "--timeout=300s",
+            ),
+            timeout=310,
+            label="orchestrator readiness after main-cloud attestation",
+        )
 
     def _verify_deployed_images(self, ledger: Mapping[str, Any]) -> None:
         profile = profile_from_ledger(ledger)
