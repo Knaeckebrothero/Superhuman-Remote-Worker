@@ -1046,6 +1046,7 @@ class TestOneDeadlineForTheWholeProbe:
         self, user_a, fake_db, fake_request
     ):
         import orchestrator.main as orch_main
+        from orchestrator.services import agent_toolset_probe
 
         async def _crawl(url):
             await asyncio.sleep(5)
@@ -1075,7 +1076,10 @@ class TestOneDeadlineForTheWholeProbe:
             patch(
                 "orchestrator.main._resolve_runner_grants", AsyncMock(return_value=None)
             ),
-            patch.object(orch_main, "_AGENT_TOOLSET_BUDGET_S", 0.2),
+            # R1.B05 moved the probe to `services/agent_toolset_probe`, which
+            # reads its own module constant. Patching the budget on `main`
+            # would leave this case green while the probe ran unbounded.
+            patch.object(agent_toolset_probe, "AGENT_TOOLSET_BUDGET_S", 0.2),
             patch(
                 "orchestrator.main.httpx.AsyncClient", MagicMock(return_value=client)
             ),

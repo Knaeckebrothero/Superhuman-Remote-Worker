@@ -242,6 +242,15 @@ from orchestrator.services import session_create_overrides  # noqa: E402
 # The schema's owner is `orchestrator.schemas.job_runtime`; this line exists
 # only so those callers keep resolving, and goes when they are re-pointed.
 from orchestrator.schemas.job_runtime import JobStartRequest  # noqa: E402,F401
+
+# Retained re-export, pinned by `test_preferences_dependency_isolation`: the
+# tier constants' owner is `session_workspace_policy`, and main re-exports
+# them so the settings surfaces resolve one set of values.
+from orchestrator.services.session_workspace_policy import (  # noqa: E402,F401
+    SESSION_CREATE_WORKSPACE_BACKENDS,
+    SESSION_DEFAULT_WORKSPACE_BACKEND,
+    SESSION_WORKSPACE_BACKENDS,
+)
 from orchestrator.services import agent_datasource_payload  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -2865,7 +2874,9 @@ async def _resolve_session_account_defaults(*args: Any, **kwargs: Any) -> Any:
 
 
 async def _account_defaults_layer(*args: Any, **kwargs: Any) -> Any:
-    return await session_config_resolution.account_defaults_layer(*args, **kwargs)
+    return await session_config_resolution.account_defaults_layer(
+        *args, **kwargs, dependencies=_session_config_dependencies()
+    )
 
 
 async def _acknowledged_grant_strip(*args: Any, **kwargs: Any) -> Any:
@@ -5879,7 +5890,10 @@ def _job_workspace_authority_dependencies() -> (
         workspace_provisioner=container_provisioner,
         vm_provisioner=vm_provisioner,
         vm_mode=lambda: vm_provisioner.mode,
-        ensure_workspace=ensure_session_workspace,
+        # `ensure_workspace`, not `ensure_session_workspace`: the scholar
+        # parent path provisions a *job* workspace and passes
+        # `current_status=`, which the session helper does not accept.
+        ensure_workspace=ensure_workspace,
         workspace_suspension=workspace_suspension_service,
         handle_scholar_completion=_handle_scholar_completion,
         handle_delegation_child_completion=_handle_delegation_child_completion,
@@ -6091,7 +6105,9 @@ from orchestrator.services.job_create_ingress import (  # noqa: E402
 
 
 async def _grant_project_ids(*args: Any, **kwargs: Any) -> Any:
-    return await grant_enforcement.grant_project_ids(*args, **kwargs)
+    return await grant_enforcement.grant_project_ids(
+        *args, **kwargs, dependencies=_grant_enforcement_dependencies()
+    )
 
 
 async def _resolve_user_save_grants(*args: Any, **kwargs: Any) -> Any:
@@ -6101,11 +6117,15 @@ async def _resolve_user_save_grants(*args: Any, **kwargs: Any) -> Any:
 
 
 async def _enforce_save_grants(*args: Any, **kwargs: Any) -> Any:
-    return await grant_enforcement.enforce_save_grants(*args, **kwargs)
+    return await grant_enforcement.enforce_save_grants(
+        *args, **kwargs, dependencies=_grant_enforcement_dependencies()
+    )
 
 
 async def _strip_save_grants(*args: Any, **kwargs: Any) -> Any:
-    return await grant_enforcement.strip_save_grants(*args, **kwargs)
+    return await grant_enforcement.strip_save_grants(
+        *args, **kwargs, dependencies=_grant_enforcement_dependencies()
+    )
 
 
 async def _enforce_expert_save_prelude(*args: Any, **kwargs: Any) -> Any:
