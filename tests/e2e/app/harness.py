@@ -39,6 +39,7 @@ K3D_TEMPLATE: Final = ASSET_ROOT / "k3d.yaml"
 VALUES_FILE: Final = ASSET_ROOT / "values-e2e.yaml"
 STATELESS_SANDBOX_VALUES_FILE: Final = ASSET_ROOT / "values-stateless-sandbox.yaml"
 FORGE_SANDBOX_VALUES_FILE: Final = ASSET_ROOT / "values-forge-sandbox.yaml"
+CLOUD_SANDBOX_VALUES_FILE: Final = ASSET_ROOT / "values-cloud-sandbox.yaml"
 PROVIDER_MANIFEST: Final = ASSET_ROOT / "deterministic_provider/kubernetes.yaml"
 PROVIDER_DOCKERFILE: Final = ASSET_ROOT / "deterministic_provider/Dockerfile"
 PLAYWRIGHT_RUNNER_DOCKERFILE: Final = ASSET_ROOT / "Dockerfile.playwright"
@@ -129,6 +130,12 @@ class ApplicationE2EProfile:
     #: This profile deploys the bundled forge. Project provisioning, project
     #: repositories and knowledge-vault materialisation all go through it.
     forge_enabled: bool = False
+    #: This profile deploys a bundled main-cloud backend, so ``MAIN_CLOUD_BACKEND``
+    #: resolves and the cloud mount/stage/settings surfaces answer for real
+    #: rather than as "no backend bound". A behavioural flag, not a name
+    #: comparison, so a later profile composing this overlay cannot silently
+    #: skip the backend check.
+    cloud_enabled: bool = False
 
 
 APPLICATION_E2E_PROFILES: Final = {
@@ -161,6 +168,23 @@ APPLICATION_E2E_PROFILES: Final = {
         additional_statefulsets=("srw-e2e-gitea",),
         stateless_agents=True,
         forge_enabled=True,
+    ),
+    "cloud-sandbox": ApplicationE2EProfile(
+        name="cloud-sandbox",
+        values_files=(
+            VALUES_FILE,
+            STATELESS_SANDBOX_VALUES_FILE,
+            FORGE_SANDBOX_VALUES_FILE,
+            CLOUD_SANDBOX_VALUES_FILE,
+        ),
+        workspace_backend="sandbox",
+        execution_lane="stateless",
+        include_workspace_image=True,
+        additional_deployments=("srw-e2e-agent-stateless", "srw-e2e-nextcloud"),
+        additional_statefulsets=("srw-e2e-gitea",),
+        stateless_agents=True,
+        forge_enabled=True,
+        cloud_enabled=True,
     ),
 }
 

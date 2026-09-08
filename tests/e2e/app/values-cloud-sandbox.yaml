@@ -1,0 +1,54 @@
+# Profile overlay for R1.B04. Layered ON TOP of values-e2e.yaml,
+# values-stateless-sandbox.yaml and values-forge-sandbox.yaml, never instead of
+# them.
+#
+# B04 owns the cloud half of the workspace surface — agent cloud mounts, the
+# protected-cloud engage/await path, staged cloud-diff review, and the
+# admin-only main-cloud configuration/reload endpoints. None of that is
+# exercised by a forge fixture: the forge answers repository reads, the cloud
+# backend answers mounts, staging and installation authority. `forge-sandbox`
+# ships `nextcloud.enabled: false`, so on that profile every main-cloud read is
+# either "no backend bound" or a refusal, and `MAIN_CLOUD_BACKEND` is unset.
+#
+# The shared baseline stays cloud-less for the same reason it stays forge-less:
+# enabling a dependency in values-e2e.yaml is what broke the journey's
+# determinism contract when SearXNG was tried there. An overlay keeps the cheap
+# pinned/virtual baseline exactly as it was.
+nextcloud:
+  enabled: true
+  # Bundled, not external: the point is a real backend instance the
+  # orchestrator can attest, activate and reload against, so
+  # `MAIN_CLOUD_BACKEND` resolves to "nextcloud" through the configmap's
+  # bundled branch rather than through `cloud.externalBackend`.
+  internal: true
+  replicas: 1
+  # Filesystem storage on the pod's own PVC. The chart default is S3 via
+  # OBJECTSTORE_S3_*, which needs an external bucket (prod uses MinIO); a
+  # disposable k3d cluster has none. This is the same choice
+  # deployment/values-local.yaml.example makes for local k3d.
+  objectStore:
+    enabled: false
+  storageSize: 2Gi
+  resources:
+    requests: {memory: 256Mi, cpu: 100m}
+    limits: {memory: 1Gi, cpu: 1}
+
+# The chart default is opencloud:enabled=true, and the configmap prefers
+# opencloud over nextcloud, so this override is what makes the bundled
+# Nextcloud the selected backend rather than a second one nobody reaches.
+# OpenCloud additionally needs a Keycloak client and a hostAliases entry that a
+# disposable cluster does not have.
+opencloud:
+  enabled: false
+
+# Nextcloud stores its own metadata in SQLite on the PVC above (the chart's
+# nextcloud Deployment sets SQLITE_DATABASE), so no extra database renders.
+cloud:
+  # Leave the external hooks empty: the bundled branch above supplies the URLs.
+  externalBackend: ""
+  externalUrl: ""
+  # rclone/FUSE mounts are the data plane B04's mount builders emit. k3d
+  # containerd needs the unconfined workspace profile the baseline already sets.
+  workspaceDriver: "rclone_mount"
+  rcloneMount:
+    allowContainer: true

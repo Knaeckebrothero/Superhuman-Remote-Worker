@@ -1298,7 +1298,8 @@ def test_stateless_sandbox_profile_renders_current_executor_and_workspace_images
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
 @pytest.mark.parametrize(
-    "profile_name", ["pinned-virtual", "stateless-sandbox", "forge-sandbox"]
+    "profile_name",
+    ["pinned-virtual", "stateless-sandbox", "forge-sandbox", "cloud-sandbox"],
 )
 def test_session_profiles_do_not_render_an_extra_catalog_provider(
     profile_name: str,
@@ -1362,6 +1363,102 @@ def test_forge_sandbox_profile_composes_the_sandbox_overlay_and_adds_the_forge()
     assert harness.resolve_profile("pinned-virtual").forge_enabled is False
     assert sandbox.forge_enabled is False
     assert sandbox.additional_statefulsets == ()
+    # And none of the three has acquired a cloud backend.
+    for name in ("pinned-virtual", "stateless-sandbox", "forge-sandbox"):
+        assert harness.resolve_profile(name).cloud_enabled is False
+
+
+def test_cloud_sandbox_extends_forge_sandbox_without_replacing_it() -> None:
+    """B04's profile *extends* forge-sandbox; it never replaces it.
+
+    B04 needs the workspace-backed stateless session (mounts, staging, End) and
+    the forge (repo reads, diff review, export), and adds the one thing neither
+    provides: a real main-cloud backend to attest, mount, stage and reload
+    against.
+    """
+    forge = harness.resolve_profile("forge-sandbox")
+    cloud = harness.resolve_profile("cloud-sandbox")
+
+    assert cloud.values_files[: len(forge.values_files)] == forge.values_files
+    assert cloud.values_files[-1] == harness.CLOUD_SANDBOX_VALUES_FILE
+    assert cloud.values_files[0] == harness.VALUES_FILE
+    assert cloud.workspace_backend == forge.workspace_backend == "sandbox"
+    assert cloud.execution_lane == forge.execution_lane == "stateless"
+    assert cloud.include_workspace_image is True
+    assert cloud.stateless_agents is True
+    assert cloud.forge_enabled is True
+    assert cloud.cloud_enabled is True
+    assert cloud.additional_statefulsets == forge.additional_statefulsets
+    # The backend is a Deployment, so it must be waited on as one.
+    assert "srw-e2e-nextcloud" in cloud.additional_deployments
+    assert set(forge.additional_deployments) <= set(cloud.additional_deployments)
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
+def test_cloud_sandbox_renders_exactly_one_bundled_backend(tmp_path: Path) -> None:
+    """Nextcloud renders and is the selected backend; OpenCloud does not.
+
+    The chart defaults OpenCloud on and the configmap prefers it over
+    Nextcloud, so an overlay that only switched Nextcloud on would deploy a
+    second backend and select the wrong one.
+    """
+    sha = "a" * 40
+    run_id = "20260824-123456-ab12cd34"
+    profile = harness.resolve_profile("cloud-sandbox")
+    images, _commands = harness.build_image_commands(
+        sha, run_id, include_workspace=True
+    )
+    image_values = tmp_path / "images.yaml"
+    image_values.write_text(
+        harness._image_values(images, sha, run_id), encoding="utf-8"
+    )
+    command = [
+        "helm",
+        "template",
+        "srw-e2e",
+        str(harness.REPO_ROOT / "helm"),
+        "-n",
+        harness.NAMESPACE,
+    ]
+    for values_file in profile.values_files:
+        command.extend(("-f", str(values_file)))
+    command.extend(("-f", str(image_values)))
+    rendered = subprocess.run(
+        command, check=True, capture_output=True, text=True, timeout=120
+    ).stdout
+    documents = [document for document in yaml.safe_load_all(rendered) if document]
+    names = {
+        (document.get("kind"), document.get("metadata", {}).get("name"))
+        for document in documents
+    }
+    assert ("Deployment", "srw-e2e-nextcloud") in names
+    assert ("Service", "srw-e2e-nextcloud") in names
+    assert not any("opencloud" in (name or "") for _kind, name in names)
+    config = next(
+        document
+        for document in documents
+        if document.get("kind") == "ConfigMap"
+        and document.get("metadata", {}).get("name") == "srw-e2e-config"
+    )
+    # Without this the main-cloud endpoints answer "no backend bound" and every
+    # mount/stage assertion would be vacuous.
+    assert config["data"]["MAIN_CLOUD_BACKEND"] == "nextcloud"
+    assert config["data"]["NEXTCLOUD_URL"] == "http://srw-e2e-nextcloud"
+    assert "OPENCLOUD_URL" not in config["data"]
+    # Filesystem storage: a disposable cluster has no object store.
+    backend = next(
+        document
+        for document in documents
+        if document.get("kind") == "Deployment"
+        and document.get("metadata", {}).get("name") == "srw-e2e-nextcloud"
+    )
+    environment = {
+        item["name"]: item.get("value")
+        for item in backend["spec"]["template"]["spec"]["containers"][0]["env"]
+        if "name" in item
+    }
+    assert "SQLITE_DATABASE" in environment
+    assert not any(key.startswith("OBJECTSTORE_S3") for key in environment)
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
