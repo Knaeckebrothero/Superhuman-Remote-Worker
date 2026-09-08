@@ -2,6 +2,7 @@ import {signal} from '@angular/core';
 import {TestBed} from '@angular/core/testing';
 import {ActivatedRoute, convertToParamMap, Router} from '@angular/router';
 import {BehaviorSubject, of, Subject} from 'rxjs';
+import {TranslocoService} from '@jsverse/transloco';
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
 import {CanvasService} from '../../core/services/canvas.service';
 import {BrowserCapability, CanvasState} from '../../core/models/canvas.model';
@@ -51,6 +52,7 @@ function createFixture(options: {
     retryOpenBrowser: ReturnType<typeof vi.fn>;
   };
   viewport: {isMobile: ReturnType<typeof signal<boolean>>};
+  toast: {danger: ReturnType<typeof vi.fn>; info: ReturnType<typeof vi.fn>};
   router: {navigate: ReturnType<typeof vi.fn>};
   api: {
     getPersistentThread: ReturnType<typeof vi.fn>;
@@ -91,6 +93,7 @@ function createFixture(options: {
     if (threadId === null) canvas.state.set(null);
   });
   const viewport = {isMobile: signal(false)};
+  const toast = {danger: vi.fn(), info: vi.fn()};
   const router = {navigate: vi.fn().mockResolvedValue(true)};
   const api = {
     getPersistentThread: vi.fn().mockReturnValue(of(options.thread ?? {
@@ -121,8 +124,15 @@ function createFixture(options: {
       {provide: ApiService, useValue: api},
       {provide: CanvasService, useValue: canvas},
       {provide: ViewportService, useValue: viewport},
-      {provide: AppToastService, useValue: {danger: vi.fn()}},
+      {provide: AppToastService, useValue: toast},
       {provide: ErrorMessageService, useValue: {translate: vi.fn()}},
+      {
+        provide: TranslocoService,
+        useValue: {
+          translate: (key: string, params?: Record<string, string>) =>
+            params?.['path'] ? `${key}:${params['path']}` : key,
+        },
+      },
     ],
   });
   return {
@@ -131,6 +141,7 @@ function createFixture(options: {
     chat,
     canvas,
     viewport,
+    toast,
     router,
     api,
   };
@@ -810,5 +821,86 @@ describe('ChatPageComponent settings pane (live_session_settings.md Slice A)', (
 
     expect(component.settingsOpen()).toBe(false);
     expect(component.canvasPending()).toBe(false);
+  });
+});
+
+describe('ChatPageComponent workspace file links', () => {
+  afterEach(() => TestBed.resetTestingModule());
+
+  it('badges the toggle when Canvas content arrives behind the mobile toggle', () => {
+    const {component, canvas, viewport} = createFixture({threadId: 'thread-1'});
+    viewport.isMobile.set(true);
+    component.ngOnInit();
+    TestBed.tick();
+
+    canvas.state.set(presentedState(1));
+    TestBed.tick();
+
+    // Mobile keeps the new stage behind the toggle — without the badge the
+    // arrival would be completely invisible.
+    expect(component.canvasContentVisible()).toBe(false);
+    expect(component.canvasPending()).toBe(true);
+
+    component.openCanvas(true);
+    expect(component.canvasContentVisible()).toBe(true);
+    expect(component.canvasPending()).toBe(false);
+  });
+
+  it('opens the Canvas when the activated path is the presented file', () => {
+    const {component, canvas, toast} = createFixture({threadId: 'thread-1'});
+    component.ngOnInit();
+    TestBed.tick();
+    canvas.state.set(presentedState(1, 'output/report.md'));
+    TestBed.tick();
+    component.closeCanvas();
+
+    component.openWorkspaceFile('output/report.md');
+
+    expect(component.canvasContentVisible()).toBe(true);
+    expect(toast.info).not.toHaveBeenCalled();
+  });
+
+  it('matches the presented file through the spellings agents write', () => {
+    const {component, canvas} = createFixture({threadId: 'thread-1'});
+    component.ngOnInit();
+    TestBed.tick();
+    canvas.state.set(presentedState(1, 'output/report.md'));
+    TestBed.tick();
+
+    for (const spelling of ['/output/report.md', './output/report.md', 'output//report.md']) {
+      component.closeCanvas();
+      component.openWorkspaceFile(spelling);
+      expect(component.canvasContentVisible(), spelling).toBe(true);
+    }
+  });
+
+  it('names a file the Canvas is not presenting instead of opening it', () => {
+    const {component, canvas, toast} = createFixture({threadId: 'thread-1'});
+    component.ngOnInit();
+    TestBed.tick();
+    canvas.state.set(presentedState(1, 'output/report.md'));
+    TestBed.tick();
+    component.closeCanvas();
+
+    component.openWorkspaceFile('output/prospects.csv');
+
+    expect(component.canvasContentVisible()).toBe(false);
+    expect(toast.info).toHaveBeenCalledWith(
+      'canvas.workspaceFile.notPresented:output/prospects.csv',
+    );
+  });
+
+  it('ignores an activation that does not address a workspace file', () => {
+    const {component, canvas, toast} = createFixture({threadId: 'thread-1'});
+    component.ngOnInit();
+    TestBed.tick();
+    canvas.state.set(presentedState(1, 'output/report.md'));
+    TestBed.tick();
+    component.closeCanvas();
+
+    component.openWorkspaceFile('../../etc/passwd');
+
+    expect(component.canvasContentVisible()).toBe(false);
+    expect(toast.info).not.toHaveBeenCalled();
   });
 });

@@ -12,7 +12,7 @@ import {
 } from '@angular/core';
 import {takeUntilDestroyed} from '@angular/core/rxjs-interop';
 import {ActivatedRoute, Router} from '@angular/router';
-import {TranslocoPipe} from '@jsverse/transloco';
+import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {AngularSplitModule, SplitGutterInteractionEvent} from 'angular-split';
 import {distinctUntilChanged, finalize, forkJoin, map, of} from 'rxjs';
 import {PersistentChatComponent} from '../../views/persistent-chat/persistent-chat.component';
@@ -28,6 +28,7 @@ import {AppButtonComponent} from '../../ui/button';
 import {AppDialogComponent} from '../../ui/dialog';
 import {CanvasPaneComponent} from '../canvas/canvas-pane.component';
 import {canvasSourceKey} from '../canvas/canvas-rendering';
+import {normalizeWorkspacePath} from '../../core/markdown/link-extension';
 import {SettingsPaneComponent} from './settings-pane.component';
 import {ConfigDriftDialogComponent} from './config-drift-dialog.component';
 import {ApiService} from '../../core/services/api.service';
@@ -101,7 +102,8 @@ export function browserReplacementTargetMatches(
                [attr.inert]="chatAreaHidden() ? '' : null"
                [attr.aria-hidden]="chatAreaHidden() ? 'true' : null">
             <app-persistent-chat (canvasRequested)="openCanvas(true)"
-                                 (settingsRequested)="openSettings($event)">
+                                 (settingsRequested)="openSettings($event)"
+                                 (workspaceFileRequested)="openWorkspaceFile($event)">
               @if (browserActionVisible()) {
                 <span chatHeaderAction class="canvas-toggle-wrap">
                   <app-icon-button size="sm"
@@ -274,6 +276,7 @@ export class ChatPageComponent implements OnInit, OnDestroy {
     readonly chat = inject(PersistentChatService);
     private readonly toast = inject(AppToastService);
     private readonly errors = inject(ErrorMessageService);
+    private readonly transloco = inject(TranslocoService);
     private readonly api = inject(ApiService);
     private readonly canvas = inject(CanvasService);
     readonly viewport = inject(ViewportService);
@@ -319,6 +322,17 @@ export class ChatPageComponent implements OnInit, OnDestroy {
     readonly browserActionVisible = computed(
         () => this.canvas.browserCapability()?.feature_enabled === true,
     );
+    /** The workspace file the Canvas is presenting, in the one spelling an
+     *  agent-written Markdown path normalizes to. Null for every other kind
+     *  of source (live app, shared browser) and for a cleared Canvas. */
+    readonly canvasFilePath = computed(() => {
+        const state = this.canvas.state();
+        if (!state || state.status === 'cleared') return null;
+        const source = state.source;
+        if (!source || source.type !== 'workspace_file') return null;
+        const path = source['path'];
+        return typeof path === 'string' ? normalizeWorkspacePath(path) : null;
+    });
     readonly browserActionLoading = computed(() => {
         const status = this.canvas.browserOpenStatus();
         return status === 'workspace' || status === 'browser';
@@ -424,9 +438,13 @@ export class ChatPageComponent implements OnInit, OnDestroy {
                 // new stage mounted/announced and let the user enter it through
                 // the trusted toggle, tool card, or skip link.
                 this.canvasFocus.set(false);
-                // Settings holds the pane — badge the canvas toggle instead of
-                // stealing it (the push is ready the moment settings closes).
-                if (this.settingsOpen()) this.canvasPending.set(true);
+                // Whenever the push isn't actually on screen — settings holds
+                // the pane, or mobile is keeping the new stage behind the
+                // toggle — badge the toggle rather than letting new content
+                // arrive with no signal at all.
+                if (this.settingsOpen() || this.viewport.isMobile()) {
+                    this.canvasPending.set(true);
+                }
             }
             this.configureSplitterAccessibility();
         });
@@ -497,6 +515,26 @@ export class ChatPageComponent implements OnInit, OnDestroy {
         if (this.viewport.isMobile()) this.canvasFocus.set(true);
         this.configureSplitterAccessibility();
         if (focus) queueMicrotask(() => this.pane()?.focusContent());
+    }
+
+    /**
+     * A workspace path written into agent prose was activated.
+     *
+     * The Canvas is the agent's stage — the Cockpit cannot present an
+     * arbitrary file onto it — so this brings the Canvas forward exactly when
+     * it already holds that file, which is what the link promised the reader.
+     * Any other path gets named rather than silently swallowed.
+     */
+    openWorkspaceFile(path: string): void {
+        const requested = normalizeWorkspacePath(path);
+        if (!requested) return;
+        if (requested === this.canvasFilePath()) {
+            this.openCanvas(true);
+            return;
+        }
+        this.toast.info(
+            this.transloco.translate('canvas.workspaceFile.notPresented', {path: requested}),
+        );
     }
 
     openSharedBrowser(): void {

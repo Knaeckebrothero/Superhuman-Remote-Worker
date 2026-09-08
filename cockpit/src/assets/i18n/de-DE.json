@@ -120,6 +120,9 @@
     "hide": "Canvas ausblenden",
     "skipToCanvas": "Zum Canvas springen",
     "newContent": "Neuer Canvas-Inhalt verfügbar",
+    "workspaceFile": {
+      "notPresented": "{{path}} ist eine Datei im Workspace dieser Session. Bitte den Agenten, sie im Canvas zu präsentieren."
+    },
     "returnToChat": "Zurück zum Chat",
     "resize": "Chat und Canvas in der Größe ändern",
     "empty": "Der Agent hat noch nichts präsentiert.",

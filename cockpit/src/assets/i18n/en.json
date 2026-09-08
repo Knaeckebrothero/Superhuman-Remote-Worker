@@ -120,6 +120,9 @@
     "hide": "Hide Canvas",
     "skipToCanvas": "Skip to Canvas",
     "newContent": "New Canvas content waiting",
+    "workspaceFile": {
+      "notPresented": "{{path}} is a file in this session's workspace. Ask the agent to present it on the Canvas."
+    },
     "returnToChat": "Return to chat",
     "resize": "Resize chat and Canvas",
     "empty": "The agent has not presented anything yet.",

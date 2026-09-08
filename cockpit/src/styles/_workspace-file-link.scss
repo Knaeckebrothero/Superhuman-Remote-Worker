@@ -1,0 +1,33 @@
+// Workspace-file controls in untrusted Markdown.
+//
+// `markdownLinkExtension` turns every agent-written relative link into a
+// <button> instead of an <a>: those hrefs resolve against <base href="/"> and
+// would navigate the Cockpit document out of the running session. Styling is
+// global because the control appears in every Markdown surface (chat prose,
+// tool cards, notification bodies), not only the ones that act on it.
+//
+// Dotted underline, matching `.citation-web`, so it reads as an in-app
+// reference rather than a link that leaves.
+
+.workspace-file-link {
+  display: inline;
+  margin: 0;
+  padding: 0;
+  font: inherit;
+  color: var(--info);
+  text-align: left;
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+  background: none;
+  border: 0;
+  cursor: pointer;
+}
+
+.workspace-file-link:hover {
+  text-decoration-style: solid;
+}
+
+.workspace-file-link:focus-visible {
+  outline: 2px solid var(--accent-color);
+  outline-offset: 2px;
+}

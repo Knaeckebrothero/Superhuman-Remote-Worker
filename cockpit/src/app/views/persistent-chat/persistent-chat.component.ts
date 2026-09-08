@@ -25,6 +25,7 @@ import {Router, RouterLink} from '@angular/router';
 import {firstValueFrom, Subscription} from 'rxjs';
 import {MarkdownComponent} from 'ngx-markdown';
 import {CitationRefDirective} from '../../core/markdown/citation-ref.directive';
+import {WorkspaceFileLinkDirective} from '../../core/markdown/workspace-file-link.directive';
 import {KatexDirective} from '../../core/markdown/katex.directive';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {ChatAttachment, PermissionRequest, PersistentChatService, RunningToolInfo, ToolCallInfo,} from '../../core/services/persistent-chat.service';
@@ -875,6 +876,7 @@ export function clearDraft(threadId: string | null): void {
         MarkdownComponent,
         ExternalImageDirective,
         CitationRefDirective,
+        WorkspaceFileLinkDirective,
         KatexDirective,
         SidebarToggleComponent,
         TranslocoPipe,
@@ -1335,8 +1337,9 @@ export function clearDraft(threadId: string | null): void {
             </span>
           </summary>
           <div class="thinking-content" [class.streaming-block]="event.status === 'streaming'">
-            <markdown appCitationRef appKatex [data]="event.content"
-                      [katexDefer]="event.status === 'streaming'"></markdown>
+            <markdown appCitationRef appKatex appWorkspaceFileLink [data]="event.content"
+                      [katexDefer]="event.status === 'streaming'"
+                      (workspaceFileOpen)="workspaceFileRequested.emit($event)"></markdown>
           </div>
         </details>
       </ng-template>
@@ -1419,7 +1422,8 @@ export function clearDraft(threadId: string | null): void {
                        class (its base styles are benign; the bubble styling is gated on
                        .message-user/.message-assistant, which this isn't). -->
                   <div class="compaction-summary-body message-body">
-                    <markdown appKatex [data]="turn.summary"></markdown>
+                    <markdown appKatex appWorkspaceFileLink [data]="turn.summary"
+                              (workspaceFileOpen)="workspaceFileRequested.emit($event)"></markdown>
                   </div>
                 </details>
               }
@@ -1601,7 +1605,8 @@ export function clearDraft(threadId: string | null): void {
                            renders growing text too — gate its DOM post-processing
                            + KaTeX off the turn's streaming status. -->
                       <div class="event-text turn-final-answer" [class.streaming-block]="streaming">
-                        <markdown appCitationRef appKatex [data]="answer" [katexDefer]="streaming"></markdown>
+                        <markdown appCitationRef appKatex appWorkspaceFileLink [data]="answer" [katexDefer]="streaming"
+                                  (workspaceFileOpen)="workspaceFileRequested.emit($event)"></markdown>
                       </div>
                     } @else {
                       <span class="turn-headline">{{ collapsedHeadline(turn) }}</span>
@@ -1672,8 +1677,9 @@ export function clearDraft(threadId: string | null): void {
                           }
                           @case ('text') {
                             <div class="event-text" [class.streaming-block]="group.event.status === 'streaming'">
-                              <markdown appCitationRef appKatex [data]="group.event.content"
-                                        [katexDefer]="group.event.status === 'streaming'"></markdown>
+                              <markdown appCitationRef appKatex appWorkspaceFileLink [data]="group.event.content"
+                                        [katexDefer]="group.event.status === 'streaming'"
+                                        (workspaceFileOpen)="workspaceFileRequested.emit($event)"></markdown>
                             </div>
                           }
                           @case ('compaction') {
@@ -1689,7 +1695,8 @@ export function clearDraft(threadId: string | null): void {
                               <details class="compaction-summary">
                                 <summary>{{ 'chat.compaction.viewSummary' | transloco }}</summary>
                                 <div class="compaction-summary-body message-body">
-                                  <markdown appKatex [data]="group.event.summary"></markdown>
+                                  <markdown appKatex appWorkspaceFileLink [data]="group.event.summary"
+                                            (workspaceFileOpen)="workspaceFileRequested.emit($event)"></markdown>
                                 </div>
                               </details>
                             }
@@ -2467,6 +2474,9 @@ export function clearDraft(threadId: string | null): void {
 })
 export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDestroy {
     readonly canvasRequested = output<void>();
+    /** An agent-written workspace path was activated in rendered Markdown.
+     *  The host chat-page decides what a file can be shown in. */
+    readonly workspaceFileRequested = output<string>();
     /** Open the session settings pane (host chat-page owns it). The optional
      *  payload names a section to focus — 'model' from the model/temp chips. */
     readonly settingsRequested = output<string | undefined>();
