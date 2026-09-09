@@ -50,10 +50,17 @@ async def _make_datasource(database: PostgresDB, *, label: str) -> str:
 async def _make_thread(database: PostgresDB, *, datasource_ids: list[str]) -> str:
     thread_id = uuid4()
     async with database.acquire() as conn:
+        # Stateless, deliberately. 0185 gave pinned threads a delete-authority
+        # trigger ("pinned thread … delete lacks exact permanent retirement
+        # authority"), and `execution_lane` defaults to 'pinned' -- so the
+        # teardown DELETE below raised CheckViolationError and failed four
+        # tests whose assertions had already passed. Nothing here is about
+        # pinned runtime authority; the scrub is lane-agnostic.
         await conn.execute(
             """
-            INSERT INTO threads (id, title, status, metadata)
-            VALUES ($1, 'drift cleanup test thread', 'active', $2::jsonb)
+            INSERT INTO threads (id, title, status, metadata, execution_lane)
+            VALUES ($1, 'drift cleanup test thread', 'active', $2::jsonb,
+                    'stateless')
             """,
             thread_id,
             json.dumps({"datasource_ids": datasource_ids}),
@@ -145,15 +152,17 @@ async def test_delete_leaves_non_array_and_unrelated_metadata_untouched(db):
     async with db.acquire() as conn:
         await conn.execute(
             """
-            INSERT INTO threads (id, title, status, metadata)
-            VALUES ($1, 'no datasource_ids key', 'active', '{}'::jsonb)
+            INSERT INTO threads (id, title, status, metadata, execution_lane)
+            VALUES ($1, 'no datasource_ids key', 'active', '{}'::jsonb,
+                    'stateless')
             """,
             bare_thread_id,
         )
         await conn.execute(
             """
-            INSERT INTO threads (id, title, status, metadata)
-            VALUES ($1, 'non-array datasource_ids', 'active', $2::jsonb)
+            INSERT INTO threads (id, title, status, metadata, execution_lane)
+            VALUES ($1, 'non-array datasource_ids', 'active', $2::jsonb,
+                    'stateless')
             """,
             scalar_thread_id,
             json.dumps({"datasource_ids": doomed_id}),
