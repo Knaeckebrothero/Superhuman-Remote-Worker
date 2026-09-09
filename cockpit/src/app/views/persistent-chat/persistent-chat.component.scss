@@ -112,6 +112,15 @@
       .status-dot.disconnected { background: var(--surface-2); }
       .status-dot.error { background: var(--danger); }
 
+      // The dot's [title] is hover-only — no touch, no keyboard, and not
+      // reliably surfaced to assistive tech — so connected/disconnected/error
+      // would otherwise differ by colour alone (WCAG 1.4.1). This carries the
+      // same text a sighted pointer user gets from the title, permanently in
+      // the a11y tree, at zero header pixels.
+      .status-announce {
+        @include m.visually-hidden;
+      }
+
       @keyframes pulse {
         0%, 100% { opacity: 1; }
         50% { opacity: 0.4; }
@@ -236,16 +245,6 @@
         opacity: 0.6;
         cursor: default;
       }
-
-      .gitea-btn {
-        border-color: var(--success);
-        color: var(--success);
-      }
-
-      .gitea-btn:hover {
-        background: var(--success-tint);
-      }
-
 
       .ide-spinner {
         width: 12px;

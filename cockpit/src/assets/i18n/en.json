@@ -348,6 +348,7 @@
     "rename": "Rename",
     "copy": "Copy",
     "copied": "Copied",
+    "copyFailed": "Couldn't copy to clipboard",
     "never": "Never",
     "default": "default",
     "noKey": "(no key)"
@@ -1673,12 +1674,9 @@
       "filesButton": "Files",
       "filesTooltip": "Open session files in Cloud",
       "gitButton": "Git",
-      "gitTooltip": "View workspace in Gitea",
       "ideButton": "IDE",
-      "ideActiveTooltip": "Open workspace in IDE",
       "ideLoadingTooltip": "Workspace starting...",
       "citationsButton": "Citations",
-      "citationsTooltip": "Show this session's citations",
       "moreActions": "More actions",
       "copySessionId": "Copy session ID {{id}}",
       "disconnect": "Disconnect",
@@ -1686,8 +1684,7 @@
       "projectFilesButton": "Project files",
       "projectFilesTooltip": "Open the {{name}} project folder in your cloud",
       "sessionFilesButton": "Session files",
-      "sshButton": "SSH",
-      "sshTooltip": "Connect to this session's workspace over SSH"
+      "sshButton": "SSH"
     },
     "ssh": {
       "intro": "Connect to this session's workspace with your own terminal, editor or IDE.",
@@ -1724,8 +1721,6 @@
       "statusUnknown": "Unknown"
     },
     "status": {
-      "temp": "temp {{value}}",
-      "turn": "Turn {{count}}",
       "agentQuiet": "Working — no output for {{seconds}}s",
       "cloudSyncOff": "Cloud sync off",
       "cloudSyncOffTooltip": "Cloud sync could not start for this session. The workspace may be missing files from the cloud, and changes won't be saved back to it."

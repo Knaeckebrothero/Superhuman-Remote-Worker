@@ -945,6 +945,7 @@ export function clearDraft(threadId: string | null): void {
             }
           </span>
           <span class="status-dot" [class]="connectionClass()" [title]="connectionLabel()"></span>
+          <span class="status-announce">{{ connectionLabel() }}</span>
 
           @if (chat.isConnected()) {
             @if (chat.modelName()) {
@@ -3991,6 +3992,8 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         if (!threadId) return;
         if (await copyText(threadId)) {
             this.toast.success(this.transloco.translate('common.copied'));
+        } else {
+            this.toast.danger(this.transloco.translate('common.copyFailed'));
         }
     }
 

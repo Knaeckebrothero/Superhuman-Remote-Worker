@@ -348,6 +348,7 @@
     "rename": "Umbenennen",
     "copy": "Kopieren",
     "copied": "Kopiert",
+    "copyFailed": "Kopieren in die Zwischenablage fehlgeschlagen",
     "never": "Nie",
     "default": "Standard",
     "noKey": "(kein Schlüssel)"
@@ -1673,12 +1674,9 @@
       "filesButton": "Dateien",
       "filesTooltip": "Sitzungsdateien in der Cloud öffnen",
       "gitButton": "Git",
-      "gitTooltip": "Arbeitsbereich in Gitea anzeigen",
       "ideButton": "IDE",
-      "ideActiveTooltip": "Arbeitsbereich in der IDE öffnen",
       "ideLoadingTooltip": "Arbeitsbereich wird gestartet...",
       "citationsButton": "Quellen",
-      "citationsTooltip": "Quellen dieser Sitzung anzeigen",
       "moreActions": "Weitere Aktionen",
       "copySessionId": "Sitzungs-ID {{id}} kopieren",
       "disconnect": "Trennen",
@@ -1686,8 +1684,7 @@
       "projectFilesButton": "Projektdateien",
       "projectFilesTooltip": "Projektordner {{name}} in Ihrer Cloud öffnen",
       "sessionFilesButton": "Sitzungsdateien",
-      "sshButton": "SSH",
-      "sshTooltip": "Über SSH mit dem Arbeitsbereich dieser Sitzung verbinden"
+      "sshButton": "SSH"
     },
     "ssh": {
       "intro": "Verbinden Sie sich mit dem Arbeitsbereich dieser Sitzung über Ihr eigenes Terminal, Ihren Editor oder Ihre IDE.",
@@ -1724,8 +1721,6 @@
       "statusUnknown": "Unbekannt"
     },
     "status": {
-      "temp": "Temp. {{value}}",
-      "turn": "Zug {{count}}",
       "agentQuiet": "Arbeitet — keine Ausgabe seit {{seconds}}s",
       "cloudSyncOff": "Cloud-Sync aus",
       "cloudSyncOffTooltip": "Die Cloud-Synchronisierung konnte für diese Sitzung nicht gestartet werden. Im Arbeitsbereich fehlen möglicherweise Dateien aus der Cloud, und Änderungen werden nicht zurückgespeichert."
