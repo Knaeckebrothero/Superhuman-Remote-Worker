@@ -34,19 +34,21 @@ const SHELL_CSS = `
 // exists to catch. A fixture with its own strings would stay green while the
 // real landing overflowed.
 //
-// Cap at 4 and take the 4 LONGEST: persistent-chat.component.ts picks 4 of
-// this pool AT RANDOM per mount (shuffled.slice(0, Math.min(4, ...))) and
-// renders the same picked set for both variants — production never shows
-// all of them at once. Rendering the full pool here measured 610/393/93px
-// of overflow (phone/short-laptop/desktop) instead of the reported
-// ~269/~259/0 and even failed desktop, which the bug report says fits. The
-// 4 longest strings are the worst combination any real random draw could
-// produce, so a fixture built from them is the only fixed 4-chip subset
-// that still holds as a guarantee once the real draw is randomized.
+// Cap at 4 and take the 4 LONGEST, per entry the LONGER of en/de: as of
+// Task 4, production shows every entry in the pool (the shuffle that used to
+// pick 4 of a bigger pool AT RANDOM per mount is gone), so the cap is now a
+// no-op guard against the pool growing again rather than an active filter.
+// The per-language max is not a no-op: fix-round-1 shipped a copy where
+// German ran to 84 characters against English's 54 while this fixture
+// rendered `.en` only, so the harder language was completely untested and a
+// German user would have seen materially worse overflow than the English
+// case that was already failing here. Deliberately render whichever
+// language is worse, not the viewer's language or always the same one —
+// which one is longer is copy-dependent and can flip per string.
 const SUGGESTIONS = `${COCKPIT_ROOT}src/assets/suggestions.json`;
 const chips = () =>
   JSON.parse(readFileSync(SUGGESTIONS, 'utf8'))
-    .map((s) => s.en)
+    .map((s) => (s.de.length > s.en.length ? s.de : s.en))
     .sort((a, b) => b.length - a.length)
     .slice(0, 4);
 

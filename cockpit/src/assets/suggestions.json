@@ -1,22 +1,22 @@
 [
   {
     "icon": "bug_report",
-    "en": "Find out why my last job failed and propose a fix",
-    "de": "Finde heraus, warum mein letzter Job fehlgeschlagen ist, und schlage eine Lösung vor"
+    "en": "Why did my last job fail?",
+    "de": "Warum ist mein letzter Job fehlgeschlagen?"
   },
   {
     "icon": "summarize",
-    "en": "Summarize what changed in my repository this week",
-    "de": "Fasse zusammen, was sich diese Woche in meinem Repository geändert hat"
+    "en": "Summarize this week's changes",
+    "de": "Fasse die Änderungen dieser Woche zusammen"
   },
   {
     "icon": "description",
-    "en": "Write a README for a folder that doesn't have one",
-    "de": "Schreibe eine README für einen Ordner, der noch keine hat"
+    "en": "Write a README for this project",
+    "de": "Schreibe eine README für dieses Projekt"
   },
   {
     "icon": "compare_arrows",
-    "en": "Compare two approaches and recommend one, with reasons",
-    "de": "Vergleiche zwei Ansätze und empfiehl einen, mit Begründung"
+    "en": "Compare two approaches and pick one",
+    "de": "Vergleiche zwei Ansätze und wähle einen"
   }
 ]
