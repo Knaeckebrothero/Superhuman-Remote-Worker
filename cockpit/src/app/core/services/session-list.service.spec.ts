@@ -95,3 +95,33 @@ describe('SessionListService', () => {
     expect(service.grouped().map((g) => g.label)).toEqual(['earlier']);
   });
 });
+
+describe('SessionListService.renameLocal', () => {
+  it('patches the title of the matching thread in place, without a re-fetch', async () => {
+    const {service, http} = create([
+      thread('a', new Date().toISOString()),
+      thread('b', new Date().toISOString()),
+    ]);
+    await service.refresh();
+
+    service.renameLocal('a', 'Renamed session');
+
+    expect(service.threads().map((t) => [t.id, t.title])).toEqual([
+      ['a', 'Renamed session'],
+      ['b', 'Session b'],
+    ]);
+    // No navigation refreshes this list for a rename (see the doc comment on
+    // renameLocal) — confirm the patch really is local, not a side-effect of
+    // an extra fetch this test would otherwise miss.
+    expect(http.get).toHaveBeenCalledTimes(1);
+  });
+
+  it('is a no-op for an id this list does not carry', async () => {
+    const {service} = create([thread('a', new Date().toISOString())]);
+    await service.refresh();
+
+    service.renameLocal('does-not-exist', 'Renamed session');
+
+    expect(service.threads().map((t) => t.title)).toEqual(['Session a']);
+  });
+});

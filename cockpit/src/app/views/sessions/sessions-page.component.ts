@@ -706,15 +706,21 @@ export class SessionsPageComponent implements OnInit {
     async onRenameThread(thread: Thread, title: string): Promise<void> {
         const previous = thread.title;
         // Optimistic: update the card immediately, revert if the PATCH fails.
+        // This page's own `threads` is a filtered/mapped snapshot of
+        // SessionListService, not a computed over it (see loadThreads), so it
+        // doesn't pick up sessionList.renameLocal below for free — both need
+        // the explicit update, and both revert together on failure.
         this.threads.update((list) =>
             list.map((t) => (t.id === thread.id ? {...t, title} : t)),
         );
+        this.sessionList.renameLocal(thread.id, title);
         try {
             await this.chat.renameThread(thread.id, title);
         } catch (e) {
             this.threads.update((list) =>
                 list.map((t) => (t.id === thread.id ? {...t, title: previous} : t)),
             );
+            this.sessionList.renameLocal(thread.id, previous);
             this.toast.danger(this.errors.translate(e, 'errors.sessions.renameFailed'));
         }
     }

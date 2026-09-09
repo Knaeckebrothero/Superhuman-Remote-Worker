@@ -96,6 +96,7 @@ import {copyText} from '../../ui/copy-field';
 import {queueParkReasonKey} from '../../core/models/queue-park-reason';
 import {ErrorMessageService} from '../../core/services/error-message.service';
 import {ExternalImageDirective} from '../../ui/external-image';
+import {SessionListService} from '../../core/services/session-list.service';
 
 interface SlashCommand {
     command: string;
@@ -2427,6 +2428,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     private readonly router = inject(Router);
     private readonly toast = inject(AppToastService);
     private readonly errors = inject(ErrorMessageService);
+    private readonly sessionList = inject(SessionListService);
     private readonly injector = inject(Injector);
     private readonly destroyRef = inject(DestroyRef);
 
@@ -3984,6 +3986,11 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     async onRenameSession(threadId: string, title: string): Promise<void> {
         try {
             await this.chat.renameThread(threadId, title);
+            // The rail has its own copy of the thread list (SessionListService)
+            // and only refreshes it on NavigationEnd — a rename never navigates,
+            // so without this the rail shows the old title until the user
+            // leaves and comes back.
+            this.sessionList.renameLocal(threadId, title);
         } catch (e) {
             this.toast.danger(this.errors.translate(e, 'errors.sessions.renameFailed'));
         }

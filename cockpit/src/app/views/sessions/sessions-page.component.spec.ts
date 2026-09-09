@@ -30,6 +30,7 @@ function createComponent() {
     const mockChat: any = {
         isConnected: () => false,
         threadId: () => null,
+        renameThread: vi.fn().mockResolvedValue(undefined),
     };
 
     const mockToast: any = {
@@ -90,7 +91,8 @@ function createComponent() {
     });
 
     const component = runInInjectionContext(injector, () => new SessionsPageComponent());
-    return {component, mockHttp, mockRouter, mockChat, mockToast};
+    const sessionList = injector.get(SessionListService);
+    return {component, mockHttp, mockRouter, mockChat, mockToast, sessionList};
 }
 
 function makeThread(overrides: Partial<any> = {}) {
@@ -116,6 +118,7 @@ describe('SessionsPageComponent', () => {
     let mockRouter: any;
     let mockChat: any;
     let mockToast: any;
+    let sessionList: SessionListService;
 
     beforeEach(() => {
         const created = createComponent();
@@ -124,6 +127,7 @@ describe('SessionsPageComponent', () => {
         mockRouter = created.mockRouter;
         mockChat = created.mockChat;
         mockToast = created.mockToast;
+        sessionList = created.sessionList;
     });
 
     afterEach(() => {
@@ -218,6 +222,38 @@ describe('SessionsPageComponent', () => {
             await component.loadThreads();
 
             expect(component.threads().map(thread => thread.id)).toEqual(['thread-1']);
+        });
+    });
+
+    // =========================================================================
+    // F3: onRenameThread() must keep SessionListService (the rail's copy of
+    // the list) in sync — this page's own `threads` is a filtered/mapped
+    // snapshot, not a computed over the service, so nothing does that for
+    // free.
+    // =========================================================================
+
+    describe('onRenameThread()', () => {
+        it('patches the rail copy (SessionListService) alongside its own list', async () => {
+            mockHttp.get.mockReturnValue(of({threads: [makeThread({id: 'thread-1', title: 'Old title'})]}));
+            await component.loadThreads();
+            mockChat.renameThread = vi.fn().mockResolvedValue(undefined);
+
+            await component.onRenameThread(component.threads()[0], 'New title');
+
+            expect(component.threads()[0].title).toBe('New title');
+            expect(sessionList.threads()[0].title).toBe('New title');
+        });
+
+        it('reverts both lists and toasts when the rename PATCH fails', async () => {
+            mockHttp.get.mockReturnValue(of({threads: [makeThread({id: 'thread-1', title: 'Old title'})]}));
+            await component.loadThreads();
+            mockChat.renameThread = vi.fn().mockRejectedValue(new Error('boom'));
+
+            await component.onRenameThread(component.threads()[0], 'New title');
+
+            expect(component.threads()[0].title).toBe('Old title');
+            expect(sessionList.threads()[0].title).toBe('Old title');
+            expect(mockToast.danger).toHaveBeenCalled();
         });
     });
 

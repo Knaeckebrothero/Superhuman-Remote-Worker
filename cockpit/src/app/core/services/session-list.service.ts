@@ -34,6 +34,20 @@ export class SessionListService {
       .filter((g) => g.threads.length > 0);
   });
 
+  /**
+   * In-place title patch, for callers that mutate a thread's title without
+   * navigating (rename). Create and end both work incidentally — they
+   * navigate, and the rail refreshes on NavigationEnd — but a rename is an
+   * in-place mutation with no navigation of its own, so nothing else ever
+   * tells this list about it. A no-op for an id this list doesn't carry
+   * (nothing loaded yet, or a thread since removed elsewhere).
+   */
+  renameLocal(id: string, title: string): void {
+    this._threads.update((threads) =>
+      threads.map((t) => (t.id === id ? {...t, title} : t)),
+    );
+  }
+
   refresh(): Promise<void> {
     this._loading.set(true);
     return firstValueFrom(

@@ -520,6 +520,44 @@ describe('approveAndAutoAccept', () => {
     });
 });
 
+/**
+ * F3: the rail (SessionListService) has its own copy of the thread list and
+ * only refreshes it on NavigationEnd — a rename is an in-place mutation with
+ * no navigation, so nothing else ever tells the rail about it. Same .call()
+ * convention as approveAndAutoAccept above: onRenameSession only ever
+ * touches this.chat, this.sessionList, this.toast and this.errors.
+ */
+describe('onRenameSession', () => {
+    function makeHost(renameThread: () => Promise<void>) {
+        const renameLocal = vi.fn();
+        const danger = vi.fn();
+        const host = {
+            chat: {renameThread},
+            sessionList: {renameLocal},
+            toast: {danger},
+            errors: {translate: (_e: unknown, fallback?: string) => fallback},
+        } as unknown as PersistentChatComponent;
+        return {host, renameLocal, danger};
+    }
+
+    it('patches the rail copy of the thread after a successful rename', async () => {
+        const {host, renameLocal} = makeHost(() => Promise.resolve());
+
+        await PersistentChatComponent.prototype.onRenameSession.call(host, 'thread-1', 'New title');
+
+        expect(renameLocal).toHaveBeenCalledWith('thread-1', 'New title');
+    });
+
+    it('leaves the rail untouched and toasts when the rename PATCH fails', async () => {
+        const {host, renameLocal, danger} = makeHost(() => Promise.reject(new Error('boom')));
+
+        await PersistentChatComponent.prototype.onRenameSession.call(host, 'thread-1', 'New title');
+
+        expect(renameLocal).not.toHaveBeenCalled();
+        expect(danger).toHaveBeenCalledWith('errors.sessions.renameFailed');
+    });
+});
+
 describe('pickCodeServerUrlToOpen', () => {
     // The pre-flight-then-open wiring (HTTP through the auth interceptor,
     // window.open, idle-session 401 → re-login) is exercised by Playwright on
