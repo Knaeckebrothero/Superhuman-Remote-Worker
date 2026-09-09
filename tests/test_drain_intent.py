@@ -15,6 +15,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+# R1.B06: this operation moved to services/agent_thread_status.
+from orchestrator.services import agent_thread_status  # noqa: E402
+
 
 # =============================================================================
 # Persistent agent — drain intent: suspend when parked, defer when busy
@@ -581,7 +584,11 @@ class TestOrchestratorInactiveCapabilityFence:
                 "X-Session-Local-Quiesced": "true",
                 "X-Session-Local-Quiescence-Protocol": "agent_runtime_zero_v1",
             }
-            result = await orch_main.agent_suspend_thread(request, "tid-drain-1")
+            result = await agent_thread_status.suspend_thread(
+                "tid-drain-1",
+                headers=getattr(request, "headers", {}),
+                dependencies=orch_main._agent_thread_status_dependencies(),
+            )
 
         assert result == {"suspended": True, "status": "suspended"}
         db.begin_pinned_thread_retirement.assert_awaited_once_with(
@@ -619,7 +626,11 @@ class TestOrchestratorInactiveCapabilityFence:
             patch.object(orch_main, "_persistent_thread_recycler", recycler),
             patch.object(orch_main, "workspace_suspension_service", suspension),
         ):
-            result = await orch_main.agent_suspend_thread(request, "tid-drain-1")
+            result = await agent_thread_status.suspend_thread(
+                "tid-drain-1",
+                headers=getattr(request, "headers", {}),
+                dependencies=orch_main._agent_thread_status_dependencies(),
+            )
 
         assert result == {
             "suspended": True,
@@ -673,7 +684,11 @@ class TestOrchestratorInactiveCapabilityFence:
             patch.object(orch_main, "_persistent_thread_recycler", recycler),
             patch.object(orch_main, "workspace_suspension_service", suspension),
         ):
-            result = await orch_main.agent_suspend_thread(request, "tid-drain-1")
+            result = await agent_thread_status.suspend_thread(
+                "tid-drain-1",
+                headers=getattr(request, "headers", {}),
+                dependencies=orch_main._agent_thread_status_dependencies(),
+            )
 
         assert result["reason"] == "persistent_recycle"
         recycler.acknowledge_parked_boundary.assert_awaited_once_with(
@@ -719,7 +734,11 @@ class TestOrchestratorInactiveCapabilityFence:
             patch.object(orch_main, "workspace_suspension_service", suspension),
             pytest.raises(HTTPException) as exc,
         ):
-            await orch_main.agent_suspend_thread(request, "tid-drain-1")
+            await agent_thread_status.suspend_thread(
+                "tid-drain-1",
+                headers=getattr(request, "headers", {}),
+                dependencies=orch_main._agent_thread_status_dependencies(),
+            )
 
         assert exc.value.status_code == 409
         db.get_thread.assert_awaited_once_with("tid-drain-1")
@@ -744,10 +763,10 @@ class TestOrchestratorInactiveCapabilityFence:
             patch.object(orch_main, "_persistent_thread_recycler", recycler),
             patch.object(orch_main, "_suspend_thread_resources", suspend_resources),
         ):
-            result = await orch_main.agent_update_thread_status(
-                MagicMock(),
+            result = await agent_thread_status.update_thread_status(
                 "tid-drain-1",
                 orch_main.AgentThreadStatusRequest(status="ended"),
+                dependencies=orch_main._agent_thread_status_dependencies(),
             )
 
         assert result == {"status": "suspended"}
@@ -787,7 +806,11 @@ class TestOrchestratorInactiveCapabilityFence:
             patch.object(orch_main, "workspace_suspension_service", suspension),
             pytest.raises(HTTPException) as exc,
         ):
-            await orch_main.agent_suspend_thread(request, "tid-drain-1")
+            await agent_thread_status.suspend_thread(
+                "tid-drain-1",
+                headers=getattr(request, "headers", {}),
+                dependencies=orch_main._agent_thread_status_dependencies(),
+            )
 
         assert exc.value.status_code == 409
         assert exc.value.detail["code"] == "pinned_local_quiescence_required"
@@ -810,10 +833,10 @@ class TestOrchestratorInactiveCapabilityFence:
             patch.object(orch_main, "_suspend_thread_resources", suspend_resources),
             patch.object(orch_main, "_conclude_conference_if_any", conclude),
         ):
-            result = await orch_main.agent_update_thread_status(
-                object(),
+            result = await agent_thread_status.update_thread_status(
                 "tid-drain-1",
                 orch_main.AgentThreadStatusRequest(status="ended"),
+                dependencies=orch_main._agent_thread_status_dependencies(),
             )
             await asyncio.sleep(0)
 

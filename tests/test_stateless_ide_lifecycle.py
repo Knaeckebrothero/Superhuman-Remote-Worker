@@ -2,6 +2,9 @@ from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+# R1.B06: this operation moved to services/run_queue_admin.
+from orchestrator.services import run_queue_admin  # noqa: E402
 from fastapi import HTTPException
 
 
@@ -396,8 +399,9 @@ async def test_present_falsey_stop_marker_refuses_admin_unpark(marker_key, value
         patch.object(main, "_require_admin", AsyncMock()),
         pytest.raises(HTTPException) as exc,
     ):
-        await main.admin_run_queue_unpark(
-            "11111111-1111-4111-8111-111111111111", MagicMock()
+        await run_queue_admin.unpark_run_queue_unit(
+            "11111111-1111-4111-8111-111111111111",
+            dependencies=main._run_queue_admin_dependencies(),
         )
 
     assert exc.value.status_code == 409

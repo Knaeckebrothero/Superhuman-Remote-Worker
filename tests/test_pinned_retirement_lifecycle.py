@@ -7,6 +7,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID
 
 import pytest
+
+# R1.B06: this operation moved to services/agent_thread_status.
+from orchestrator.services import agent_thread_status  # noqa: E402
 import httpx
 from fastapi import FastAPI
 
@@ -208,18 +211,21 @@ async def test_agent_ending_installs_and_authorizes_retirement_atomically(
         }
     )
     db.authorize_pinned_thread_retirement = AsyncMock()
-    request = MagicMock()
 
     with (
         patch.object(main, "require_internal", AsyncMock()),
         patch.object(main, "postgres_db", db),
     ):
         if through_client:
+            # R1.B06: the route moved to routers/agent_thread_status. Mount the
+            # real router and give the app the factory it resolves through, so
+            # this still exercises the wire and the internal gate.
+            from orchestrator.routers import agent_thread_status as status_routes
+
             app = FastAPI()
-            app.add_api_route(
-                "/api/agents/threads/{thread_id}/status",
-                main.agent_update_thread_status,
-                methods=["PUT"],
+            app.include_router(status_routes.router)
+            app.state.agent_thread_status_dependencies_factory = (
+                main._agent_thread_status_dependencies
             )
             client = OrchestratorClient(
                 orchestrator_url="http://test",
@@ -241,8 +247,7 @@ async def test_agent_ending_installs_and_authorizes_retirement_atomically(
                     retirement_disposition="ended",
                 )
         else:
-            response = await main.agent_update_thread_status(
-                request,
+            response = await agent_thread_status.update_thread_status(
                 THREAD_ID,
                 main.AgentThreadStatusRequest(
                     status="ending",
@@ -253,6 +258,7 @@ async def test_agent_ending_installs_and_authorizes_retirement_atomically(
                     session_runtime_attach_token=ATTACH_TOKEN,
                     retirement_disposition="ended",
                 ),
+                dependencies=main._agent_thread_status_dependencies(),
             )
 
     assert response == {

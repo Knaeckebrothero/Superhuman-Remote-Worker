@@ -7,6 +7,17 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+# R1.B06: main no longer re-exports this. It belongs to
+# services/session_class_policy and lane B's admission path imports it
+# from there directly.
+from orchestrator.services import session_class_policy  # noqa: E402
+
+# R1.B06: these handlers moved to services/thread_config_update with their
+# routes in routers/thread_config. main's dependency factory still reads
+# main's attributes at call time, so the patches below keep steering what
+# they steered before.
+from orchestrator.services import thread_config_update  # noqa: E402
 from fastapi import HTTPException
 
 from orchestrator.services.stateless_workspace_gate import (
@@ -589,7 +600,7 @@ def test_malformed_session_class_pins_and_cannot_be_materialized(monkeypatch, of
         == "pinned"
     )
     with pytest.raises(HTTPException) as exc:
-        orch_main._materialized_session_class_override(config)
+        session_class_policy.materialized_session_class_override(config)
     assert exc.value.status_code == 400
 
 
@@ -597,7 +608,7 @@ def test_materialized_ordinary_class_wins_over_later_expert_and_account_changes(
     from orchestrator import main as orch_main
 
     materialized = {
-        "officer": orch_main._materialized_session_class_override(
+        "officer": session_class_policy.materialized_session_class_override(
             {"officer": {"enabled": False, "conference": False}}
         )
     }
@@ -670,7 +681,11 @@ async def test_stateless_vm_upgrade_refuses_before_grants_or_provisioning():
         patch.object(orch_main, "_enforce_workspace_upgrade_grants", grants),
     ):
         with pytest.raises(HTTPException) as exc:
-            await orch_main.agent_upgrade_thread_to_vm(MagicMock(), THREAD_ID)
+            await thread_config_update.agent_upgrade_thread_to_vm(
+                MagicMock(),
+                THREAD_ID,
+                dependencies=orch_main._thread_config_update_dependencies(),
+            )
 
     assert exc.value.status_code == 409
     grants.assert_not_awaited()
@@ -703,10 +718,11 @@ async def test_stateless_sandbox_upgrade_refuses_before_any_workspace_write():
         patch.object(orch_main, "_enforce_workspace_upgrade_grants", grants),
     ):
         with pytest.raises(HTTPException) as exc:
-            await orch_main.agent_upgrade_thread_to_workspace(
+            await thread_config_update.agent_upgrade_thread_to_workspace(
                 MagicMock(),
                 THREAD_ID,
                 orch_main.ThreadWorkspaceUpgradeRequest(target_tier="sandbox"),
+                dependencies=orch_main._thread_config_update_dependencies(),
             )
 
     assert exc.value.status_code == 409
@@ -797,10 +813,11 @@ async def test_protected_workspace_upgrade_refuses_before_every_effect(
         patch.object(orch_main, "_enforce_workspace_upgrade_grants", grants),
     ):
         with pytest.raises(HTTPException) as exc:
-            await orch_main.agent_upgrade_thread_to_workspace(
+            await thread_config_update.agent_upgrade_thread_to_workspace(
                 MagicMock(),
                 THREAD_ID,
                 orch_main.ThreadWorkspaceUpgradeRequest(target_tier=target_tier),
+                dependencies=orch_main._thread_config_update_dependencies(),
             )
 
     assert exc.value.status_code == 409

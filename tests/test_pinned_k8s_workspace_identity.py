@@ -3,6 +3,12 @@
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+# R1.B06: these handlers moved to services/thread_config_update with their
+# routes in routers/thread_config. main's dependency factory still reads
+# main's attributes at call time, so the patches below keep steering what
+# they steered before.
+from orchestrator.services import thread_config_update  # noqa: E402
 from fastapi import HTTPException
 
 from orchestrator import main
@@ -176,16 +182,19 @@ async def test_vm_hot_upgrade_keeps_separate_authority_path():
     expected = {"status": "provisioning", "thread_id": THREAD_ID}
     with (
         patch.object(main, "require_internal", AsyncMock()),
+        # R1.B06: the VM fork is a call *inside* services/thread_config_update,
+        # so the double has to live there — patching main would be inert.
         patch.object(
-            main,
+            thread_config_update,
             "agent_upgrade_thread_to_vm",
             AsyncMock(return_value=expected),
         ) as upgrade_vm,
     ):
-        result = await main.agent_upgrade_thread_to_workspace(
+        result = await thread_config_update.agent_upgrade_thread_to_workspace(
             MagicMock(),
             THREAD_ID,
             main.ThreadWorkspaceUpgradeRequest(target_tier="vm"),
+            dependencies=main._thread_config_update_dependencies(),
         )
 
     assert result == expected

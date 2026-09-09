@@ -14,6 +14,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID
 
 import pytest
+
+# R1.B06: this operation moved to services/agent_thread_status.
+from orchestrator.services import agent_thread_status  # noqa: E402
 from fastapi import HTTPException
 from pydantic import ValidationError
 
@@ -602,8 +605,7 @@ async def test_exact_pinned_ended_status_refuses_successor_binding():
         patch.object(orchestrator_main, "postgres_db", db),
     ):
         with pytest.raises(HTTPException) as exc:
-            await orchestrator_main.agent_update_thread_status(
-                MagicMock(),
+            await agent_thread_status.update_thread_status(
                 str(THREAD_ID),
                 orchestrator_main.AgentThreadStatusRequest(
                     status="ended",
@@ -612,6 +614,7 @@ async def test_exact_pinned_ended_status_refuses_successor_binding():
                     # the refusal under test is the endpoint's, not the model's.
                     process_generation=PROCESS_GENERATION,
                 ),
+                dependencies=orchestrator_main._agent_thread_status_dependencies(),
             )
 
     assert exc.value.status_code == 409
@@ -651,14 +654,14 @@ async def test_exact_pinned_live_status_refuses_stale_pre_resume_agent(status):
         patch.object(orchestrator_main, "postgres_db", db),
     ):
         with pytest.raises(HTTPException) as exc:
-            await orchestrator_main.agent_update_thread_status(
-                MagicMock(),
+            await agent_thread_status.update_thread_status(
                 str(THREAD_ID),
                 orchestrator_main.AgentThreadStatusRequest(
                     status=status,
                     agent_id=AGENT_ID,
                     process_generation=PROCESS_GENERATION,
                 ),
+                dependencies=orchestrator_main._agent_thread_status_dependencies(),
             )
 
     assert exc.value.status_code == 409
@@ -710,8 +713,7 @@ async def test_exact_pinned_live_status_preserves_runtime_resources(status):
             orchestrator_main, "_conclude_conference_if_any", conclude_conference
         ),
     ):
-        result = await orchestrator_main.agent_update_thread_status(
-            MagicMock(),
+        result = await agent_thread_status.update_thread_status(
             str(THREAD_ID),
             orchestrator_main.AgentThreadStatusRequest(
                 status=status,
@@ -720,6 +722,7 @@ async def test_exact_pinned_live_status_preserves_runtime_resources(status):
                 session_runtime_generation=RUNTIME_GENERATION,
                 session_runtime_attach_token=ATTACH_TOKEN,
             ),
+            dependencies=orchestrator_main._agent_thread_status_dependencies(),
         )
 
     assert result == {"status": status}
@@ -742,10 +745,10 @@ async def test_strict_pinned_status_phase_rejects_missing_identity(monkeypatch):
         patch.object(orchestrator_main, "postgres_db", db),
     ):
         with pytest.raises(HTTPException) as exc:
-            await orchestrator_main.agent_update_thread_status(
-                MagicMock(),
+            await agent_thread_status.update_thread_status(
                 str(THREAD_ID),
                 orchestrator_main.AgentThreadStatusRequest(status="awaiting_user"),
+                dependencies=orchestrator_main._agent_thread_status_dependencies(),
             )
 
     assert exc.value.status_code == 409

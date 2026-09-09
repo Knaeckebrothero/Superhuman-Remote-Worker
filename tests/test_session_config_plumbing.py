@@ -21,6 +21,10 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+from orchestrator.services import (  # noqa: E402
+    thread_datasource_authorization,
+)
 from fastapi import HTTPException
 
 import orchestrator.main as orch_main
@@ -1273,9 +1277,13 @@ class TestSendSessionAttachPayload:
                 "get_thread",
                 AsyncMock(return_value=thread),
             ),
+            # R1.B06: `resolve_authorized_thread_datasources` moved into
+            # services/thread_datasource_authorization and now calls its
+            # module-local revalidator, so the double belongs there —
+            # patching main would be green but inert.
             patch.object(
-                orch_main,
-                "_revalidate_thread_datasource_selection",
+                thread_datasource_authorization,
+                "revalidate_thread_datasource_selection",
                 AsyncMock(side_effect=denied),
             ) as revalidate,
             patch.object(
@@ -1300,11 +1308,11 @@ class TestSendSessionAttachPayload:
             )
 
         assert ok is False
-        revalidate.assert_awaited_once_with(
-            thread,
-            [datasource_id],
-            target_project_ids=[],
-        )
+        # R1.B06: the call now carries the service's injected ``dependencies``.
+        # Assert the subject, not the plumbing.
+        revalidate.assert_awaited_once()
+        assert revalidate.await_args.args == (thread, [datasource_id])
+        assert revalidate.await_args.kwargs["target_project_ids"] == []
         assert _FakeAsyncClient.calls == []
 
     @pytest.mark.asyncio
@@ -1324,9 +1332,13 @@ class TestSendSessionAttachPayload:
                 "get_thread",
                 AsyncMock(return_value=thread),
             ),
+            # R1.B06: `resolve_authorized_thread_datasources` moved into
+            # services/thread_datasource_authorization and now calls its
+            # module-local revalidator, so the double belongs there —
+            # patching main would be green but inert.
             patch.object(
-                orch_main,
-                "_revalidate_thread_datasource_selection",
+                thread_datasource_authorization,
+                "revalidate_thread_datasource_selection",
                 AsyncMock(return_value=([], {})),
             ),
             patch.object(
@@ -1393,9 +1405,13 @@ class TestSendSessionAttachPayload:
                 "_revalidate_thread_project_ids",
                 AsyncMock(return_value=[project_id]),
             ),
+            # R1.B06: `resolve_authorized_thread_datasources` moved into
+            # services/thread_datasource_authorization and now calls its
+            # module-local revalidator, so the double belongs there —
+            # patching main would be green but inert.
             patch.object(
-                orch_main,
-                "_revalidate_thread_datasource_selection",
+                thread_datasource_authorization,
+                "revalidate_thread_datasource_selection",
                 AsyncMock(return_value=([current_id], {current_id: 2})),
             ),
             patch.object(

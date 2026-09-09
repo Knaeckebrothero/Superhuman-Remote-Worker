@@ -7,6 +7,10 @@ import pytest
 from fastapi import HTTPException
 
 import orchestrator.main as main
+
+# R1.B06: main no longer re-exports this constant. It belongs to the
+# workspace-binding service and the successor path reads it from there.
+from orchestrator.services.workspace_binding import CANVAS_WORKSPACE_GENERATION_KEY
 from orchestrator.services.workspace_lifecycle import EnsureOutcome, EnsureResult
 
 THREAD_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1"
@@ -69,13 +73,13 @@ def _successor_thread(
         "provisioner": provisioner,
         "pod_ip": "10.42.0.25",
         "port": 30022,
-        main.CANVAS_WORKSPACE_GENERATION_KEY: WORKSPACE_GENERATION,
+        CANVAS_WORKSPACE_GENERATION_KEY: WORKSPACE_GENERATION,
         main.WORKSPACE_RUNTIME_INCARNATION_KEY: workspace_runtime,
     }
     if workspace_runtime is None:
         workspace["pod_ip"] = None
         workspace["port"] = None
-        workspace[main.CANVAS_WORKSPACE_GENERATION_KEY] = None
+        workspace[CANVAS_WORKSPACE_GENERATION_KEY] = None
     return {
         "id": THREAD_ID,
         "user_id": "user-a",
@@ -149,6 +153,28 @@ async def _release(
 @asynccontextmanager
 async def _owned_lifecycle_lock(*_args, **_kwargs):
     yield True
+
+
+async def _release_agent_via_owner(request, thread_id):
+    """Drive release-agent through its R1.B06 owner.
+
+    The handler moved to ``routers/agent_thread_status`` and its policy to
+    ``services/agent_thread_status``; the transport half — the internal-key
+    guard and the raw JSON read whose *unparseable* case is the 400 — stayed in
+    the router. These cases are about the outcomes, so they call the service
+    and hand it the body the fake request would have yielded.
+
+    Dependencies come from ``main._agent_thread_status_dependencies()`` rather
+    than a hand-built object on purpose: the factory reads main's attributes at
+    call time, so every ``patch.object(main, ...)`` below still steers exactly
+    what it steered before the extraction.
+    """
+    from orchestrator.services import agent_thread_status
+
+    body = await request.json()
+    return await agent_thread_status.release_thread_agent(
+        thread_id, body, dependencies=main._agent_thread_status_dependencies()
+    )
 
 
 @pytest.mark.asyncio
@@ -318,7 +344,7 @@ async def test_http_boundary_preserves_exact_release_outcome(outcome):
         ) as acknowledge_retirement,
         patch.object(main, "_schedule_attach_abort_successor") as schedule,
     ):
-        response = await main.agent_release_thread_agent(request, THREAD_ID)
+        response = await _release_agent_via_owner(request, THREAD_ID)
 
     assert response == {"status": outcome}
     # Exact append-only outcome readback remains reachable after a concurrent
@@ -388,7 +414,7 @@ async def test_http_boundary_routes_failed_attach_proof_into_retirement_only():
         ) as acknowledge_retirement,
         patch.object(main, "_schedule_attach_abort_successor") as schedule,
     ):
-        response = await main.agent_release_thread_agent(request, THREAD_ID)
+        response = await _release_agent_via_owner(request, THREAD_ID)
 
     assert response == {"status": "retirement_acknowledged"}
     acknowledge_retirement.assert_awaited_once()
@@ -892,6 +918,6 @@ async def test_http_boundary_refuses_a_claim_without_process_zero():
         ),
     ):
         with pytest.raises(HTTPException) as exc:
-            await main.agent_release_thread_agent(request, THREAD_ID)
+            await _release_agent_via_owner(request, THREAD_ID)
     assert exc.value.status_code == 409
     assert exc.value.detail["code"] == "pinned_attach_quiescence_required"

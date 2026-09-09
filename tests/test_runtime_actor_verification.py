@@ -6,6 +6,10 @@ from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID
 
 import pytest
+
+from orchestrator.routers import (  # noqa: E402
+    officer_runtime_verification as officer_runtime_verification_router,
+)
 from fastapi import HTTPException
 
 import orchestrator.main as main
@@ -17,6 +21,21 @@ PROJECT_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 ADMIN_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 PLAN_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 IDEMPOTENCY_KEY = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+
+
+def _routed_request():
+    """A request the moved routes can resolve their collaborators from.
+
+    R1.B06: the five verification routes live in
+    ``routers/officer_runtime_verification`` and read their dependency object
+    off ``request.app.state``. Driving the route rather than the service keeps
+    the admin gate in the picture, which is the subject of half these cases.
+    """
+    request = MagicMock()
+    request.app.state.officer_runtime_verification_dependencies_factory = (
+        main._officer_runtime_verification_dependencies
+    )
+    return request
 
 
 def _body(**overrides):
@@ -47,9 +66,14 @@ async def test_admin_plan_route_uses_only_authenticated_admin_identity(monkeypat
     monkeypatch.setattr(main, "log_security_event", audit)
     monkeypatch.setattr(main, "OFFICER_RUNTIME_VERIFICATION_ENABLED", True)
     request = MagicMock()
+    request.app.state.officer_runtime_verification_dependencies_factory = (
+        main._officer_runtime_verification_dependencies
+    )
 
-    result = await main.create_officer_runtime_verification(
-        PROJECT_ID, _body(), request
+    result = (
+        await officer_runtime_verification_router.create_officer_runtime_verification(
+            PROJECT_ID, _body(), request
+        )
     )
 
     assert result == {
@@ -95,7 +119,9 @@ async def test_viewer_cannot_reach_plan_service(monkeypatch):
     monkeypatch.setattr(main, "create_runtime_verification_plan", create)
 
     with pytest.raises(HTTPException) as exc:
-        await main.create_officer_runtime_verification(PROJECT_ID, _body(), MagicMock())
+        await officer_runtime_verification_router.create_officer_runtime_verification(
+            PROJECT_ID, _body(), _routed_request()
+        )
 
     assert exc.value.status_code == 403
     create.assert_not_awaited()
@@ -120,7 +146,9 @@ async def test_disabled_plan_route_is_not_discoverable_as_an_active_seam(monkeyp
     )
 
     with pytest.raises(HTTPException) as exc:
-        await main.create_officer_runtime_verification(PROJECT_ID, _body(), MagicMock())
+        await officer_runtime_verification_router.create_officer_runtime_verification(
+            PROJECT_ID, _body(), _routed_request()
+        )
 
     assert exc.value.status_code == 404
     assert exc.value.detail["code"] == "verification_disabled"
@@ -152,7 +180,9 @@ async def test_committed_response_loss_returns_only_generic_retry(monkeypatch):
     monkeypatch.setattr(main, "OFFICER_RUNTIME_VERIFICATION_ENABLED", True)
 
     with pytest.raises(HTTPException) as exc:
-        await main.refresh_runtime_actor(MagicMock())
+        await officer_runtime_verification_router.refresh_runtime_actor(
+            _routed_request()
+        )
 
     assert exc.value.status_code == 503
     assert exc.value.detail == {
@@ -186,8 +216,11 @@ async def test_recover_transition_is_admin_only_and_exact_plan(monkeypatch):
     monkeypatch.setattr(main, "log_security_event", audit)
     monkeypatch.setattr(main, "OFFICER_RUNTIME_VERIFICATION_ENABLED", True)
     request = MagicMock()
+    request.app.state.officer_runtime_verification_dependencies_factory = (
+        main._officer_runtime_verification_dependencies
+    )
 
-    result = await main.transition_officer_runtime_verification(
+    result = await officer_runtime_verification_router.transition_officer_runtime_verification(
         PROJECT_ID, PLAN_ID, "recover", request
     )
 
@@ -237,11 +270,11 @@ async def test_transition_retry_after_lost_response_is_audited_as_replay(monkeyp
     monkeypatch.setattr(main, "OFFICER_RUNTIME_VERIFICATION_ENABLED", True)
 
     # The first successful HTTP result is deliberately discarded.
-    await main.transition_officer_runtime_verification(
-        PROJECT_ID, PLAN_ID, "recover", MagicMock()
+    await officer_runtime_verification_router.transition_officer_runtime_verification(
+        PROJECT_ID, PLAN_ID, "recover", _routed_request()
     )
-    retry = await main.transition_officer_runtime_verification(
-        PROJECT_ID, PLAN_ID, "recover", MagicMock()
+    retry = await officer_runtime_verification_router.transition_officer_runtime_verification(
+        PROJECT_ID, PLAN_ID, "recover", _routed_request()
     )
 
     assert retry["plan"] == {**immutable, "replayed": True}
@@ -271,8 +304,11 @@ async def test_disarm_success_emits_attributed_security_event(monkeypatch):
     monkeypatch.setattr(main, "log_security_event", audit)
     monkeypatch.setattr(main, "OFFICER_RUNTIME_VERIFICATION_ENABLED", True)
     request = MagicMock()
+    request.app.state.officer_runtime_verification_dependencies_factory = (
+        main._officer_runtime_verification_dependencies
+    )
 
-    result = await main.transition_officer_runtime_verification(
+    result = await officer_runtime_verification_router.transition_officer_runtime_verification(
         PROJECT_ID, PLAN_ID, "disarm", request
     )
 
@@ -320,7 +356,9 @@ async def test_idempotency_conflict_is_stable_409_and_not_success_audited(monkey
     monkeypatch.setattr(main, "OFFICER_RUNTIME_VERIFICATION_ENABLED", True)
 
     with pytest.raises(HTTPException) as exc:
-        await main.create_officer_runtime_verification(PROJECT_ID, _body(), MagicMock())
+        await officer_runtime_verification_router.create_officer_runtime_verification(
+            PROJECT_ID, _body(), _routed_request()
+        )
 
     assert exc.value.status_code == 409
     assert exc.value.detail["code"] == "idempotency_conflict"

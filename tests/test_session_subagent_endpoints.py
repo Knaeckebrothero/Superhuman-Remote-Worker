@@ -16,6 +16,10 @@ import pytest
 from pydantic import ValidationError
 
 import orchestrator.main as m
+from orchestrator.routers import agent_child_threads as _child_routes
+from orchestrator.schemas.agent_child_threads import (
+    AgentSessionSubagentAuthority,
+)
 from orchestrator.routers import job_inspection as job_inspection_routes
 from shared.persistent_input_delivery import InputDeliveryConflict
 
@@ -30,10 +34,28 @@ DELIVERY = uuid.UUID("70000000-0000-4000-8000-000000000007")
 NOW = datetime(2026, 9, 2, 1, 0, tzinfo=timezone.utc)
 
 
+@pytest.fixture(autouse=True)
+def _child_thread_routes_resolve_from_main(monkeypatch):
+    """R1.B06: these routes moved to ``routers/agent_child_threads``.
+
+    They resolve their collaborators from ``request.app.state``, and the cases
+    below hand the handlers bare ``SimpleNamespace()`` / ``MagicMock()``
+    requests. Resolving through main's real factory keeps every
+    ``monkeypatch.setattr(m, ...)`` below steering exactly what it steered when
+    these were main functions — including the internal gate, which is now
+    ``dependencies.require_internal`` inside the route body.
+    """
+    monkeypatch.setattr(
+        _child_routes,
+        "get_agent_child_thread_dependencies",
+        lambda request: m._agent_child_threads_dependencies(),
+    )
+
+
 def _pinned_authority(
     parent_thread_id: uuid.UUID = PARENT,
-) -> m.AgentSessionSubagentAuthority:
-    return m.AgentSessionSubagentAuthority(
+) -> AgentSessionSubagentAuthority:
+    return AgentSessionSubagentAuthority(
         execution_lane="pinned",
         parent_thread_id=parent_thread_id,
         agent_id=AGENT,
@@ -43,8 +65,8 @@ def _pinned_authority(
     )
 
 
-def _stateless_authority() -> m.AgentSessionSubagentAuthority:
-    return m.AgentSessionSubagentAuthority(
+def _stateless_authority() -> AgentSessionSubagentAuthority:
+    return AgentSessionSubagentAuthority(
         execution_lane="stateless",
         parent_thread_id=PARENT,
         lease_token=17,
@@ -91,7 +113,7 @@ class TestSessionAuthorityBody:
         assert _pinned_authority().execution_lane == "pinned"
         assert _stateless_authority().execution_lane == "stateless"
         with pytest.raises(ValidationError):
-            m.AgentSessionSubagentAuthority(
+            AgentSessionSubagentAuthority(
                 execution_lane="pinned",
                 parent_thread_id=PARENT,
                 agent_id=AGENT,
@@ -103,14 +125,14 @@ class TestSessionAuthorityBody:
                 executor_pod_uid="executor-pod",
             )
         with pytest.raises(ValidationError):
-            m.AgentSessionSubagentAuthority(
+            AgentSessionSubagentAuthority(
                 execution_lane="stateless",
                 parent_thread_id=PARENT,
                 lease_token=9,
                 executor_id="executor",
             )
         with pytest.raises(ValidationError):
-            m.AgentSessionSubagentAuthority(
+            AgentSessionSubagentAuthority(
                 execution_lane="pinned",
                 parent_thread_id=PARENT,
                 agent_id=AGENT,
@@ -134,7 +156,7 @@ class TestSessionCreateRoute:
             subagent_type="reviewer",
         )
         with pytest.raises(m.HTTPException) as excinfo:
-            await m.agent_create_session_subagent_thread(
+            await _child_routes.agent_create_session_subagent_thread(
                 SimpleNamespace(), str(PARENT), body
             )
         assert excinfo.value.status_code == 401
@@ -171,7 +193,7 @@ class TestSessionCreateRoute:
             run_in_background=True,
             initial_status="queued",
         )
-        result = await m.agent_create_session_subagent_thread(
+        result = await _child_routes.agent_create_session_subagent_thread(
             SimpleNamespace(), str(PARENT), body
         )
         assert result == {
@@ -217,7 +239,7 @@ class TestSessionCreateRoute:
             initial_status="queued",
         )
         with pytest.raises(m.HTTPException) as excinfo:
-            await m.agent_create_session_subagent_thread(
+            await _child_routes.agent_create_session_subagent_thread(
                 SimpleNamespace(), str(PARENT), body
             )
         assert excinfo.value.status_code == 409
@@ -244,13 +266,13 @@ class TestSessionLifecycleRoutes:
             parent_authority=_pinned_authority(), parent_tool_call_id="call-1"
         )
 
-        live = await m.agent_list_live_session_subagent_threads(
+        live = await _child_routes.agent_list_live_session_subagent_threads(
             SimpleNamespace(), str(PARENT), query
         )
-        exact = await m.agent_get_session_subagent_thread(
+        exact = await _child_routes.agent_get_session_subagent_thread(
             SimpleNamespace(), str(PARENT), CHILD, query
         )
-        replay = await m.agent_get_session_subagent_thread_by_call(
+        replay = await _child_routes.agent_get_session_subagent_thread_by_call(
             SimpleNamespace(), str(PARENT), by_call
         )
 
@@ -277,7 +299,7 @@ class TestSessionLifecycleRoutes:
         body = m.AgentSessionSubagentReopenRequest(
             parent_authority=_pinned_authority(), runtime_generation=GENERATION
         )
-        result = await m.agent_reopen_session_subagent_thread(
+        result = await _child_routes.agent_reopen_session_subagent_thread(
             SimpleNamespace(), str(PARENT), CHILD, body
         )
         assert result["runtime_generation"] == str(NEXT_GENERATION)
@@ -290,7 +312,7 @@ class TestSessionLifecycleRoutes:
 
         db.reopen_session_subagent_thread.return_value = {"result": "stale"}
         with pytest.raises(m.HTTPException) as excinfo:
-            await m.agent_reopen_session_subagent_thread(
+            await _child_routes.agent_reopen_session_subagent_thread(
                 SimpleNamespace(), str(PARENT), CHILD, body
             )
         assert excinfo.value.status_code == 409
@@ -324,7 +346,7 @@ class TestSessionLifecycleRoutes:
             foreground_orphan_recovery=True,
         )
         assert (
-            await m.agent_terminalize_session_subagent_thread(
+            await _child_routes.agent_terminalize_session_subagent_thread(
                 SimpleNamespace(), str(PARENT), CHILD, body
             )
             == applied
@@ -342,7 +364,7 @@ class TestSessionLifecycleRoutes:
             "different transcript"
         )
         with pytest.raises(m.HTTPException) as excinfo:
-            await m.agent_terminalize_session_subagent_thread(
+            await _child_routes.agent_terminalize_session_subagent_thread(
                 SimpleNamespace(), str(PARENT), CHILD, body
             )
         assert excinfo.value.status_code == 409

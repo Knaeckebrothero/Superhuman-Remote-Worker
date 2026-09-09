@@ -30,6 +30,9 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+# R1.B06: the heartbeat moved to services/agent_registration.
+from orchestrator.services import agent_registration  # noqa: E402
 from fastapi import HTTPException
 from langchain_core.messages import AIMessage, HumanMessage
 
@@ -380,8 +383,11 @@ class TestHeartbeatCarriesGuidance:
             patch.object(om, "postgres_db", db),
             patch.object(om, "require_internal", AsyncMock()),
         ):
-            out = await om.agent_heartbeat(
-                MagicMock(), "agent-1", self._heartbeat_body(om)
+            out = await agent_registration.agent_heartbeat(
+                MagicMock(),
+                "agent-1",
+                self._heartbeat_body(om),
+                dependencies=om._agent_registration_dependencies(),
             )
 
         assert out["job_status"] == "processing"
@@ -396,8 +402,11 @@ class TestHeartbeatCarriesGuidance:
             patch.object(om, "postgres_db", db),
             patch.object(om, "require_internal", AsyncMock()),
         ):
-            out = await om.agent_heartbeat(
-                MagicMock(), "agent-1", self._heartbeat_body(om)
+            out = await agent_registration.agent_heartbeat(
+                MagicMock(),
+                "agent-1",
+                self._heartbeat_body(om),
+                dependencies=om._agent_registration_dependencies(),
             )
 
         assert out["pending_guidance"] == []
@@ -412,8 +421,11 @@ class TestHeartbeatCarriesGuidance:
             patch.object(om, "postgres_db", db),
             patch.object(om, "require_internal", AsyncMock()),
         ):
-            out = await om.agent_heartbeat(
-                MagicMock(), "agent-1", self._heartbeat_body(om)
+            out = await agent_registration.agent_heartbeat(
+                MagicMock(),
+                "agent-1",
+                self._heartbeat_body(om),
+                dependencies=om._agent_registration_dependencies(),
             )
 
         assert out["pending_guidance"] is None

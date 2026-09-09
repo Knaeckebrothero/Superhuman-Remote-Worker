@@ -178,7 +178,9 @@ class TestAgentThreadCreateWriteBoundary:
 
     @pytest.mark.asyncio
     async def test_hostile_name_is_refused_before_any_insert(self, fake_db):
-        from orchestrator.main import AgentThreadCreateRequest, agent_create_thread
+        import orchestrator.main as main
+        from orchestrator.main import AgentThreadCreateRequest
+        from orchestrator.services.agent_child_threads import agent_create_thread
 
         fake_db.create_thread = AsyncMock()
         with patch("orchestrator.main.postgres_db", fake_db):
@@ -187,6 +189,7 @@ class TestAgentThreadCreateWriteBoundary:
                     await agent_create_thread(
                         MagicMock(),
                         AgentThreadCreateRequest(config_name="a; rm -rf /"),
+                        dependencies=main._agent_child_threads_dependencies(),
                     )
 
         assert exc.value.status_code == 422

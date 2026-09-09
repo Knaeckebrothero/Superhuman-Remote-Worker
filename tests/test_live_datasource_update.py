@@ -28,6 +28,12 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+# R1.B06: these handlers moved to services/thread_config_update with their
+# routes in routers/thread_config. main's dependency factory still reads
+# main's attributes at call time, so the patches below keep steering what
+# they steered before.
+from orchestrator.services import thread_config_update  # noqa: E402
 from fastapi import HTTPException
 
 THREAD_ID = "11111111-2222-3333-4444-555555555555"
@@ -312,8 +318,11 @@ class TestAgentPatchDatasourceIds:
             metadata_extra={"datasource_ids": [DATASOURCE_A_ID]}
         )
         with pytest.raises(main.HTTPException) as caught:
-            await main.agent_update_thread_config(
-                MagicMock(), THREAD_ID, _body(main, datasource_ids=[])
+            await thread_config_update.agent_update_thread_config(
+                MagicMock(),
+                THREAD_ID,
+                _body(main, datasource_ids=[]),
+                dependencies=main._thread_config_update_dependencies(),
             )
         assert caught.value.status_code == 409
         assert "stay attached" in caught.value.detail
@@ -334,8 +343,11 @@ class TestAgentPatchDatasourceIds:
         }
 
         with pytest.raises(main.HTTPException) as exc:
-            await main.agent_update_thread_config(
-                MagicMock(), THREAD_ID, _body(main, datasource_ids=[REPOSITORY_ID])
+            await thread_config_update.agent_update_thread_config(
+                MagicMock(),
+                THREAD_ID,
+                _body(main, datasource_ids=[REPOSITORY_ID]),
+                dependencies=main._thread_config_update_dependencies(),
             )
         assert exc.value.status_code == 400
         assert "repository" in exc.value.detail.lower()
@@ -348,8 +360,11 @@ class TestAgentPatchDatasourceIds:
         principal fails at the PATCH — and nothing persists on denial."""
         main, db, grants = patched_main
 
-        await main.agent_update_thread_config(
-            MagicMock(), THREAD_ID, _body(main, datasource_ids=[DATASOURCE_A_ID])
+        await thread_config_update.agent_update_thread_config(
+            MagicMock(),
+            THREAD_ID,
+            _body(main, datasource_ids=[DATASOURCE_A_ID]),
+            dependencies=main._thread_config_update_dependencies(),
         )
 
         fragment = grants.await_args.args[0]
@@ -369,8 +384,11 @@ class TestAgentPatchDatasourceIds:
         grants.side_effect = main.HTTPException(status_code=422, detail="denied")
 
         with pytest.raises(main.HTTPException) as exc:
-            await main.agent_update_thread_config(
-                MagicMock(), THREAD_ID, _body(main, datasource_ids=[DATASOURCE_A_ID])
+            await thread_config_update.agent_update_thread_config(
+                MagicMock(),
+                THREAD_ID,
+                _body(main, datasource_ids=[DATASOURCE_A_ID]),
+                dependencies=main._thread_config_update_dependencies(),
             )
         assert exc.value.status_code == 422
         db.set_thread_datasource_ids.assert_not_awaited()
@@ -387,10 +405,11 @@ class TestAgentPatchDatasourceIds:
         )
 
         with pytest.raises(HTTPException) as exc:
-            await main.agent_update_thread_config(
+            await thread_config_update.agent_update_thread_config(
                 MagicMock(),
                 THREAD_ID,
                 _body(main, datasource_ids=[DATASOURCE_A_ID]),
+                dependencies=main._thread_config_update_dependencies(),
             )
 
         assert exc.value.status_code == 409
@@ -403,8 +422,11 @@ class TestAgentPatchDatasourceIds:
         config_override merge (attach re-derives them from datasource_ids)."""
         main, db, _ = patched_main
 
-        result = await main.agent_update_thread_config(
-            MagicMock(), THREAD_ID, _body(main, datasource_ids=[DATASOURCE_A_ID])
+        result = await thread_config_update.agent_update_thread_config(
+            MagicMock(),
+            THREAD_ID,
+            _body(main, datasource_ids=[DATASOURCE_A_ID]),
+            dependencies=main._thread_config_update_dependencies(),
         )
 
         merged = db.merge_thread_config_override.await_args.args[1]
@@ -420,10 +442,11 @@ class TestAgentPatchDatasourceIds:
         db.get_thread.return_value = _thread_row(user_id=None)
 
         with pytest.raises(HTTPException) as exc:
-            await main.agent_update_thread_config(
+            await thread_config_update.agent_update_thread_config(
                 MagicMock(),
                 THREAD_ID,
                 _body(main, datasource_ids=[DATASOURCE_A_ID]),
+                dependencies=main._thread_config_update_dependencies(),
             )
 
         assert exc.value.status_code == 403
@@ -440,10 +463,11 @@ class TestAgentPatchDatasourceIds:
             metadata_extra={"datasource_ids": [DATASOURCE_A_ID, DATASOURCE_B_ID]},
         )
 
-        result = await main.agent_update_thread_config(
+        result = await thread_config_update.agent_update_thread_config(
             MagicMock(),
             THREAD_ID,
             _body(main, datasource_ids=[DATASOURCE_A_ID]),
+            dependencies=main._thread_config_update_dependencies(),
         )
 
         grants.assert_not_awaited()
@@ -456,10 +480,11 @@ class TestAgentPatchDatasourceIds:
     async def test_no_datasource_field_means_no_datasource_write(self, patched_main):
         main, db, _ = patched_main
 
-        result = await main.agent_update_thread_config(
+        result = await thread_config_update.agent_update_thread_config(
             MagicMock(),
             THREAD_ID,
             _body(main, config_override={"llm": {"temperature": 0.5}}),
+            dependencies=main._thread_config_update_dependencies(),
         )
 
         db.set_thread_datasource_ids.assert_not_awaited()
@@ -469,8 +494,11 @@ class TestAgentPatchDatasourceIds:
     async def test_empty_list_detaches_all(self, patched_main):
         main, db, _ = patched_main
 
-        await main.agent_update_thread_config(
-            MagicMock(), THREAD_ID, _body(main, datasource_ids=[])
+        await thread_config_update.agent_update_thread_config(
+            MagicMock(),
+            THREAD_ID,
+            _body(main, datasource_ids=[]),
+            dependencies=main._thread_config_update_dependencies(),
         )
 
         persisted = db.set_thread_datasource_ids.await_args
@@ -518,10 +546,11 @@ class TestOwnerConfigPatch:
         db.get_thread.return_value = row
 
         with pytest.raises(main.HTTPException) as exc:
-            await main.update_thread_config(
+            await thread_config_update.update_thread_config(
                 THREAD_ID,
                 _patch_body(main, {"llm": {"temperature": 0.2}}),
                 MagicMock(),
+                dependencies=main._thread_config_update_dependencies(),
             )
         assert exc.value.status_code == 409
         db.merge_thread_config_override.assert_not_awaited()
@@ -536,8 +565,11 @@ class TestOwnerConfigPatch:
         row.update(agent_id="agent-dead", status="suspended")
         db.get_thread.return_value = row
 
-        result = await main.update_thread_config(
-            THREAD_ID, _patch_body(main, {"llm": {"temperature": 0.2}}), MagicMock()
+        result = await thread_config_update.update_thread_config(
+            THREAD_ID,
+            _patch_body(main, {"llm": {"temperature": 0.2}}),
+            MagicMock(),
+            dependencies=main._thread_config_update_dependencies(),
         )
         assert result["status"] == "updated"
         assert result["effective"] == "next_attach"
@@ -556,10 +588,11 @@ class TestOwnerConfigPatch:
         row.update(execution_lane="stateless", agent_id=None, status="active")
         db.get_thread.return_value = row
 
-        result = await main.update_thread_config(
+        result = await thread_config_update.update_thread_config(
             THREAD_ID,
             _patch_body(main, {"llm": {"reasoning_level": "max"}}),
             MagicMock(),
+            dependencies=main._thread_config_update_dependencies(),
         )
         assert result["status"] == "updated"
         assert result["effective"] == "next_turn"
@@ -578,7 +611,7 @@ class TestOwnerConfigPatch:
         row.update(execution_lane="stateless", agent_id=None, status="active")
         db.get_thread.return_value = row
 
-        result = await main.update_thread_config(
+        result = await thread_config_update.update_thread_config(
             THREAD_ID,
             _patch_body(
                 main,
@@ -588,6 +621,7 @@ class TestOwnerConfigPatch:
                 },
             ),
             MagicMock(),
+            dependencies=main._thread_config_update_dependencies(),
         )
         assert result["config_override"]["delegation"] == {"enabled": True}
         merged = db.merge_thread_config_override.await_args.args[1]
@@ -595,10 +629,11 @@ class TestOwnerConfigPatch:
         assert merged["tools"]["delegation"] == ["delegate_agent"]
 
         with pytest.raises(main.HTTPException) as exc:
-            await main.update_thread_config(
+            await thread_config_update.update_thread_config(
                 THREAD_ID,
                 _patch_body(main, {"delegation": {"enabled": "yes"}}),
                 MagicMock(),
+                dependencies=main._thread_config_update_dependencies(),
             )
         assert exc.value.status_code == 400
 
@@ -612,8 +647,11 @@ class TestOwnerConfigPatch:
         the response nor in the durable merge."""
         main, db, _ = patched_owner
 
-        result = await main.update_thread_config(
-            THREAD_ID, _patch_body(main, {"llm": {"model": "minimax-m3"}}), MagicMock()
+        result = await thread_config_update.update_thread_config(
+            THREAD_ID,
+            _patch_body(main, {"llm": {"model": "minimax-m3"}}),
+            MagicMock(),
+            dependencies=main._thread_config_update_dependencies(),
         )
 
         assert "api_key" not in result["config_override"]["llm"]
@@ -637,10 +675,11 @@ class TestOwnerConfigPatch:
         }
 
         with pytest.raises(main.HTTPException) as exc:
-            await main.update_thread_config(
+            await thread_config_update.update_thread_config(
                 THREAD_ID,
                 _patch_body(main, datasource_ids=[REPOSITORY_ID]),
                 MagicMock(),
+                dependencies=main._thread_config_update_dependencies(),
             )
         assert exc.value.status_code == 400
         db.set_thread_datasource_ids.assert_not_awaited()
@@ -649,10 +688,11 @@ class TestOwnerConfigPatch:
     async def test_datasource_set_persists_and_returns(self, patched_owner):
         main, db, _ = patched_owner
 
-        result = await main.update_thread_config(
+        result = await thread_config_update.update_thread_config(
             THREAD_ID,
             _patch_body(main, datasource_ids=[DATASOURCE_A_ID]),
             MagicMock(),
+            dependencies=main._thread_config_update_dependencies(),
         )
         persisted = db.set_thread_datasource_ids.await_args
         assert persisted.args == (THREAD_ID, [DATASOURCE_A_ID])
@@ -663,7 +703,12 @@ class TestOwnerConfigPatch:
     async def test_empty_body_rejected(self, patched_owner):
         main, db, _ = patched_owner
         with pytest.raises(main.HTTPException) as exc:
-            await main.update_thread_config(THREAD_ID, _patch_body(main), MagicMock())
+            await thread_config_update.update_thread_config(
+                THREAD_ID,
+                _patch_body(main),
+                MagicMock(),
+                dependencies=main._thread_config_update_dependencies(),
+            )
         assert exc.value.status_code == 400
         db.merge_thread_config_override.assert_not_awaited()
 
@@ -675,10 +720,11 @@ class TestOwnerConfigPatch:
         )
 
         with pytest.raises(main.HTTPException) as exc:
-            await main.update_thread_config(
+            await thread_config_update.update_thread_config(
                 THREAD_ID,
                 _patch_body(main, {"llm": {"temperature": 0.1}}),
                 MagicMock(),
+                dependencies=main._thread_config_update_dependencies(),
             )
         assert exc.value.status_code == 403
         db.merge_thread_config_override.assert_not_awaited()
@@ -689,7 +735,7 @@ class TestConfigChangeAudit:
     async def test_owner_patch_records_audit_event(self, patched_owner):
         main, db, _ = patched_owner
 
-        await main.update_thread_config(
+        await thread_config_update.update_thread_config(
             THREAD_ID,
             _patch_body(
                 main,
@@ -697,6 +743,7 @@ class TestConfigChangeAudit:
                 datasource_ids=[DATASOURCE_A_ID],
             ),
             MagicMock(),
+            dependencies=main._thread_config_update_dependencies(),
         )
 
         kwargs = db.record_security_event.await_args.kwargs
@@ -714,10 +761,11 @@ class TestConfigChangeAudit:
     async def test_internal_patch_records_audit_event_without_user(self, patched_main):
         main, db, _ = patched_main
 
-        await main.agent_update_thread_config(
+        await thread_config_update.agent_update_thread_config(
             MagicMock(),
             THREAD_ID,
             _body(main, config_override={"llm": {"temperature": 0.4}}),
+            dependencies=main._thread_config_update_dependencies(),
         )
 
         kwargs = db.record_security_event.await_args.kwargs
@@ -731,8 +779,11 @@ class TestConfigChangeAudit:
         grants.side_effect = main.HTTPException(status_code=422, detail="denied")
 
         with pytest.raises(main.HTTPException):
-            await main.agent_update_thread_config(
-                MagicMock(), THREAD_ID, _body(main, datasource_ids=[DATASOURCE_A_ID])
+            await thread_config_update.agent_update_thread_config(
+                MagicMock(),
+                THREAD_ID,
+                _body(main, datasource_ids=[DATASOURCE_A_ID]),
+                dependencies=main._thread_config_update_dependencies(),
             )
         db.record_security_event.assert_not_awaited()
 

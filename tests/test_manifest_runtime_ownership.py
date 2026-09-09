@@ -8,6 +8,12 @@ from uuid import uuid4
 
 from fastapi import HTTPException
 import pytest
+
+# R1.B06: session admission moved to services/thread_admission, which
+# imports the expert resolver and the config loader directly. Patching
+# them on main would be green but inert.
+from orchestrator.services import agent_child_threads  # noqa: E402
+from orchestrator.services import thread_admission  # noqa: E402
 import pytest_asyncio
 from testcontainers.postgres import PostgresContainer
 
@@ -50,16 +56,22 @@ async def test_generic_expert_is_refused_before_interactive_loader(
     monkeypatch.setattr(main, "_is_experts_db_enabled", lambda: True)
     monkeypatch.setattr(main, "_user_experts_enabled", AsyncMock(return_value=True))
     monkeypatch.setattr(
-        main,
+        thread_admission,
         "resolve_root_expert",
         AsyncMock(return_value=SimpleNamespace(expert=expert, project_override=None)),
     )
     monkeypatch.setattr(
-        main, "resolve_config", lambda **_: pytest.fail("SRW loader reached")
+        thread_admission,
+        "resolve_config",
+        lambda **_: pytest.fail("SRW loader reached"),
     )
     with pytest.raises(HTTPException) as denied:
         if internal:
-            await main.agent_create_thread(None, main.AgentThreadCreateRequest())
+            await agent_child_threads.agent_create_thread(
+                None,
+                main.AgentThreadCreateRequest(),
+                dependencies=main._agent_child_threads_dependencies(),
+            )
         else:
             await main.create_thread(main.ThreadCreateRequest(expert_id=WORK), None)
     assert denied.value.status_code == 409

@@ -12,6 +12,9 @@ from uuid import UUID, uuid4
 
 import asyncpg
 import pytest
+
+# R1.B06: agent registration moved to services/agent_registration.
+from orchestrator.services import agent_registration  # noqa: E402
 import pytest_asyncio
 from testcontainers.postgres import PostgresContainer
 
@@ -7102,7 +7105,11 @@ async def test_recycler_legacy_thread_recovers_through_registration_route(db, ca
         patch.object(orch_main, "gitea_client", gitea),
         pytest.raises(orch_main.HTTPException) as unavailable,
     ):
-        await orch_main.register_agent(request, registration)
+        await agent_registration.register_agent(
+            request,
+            registration,
+            dependencies=orch_main._agent_registration_dependencies(),
+        )
     assert unavailable.value.status_code == 503
     assert unavailable.value.detail == "Workspace repository authority is unavailable"
     assert "shared-secret" not in str(unavailable.value.detail)
@@ -7152,7 +7159,11 @@ async def test_recycler_legacy_thread_recovers_through_registration_route(db, ca
         patch.object(orch_main, "postgres_db", db),
         patch.object(orch_main, "gitea_client", gitea),
     ):
-        response = await orch_main.register_agent(request, registration)
+        response = await agent_registration.register_agent(
+            request,
+            registration,
+            dependencies=orch_main._agent_registration_dependencies(),
+        )
     assert response.runtime_actor is not None
     successor = response.agent_id
 

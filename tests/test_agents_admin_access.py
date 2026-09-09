@@ -55,7 +55,12 @@ def _scoped(user: dict, scope: str) -> dict:
 class TestAgentsAdminOnly:
     @pytest.mark.asyncio
     async def test_list_agents_non_admin_403(self, user_a, fake_db, fake_request):
-        from orchestrator.main import list_agents
+        from orchestrator.routers.agent_registration import list_agents
+        import orchestrator.main as _orch_main
+
+        fake_request.app.state.agent_registration_dependencies_factory = (
+            _orch_main._agent_registration_dependencies
+        )
 
         fake_db.list_agents = AsyncMock(
             side_effect=AssertionError("list_agents called past gate")
@@ -67,7 +72,12 @@ class TestAgentsAdminOnly:
 
     @pytest.mark.asyncio
     async def test_list_agents_admin_passes(self, user_admin, fake_db, fake_request):
-        from orchestrator.main import list_agents
+        from orchestrator.routers.agent_registration import list_agents
+        import orchestrator.main as _orch_main
+
+        fake_request.app.state.agent_registration_dependencies_factory = (
+            _orch_main._agent_registration_dependencies
+        )
 
         fake_db.list_agents = AsyncMock(
             return_value=[{"id": "a1", "pod_ip": "10.0.0.1"}]
@@ -78,7 +88,12 @@ class TestAgentsAdminOnly:
 
     @pytest.mark.asyncio
     async def test_get_agent_non_admin_403(self, user_a, fake_db, fake_request):
-        from orchestrator.main import get_agent
+        from orchestrator.routers.agent_registration import get_agent
+        import orchestrator.main as _orch_main
+
+        fake_request.app.state.agent_registration_dependencies_factory = (
+            _orch_main._agent_registration_dependencies
+        )
 
         fake_db.get_agent = AsyncMock(
             side_effect=AssertionError("get_agent called past gate")
@@ -90,7 +105,12 @@ class TestAgentsAdminOnly:
 
     @pytest.mark.asyncio
     async def test_get_agent_admin_passes(self, user_admin, fake_db, fake_request):
-        from orchestrator.main import get_agent
+        from orchestrator.routers.agent_registration import get_agent
+        import orchestrator.main as _orch_main
+
+        fake_request.app.state.agent_registration_dependencies_factory = (
+            _orch_main._agent_registration_dependencies
+        )
 
         fake_db.get_agent = AsyncMock(return_value={"id": "agent-1"})
         with _patch_caller_and_db(user_admin, fake_db):
@@ -101,7 +121,12 @@ class TestAgentsAdminOnly:
     async def test_get_agent_system_info_non_admin_403(
         self, user_a, fake_db, fake_request
     ):
-        from orchestrator.main import get_agent_system_info
+        from orchestrator.routers.agent_registration import get_agent_system_info
+        import orchestrator.main as _orch_main
+
+        fake_request.app.state.agent_registration_dependencies_factory = (
+            _orch_main._agent_registration_dependencies
+        )
 
         fake_db.get_agent = AsyncMock(
             side_effect=AssertionError("get_agent called past gate")
@@ -113,7 +138,12 @@ class TestAgentsAdminOnly:
 
     @pytest.mark.asyncio
     async def test_delete_agent_non_admin_403(self, user_a, fake_db, fake_request):
-        from orchestrator.main import delete_agent
+        from orchestrator.routers.agent_registration import delete_agent
+        import orchestrator.main as _orch_main
+
+        fake_request.app.state.agent_registration_dependencies_factory = (
+            _orch_main._agent_registration_dependencies
+        )
 
         fake_db.delete_agent = AsyncMock(
             side_effect=AssertionError("delete_agent called past gate")
@@ -125,7 +155,12 @@ class TestAgentsAdminOnly:
 
     @pytest.mark.asyncio
     async def test_delete_agent_admin_passes(self, user_admin, fake_db, fake_request):
-        from orchestrator.main import delete_agent
+        from orchestrator.routers.agent_registration import delete_agent
+        import orchestrator.main as _orch_main
+
+        fake_request.app.state.agent_registration_dependencies_factory = (
+            _orch_main._agent_registration_dependencies
+        )
 
         fake_db.delete_agent = AsyncMock(return_value=True)
         with _patch_caller_and_db(user_admin, fake_db):
@@ -138,7 +173,12 @@ class TestAgentsAdminOnly:
     ):
         """An agent deregistering itself on graceful exit carries only
         X-Internal-Key — no user resolves, so admin auth must not run."""
-        from orchestrator.main import delete_agent
+        from orchestrator.routers.agent_registration import delete_agent
+        import orchestrator.main as _orch_main
+
+        fake_request.app.state.agent_registration_dependencies_factory = (
+            _orch_main._agent_registration_dependencies
+        )
 
         fake_db.delete_agent = AsyncMock(return_value=True)
         with ExitStack() as stack:

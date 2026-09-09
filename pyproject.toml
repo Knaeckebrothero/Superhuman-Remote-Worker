@@ -377,6 +377,62 @@ ignore_imports = [
 unmatched_ignore_imports_alerting = "warn"
 
 [[tool.importlinter.contracts]]
+name = "Agent authority, child APIs, session admission and claim bundles do not import application startup"
+type = "forbidden"
+source_modules = [
+    "orchestrator.routers.agent_child_threads",
+    "orchestrator.routers.agent_registration",
+    "orchestrator.routers.agent_thread_status",
+    "orchestrator.routers.officer_runtime_verification",
+    "orchestrator.routers.run_queue_admin",
+    "orchestrator.routers.thread_admission",
+    "orchestrator.routers.thread_config",
+    "orchestrator.routers.unit_claim",
+    "orchestrator.schemas.agent_child_threads",
+    "orchestrator.schemas.agent_registration",
+    "orchestrator.schemas.agent_thread_status",
+    "orchestrator.schemas.officer_runtime_verification",
+    "orchestrator.schemas.run_queue_admin",
+    "orchestrator.schemas.thread_admission",
+    "orchestrator.schemas.thread_config",
+    "orchestrator.services.agent_child_threads",
+    "orchestrator.services.agent_registration",
+    "orchestrator.services.agent_thread_status",
+    "orchestrator.services.commissioned_officer_provisioning",
+    "orchestrator.services.officer_runtime_verification",
+    "orchestrator.services.pinned_session_mutation_target",
+    "orchestrator.services.run_queue_admin",
+    "orchestrator.services.session_attach_binding",
+    "orchestrator.services.session_attach_recovery",
+    "orchestrator.services.session_runtime_identity",
+    "orchestrator.services.thread_admission",
+    "orchestrator.services.thread_config_update",
+    "orchestrator.services.thread_datasource_authorization",
+    "orchestrator.services.thread_project_authorization",
+    "orchestrator.services.unit_claim_bundle",
+]
+forbidden_modules = ["orchestrator.main"]
+# No B06 module imports main directly. The indirect edges below are the same
+# ones B02-B05 recorded, reached through orchestrator.security.access ->
+# services.sudo_gate. Each exact edge is ignored rather than setting
+# `allow_indirect_imports`, so a NEW transitive path to main still breaks this.
+ignore_imports = [
+    # B06's own remaining debt: services/session_lifecycle.py still resolves
+    # postgres_db on main. Closed with the rest of that file's migration.
+    "orchestrator.services.session_lifecycle -> orchestrator.main",
+    # B06's other remaining debt, reached from services.thread_admission.
+    # provision_or_assign.py still late-imports eleven names from main. Eight
+    # now have real service homes, but three do not yet: the two
+    # `_session_*_violations` wrappers are B05 varargs bridges that need a
+    # main-built dependency object, and `_await_protected_cloud_runtime_ready`
+    # is a B04 function that has not left main. Closing this edge means moving
+    # one of those, so it is named here rather than hidden behind
+    # `allow_indirect_imports` — a NEW path to main still breaks the contract.
+    "orchestrator.services.provision_or_assign -> orchestrator.main",
+]
+unmatched_ignore_imports_alerting = "warn"
+
+[[tool.importlinter.contracts]]
 name = "Shared initializer stays lightweight"
 type = "forbidden"
 # Check the root initializer separately without including its child packages.

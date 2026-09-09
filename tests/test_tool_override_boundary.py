@@ -70,6 +70,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from orchestrator.services import thread_admission  # noqa: E402
+
+# R1.B06: these handlers moved to services/thread_config_update with their
+# routes in routers/thread_config. main's dependency factory still reads
+# main's attributes at call time, so the patches below keep steering what
+# they steered before.
+from orchestrator.services import thread_config_update  # noqa: E402
+
 from shared.runtime.core.session_tool_overrides import SESSION_TOOL_OVERRIDE_NAMES
 from shared.runtime.core.tool_policy import (
     MCP_WILDCARD,
@@ -1112,8 +1120,10 @@ class TestSessionCreateBoundary:
             monkeypatch.setattr(
                 main, "_user_experts_enabled", AsyncMock(return_value=True)
             )
+            # R1.B06: session admission moved to services/thread_admission, which
+            # imports the resolver directly; patching main would be inert.
             monkeypatch.setattr(
-                main,
+                thread_admission,
                 "resolve_root_expert",
                 AsyncMock(
                     return_value=SimpleNamespace(
@@ -1190,7 +1200,7 @@ class TestSessionCreateBoundary:
         )
         monkeypatch.setattr(main, "OFFICER_AUTO_PULL_RELEASE_ENABLED", True)
         monkeypatch.setattr(
-            main, "ensure_virtual_thread_workspace_binding", AsyncMock()
+            thread_admission, "ensure_virtual_thread_workspace_binding", AsyncMock()
         )
         warm_provision = AsyncMock()
         request = main.ThreadCreateRequest(
@@ -1394,12 +1404,13 @@ class TestSessionRuntimeUpdateBoundary:
         subset, so a live "turn research off" was acknowledged and dropped."""
         main, db, _ = session_patch_env
 
-        await main.agent_update_thread_config(
+        await thread_config_update.agent_update_thread_config(
             MagicMock(),
             SESSION_THREAD_ID,
             main.AgentThreadConfigUpdateRequest(
                 config_override={"tools": {"research": [], "canvas": []}}
             ),
+            dependencies=main._thread_config_update_dependencies(),
         )
 
         merged = db.merge_thread_config_override.await_args.args[1]
@@ -1412,12 +1423,13 @@ class TestSessionRuntimeUpdateBoundary:
         main, db, _ = session_patch_env
 
         with pytest.raises(main.HTTPException) as exc:
-            await main.agent_update_thread_config(
+            await thread_config_update.agent_update_thread_config(
                 MagicMock(),
                 SESSION_THREAD_ID,
                 main.AgentThreadConfigUpdateRequest(
                     config_override={"tools": {"citation": ["run_command"]}}
                 ),
+                dependencies=main._thread_config_update_dependencies(),
             )
         assert exc.value.status_code == 400
         db.merge_thread_config_override.assert_not_awaited()
@@ -1455,13 +1467,14 @@ class TestSessionRuntimeUpdateBoundary:
             "orchestrator.security.access.user_can_access_datasource",
             AsyncMock(return_value=True),
         ):
-            await main.agent_update_thread_config(
+            await thread_config_update.agent_update_thread_config(
                 MagicMock(),
                 SESSION_THREAD_ID,
                 main.AgentThreadConfigUpdateRequest(
                     config_override={"tools": {"sql": []}},
                     datasource_ids=[SESSION_DATASOURCE_ID],
                 ),
+                dependencies=main._thread_config_update_dependencies(),
             )
 
         fragment = grants.await_args.args[0]

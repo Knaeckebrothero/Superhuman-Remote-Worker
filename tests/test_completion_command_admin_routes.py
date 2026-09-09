@@ -6,6 +6,15 @@ from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+
+# R1.B06: the four operator verbs moved to ``services/run_queue_admin`` with
+# their routes in ``routers/run_queue_admin``. main's dependency factory still
+# reads main's attributes at call time, so the monkeypatches below keep
+# steering exactly what they steered before.
+from orchestrator.schemas.run_queue_admin import (  # noqa: E402
+    CompletionCommandForceResolveRequest,
+)
+from orchestrator.services import run_queue_admin  # noqa: E402
 from fastapi import HTTPException
 
 import orchestrator.main as main
@@ -49,7 +58,11 @@ async def test_admin_unpark_delegates_exact_command_and_serializes_deadline(
         deadline_at=deadline,
     )
 
-    result = await main.admin_completion_command_unpark(COMMAND_ID, MagicMock())
+    result = await run_queue_admin.unpark_completion_command(
+        COMMAND_ID,
+        admin={"id": ADMIN_ID},
+        dependencies=main._run_queue_admin_dependencies(),
+    )
 
     operator.unpark.assert_awaited_once_with(main.UUID(COMMAND_ID), actor=ADMIN_ID)
     assert result == {
@@ -84,14 +97,19 @@ async def test_admin_force_resolve_prunes_checkpoint_after_durable_commit(
     )
     prune = AsyncMock()
     monkeypatch.setattr(main.postgres_db, "delete_checkpoint_thread", prune)
-    body = main.CompletionCommandForceResolveRequest(
+    body = CompletionCommandForceResolveRequest(
         expected_state="parked",
         terminal_status="failed",
         reason="operator confirmed delivery cannot converge",
     )
 
-    result = await main.admin_completion_command_force_resolve(
-        COMMAND_ID, body, MagicMock()
+    result = await run_queue_admin.force_resolve_completion_command(
+        COMMAND_ID,
+        expected_state=(body).expected_state,
+        terminal_status=(body).terminal_status,
+        reason=(body).reason,
+        admin={"id": ADMIN_ID},
+        dependencies=main._run_queue_admin_dependencies(),
     )
 
     operator.force_resolve.assert_awaited_once_with(
@@ -142,16 +160,37 @@ async def test_admin_operator_errors_have_stable_http_status(
 
     with pytest.raises(HTTPException) as exc:
         if operation == "unpark":
-            await main.admin_completion_command_unpark(COMMAND_ID, MagicMock())
-        else:
-            await main.admin_completion_command_force_resolve(
+            await run_queue_admin.unpark_completion_command(
                 COMMAND_ID,
-                main.CompletionCommandForceResolveRequest(
-                    expected_state="parked",
-                    terminal_status="completed",
-                    reason="incident resolution",
-                ),
-                MagicMock(),
+                admin={"id": ADMIN_ID},
+                dependencies=main._run_queue_admin_dependencies(),
+            )
+        else:
+            await run_queue_admin.force_resolve_completion_command(
+                COMMAND_ID,
+                expected_state=(
+                    CompletionCommandForceResolveRequest(
+                        expected_state="parked",
+                        terminal_status="completed",
+                        reason="incident resolution",
+                    )
+                ).expected_state,
+                terminal_status=(
+                    CompletionCommandForceResolveRequest(
+                        expected_state="parked",
+                        terminal_status="completed",
+                        reason="incident resolution",
+                    )
+                ).terminal_status,
+                reason=(
+                    CompletionCommandForceResolveRequest(
+                        expected_state="parked",
+                        terminal_status="completed",
+                        reason="incident resolution",
+                    )
+                ).reason,
+                admin={"id": ADMIN_ID},
+                dependencies=main._run_queue_admin_dependencies(),
             )
 
     assert exc.value.status_code == status
@@ -163,7 +202,11 @@ async def test_invalid_command_id_is_404_after_admin_authorization(
     operator: MagicMock,
 ) -> None:
     with pytest.raises(HTTPException) as exc:
-        await main.admin_completion_command_unpark("not-a-uuid", MagicMock())
+        await run_queue_admin.unpark_completion_command(
+            "not-a-uuid",
+            admin={"id": ADMIN_ID},
+            dependencies=main._run_queue_admin_dependencies(),
+        )
 
     assert exc.value.status_code == 404
     operator.unpark.assert_not_awaited()
@@ -180,16 +223,37 @@ async def test_commands_off_authorizes_then_stays_service_dark(
 
     with pytest.raises(HTTPException) as exc:
         if operation == "unpark":
-            await main.admin_completion_command_unpark(COMMAND_ID, MagicMock())
-        else:
-            await main.admin_completion_command_force_resolve(
+            await run_queue_admin.unpark_completion_command(
                 COMMAND_ID,
-                main.CompletionCommandForceResolveRequest(
-                    expected_state="parked",
-                    terminal_status="completed",
-                    reason="must remain dark",
-                ),
-                MagicMock(),
+                admin={"id": ADMIN_ID},
+                dependencies=main._run_queue_admin_dependencies(),
+            )
+        else:
+            await run_queue_admin.force_resolve_completion_command(
+                COMMAND_ID,
+                expected_state=(
+                    CompletionCommandForceResolveRequest(
+                        expected_state="parked",
+                        terminal_status="completed",
+                        reason="must remain dark",
+                    )
+                ).expected_state,
+                terminal_status=(
+                    CompletionCommandForceResolveRequest(
+                        expected_state="parked",
+                        terminal_status="completed",
+                        reason="must remain dark",
+                    )
+                ).terminal_status,
+                reason=(
+                    CompletionCommandForceResolveRequest(
+                        expected_state="parked",
+                        terminal_status="completed",
+                        reason="must remain dark",
+                    )
+                ).reason,
+                admin={"id": ADMIN_ID},
+                dependencies=main._run_queue_admin_dependencies(),
             )
 
     assert exc.value.status_code == 404
