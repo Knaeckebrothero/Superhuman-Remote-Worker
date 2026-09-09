@@ -15,9 +15,22 @@ import type {Thread} from '../../core/models/api.model';
  * Builds the component directly with stub providers — no TestBed. Every
  * dependency is a plain object exposing only what the component reads.
  */
-function create(opts: {url: string; threads?: Partial<Thread>[]; isAdmin?: boolean}) {
+function create(opts: {
+  url: string;
+  threads?: Partial<Thread>[];
+  isAdmin?: boolean;
+  /** Router.navigated: true once a first navigation has occurred. Defaults to
+   *  true (steady state) — tests exercising the cold-boot distinction set it
+   *  explicitly. */
+  navigated?: boolean;
+}) {
   const threads = signal((opts.threads ?? []) as Thread[]);
-  const router = {url: opts.url, navigate: vi.fn(), events: new Subject()};
+  const router = {
+    url: opts.url,
+    navigated: opts.navigated ?? true,
+    navigate: vi.fn(),
+    events: new Subject(),
+  };
   const sessions = {
     threads,
     loading: signal(false),
@@ -147,6 +160,26 @@ describe('SidebarComponent session list', () => {
     const {router, sessions} = create({url: '/'});
     expect(sessions.refresh).toHaveBeenCalledTimes(1); // the construction-time call
     router.events.next(new NavigationEnd(1, '/admin/users', '/admin/users'));
+    expect(sessions.refresh).toHaveBeenCalledTimes(1);
+  });
+
+  // Cold-boot double fetch (fix round 1): under Angular's default
+  // enabledNonBlocking initial navigation, the sidebar is constructed BEFORE
+  // the first navigation completes, so Router.navigated is still false. An
+  // unconditional refresh() here would double up with the NavigationEnd
+  // handler below firing for that same first navigation.
+  it('does not refresh on construction when the router has not navigated yet, but the subsequent NavigationEnd does', () => {
+    const {router, sessions} = create({url: '/', navigated: false});
+    expect(sessions.refresh).toHaveBeenCalledTimes(0);
+    router.events.next(new NavigationEnd(1, '/', '/'));
+    expect(sessions.refresh).toHaveBeenCalledTimes(1);
+  });
+
+  // The other side of the guard: enabledBlocking, SSR, or a remount can
+  // construct the sidebar AFTER the first navigation already resolved — no
+  // NavigationEnd is coming for it, so construction must fetch directly.
+  it('refreshes on construction when the router has already navigated', () => {
+    const {sessions} = create({url: '/', navigated: true});
     expect(sessions.refresh).toHaveBeenCalledTimes(1);
   });
 });

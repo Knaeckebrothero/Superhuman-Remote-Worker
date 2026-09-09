@@ -504,11 +504,13 @@ export class SidebarComponent {
   }
 
   constructor() {
-    // Prime the rail's session list immediately so it's ready the moment
-    // the user is looking at Chat mode, even if they land somewhere else.
-    // Fire-and-forget: refresh() always resolves (never rejects) and leaves
-    // prior threads in place on failure, so there's nothing to await/catch.
-    this.sessions.refresh();
+    // enabledNonBlocking (Angular's default) constructs this component before the
+    // first navigation, so the subscription below covers the initial load. If the
+    // sidebar is instead constructed after navigation already finished
+    // (enabledBlocking, SSR, or a remount), no event is coming and we must fetch here.
+    if (this.router.navigated) {
+      this.sessions.refresh();
+    }
 
     // Auto-collapse sidebar on mobile after navigation, and keep the rail's
     // session list current — reusing this subscription rather than adding a
