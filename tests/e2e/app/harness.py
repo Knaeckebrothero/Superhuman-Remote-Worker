@@ -299,6 +299,25 @@ class SecretBundle:
     #: value, so both halves must read the same key or the orchestrator
     #: authenticates as an account whose password only Nextcloud knows.
     nextcloud_agent_password: str = dataclasses.field(repr=False)
+    #: Root key for per-workspace code-server credentials. The orchestrator's
+    #: `secretKeyRef` for `IDE_CREDENTIAL_KEY` is `optional: true` and
+    #: `services/ide_proxy.py` fails *closed* without it: the thread's IDE
+    #: status answers `ide_credential_key_unconfigured` and withholds the URL
+    #: rather than handing out one the proxy would refuse. That is the correct
+    #: production default and a silent hole in a fixture -- the whole browser
+    #: IDE lane (HTTP proxy, WebSocket upgrade, content and stream delivery)
+    #: is unreachable, and nothing fails to say so. R1.B05 shipped with exactly
+    #: that gap as a recorded qualification. Minted unconditionally like the
+    #: Gitea/Nextcloud keys so the secret topology does not vary by profile.
+    #:
+    #: This one belongs in ``app_secret_data()`` and not in its own Secret, in
+    #: deliberate contrast to ``protected_effect_hmac_key``: the chart puts
+    #: `IDE_CREDENTIAL_KEY` in the same application Secret in production
+    #: (`helm/templates/secret.yaml`), so a dedicated Secret here would make the
+    #: fixture exercise a topology no deployment has. The wider question of
+    #: agent Pods receiving the whole bundle through ``envFrom`` is a real and
+    #: separate posture issue; it is not resolved by making this profile lie.
+    ide_credential_key: str = dataclasses.field(repr=False)
     gitea_admin_password: str = dataclasses.field(repr=False)
     #: The protected-effect lane's adoption-once HMAC root. Deliberately NOT a
     #: member of ``app_secret_data()``: dynamic agent Pods consume that bundle
@@ -346,6 +365,9 @@ class SecretBundle:
             nextcloud_oidc_secret=token(48),
             nextcloud_admin_password=token(24),
             nextcloud_agent_password=token(24),
+            # `secret.yaml` generates randAlphaNum(48) for this key when the
+            # chart owns the Secret; match that length here.
+            ide_credential_key=token(36),
             gitea_admin_password=token(36),
             # The chart floor is 32 bytes; 48 matches its own randAlphaNum(48).
             protected_effect_hmac_key=token(48),
@@ -431,6 +453,12 @@ class SecretBundle:
             "GITEA_ADMIN_PASSWORD": self.gitea_admin_password,
             "SESSION_JWT_SECRET": self.session_jwt_secret,
             "MCP_INTERNAL_KEY": self.mcp_internal_key,
+            # Without this the browser IDE lane cannot be exercised at all --
+            # see the field's own note. `optional: true` on the chart side
+            # means no render check can catch its absence, so
+            # `test_generated_app_secret_mints_the_ide_credential_root` guards
+            # it the same way the Nextcloud agent password is guarded.
+            "IDE_CREDENTIAL_KEY": self.ide_credential_key,
             "OPENAI_API_KEY": "",
             "ANTHROPIC_API_KEY": "",
             "GROQ_API_KEY": "",

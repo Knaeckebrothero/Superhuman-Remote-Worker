@@ -1618,6 +1618,33 @@ def test_generated_app_secret_covers_the_backend_required_secrets(
     )
 
 
+def test_generated_app_secret_mints_the_ide_credential_root() -> None:
+    """Every profile must mint `IDE_CREDENTIAL_KEY`, for the same reason as above.
+
+    The chart mounts it `optional: true` — deliberately, because unset must mean
+    "no credential can be derived, so the browser IDE stays contained" and never
+    "fall back to an unauthenticated code-server". So the render check two tests
+    up cannot see it missing, and neither can Kubernetes: pods start, the API
+    answers, and only the IDE lane is quietly dead. `services/ide_proxy.py`
+    reports `ide_credential_key_unconfigured` and withholds the URL.
+
+    R1.B05 froze with "the live IDE HTTP/WebSocket proxy is unexercised" as a
+    qualification for exactly this reason: its refusals were covered, its success
+    path could not be reached on any profile. This asserts the fixture can reach
+    it.
+    """
+    minted = harness.SecretBundle.generate("20260824-123456-ab12cd34").app_secret_data()
+
+    assert "IDE_CREDENTIAL_KEY" in minted, (
+        "no profile mints IDE_CREDENTIAL_KEY; the orchestrator will refuse every "
+        "browser-IDE URL with ide_credential_key_unconfigured and no pod will "
+        "fail to say so"
+    )
+    # A short root would derive weak per-workspace credentials; the chart's own
+    # generator is randAlphaNum(48).
+    assert len(minted["IDE_CREDENTIAL_KEY"]) >= 32
+
+
 def test_profile_overlays_have_no_duplicate_top_level_keys() -> None:
     """A repeated top-level key in an overlay silently drops the first block.
 
