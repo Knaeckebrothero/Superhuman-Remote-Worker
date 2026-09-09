@@ -1,42 +1,22 @@
 [
   {
-    "icon": "route",
-    "en": "Plan and execute a multi-step research task",
-    "de": "Plane und führe eine mehrstufige Recherche durch"
-  },
-  {
-    "icon": "terminal",
-    "en": "Inspect a repository with the developer config",
-    "de": "Untersuche ein Repository mit dem Developer-Config"
-  },
-  {
-    "icon": "folder_shared",
-    "en": "Continue from a project I've shared",
-    "de": "Mache mit einem von mir geteilten Projekt weiter"
-  },
-  {
-    "icon": "lightbulb",
-    "en": "Surprise me — propose three useful jobs",
-    "de": "Überrasche mich — schlage drei nützliche Jobs vor"
+    "icon": "bug_report",
+    "en": "Find out why my last job failed and propose a fix",
+    "de": "Finde heraus, warum mein letzter Job fehlgeschlagen ist, und schlage eine Lösung vor"
   },
   {
     "icon": "summarize",
-    "en": "Summarize recent changes in a codebase",
-    "de": "Fasse die letzten Änderungen in einem Codebestand zusammen"
-  },
-  {
-    "icon": "bug_report",
-    "en": "Investigate a failing job and propose a fix",
-    "de": "Untersuche einen fehlgeschlagenen Job und schlage eine Lösung vor"
+    "en": "Summarize what changed in my repository this week",
+    "de": "Fasse zusammen, was sich diese Woche in meinem Repository geändert hat"
   },
   {
     "icon": "description",
-    "en": "Draft a documentation page from existing code",
-    "de": "Entwirf eine Dokumentationsseite aus bestehendem Code"
+    "en": "Write a README for a folder that doesn't have one",
+    "de": "Schreibe eine README für einen Ordner, der noch keine hat"
   },
   {
     "icon": "compare_arrows",
-    "en": "Compare two implementations and recommend one",
-    "de": "Vergleiche zwei Implementierungen und empfehle eine"
+    "en": "Compare two approaches and recommend one, with reasons",
+    "de": "Vergleiche zwei Ansätze und empfiehl einen, mit Begründung"
   }
 ]

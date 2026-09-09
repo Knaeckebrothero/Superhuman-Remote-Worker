@@ -2919,12 +2919,11 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
             }
         });
 
-        // Load empty-state suggestions and pick 4 at random for this mount
+        // Load the empty-state suggestions. The set is deliberately NOT shuffled:
+        // picking 4 of 8 at random per mount meant a chip seen once could not be
+        // found again, which read as the list being broken.
         this.http.get<Suggestion[]>('assets/suggestions.json').subscribe({
-            next: (data) => {
-                const shuffled = [...data].sort(() => Math.random() - 0.5);
-                this.pickedSuggestions.set(shuffled.slice(0, Math.min(4, shuffled.length)));
-            },
+            next: (list) => this.pickedSuggestions.set(list ?? []),
             error: () => this.pickedSuggestions.set([]),
         });
 
