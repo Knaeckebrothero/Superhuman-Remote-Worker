@@ -890,6 +890,14 @@
     }
   },
   "admin": {
+    "nav": {
+      "models": "Models",
+      "users": "Users",
+      "config": "Configuration",
+      "grants": "Grants",
+      "usage": "Usage",
+      "capacity": "Capacity"
+    },
     "capacity": {
       "title": "Capacity",
       "desc": "What the stateless pool and its autoscaler see right now: executors, runnable demand, and units parked after a failure.",

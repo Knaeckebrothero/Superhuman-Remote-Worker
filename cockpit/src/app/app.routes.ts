@@ -16,6 +16,7 @@ import {ExpertsPageComponent} from './views/experts/experts-page.component';
 import {ExpertEditorComponent} from './views/experts/expert-editor.component';
 import {SkillsPageComponent} from './views/skills/skills-page.component';
 import {SkillEditorComponent} from './views/skills/skill-editor.component';
+import {AdminShellComponent} from './views/admin/admin-shell.component';
 import {authGuard} from './core/guards/auth.guard';
 import {adminGuard} from './core/guards/admin.guard';
 import {projectAccessGuard} from './core/guards/project-access.guard';
@@ -99,11 +100,50 @@ export const routes: Routes = [
   // them — keeping them in the initial bundle taxed every page load to serve a
   // handful of admin visits, and pushed the build past its initial-bundle
   // budget.
+  // Admin is one gated section, not six separate rail links. The shell
+  // (AdminShellComponent) renders the sub-nav and is small enough to load
+  // eagerly; each page underneath stays on loadComponent exactly as before
+  // (see the comment above) so this refactor doesn't undo that budget work.
+  // Guards move from each of the six routes onto this shared parent — same
+  // effective protection, asserted in app.routes.spec.ts so a future edit
+  // can't drop it silently.
   {
-    path: 'admin/models',
-    loadComponent: () =>
-      import('./views/admin/models/admin-models.component').then(m => m.AdminModelsComponent),
+    path: 'admin',
+    component: AdminShellComponent,
     canActivate: [authGuard, adminGuard],
+    children: [
+      {path: '', pathMatch: 'full', redirectTo: 'models'},
+      {
+        path: 'models',
+        loadComponent: () =>
+          import('./views/admin/models/admin-models.component').then(m => m.AdminModelsComponent),
+      },
+      {
+        path: 'users',
+        loadComponent: () =>
+          import('./views/admin/users/admin-users.component').then(m => m.AdminUsersComponent),
+      },
+      {
+        path: 'config',
+        loadComponent: () =>
+          import('./views/admin/config/admin-config.component').then(m => m.AdminConfigComponent),
+      },
+      {
+        path: 'grants',
+        loadComponent: () =>
+          import('./views/admin/grants/admin-grants.component').then(m => m.AdminGrantsComponent),
+      },
+      {
+        path: 'usage',
+        loadComponent: () =>
+          import('./views/admin/usage/admin-usage.component').then(m => m.AdminUsageComponent),
+      },
+      {
+        path: 'capacity',
+        loadComponent: () =>
+          import('./views/admin/capacity/admin-capacity.component').then(m => m.AdminCapacityComponent),
+      },
+    ],
   },
   // The page was 'admin/llm' until the catalog grew past chat models — it now
   // holds TTS, speech-to-text, vision and embedding entries too, so the name
@@ -111,36 +151,6 @@ export const routes: Routes = [
   // 'admin/llm' in particular is in the wild via the readiness-gate banners.
   { path: 'admin/providers', redirectTo: 'admin/models' },
   { path: 'admin/llm', redirectTo: 'admin/models' },
-  {
-    path: 'admin/users',
-    loadComponent: () =>
-      import('./views/admin/users/admin-users.component').then(m => m.AdminUsersComponent),
-    canActivate: [authGuard, adminGuard],
-  },
-  {
-    path: 'admin/config',
-    loadComponent: () =>
-      import('./views/admin/config/admin-config.component').then(m => m.AdminConfigComponent),
-    canActivate: [authGuard, adminGuard],
-  },
-  {
-    path: 'admin/grants',
-    loadComponent: () =>
-      import('./views/admin/grants/admin-grants.component').then(m => m.AdminGrantsComponent),
-    canActivate: [authGuard, adminGuard],
-  },
-  {
-    path: 'admin/usage',
-    loadComponent: () =>
-      import('./views/admin/usage/admin-usage.component').then(m => m.AdminUsageComponent),
-    canActivate: [authGuard, adminGuard],
-  },
-  {
-    path: 'admin/capacity',
-    loadComponent: () =>
-      import('./views/admin/capacity/admin-capacity.component').then(m => m.AdminCapacityComponent),
-    canActivate: [authGuard, adminGuard],
-  },
   {
     path: 'workbench',
     loadComponent: () =>

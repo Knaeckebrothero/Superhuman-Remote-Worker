@@ -890,6 +890,14 @@
     }
   },
   "admin": {
+    "nav": {
+      "models": "Modelle",
+      "users": "Benutzer",
+      "config": "Konfiguration",
+      "grants": "Berechtigungen",
+      "usage": "Nutzung",
+      "capacity": "Kapazität"
+    },
     "capacity": {
       "title": "Kapazität",
       "desc": "Was der Stateless-Pool und sein Autoscaler gerade sehen: Executors, anstehende Arbeit und nach einem Fehler geparkte Einheiten.",
