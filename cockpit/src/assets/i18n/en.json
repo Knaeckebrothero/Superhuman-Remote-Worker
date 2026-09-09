@@ -375,6 +375,7 @@
     "modeChat": "Chat",
     "modeJobs": "Jobs",
     "modeProjects": "Projects",
+    "newChat": "New chat",
     "sessions": "Sessions",
     "jobs": "Jobs",
     "review": "Job Review",
@@ -390,7 +391,12 @@
     "logout": "Logout",
     "admin": "admin",
     "collapseSidebar": "Collapse sidebar",
-    "openSidebar": "Open sidebar"
+    "openSidebar": "Open sidebar",
+    "recency": {
+      "today": "Today",
+      "yesterday": "Yesterday",
+      "earlier": "Earlier"
+    }
   },
   "grants": {
     "lockedShort": "Requires a capability grant",

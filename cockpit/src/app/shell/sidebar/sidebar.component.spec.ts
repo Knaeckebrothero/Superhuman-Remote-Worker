@@ -1,6 +1,6 @@
 import {describe, expect, it, vi} from 'vitest';
 import {Injector, computed, runInInjectionContext, signal} from '@angular/core';
-import {Router} from '@angular/router';
+import {NavigationEnd, Router} from '@angular/router';
 import {Subject} from 'rxjs';
 import {SidebarComponent} from './sidebar.component';
 import {UserService} from '../../core/services/user.service';
@@ -87,5 +87,66 @@ describe('SidebarComponent mode switcher', () => {
 
   it('treats a session thread url as chat, using the id from the hijack test', () => {
     expect(create({url: '/sessions/abc-123'}).component.mode()).toBe('chat');
+  });
+});
+
+describe('SidebarComponent session list', () => {
+  it('lists sessions grouped by recency when the mode is chat', () => {
+    const {component} = create({url: '/', threads: [
+      {id: 'a', title: 'Comparing take-home pay', last_activity: new Date().toISOString()},
+    ]});
+    expect(component.sessionGroups().map((g) => g.label)).toEqual(['today']);
+  });
+
+  it('renders no session groups outside chat mode', () => {
+    const {component} = create({url: '/jobs', threads: [
+      {id: 'a', title: 'Comparing take-home pay', last_activity: new Date().toISOString()},
+    ]});
+    expect(component.sessionGroups()).toEqual([]);
+  });
+
+  // mode() is an allowlist that returns null for routes outside the three
+  // modes (/admin/*, /experts, /settings, ...). A `!== 'jobs'` rewrite of the
+  // sessionGroups gate would also pass the two tests above yet show sessions
+  // on an admin page — guard that case explicitly.
+  it('renders no session groups when the mode is null', () => {
+    const {component} = create({url: '/admin/users', threads: [
+      {id: 'a', title: 'Comparing take-home pay', last_activity: new Date().toISOString()},
+    ]});
+    expect(component.sessionGroups()).toEqual([]);
+  });
+
+  // The rail must have sessions ready the instant the user is looking at
+  // Chat, even when the app boots somewhere else — so the initial refresh is
+  // unconditional, not gated on the starting route.
+  it('refreshes the session list once on construction, regardless of the starting route', () => {
+    const {sessions} = create({url: '/jobs'});
+    expect(sessions.refresh).toHaveBeenCalledTimes(1);
+  });
+
+  it('refreshes the session list again on navigating into chat mode', () => {
+    const {router, sessions} = create({url: '/jobs'});
+    expect(sessions.refresh).toHaveBeenCalledTimes(1); // the construction-time call
+    router.events.next(new NavigationEnd(1, '/', '/'));
+    expect(sessions.refresh).toHaveBeenCalledTimes(2);
+  });
+
+  // Refreshing on every navigation regardless of mode would fetch threads
+  // while the user is in Jobs or Admin, for nothing.
+  it('does not refresh the session list on navigating to a non-chat route', () => {
+    const {router, sessions} = create({url: '/'});
+    expect(sessions.refresh).toHaveBeenCalledTimes(1); // the construction-time call
+    router.events.next(new NavigationEnd(1, '/jobs', '/jobs'));
+    expect(sessions.refresh).toHaveBeenCalledTimes(1);
+  });
+
+  // Same allowlist trap as sessionGroups: a `!== 'jobs'` gate on the
+  // navigation subscription would also pass the two tests above yet refetch
+  // threads while navigating around in the admin section.
+  it('does not refresh the session list on navigating to a route with no mode', () => {
+    const {router, sessions} = create({url: '/'});
+    expect(sessions.refresh).toHaveBeenCalledTimes(1); // the construction-time call
+    router.events.next(new NavigationEnd(1, '/admin/users', '/admin/users'));
+    expect(sessions.refresh).toHaveBeenCalledTimes(1);
   });
 });

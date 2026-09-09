@@ -375,6 +375,7 @@
     "modeChat": "Chat",
     "modeJobs": "Jobs",
     "modeProjects": "Projekte",
+    "newChat": "Neuer Chat",
     "sessions": "Sitzungen",
     "jobs": "Aufträge",
     "review": "Auftragsprüfung",
@@ -390,7 +391,12 @@
     "logout": "Abmelden",
     "admin": "Admin",
     "collapseSidebar": "Seitenleiste einklappen",
-    "openSidebar": "Seitenleiste öffnen"
+    "openSidebar": "Seitenleiste öffnen",
+    "recency": {
+      "today": "Heute",
+      "yesterday": "Gestern",
+      "earlier": "Früher"
+    }
   },
   "grants": {
     "lockedShort": "Erfordert eine Freigabe",

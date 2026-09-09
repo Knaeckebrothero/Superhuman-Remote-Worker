@@ -5,6 +5,7 @@ import {filter, map} from 'rxjs';
 import {UserService} from '../../core/services/user.service';
 import {SidebarService} from '../../core/services/sidebar.service';
 import {ViewportService} from '../../core/services/viewport.service';
+import {SessionListService} from '../../core/services/session-list.service';
 import {LayoutService} from '../../workbench/services/layout.service';
 import {LayoutPickerComponent} from '../../workbench/components/layout-picker/layout-picker.component';
 import {NotificationBellComponent} from '../notification-bell/notification-bell.component';
@@ -48,6 +49,19 @@ const MODE_ROUTES: Record<RailMode, string> = {
           <app-tab-nav-item value="jobs">{{ 'nav.modeJobs' | transloco }}</app-tab-nav-item>
           <app-tab-nav-item value="projects">{{ 'nav.modeProjects' | transloco }}</app-tab-nav-item>
         </app-tab-nav>
+
+        <a class="rail-new" routerLink="/">
+          <app-icon size="md">edit_square</app-icon> {{ 'nav.newChat' | transloco }}
+        </a>
+
+        @for (group of sessionGroups(); track group.label) {
+          <div class="rail-group">{{ ('nav.recency.' + group.label) | transloco }}</div>
+          @for (t of group.threads; track t.id) {
+            <a class="rail-item" [routerLink]="['/sessions', t.id]" routerLinkActive="active">
+              {{ t.title }}
+            </a>
+          }
+        }
 
         @if (isWorkbenchRoute()) {
           <div class="section">
@@ -214,6 +228,66 @@ const MODE_ROUTES: Record<RailMode, string> = {
 
       .mode-switcher {
         margin: 8px;
+      }
+
+      /* Rail session list: the Chat mode's "New chat" action and the
+         recency-grouped thread list that fills the space below the
+         switcher. */
+
+      .rail-new {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin: 0 8px;
+        padding: 8px 12px;
+        border-radius: var(--radius-control);
+        color: var(--text-secondary);
+        text-decoration: none;
+        font-size: 13px;
+        transition:
+          background 0.15s ease,
+          color 0.15s ease;
+      }
+
+      .rail-new:hover {
+        background: var(--surface-0);
+        color: var(--text-primary);
+      }
+
+      .rail-group {
+        margin: 0 8px;
+        padding: 12px 4px 4px;
+        font-size: 10px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 1px;
+        color: var(--text-muted);
+      }
+
+      .rail-item {
+        display: block;
+        margin: 0 8px;
+        padding: 8px 12px;
+        border-radius: var(--radius-control);
+        color: var(--text-secondary);
+        text-decoration: none;
+        font-size: 13px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        transition:
+          background 0.15s ease,
+          color 0.15s ease;
+      }
+
+      .rail-item:hover {
+        background: var(--surface-0);
+        color: var(--text-primary);
+      }
+
+      .rail-item.active {
+        background: var(--surface-0);
+        color: var(--accent-color);
       }
 
       /* Mobile drawer sizing: the 200px/13px desktop rail reads cramped as an
@@ -399,6 +473,7 @@ export class SidebarComponent {
   private readonly router = inject(Router);
   private readonly chatService = inject(PersistentChatService);
   readonly viewport = inject(ViewportService);
+  private readonly sessions = inject(SessionListService);
 
   readonly mode = computed<RailMode | null>(() => {
     // Allowlist, deliberately not a fallback: a route that is none of the three
@@ -415,6 +490,12 @@ export class SidebarComponent {
     return null;
   });
 
+  // Null, same as 'jobs'/'projects': outside chat mode the rail shows no
+  // session groups at all (see the mode() allowlist above).
+  readonly sessionGroups = computed(() =>
+    this.mode() === 'chat' ? this.sessions.grouped() : [],
+  );
+
   selectMode(mode: RailMode | null): void {
     // Always the mode's own route. Never a thread id — see the April 2026
     // hijack regression recorded in coding_agent_ui_assessment.md §3.
@@ -423,13 +504,25 @@ export class SidebarComponent {
   }
 
   constructor() {
-    // Auto-collapse sidebar on mobile after navigation
+    // Prime the rail's session list immediately so it's ready the moment
+    // the user is looking at Chat mode, even if they land somewhere else.
+    // Fire-and-forget: refresh() always resolves (never rejects) and leaves
+    // prior threads in place on failure, so there's nothing to await/catch.
+    this.sessions.refresh();
+
+    // Auto-collapse sidebar on mobile after navigation, and keep the rail's
+    // session list current — reusing this subscription rather than adding a
+    // second one. Gated on chat mode so navigating within Jobs/Admin doesn't
+    // refetch threads for a list that isn't even shown.
     this.router.events.pipe(
       filter(e => e instanceof NavigationEnd),
       takeUntilDestroyed(),
     ).subscribe(() => {
       if (this.viewport.isMobile()) {
         this.sidebar.collapse();
+      }
+      if (this.mode() === 'chat') {
+        this.sessions.refresh();
       }
     });
   }
