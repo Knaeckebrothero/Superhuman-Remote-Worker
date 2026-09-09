@@ -1,27 +1,65 @@
-# yaml-language-server: $schema=../../schema.json
-# Writer - user-facing prose. The artifact someone reads IS the deliverable.
-$extends: worker_base
+apiVersion: srw/v1alpha1
+kind: Expert
+metadata:
+  name: writer
+  scope:
+    kind: Catalog
+    name: shared
+  annotations:
+    srw.io/display-name: Writer
+    srw.io/description: 'Produces the prose a person actually reads: reports, documentation,
+      guides,
 
-agent_id: writer
-display_name: Writer
-description: |
-  Produces the prose a person actually reads: reports, documentation, guides,
-  release notes, and user-visible copy. It is handed the findings — the brief,
-  the knowledge base, cited sources — and turns them into a finished piece for
-  a named reader. An executor, not a researcher: the artifact is the
-  deliverable, and a gap in the source material is reported as unknown rather
-  than filled with plausible prose.
-icon: edit_note
-color: "#cba6f7"
-tags:
+      release notes, and user-visible copy. It is handed the findings — the brief,
+
+      the knowledge base, cited sources — and turns them into a finished piece for
+
+      a named reader. An executor, not a researcher: the artifact is the
+
+      deliverable, and a gap in the source material is reported as unknown rather
+
+      than filled with plausible prose.'
+    srw.io/icon: edit_note
+    srw.io/color: '#cba6f7'
+    srw.io/expert-type: worker
+    srw.io/bundled-selector: writer
+  tags:
   - writing
   - documentation
   - prose
   - reporting
+  - worker
+spec:
+  runtime:
+    image: srw-agent:latest
+    adapter: srw/v1
+    config:
+      config_name: worker_base
+      asset_name: writer
+      config:
+        # Writer - user-facing prose. The artifact someone reads IS the deliverable.
+        $extends: worker_base
 
-# No tools override: the base grant is already the right shape for prose —
-# files, the KB and citation suites, and enough web reach to check a claim
-# against the source it came from. Two absences are the point and both are
-# inherited rather than restated: no shell, because nothing here is built or
-# run, and no delegation, because a document has one voice and a fanned-out
-# draft reads like four people wrote it.
+        agent_id: writer
+        display_name: Writer
+        description: |
+          Produces the prose a person actually reads: reports, documentation, guides,
+          release notes, and user-visible copy. It is handed the findings — the brief,
+          the knowledge base, cited sources — and turns them into a finished piece for
+          a named reader. An executor, not a researcher: the artifact is the
+          deliverable, and a gap in the source material is reported as unknown rather
+          than filled with plausible prose.
+        icon: edit_note
+        color: "#cba6f7"
+        tags:
+          - writing
+          - documentation
+          - prose
+          - reporting
+
+        # No tools override: the base grant is already the right shape for prose —
+        # files, the KB and citation suites, and enough web reach to check a claim
+        # against the source it came from. Two absences are the point and both are
+        # inherited rather than restated: no shell, because nothing here is built or
+        # run, and no delegation, because a document has one voice and a fanned-out
+        # draft reads like four people wrote it.

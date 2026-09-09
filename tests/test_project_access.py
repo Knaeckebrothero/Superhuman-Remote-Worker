@@ -259,6 +259,7 @@ class TestListProjects:
     async def test_admin_no_user_id_uses_admin_view(
         self, user_admin, project_a, project_b, fake_db, fake_request
     ):
+        fake_db.fetchrow = AsyncMock(return_value=None)
         fake_db.acquire = MagicMock(
             return_value=_patch_admin_list_fetch([project_a, project_b])
         )
@@ -288,6 +289,7 @@ class TestListProjects:
     async def test_mcp_project_scope_narrows_admin(
         self, user_admin, project_a, project_b, fake_db, fake_request
     ):
+        fake_db.fetchrow = AsyncMock(return_value=None)
         scoped = _scoped(user_admin, f"project:{project_a['id']}")
         fake_db.acquire = MagicMock(
             return_value=_patch_admin_list_fetch([project_a, project_b])
@@ -925,6 +927,7 @@ class TestListProjectsStatusFilter:
     async def test_admin_branch_binds_the_statuses_and_drops_the_dead_filter(
         self, user_admin, project_a, project_b, fake_db, fake_request
     ):
+        fake_db.fetchrow = AsyncMock(return_value=None)
         ctx = _patch_admin_list_fetch([project_a, project_b])
         fake_db.acquire = MagicMock(return_value=ctx)
         with _patch_caller(user_admin):

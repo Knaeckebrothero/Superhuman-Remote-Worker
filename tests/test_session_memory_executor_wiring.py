@@ -174,6 +174,9 @@ async def test_config_resolver_project_scope_requires_thread_owner() -> None:
 async def test_experts_off_default_keeps_attach_fallback() -> None:
     status: dict[str, object] = {}
     with (
+        patch.object(
+            orchestrator.main.postgres_db, "fetchrow", AsyncMock(return_value=None)
+        ),
         patch.object(orchestrator.main, "_is_experts_db_enabled", return_value=False),
         patch.object(
             orchestrator.main, "_user_experts_enabled", AsyncMock()

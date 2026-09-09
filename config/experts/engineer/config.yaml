@@ -1,84 +1,125 @@
-# yaml-language-server: $schema=../../schema.json
-# Engineer - the universal software expert: code, scripts, installs, ops.
-# Explores first, follows the repository's conventions, makes the smallest
-# change that solves the task, proves it with the project's own checks. No
-# TDD ceremony — that is `developer`, for briefs that ask for strict
-# test-first work. Design: knowledge-base/knowledge/features/engineer_expert.md
-$extends: worker_base
+apiVersion: srw/v1alpha1
+kind: Expert
+metadata:
+  name: engineer
+  scope:
+    kind: Catalog
+    name: shared
+  annotations:
+    srw.io/display-name: Engineer
+    srw.io/description: 'Universal software engineer for hands-on technical work:
+      features, bug
 
-agent_id: engineer
-display_name: Engineer
-description: |
-  Universal software engineer for hands-on technical work: features, bug
-  fixes, refactors, scripts, frontend and backend code, installs, migrations,
-  benchmarks and ops chores. Explores the repository first, follows its
-  conventions, makes the smallest change that solves the task, and proves it
-  with the project's own tests, build and lint. Shell, browser, git and
-  delegation included. Pick this for code or terminal work unless the brief
-  explicitly asks for strict test-first TDD — then pick the developer.
-icon: terminal
-color: "#89dceb"
-tags:
+      fixes, refactors, scripts, frontend and backend code, installs, migrations,
+
+      benchmarks and ops chores. Explores the repository first, follows its
+
+      conventions, makes the smallest change that solves the task, and proves it
+
+      with the project''s own tests, build and lint. Shell, browser, git and
+
+      delegation included. Pick this for code or terminal work unless the brief
+
+      explicitly asks for strict test-first TDD — then pick the developer.'
+    srw.io/icon: terminal
+    srw.io/color: '#89dceb'
+    srw.io/expert-type: worker
+    srw.io/bundled-selector: engineer
+  tags:
   - coding
   - development
   - engineering
   - ops
   - delegation
+  - worker
+spec:
+  runtime:
+    image: srw-agent:latest
+    adapter: srw/v1
+    config:
+      config_name: worker_base
+      asset_name: engineer
+      config:
+        # Engineer - the universal software expert: code, scripts, installs, ops.
+        # Explores first, follows the repository's conventions, makes the smallest
+        # change that solves the task, proves it with the project's own checks. No
+        # TDD ceremony — that is `developer`, for briefs that ask for strict
+        # test-first work. Design: knowledge-base/knowledge/features/engineer_expert.md
+        $extends: worker_base
 
-llm:
-  reasoning_level: high
+        agent_id: engineer
+        display_name: Engineer
+        description: |
+          Universal software engineer for hands-on technical work: features, bug
+          fixes, refactors, scripts, frontend and backend code, installs, migrations,
+          benchmarks and ops chores. Explores the repository first, follows its
+          conventions, makes the smallest change that solves the task, and proves it
+          with the project's own tests, build and lint. Shell, browser, git and
+          delegation included. Pick this for code or terminal work unless the brief
+          explicitly asks for strict test-first TDD — then pick the developer.
+        icon: terminal
+        color: "#89dceb"
+        tags:
+          - coding
+          - development
+          - engineering
+          - ops
+          - delegation
 
-# Built-in subagents (delegate_agent). `enabled` gates the tool binding; the
-# roster decides which children exist (config/subagents/README.md).
-delegation:
-  enabled: true
-  max_concurrent: 4
+        llm:
+          reasoning_level: high
 
-subagents:
-  default: explorer
-  roster:
-    explorer: {$ref: subagents/explorer}
-    implementer: {$ref: subagents/implementer}
-    tester: {$ref: subagents/tester}
-    reviewer: {$ref: subagents/reviewer}
+        # Built-in subagents (delegate_agent). `enabled` gates the tool binding; the
+        # roster decides which children exist (config/subagents/README.md).
+        delegation:
+          enabled: true
+          max_concurrent: 4
 
-workspace:
-  # Pinned: shell-bound. A session's account layer overrides expert_base's
-  # `sandbox` with the owner's default (platform default `virtual`, which
-  # strips shell/browser/git); a backend declared HERE sits above that layer.
-  # Jobs stamp their tier from config_override and ignore this key. See
-  # tests/test_expert_defaults.py::TestShellBoundBundledExpertsPinTheirTier.
-  backend: sandbox
-  structure:
-    - archive/
-    - documents/
-    - output/
-  git_versioning: true
+        subagents:
+          default: explorer
+          roster:
+            explorer: {$ref: subagents/explorer}
+            implementer: {$ref: subagents/implementer}
+            tester: {$ref: subagents/tester}
+            reviewer: {$ref: subagents/reviewer}
 
-tools:
-  # workspace: inherited in full from expert_base — including edit_file.
-  # The developer's write_file-only grant forced a whole-file rewrite for
-  # every change; that was a handicap, not a discipline.
-  shell:
-    - run_command
-    - cancel_command
-    - shell_read
-  # git: intentionally absent. ToolsConfig.__post_init__ suppresses the git_*
-  # group whenever shell is present — git runs through the shell, against any
-  # checkout under repos/<name>/.
-  research:
-    - web_search
-    - extract_webpage
-    - crawl_website
-    - map_website
-    - research_topic
-  # Spawn + background controls (each bound only with delegation.enabled).
-  delegation:
-    - delegate_agent
-    - wait_agent
-    - message_agent
-    - stop_agent
-    - list_agents
-  # Unused categories off.
-  citation: []
-  graph: []
+        workspace:
+          # Pinned: shell-bound. A session's account layer overrides expert_base's
+          # `sandbox` with the owner's default (platform default `virtual`, which
+          # strips shell/browser/git); a backend declared HERE sits above that layer.
+          # Jobs stamp their tier from config_override and ignore this key. See
+          # tests/test_expert_defaults.py::TestShellBoundBundledExpertsPinTheirTier.
+          backend: sandbox
+          structure:
+            - archive/
+            - documents/
+            - output/
+          git_versioning: true
+
+        tools:
+          # workspace: inherited in full from expert_base — including edit_file.
+          # The developer's write_file-only grant forced a whole-file rewrite for
+          # every change; that was a handicap, not a discipline.
+          shell:
+            - run_command
+            - cancel_command
+            - shell_read
+          # git: intentionally absent. ToolsConfig.__post_init__ suppresses the git_*
+          # group whenever shell is present — git runs through the shell, against any
+          # checkout under repos/<name>/.
+          research:
+            - web_search
+            - extract_webpage
+            - crawl_website
+            - map_website
+            - research_topic
+          # Spawn + background controls (each bound only with delegation.enabled).
+          delegation:
+            - delegate_agent
+            - wait_agent
+            - message_agent
+            - stop_agent
+            - list_agents
+          # Unused categories off.
+          citation: []
+          graph: []

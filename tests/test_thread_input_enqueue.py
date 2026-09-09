@@ -102,7 +102,16 @@ class FakeConn:
             assert self.txn_depth == 1
             return self._locked_thread
         if "FROM run_queue" in q:
-            return dict(self._watermarks)
+            return {
+                "park_reason": None,
+                "parked_at": None,
+                "last_error": None,
+                "attempts_since_completion": 0,
+                "max_attempts": 3,
+                "attach_failures": 0,
+                "run_after": None,
+                **self._watermarks,
+            }
         return None
 
 

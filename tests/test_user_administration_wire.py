@@ -411,6 +411,21 @@ def test_delete_missing_user_is_404():
     assert wire.client.delete(f"/api/users/{USER_ID}").status_code == 404
 
 
+def test_delete_user_preserves_workspace_conflict_response():
+    wire = _wire(
+        store=_store(
+            delete_user=AsyncMock(
+                side_effect=HTTPException(
+                    409, "Release retained workspace instances first."
+                )
+            )
+        )
+    )
+    response = wire.client.delete(f"/api/users/{USER_ID}")
+    assert response.status_code == 409
+    assert response.json() == {"detail": "Release retained workspace instances first."}
+
+
 # =============================================================================
 # Admin user administration
 # =============================================================================

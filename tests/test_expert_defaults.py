@@ -1,5 +1,9 @@
 """Mode-specific virtual framework-default expert details."""
 
+from shared.runtime.core.srw_manifest_config import (
+    srw_config_fragment as _srw_config_fragment,
+)
+
 from tests._expert_catalog import catalogue_service
 
 
@@ -372,9 +376,11 @@ def test_scan_experts_adds_the_role_tag():
     config_dir = orchestrator_main._get_config_dir()
 
     def authored(expert_id: str) -> list[str]:
-        raw = yaml.safe_load(
-            (config_dir / "experts" / expert_id / "config.yaml").read_text(
-                encoding="utf-8"
+        raw = _srw_config_fragment(
+            yaml.safe_load(
+                (config_dir / "experts" / expert_id / "config.yaml").read_text(
+                    encoding="utf-8"
+                )
             )
         )
         return list(raw.get("tags") or [])
@@ -652,7 +658,7 @@ class TestShellBoundBundledExpertsPinTheirTier:
         experts_dir = Path(__file__).resolve().parents[1] / "config" / "experts"
         undecided: list[str] = []
         for path in sorted(experts_dir.glob("*/config.yaml")):
-            raw = yaml.safe_load(path.read_text()) or {}
+            raw = _srw_config_fragment(yaml.safe_load(path.read_text())) or {}
             shell = (raw.get("tools") or {}).get("shell")
             lists_shell = isinstance(shell, list) and len(shell) > 0
             declared = (raw.get("workspace") or {}).get("backend")

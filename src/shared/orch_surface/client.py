@@ -10,8 +10,10 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 import functools
 import os
+import ssl
 from types import MappingProxyType
 from typing import Any, Iterator, Literal, Mapping
+from uuid import UUID
 
 import httpx
 
@@ -147,6 +149,27 @@ class _RequestScopeAuth(httpx.Auth):
             request.headers.pop(name, None)
         for name, value in (self._headers.get() or {}).items():
             request.headers[name] = value
+        yield request
+
+
+class _BearerOnlyAuth(httpx.Auth):
+    """Explicit human/client identity cannot inherit internal MCP authority."""
+
+    def __init__(self, token: str):
+        if (
+            not token
+            or len(token) > 65536
+            or any(ord(char) < 33 or ord(char) > 126 for char in token)
+        ):
+            raise ValueError(
+                "Bearer credentials must be a nonempty token without whitespace."
+            )
+        self._token = token
+
+    def auth_flow(self, request: httpx.Request):
+        for name in _RequestScopeAuth._HEADER_NAMES:
+            request.headers.pop(name, None)
+        request.headers["Authorization"] = "Bearer " + self._token
         yield request
 
 
@@ -526,6 +549,9 @@ class AsyncCockpitClient:
         base_url: str | None = None,
         *,
         transport: httpx.AsyncBaseTransport | None = None,
+        bearer_token: str | None = None,
+        verify: bool | ssl.SSLContext = True,
+        trust_env: bool = True,
     ):
         """Initialize the async client.
 
@@ -536,15 +562,23 @@ class AsyncCockpitClient:
         self.base_url = base_url or os.environ.get(
             "COCKPIT_API_URL", "http://localhost:8085"
         )
-        self._internal_key = os.environ.get("MCP_INTERNAL_KEY", "")
+        self._internal_key = (
+            os.environ.get("MCP_INTERNAL_KEY", "") if bearer_token is None else ""
+        )
         self._scope_headers: ContextVar[Mapping[str, str] | None] = ContextVar(
             f"mcp_scope_headers_{id(self)}", default=None
         )
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
             timeout=30.0,
-            auth=_RequestScopeAuth(self._scope_headers),
+            auth=(
+                _RequestScopeAuth(self._scope_headers)
+                if bearer_token is None
+                else _BearerOnlyAuth(bearer_token)
+            ),
             transport=transport,
+            verify=verify,
+            trust_env=trust_env,
         )
 
     # F15: the imperative set_scope_headers/clear_scope_headers pair was
@@ -700,6 +734,138 @@ class AsyncCockpitClient:
 
     async def __aexit__(self, *args: Any) -> None:
         await self.close()
+
+    # =========================================================================
+    # Native manifests and canonical resources
+    # =========================================================================
+
+    async def manifest_validate(
+        self, source: str, *, format: str = "yaml"
+    ) -> dict[str, Any]:
+        response = await self._non_get_read_request(
+            "POST", "/api/manifests/validate", json={"source": source, "format": format}
+        )
+        response.raise_for_status()
+        return response.json()
+
+    async def manifest_preview(
+        self,
+        source: str,
+        *,
+        format: str = "yaml",
+        default_scope: dict[str, str] | None = None,
+        resolution: str = "stored",
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "source": source,
+            "format": format,
+            "resolution": resolution,
+        }
+        if default_scope is not None:
+            body["default_scope"] = default_scope
+        response = await self._non_get_read_request(
+            "POST", "/api/manifests/preview", json=body
+        )
+        response.raise_for_status()
+        return response.json()
+
+    async def manifest_apply(
+        self,
+        source: str,
+        *,
+        format: str = "yaml",
+        default_scope: dict[str, str] | None = None,
+        expected_versions: dict[str, int] | None = None,
+        plan_revision: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"source": source, "format": format}
+        for key, value in (
+            ("default_scope", default_scope),
+            ("expected_versions", expected_versions),
+            ("plan_revision", plan_revision),
+            ("idempotency_key", idempotency_key),
+        ):
+            if value is not None:
+                body[key] = value
+        response = await self._mutation_request(
+            "POST", "/api/manifests/apply", json=body
+        )
+        response.raise_for_status()
+        return response.json()
+
+    async def manifest_export(
+        self,
+        source: str,
+        *,
+        format: str = "yaml",
+        default_scope: dict[str, str] | None = None,
+        output_format: str = "yaml",
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "source": source,
+            "format": format,
+            "output_format": output_format,
+        }
+        if default_scope is not None:
+            body["default_scope"] = default_scope
+        response = await self._non_get_read_request(
+            "POST", "/api/manifests/export", json=body
+        )
+        response.raise_for_status()
+        return response.json()
+
+    @_create_retry_decorator()
+    async def list_manifest_resources(
+        self,
+        *,
+        scope_kind: str = "Account",
+        scope_name: str = "me",
+        kind: str | None = None,
+    ) -> dict[str, Any]:
+        params = {"scope_kind": scope_kind, "scope_name": scope_name}
+        if kind is not None:
+            params["kind"] = kind
+        response = await self._client.get("/api/resources", params=params)
+        response.raise_for_status()
+        return response.json()
+
+    @_create_retry_decorator()
+    async def get_manifest_resource(self, resource_id: str) -> dict[str, Any]:
+        identity = str(UUID(str(resource_id)))
+        response = await self._client.get(f"/api/resources/{identity}")
+        response.raise_for_status()
+        return response.json()
+
+    async def delete_manifest_resource(
+        self, resource_id: str, *, expected_version: int
+    ) -> dict[str, Any]:
+        identity = str(UUID(str(resource_id)))
+        if (
+            isinstance(expected_version, bool)
+            or not isinstance(expected_version, int)
+            or expected_version < 1
+        ):
+            raise ValueError("Resource deletion requires a positive expected version.")
+        response = await self._mutation_request(
+            "DELETE",
+            f"/api/resources/{identity}",
+            params={"expected_version": expected_version},
+        )
+        response.raise_for_status()
+        return response.json()
+
+    async def export_manifest_resource(
+        self, resource_id: str, *, output_format: str = "yaml"
+    ) -> dict[str, Any]:
+        import json
+
+        record = await self.get_manifest_resource(resource_id)
+        return await self.manifest_export(
+            json.dumps(record["resource"], allow_nan=False),
+            format="json",
+            output_format=output_format,
+        )
 
     # =========================================================================
     # Health

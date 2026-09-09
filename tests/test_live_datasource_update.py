@@ -272,6 +272,23 @@ def patched_main(monkeypatch):
         resolve_api_keys_for_job=AsyncMock(return_value={}),
     )
     db.datasource_policy_rows = policy_rows
+
+    @asynccontextmanager
+    async def transaction_scope(_thread_id):
+        yield SimpleNamespace(
+            fetchrow=AsyncMock(
+                side_effect=lambda query, *_: None
+                if "srw_execution_specs" in query
+                else db.get_thread.return_value
+            )
+        )
+
+    db.thread_configuration_transaction = transaction_scope
+    db.refresh_session_execution = AsyncMock(
+        side_effect=lambda _thread_id, *, conn, config_override: {
+            "delivery_override": config_override
+        }
+    )
     monkeypatch.setattr(main, "postgres_db", db)
     monkeypatch.setattr(main, "require_internal", AsyncMock())
     monkeypatch.setattr(main, "_thread_project_ids", AsyncMock(return_value=[]))

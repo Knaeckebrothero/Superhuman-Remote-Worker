@@ -1,27 +1,58 @@
-# yaml-language-server: $schema=../../schema.json
-# General Worker — bundled seed for the application worker default.
-$extends: worker_base
+apiVersion: srw/v1alpha1
+kind: Expert
+metadata:
+  name: general-worker
+  scope:
+    kind: Catalog
+    name: shared
+  annotations:
+    srw.io/display-name: General Worker
+    srw.io/description: 'General-purpose worker for research, writing, analysis, planning,
+      and file
 
-agent_id: general-worker
-display_name: General Worker
-description: |
-  General-purpose worker for research, writing, analysis, planning, and file
-  deliverables. It starts with a safe, non-orchestrating tool profile: no shell,
-  delegation, scholar pre-job, critic verification, automations, or loops unless
-  an administrator or copied expert explicitly enables them.
-icon: engineering
-color: "#a6e3a1"
-tags:
+      deliverables. It starts with a safe, non-orchestrating tool profile: no shell,
+
+      delegation, scholar pre-job, critic verification, automations, or loops unless
+
+      an administrator or copied expert explicitly enables them.'
+    srw.io/icon: engineering
+    srw.io/color: '#a6e3a1'
+    srw.io/expert-type: worker
+    srw.io/bundled-selector: general-worker
+  tags:
   - general
   - worker
   - safe-default
+spec:
+  runtime:
+    image: srw-agent:latest
+    adapter: srw/v1
+    config:
+      config_name: worker_base
+      asset_name: general-worker
+      config:
+        # General Worker — bundled seed for the application worker default.
+        $extends: worker_base
 
-verification:
-  enabled: false
-scholar:
-  enabled: false
-curator:
-  enabled: false
-delegation:
-  enabled: false
+        agent_id: general-worker
+        display_name: General Worker
+        description: |
+          General-purpose worker for research, writing, analysis, planning, and file
+          deliverables. It starts with a safe, non-orchestrating tool profile: no shell,
+          delegation, scholar pre-job, critic verification, automations, or loops unless
+          an administrator or copied expert explicitly enables them.
+        icon: engineering
+        color: "#a6e3a1"
+        tags:
+          - general
+          - worker
+          - safe-default
 
+        verification:
+          enabled: false
+        scholar:
+          enabled: false
+        curator:
+          enabled: false
+        delegation:
+          enabled: false

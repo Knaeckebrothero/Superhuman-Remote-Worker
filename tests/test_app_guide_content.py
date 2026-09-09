@@ -8,6 +8,10 @@ live session control group gains a tool.
 
 from __future__ import annotations
 
+from shared.runtime.core.srw_manifest_config import (
+    srw_config_fragment as _srw_config_fragment,
+)
+
 from pathlib import Path
 from typing import get_args
 
@@ -262,7 +266,9 @@ def test_experts_guide_covers_current_bundled_roster_and_selection_rules():
     _, body = _focused_topic("experts")
 
     for config_path in sorted((_ROOT / "config" / "experts").glob("*/config.yaml")):
-        config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        config = _srw_config_fragment(
+            yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        )
         expert_type = (
             "session" if config.get("$extends") == "session_base" else "worker"
         )

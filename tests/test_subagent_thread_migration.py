@@ -595,9 +595,19 @@ async def test_replay_onto_seeded_rows_and_the_child_lifecycle(
         # server-minted workspace dispatch receipt when a job becomes pinned
         # and processing.  The agent's reciprocal current_job row above makes
         # the later process-identity fence exact.
+        # This phase deliberately runs current claim code before migration
+        # 0206. No native executions exist yet; expose that empty relation for
+        # the new hosting-lane predicate, then remove it before replaying 0234.
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "CREATE TABLE srw_execution_specs "
+                "(work_kind text, work_id uuid, harness_adapter text)"
+            )
         assert await _orchestrator_db(pool).claim_job_for_agent(
             str(job_id), str(agent_id)
         )
+        async with pool.acquire() as conn:
+            await conn.execute("DROP TABLE srw_execution_specs")
 
         # --- the upgrade -------------------------------------------------
         await run_migrations(pool, MIGRATIONS)

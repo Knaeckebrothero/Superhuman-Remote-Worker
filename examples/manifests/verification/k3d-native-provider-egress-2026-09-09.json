@@ -1,0 +1,596 @@
+{
+  "recordedOn": "2026-09-09",
+  "result": "passed",
+  "command": "python scripts/manifests-cilium-k3d-gate.py --service-only",
+  "schemaMigrationHead": "0236",
+  "profile": {
+    "cluster": "srw-native-gate-9adbfd49",
+    "ciliumVersion": "1.18.13",
+    "chartDigest": "7d39d95fa5528c31f33eb18d41b78da0ceace9d8c7a81334935cb817c075c32a",
+    "ciliumImageIDs": [
+      "quay.io/cilium/cilium@sha256:6e6e6a82a6a2a6d0bfe6dd7e36cb0222fa48135ad139ddc979b5c3c841e2db1a"
+    ],
+    "values": {
+      "operator": {
+        "replicas": 1
+      },
+      "kubeProxyReplacement": false,
+      "policyEnforcementMode": "always",
+      "envoy": {
+        "enabled": false
+      },
+      "l7Proxy": false,
+      "hubble": {
+        "enabled": false
+      },
+      "ipam": {
+        "mode": "kubernetes"
+      },
+      "securityContext": {
+        "privileged": true
+      }
+    },
+    "result": "passed",
+    "profile": "Cilium always-enforce",
+    "nodeImage": "rancher/k3s:v1.31.5-k3s1"
+  },
+  "networkStartupEvidence": {
+    "baselineUID": "01d50203-c09c-499d-8033-e81174e265d4",
+    "baselineCreationTime": "2026-09-09T10:44:59+00:00",
+    "baselineSelector": {},
+    "baselineIngress": [],
+    "baselineEgress": [],
+    "witness": {
+      "startedAtUnix": 1788950710.959764,
+      "allowedConnections": 0,
+      "firstAllowedMs": null,
+      "lastAllowedMs": null,
+      "blockedConnections": 20,
+      "lastAttemptBlocked": true,
+      "establishedSurvived": false
+    },
+    "samples": [
+      {
+        "podName": "srw-run-4124bbdb4d4743e1895a22125cd6c44a-a1",
+        "podUID": "64e59b86-c303-4641-882a-e246cd7a88fb",
+        "startedAtUnix": 1788950721.6199658,
+        "allowedConnections": 0,
+        "firstAllowedMs": null,
+        "lastAllowedMs": null,
+        "blockedConnections": 27,
+        "lastAttemptBlocked": true,
+        "establishedSurvived": false
+      },
+      {
+        "podName": "srw-run-0dbf8c9459d144f992adc48976d9389a-a1",
+        "podUID": "bfaa690a-0c0b-4ecc-84bd-dd467e6bb01d",
+        "startedAtUnix": 1788950721.609256,
+        "allowedConnections": 0,
+        "firstAllowedMs": null,
+        "lastAllowedMs": null,
+        "blockedConnections": 27,
+        "lastAttemptBlocked": true,
+        "establishedSurvived": false
+      },
+      {
+        "podName": "srw-run-01c8d55b14b7442a84eadf8868a7793c-a1",
+        "podUID": "7e10ea70-f6d6-44fe-a1e0-f9acfa302a2a",
+        "startedAtUnix": 1788950722.1097233,
+        "allowedConnections": 0,
+        "firstAllowedMs": null,
+        "lastAllowedMs": null,
+        "blockedConnections": 27,
+        "lastAttemptBlocked": true,
+        "establishedSurvived": false
+      },
+      {
+        "podName": "srw-run-78ba833d210c4cee819305bc1a0fd038-a1",
+        "podUID": "71dd0b65-ffd9-47d8-ac68-995d82b33d19",
+        "startedAtUnix": 1788950721.8927958,
+        "allowedConnections": 0,
+        "firstAllowedMs": null,
+        "lastAllowedMs": null,
+        "blockedConnections": 27,
+        "lastAttemptBlocked": true,
+        "establishedSurvived": false
+      },
+      {
+        "podName": "srw-run-d585d9374c72463eb95d0eefff2ba87e-a1",
+        "podUID": "3694f34f-001e-4f61-bfc0-aea886ba4959",
+        "startedAtUnix": 1788950721.6962874,
+        "allowedConnections": 0,
+        "firstAllowedMs": null,
+        "lastAllowedMs": null,
+        "blockedConnections": 27,
+        "lastAttemptBlocked": true,
+        "establishedSurvived": false
+      },
+      {
+        "podName": "srw-run-b6fea70a189b495487393f5c8733b0c5-a1",
+        "podUID": "ce983c07-e060-427a-a006-4680e35e81a7",
+        "startedAtUnix": 1788950722.272248,
+        "allowedConnections": 0,
+        "firstAllowedMs": null,
+        "lastAllowedMs": null,
+        "blockedConnections": 27,
+        "lastAttemptBlocked": true,
+        "establishedSurvived": false
+      },
+      {
+        "podName": "srw-run-7e5d749678594935aa34192194c2a92b-a1",
+        "podUID": "05c04750-e2d8-4513-ae40-7440fa12bc85",
+        "startedAtUnix": 1788950722.2628794,
+        "allowedConnections": 0,
+        "firstAllowedMs": null,
+        "lastAllowedMs": null,
+        "blockedConnections": 27,
+        "lastAttemptBlocked": true,
+        "establishedSurvived": false
+      },
+      {
+        "podName": "srw-run-4d1b6fd2f90f4c09ae0083447fdcf016-a1",
+        "podUID": "7ad85453-d266-4f7b-a8e4-c50340ced370",
+        "startedAtUnix": 1788950722.1132667,
+        "allowedConnections": 0,
+        "firstAllowedMs": null,
+        "lastAllowedMs": null,
+        "blockedConnections": 27,
+        "lastAttemptBlocked": true,
+        "establishedSurvived": false
+      },
+      {
+        "podName": "srw-run-08d62b5a70fe44c99451646508f6a3d2-a1",
+        "podUID": "236fc788-a471-46be-9cda-dbc16fe05027",
+        "startedAtUnix": 1788950722.1135635,
+        "allowedConnections": 0,
+        "firstAllowedMs": null,
+        "lastAllowedMs": null,
+        "blockedConnections": 27,
+        "lastAttemptBlocked": true,
+        "establishedSurvived": false
+      },
+      {
+        "podName": "srw-run-661f6fbbdd6740a0b5ef15419c3dd913-a1",
+        "podUID": "9ced7a74-47a4-4f3f-8df2-fb4736d70cc8",
+        "startedAtUnix": 1788950722.132601,
+        "allowedConnections": 0,
+        "firstAllowedMs": null,
+        "lastAllowedMs": null,
+        "blockedConnections": 27,
+        "lastAttemptBlocked": true,
+        "establishedSurvived": false
+      },
+      {
+        "podName": "srw-run-4015c59b109849cd86ffea63f552d25c-a1",
+        "podUID": "190633a8-cdc9-47f9-a2f1-16d319358320",
+        "startedAtUnix": 1788950722.1513548,
+        "allowedConnections": 0,
+        "firstAllowedMs": null,
+        "lastAllowedMs": null,
+        "blockedConnections": 27,
+        "lastAttemptBlocked": true,
+        "establishedSurvived": false
+      },
+      {
+        "podName": "srw-run-694f40920bf0443a9490e19aa20589ef-a1",
+        "podUID": "147e39f9-d6b2-474d-9304-31d062446188",
+        "startedAtUnix": 1788950722.4996479,
+        "allowedConnections": 0,
+        "firstAllowedMs": null,
+        "lastAllowedMs": null,
+        "blockedConnections": 27,
+        "lastAttemptBlocked": true,
+        "establishedSurvived": false
+      }
+    ],
+    "leakedSamples": 0,
+    "establishedConnectionsSurvived": 0
+  },
+  "isolation": {
+    "result": "passed",
+    "coldStartIsolationAccepted": true,
+    "context": "k3d-srw-native-gate-9adbfd49",
+    "nodes": [
+      "k3d-srw-native-gate-9adbfd49-server-0"
+    ],
+    "namespaceRemoved": "srw-native-gate-9ffcb5a557c0",
+    "checks": [],
+    "images": {
+      "workspace": {
+        "localImageID": "sha256:dec082b4bc75dd1517792974d050b7af307264b4d71386f60faf7e016a88aaec",
+        "registryDigest": "sha256:dec082b4bc75dd1517792974d050b7af307264b4d71386f60faf7e016a88aaec"
+      },
+      "busybox": {
+        "localImageID": "sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662",
+        "registryDigest": "sha256:b7f3d86d6e84fc17718c48bcde1450807faa2d56704205c697b4bd5df7b9e29f"
+      },
+      "ssh": {
+        "localImageID": "sha256:6f3b5029566da8e90b24945933dcd806be866b64b1e706f51828bf84faccf21b",
+        "registryDigest": "sha256:1e9d9a40acbd02aeb3cb005ff43f9e51ac09ba0c241bb2298f811d3f426a2ffd"
+      },
+      "python": {
+        "localImageID": "sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea",
+        "registryDigest": "sha256:2fe5997d249a808b8eeea52c58a1dbffbba28754dc11699ef5c029f2d818ce79"
+      }
+    },
+    "observedImageIDs": {
+      "srw-run-2914209bf9dc4680ac7d41ce7b9270ff-a1": "srw-registry:5000/srw-native-gate-python@sha256:2fe5997d249a808b8eeea52c58a1dbffbba28754dc11699ef5c029f2d818ce79",
+      "srw-run-8c5862b585294e9eba342fea3636f797-a1": "srw-registry:5000/srw-native-gate-python@sha256:2fe5997d249a808b8eeea52c58a1dbffbba28754dc11699ef5c029f2d818ce79",
+      "srw-run-4124bbdb4d4743e1895a22125cd6c44a-a1": "srw-registry:5000/srw-native-gate-python@sha256:2fe5997d249a808b8eeea52c58a1dbffbba28754dc11699ef5c029f2d818ce79",
+      "srw-run-0dbf8c9459d144f992adc48976d9389a-a1": "srw-registry:5000/srw-native-gate-python@sha256:2fe5997d249a808b8eeea52c58a1dbffbba28754dc11699ef5c029f2d818ce79",
+      "srw-run-01c8d55b14b7442a84eadf8868a7793c-a1": "srw-registry:5000/srw-native-gate-python@sha256:2fe5997d249a808b8eeea52c58a1dbffbba28754dc11699ef5c029f2d818ce79",
+      "srw-run-78ba833d210c4cee819305bc1a0fd038-a1": "srw-registry:5000/srw-native-gate-python@sha256:2fe5997d249a808b8eeea52c58a1dbffbba28754dc11699ef5c029f2d818ce79",
+      "srw-run-d585d9374c72463eb95d0eefff2ba87e-a1": "srw-registry:5000/srw-native-gate-python@sha256:2fe5997d249a808b8eeea52c58a1dbffbba28754dc11699ef5c029f2d818ce79",
+      "srw-run-b6fea70a189b495487393f5c8733b0c5-a1": "srw-registry:5000/srw-native-gate-python@sha256:2fe5997d249a808b8eeea52c58a1dbffbba28754dc11699ef5c029f2d818ce79",
+      "srw-run-7e5d749678594935aa34192194c2a92b-a1": "srw-registry:5000/srw-native-gate-python@sha256:2fe5997d249a808b8eeea52c58a1dbffbba28754dc11699ef5c029f2d818ce79",
+      "srw-run-4d1b6fd2f90f4c09ae0083447fdcf016-a1": "srw-registry:5000/srw-native-gate-python@sha256:2fe5997d249a808b8eeea52c58a1dbffbba28754dc11699ef5c029f2d818ce79",
+      "srw-run-08d62b5a70fe44c99451646508f6a3d2-a1": "srw-registry:5000/srw-native-gate-python@sha256:2fe5997d249a808b8eeea52c58a1dbffbba28754dc11699ef5c029f2d818ce79",
+      "srw-run-661f6fbbdd6740a0b5ef15419c3dd913-a1": "srw-registry:5000/srw-native-gate-python@sha256:2fe5997d249a808b8eeea52c58a1dbffbba28754dc11699ef5c029f2d818ce79",
+      "srw-run-4015c59b109849cd86ffea63f552d25c-a1": "srw-registry:5000/srw-native-gate-python@sha256:2fe5997d249a808b8eeea52c58a1dbffbba28754dc11699ef5c029f2d818ce79",
+      "srw-run-694f40920bf0443a9490e19aa20589ef-a1": "srw-registry:5000/srw-native-gate-python@sha256:2fe5997d249a808b8eeea52c58a1dbffbba28754dc11699ef5c029f2d818ce79",
+      "srw-run-244a4e97ca0443158bfe0bdac0041673-a1": "srw-registry:5000/srw-native-gate-python@sha256:2fe5997d249a808b8eeea52c58a1dbffbba28754dc11699ef5c029f2d818ce79",
+      "srw-run-7fa4264c02044a66a5a8f1a7294e7298-a1": "srw-registry:5000/srw-native-gate-python@sha256:2fe5997d249a808b8eeea52c58a1dbffbba28754dc11699ef5c029f2d818ce79"
+    },
+    "scope": "Real Kubernetes adapters with a durable test identity ledger; not production API/admission/Postgres lifecycle integration."
+  },
+  "productionServices": {
+    "result": "passed",
+    "context": "k3d-srw-native-gate-9adbfd49",
+    "nodes": [
+      "k3d-srw-native-gate-9adbfd49-server-0"
+    ],
+    "namespaceRemoved": "srw-native-service-6185d0985a8a",
+    "namespaceUID": "641f09fb-7a4a-4be3-b4c0-b1e5052b1590",
+    "checks": [
+      "real Account authorization refuses foreign admission before resource/job/Pod effects",
+      "production admission and restarted reconciler complete an unmodified image; reapply never replays it",
+      "real generic image reads exact opaque config/task/env/file bindings without ambient SRW credentials",
+      "operator JSON policy permits provider HTTP from a real harness while an unselected live peer and Kubernetes API stay denied from startup",
+      "Postgres reconciler retries exit23 as a fresh Pod on the same PVC, initializes once, and rotates attachment credentials",
+      "a second manifest Job reuses initialized files across executions, then the workspace service releases the exact PVC"
+    ],
+    "images": {
+      "workspace": {
+        "localImageID": "sha256:dec082b4bc75dd1517792974d050b7af307264b4d71386f60faf7e016a88aaec",
+        "registryDigest": "sha256:dec082b4bc75dd1517792974d050b7af307264b4d71386f60faf7e016a88aaec"
+      },
+      "busybox": {
+        "localImageID": "sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662",
+        "registryDigest": "sha256:b7f3d86d6e84fc17718c48bcde1450807faa2d56704205c697b4bd5df7b9e29f"
+      },
+      "ssh": {
+        "localImageID": "sha256:6f3b5029566da8e90b24945933dcd806be866b64b1e706f51828bf84faccf21b",
+        "registryDigest": "sha256:1e9d9a40acbd02aeb3cb005ff43f9e51ac09ba0c241bb2298f811d3f426a2ffd"
+      },
+      "python": {
+        "localImageID": "sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea",
+        "registryDigest": "sha256:2fe5997d249a808b8eeea52c58a1dbffbba28754dc11699ef5c029f2d818ce79"
+      }
+    },
+    "ciliumImageIDs": [
+      "quay.io/cilium/cilium@sha256:6e6e6a82a6a2a6d0bfe6dd7e36cb0222fa48135ad139ddc979b5c3c841e2db1a"
+    ],
+    "executionCount": 7,
+    "executions": {
+      "b9139223-772d-477c-9a1c-65488d0dcb78": "d69d5808-657c-4d82-a346-db26d70db153",
+      "0a2e698a-b9a1-4b74-a9cf-2937e736dd0f": "dc1949ec-d512-4721-971c-efad482a2e68",
+      "318e427c-708a-4567-91ed-cf54cef62111": "504d894e-16f2-4563-81c6-6cafa685a47b",
+      "96ef573d-205c-4a18-a9b6-901b12ec0c7c": "54766e4b-6aca-4394-a5be-ea1fdaa0b379",
+      "91f5f4fa-efde-4707-8d00-919ab13061ec": "a7cfbc6e-c28a-40ae-9bff-efe883a96734",
+      "1ce05c50-cf0c-4772-becd-0d14ebb2c6db": "15e0f0a4-9bec-45bf-bdc5-5435c675b048",
+      "9d9d1bbb-6bd7-464a-9664-1f0a5aeabce3": "397c867a-aae8-45c6-97ea-64b0b46e94c8"
+    },
+    "attempts": {
+      "b9139223-772d-477c-9a1c-65488d0dcb78": [
+        {
+          "attempt": 1,
+          "phase": "Succeeded",
+          "podUID": "4c4f5ead-a56e-4cb7-b395-26e34a26f2ae",
+          "imageID": "srw-registry:5000/srw-native-gate-busybox@sha256:b7f3d86d6e84fc17718c48bcde1450807faa2d56704205c697b4bd5df7b9e29f",
+          "exitCode": 0,
+          "cleaned": true
+        }
+      ],
+      "0a2e698a-b9a1-4b74-a9cf-2937e736dd0f": [
+        {
+          "attempt": 1,
+          "phase": "Succeeded",
+          "podUID": "b69ced8b-1ca4-4493-9d9e-695a5dae06e0",
+          "imageID": "srw-registry:5000/srw-native-gate-python@sha256:2fe5997d249a808b8eeea52c58a1dbffbba28754dc11699ef5c029f2d818ce79",
+          "exitCode": 0,
+          "cleaned": true
+        }
+      ],
+      "318e427c-708a-4567-91ed-cf54cef62111": [
+        {
+          "attempt": 1,
+          "phase": "Succeeded",
+          "podUID": "332c2bee-b895-4890-bef9-ea23d116c243",
+          "imageID": "srw-registry:5000/srw-native-gate-python@sha256:2fe5997d249a808b8eeea52c58a1dbffbba28754dc11699ef5c029f2d818ce79",
+          "exitCode": 0,
+          "cleaned": true
+        }
+      ],
+      "96ef573d-205c-4a18-a9b6-901b12ec0c7c": [
+        {
+          "attempt": 1,
+          "phase": "Succeeded",
+          "podUID": "a12d316b-2304-4287-bd82-0b45324b234c",
+          "imageID": "srw-registry:5000/srw-native-gate-python@sha256:2fe5997d249a808b8eeea52c58a1dbffbba28754dc11699ef5c029f2d818ce79",
+          "exitCode": 0,
+          "cleaned": true
+        }
+      ],
+      "91f5f4fa-efde-4707-8d00-919ab13061ec": [
+        {
+          "attempt": 1,
+          "phase": "Succeeded",
+          "podUID": "280f7260-9993-467d-ad5a-41eeab29375e",
+          "imageID": "srw-registry:5000/srw-native-gate-python@sha256:2fe5997d249a808b8eeea52c58a1dbffbba28754dc11699ef5c029f2d818ce79",
+          "exitCode": 0,
+          "cleaned": true
+        }
+      ],
+      "1ce05c50-cf0c-4772-becd-0d14ebb2c6db": [
+        {
+          "attempt": 1,
+          "phase": "Failed",
+          "podUID": "d659cc52-4b63-4a16-8b9b-83db80911142",
+          "imageID": "srw-registry:5000/srw-native-gate-ssh@sha256:1e9d9a40acbd02aeb3cb005ff43f9e51ac09ba0c241bb2298f811d3f426a2ffd",
+          "exitCode": 23,
+          "cleaned": true
+        },
+        {
+          "attempt": 2,
+          "phase": "Succeeded",
+          "podUID": "a82c7df4-3c97-4ca0-8157-acd6fbd72e7a",
+          "imageID": "srw-registry:5000/srw-native-gate-ssh@sha256:1e9d9a40acbd02aeb3cb005ff43f9e51ac09ba0c241bb2298f811d3f426a2ffd",
+          "exitCode": 0,
+          "cleaned": true
+        }
+      ],
+      "9d9d1bbb-6bd7-464a-9664-1f0a5aeabce3": [
+        {
+          "attempt": 1,
+          "phase": "Succeeded",
+          "podUID": "26a29ab5-1bae-4846-b50f-22215fc65b20",
+          "imageID": "srw-registry:5000/srw-native-gate-ssh@sha256:1e9d9a40acbd02aeb3cb005ff43f9e51ac09ba0c241bb2298f811d3f426a2ffd",
+          "exitCode": 0,
+          "cleaned": true
+        }
+      ]
+    },
+    "providerConnectivity": {
+      "providerPodUID": "68a1027a-b53f-4eb8-86fd-ecfcdf333a86",
+      "otherPodUID": "d956b551-5c54-46ec-a02f-211646842fce",
+      "positiveBeforeWorkId": "318e427c-708a-4567-91ed-cf54cef62111",
+      "restrictedWorkId": "96ef573d-205c-4a18-a9b6-901b12ec0c7c",
+      "positiveAfterWorkId": "91f5f4fa-efde-4707-8d00-919ab13061ec",
+      "installedRules": [
+        {
+          "to": [
+            {
+              "namespaceSelector": {
+                "matchLabels": {
+                  "kubernetes.io/metadata.name": "srw-native-service-6185d0985a8a"
+                }
+              },
+              "podSelector": {
+                "matchLabels": {
+                  "srw/managed-by": "generic-harness-runtime",
+                  "srw.io/execution-id": "a35c9eb1-8177-4aa0-8c52-36cd6655ba4e",
+                  "srw.io/execution-attempt": "1"
+                }
+              }
+            }
+          ],
+          "ports": [
+            {
+              "protocol": "TCP",
+              "port": 8443
+            }
+          ]
+        }
+      ],
+      "deniedTargets": [
+        "unselected live provider fixture",
+        "Kubernetes API service"
+      ],
+      "negativeChecksBeforeFirstProviderCall": true,
+      "transport": "HTTP POST /v1/chat/completions from a generic Python harness"
+    },
+    "workspaceGenerations": {
+      "5fa5c628-d571-4367-a31d-aec2a5ec0e92": {
+        "1": {
+          "pvcUID": "b3ecfcb1-dd9b-4d61-9cfc-5db66f2bfbf8",
+          "initialized": true
+        },
+        "2": {
+          "pvcUID": "b3ecfcb1-dd9b-4d61-9cfc-5db66f2bfbf8",
+          "initialized": true
+        },
+        "3": {
+          "pvcUID": "b3ecfcb1-dd9b-4d61-9cfc-5db66f2bfbf8",
+          "initialized": true
+        }
+      }
+    },
+    "schemaSHA256": "c11f76ba586036edbfb4e22941eb38419f9e3d7852f96f699aa12d0fcac8982e",
+    "sourceSHA256": {
+      "src/orchestrator/services/manifest_execution.py": "09a41d32820a8be6a9de59fa640d5cf0310bfb9f32ee650df15f37340f6f5b9c",
+      "src/orchestrator/services/manifest_harness_egress.py": "791360f4b52912156644c290709a014770069809a9e24b6dde1dc8b2136963eb",
+      "src/orchestrator/services/manifest_workspaces.py": "a6a2b962f19b4caac4e4df2e2afa7fad7b716452733632042b5d07f20320904b",
+      "src/orchestrator/services/generic_harness_runtime.py": "c74ed1076dbed7a3bf3fb47d3cf118ee835b9c4bd57189dc8eff0fb633f33fc7",
+      "src/orchestrator/services/manifest_workspace_runtime.py": "c4c2d83aebec7ee26d58560f3ced13012e510df261e7659ce4dc213183b351e2"
+    },
+    "podIdentities": {
+      "srw-run-d69d5808657c4d82a346db26d70db153-a1": {
+        "uid": "4c4f5ead-a56e-4cb7-b395-26e34a26f2ae",
+        "image": "srw-registry:5000/srw-native-gate-busybox@sha256:b7f3d86d6e84fc17718c48bcde1450807faa2d56704205c697b4bd5df7b9e29f",
+        "initializers": [],
+        "workspace": null,
+        "phases": [
+          "Pending",
+          "Succeeded"
+        ],
+        "imageID": "srw-registry:5000/srw-native-gate-busybox@sha256:b7f3d86d6e84fc17718c48bcde1450807faa2d56704205c697b4bd5df7b9e29f"
+      },
+      "srw-run-dc1949ecd5124721971cefad482a2e68-a1": {
+        "uid": "b69ced8b-1ca4-4493-9d9e-695a5dae06e0",
+        "image": "srw-registry:5000/srw-native-gate-python@sha256:2fe5997d249a808b8eeea52c58a1dbffbba28754dc11699ef5c029f2d818ce79",
+        "initializers": [],
+        "workspace": null,
+        "phases": [
+          "Pending",
+          "Succeeded"
+        ],
+        "imageID": "srw-registry:5000/srw-native-gate-python@sha256:2fe5997d249a808b8eeea52c58a1dbffbba28754dc11699ef5c029f2d818ce79"
+      },
+      "srw-run-12c1a5be19a443d88187d8897d115d26-a1": {
+        "uid": "d956b551-5c54-46ec-a02f-211646842fce",
+        "image": "srw-registry:5000/srw-native-gate-python@sha256:2fe5997d249a808b8eeea52c58a1dbffbba28754dc11699ef5c029f2d818ce79",
+        "initializers": [],
+        "workspace": null,
+        "phases": [
+          "Running"
+        ],
+        "imageID": "srw-registry:5000/srw-native-gate-python@sha256:2fe5997d249a808b8eeea52c58a1dbffbba28754dc11699ef5c029f2d818ce79"
+      },
+      "srw-run-504d894e16f2456381c66cafa685a47b-a1": {
+        "uid": "332c2bee-b895-4890-bef9-ea23d116c243",
+        "image": "srw-registry:5000/srw-native-gate-python@sha256:2fe5997d249a808b8eeea52c58a1dbffbba28754dc11699ef5c029f2d818ce79",
+        "initializers": [],
+        "workspace": null,
+        "phases": [
+          "Pending",
+          "Running",
+          "Succeeded"
+        ],
+        "imageID": "srw-registry:5000/srw-native-gate-python@sha256:2fe5997d249a808b8eeea52c58a1dbffbba28754dc11699ef5c029f2d818ce79"
+      },
+      "srw-run-a35c9eb181774aa08c5236cd6655ba4e-a1": {
+        "uid": "68a1027a-b53f-4eb8-86fd-ecfcdf333a86",
+        "image": "srw-registry:5000/srw-native-gate-python@sha256:2fe5997d249a808b8eeea52c58a1dbffbba28754dc11699ef5c029f2d818ce79",
+        "initializers": [],
+        "workspace": null,
+        "phases": [
+          "Running"
+        ],
+        "imageID": "srw-registry:5000/srw-native-gate-python@sha256:2fe5997d249a808b8eeea52c58a1dbffbba28754dc11699ef5c029f2d818ce79"
+      },
+      "srw-run-54766e4b6aca4394a5beea1fdaa0b379-a1": {
+        "uid": "a12d316b-2304-4287-bd82-0b45324b234c",
+        "image": "srw-registry:5000/srw-native-gate-python@sha256:2fe5997d249a808b8eeea52c58a1dbffbba28754dc11699ef5c029f2d818ce79",
+        "initializers": [],
+        "workspace": null,
+        "phases": [
+          "Pending",
+          "Running",
+          "Succeeded"
+        ],
+        "imageID": "srw-registry:5000/srw-native-gate-python@sha256:2fe5997d249a808b8eeea52c58a1dbffbba28754dc11699ef5c029f2d818ce79"
+      },
+      "srw-run-a7cfbc6ec28a40ae9bffefe883a96734-a1": {
+        "uid": "280f7260-9993-467d-ad5a-41eeab29375e",
+        "image": "srw-registry:5000/srw-native-gate-python@sha256:2fe5997d249a808b8eeea52c58a1dbffbba28754dc11699ef5c029f2d818ce79",
+        "initializers": [],
+        "workspace": null,
+        "phases": [
+          "Pending",
+          "Running",
+          "Succeeded"
+        ],
+        "imageID": "srw-registry:5000/srw-native-gate-python@sha256:2fe5997d249a808b8eeea52c58a1dbffbba28754dc11699ef5c029f2d818ce79"
+      },
+      "srw-ws-5fa5c628d5714367a31daec2a5ec0e92-g1": {
+        "uid": "90f7df85-d356-4b6a-b804-00df14960229",
+        "image": "srw-registry:5000/srw-native-gate-workspace@sha256:dec082b4bc75dd1517792974d050b7af307264b4d71386f60faf7e016a88aaec",
+        "initializers": [
+          "initialize-0"
+        ],
+        "workspace": "5fa5c628-d571-4367-a31d-aec2a5ec0e92",
+        "phases": [
+          "Pending",
+          "Running",
+          "Failed"
+        ],
+        "imageID": "srw-registry:5000/srw-native-gate-workspace@sha256:dec082b4bc75dd1517792974d050b7af307264b4d71386f60faf7e016a88aaec"
+      },
+      "srw-run-15e0f0a49bec45bfbdc55435c675b048-a1": {
+        "uid": "d659cc52-4b63-4a16-8b9b-83db80911142",
+        "image": "srw-registry:5000/srw-native-gate-ssh@sha256:1e9d9a40acbd02aeb3cb005ff43f9e51ac09ba0c241bb2298f811d3f426a2ffd",
+        "initializers": [],
+        "workspace": null,
+        "phases": [
+          "Pending",
+          "Running",
+          "Failed"
+        ],
+        "imageID": "srw-registry:5000/srw-native-gate-ssh@sha256:1e9d9a40acbd02aeb3cb005ff43f9e51ac09ba0c241bb2298f811d3f426a2ffd"
+      },
+      "srw-ws-5fa5c628d5714367a31daec2a5ec0e92-g2": {
+        "uid": "26c41e47-ffbb-41d1-952f-cc2974fa1ba5",
+        "image": "srw-registry:5000/srw-native-gate-workspace@sha256:dec082b4bc75dd1517792974d050b7af307264b4d71386f60faf7e016a88aaec",
+        "initializers": [],
+        "workspace": "5fa5c628-d571-4367-a31d-aec2a5ec0e92",
+        "phases": [
+          "Pending",
+          "Running"
+        ],
+        "imageID": "srw-registry:5000/srw-native-gate-workspace@sha256:dec082b4bc75dd1517792974d050b7af307264b4d71386f60faf7e016a88aaec"
+      },
+      "srw-run-15e0f0a49bec45bfbdc55435c675b048-a2": {
+        "uid": "a82c7df4-3c97-4ca0-8157-acd6fbd72e7a",
+        "image": "srw-registry:5000/srw-native-gate-ssh@sha256:1e9d9a40acbd02aeb3cb005ff43f9e51ac09ba0c241bb2298f811d3f426a2ffd",
+        "initializers": [],
+        "workspace": null,
+        "phases": [
+          "Pending",
+          "Succeeded"
+        ],
+        "imageID": "srw-registry:5000/srw-native-gate-ssh@sha256:1e9d9a40acbd02aeb3cb005ff43f9e51ac09ba0c241bb2298f811d3f426a2ffd"
+      },
+      "srw-ws-5fa5c628d5714367a31daec2a5ec0e92-g3": {
+        "uid": "4c6c6438-d9a1-43ca-ad39-e7969bc1faca",
+        "image": "srw-registry:5000/srw-native-gate-workspace@sha256:dec082b4bc75dd1517792974d050b7af307264b4d71386f60faf7e016a88aaec",
+        "initializers": [],
+        "workspace": "5fa5c628-d571-4367-a31d-aec2a5ec0e92",
+        "phases": [
+          "Pending",
+          "Running",
+          "Failed"
+        ],
+        "imageID": "srw-registry:5000/srw-native-gate-workspace@sha256:dec082b4bc75dd1517792974d050b7af307264b4d71386f60faf7e016a88aaec"
+      },
+      "srw-run-397c867aaae845c697ea64b0b46e94c8-a1": {
+        "uid": "26a29ab5-1bae-4846-b50f-22215fc65b20",
+        "image": "srw-registry:5000/srw-native-gate-ssh@sha256:1e9d9a40acbd02aeb3cb005ff43f9e51ac09ba0c241bb2298f811d3f426a2ffd",
+        "initializers": [],
+        "workspace": null,
+        "phases": [
+          "Pending",
+          "Succeeded"
+        ],
+        "imageID": "srw-registry:5000/srw-native-gate-ssh@sha256:1e9d9a40acbd02aeb3cb005ff43f9e51ac09ba0c241bb2298f811d3f426a2ffd"
+      }
+    },
+    "scope": "Production manifest services and full-schema PostgreSQL admission/reconciliation with real Cilium Pods, SSH workspaces and PVCs. No installed SRW identity or database was used.",
+    "postgresContainerRemoved": "477addf6297a773176006e8c2c4135f43509299d55cfbd58da897cd9f370b61f"
+  },
+  "cleanup": {
+    "clusterRemoved": "srw-native-gate-9adbfd49",
+    "registryNetworksRestored": true,
+    "defaultKubeconfigUnchanged": true,
+    "temporaryCredentialsRemoved": true
+  },
+  "gateScriptSHA256": "7277a2280e175d22caa8d24cb237c56f33354b2035b78e1e94d1dc9c5f2da828",
+  "coverageBoundary": "One disposable IPv4 Cilium node, one disposable full-schema PostgreSQL database and a non-admin approved Account. Real manifest services and Kubernetes adapters. Provider responses are test-owned HTTP fixtures, not external model inference. Source fingerprints cover the manifest services exercised; concurrent historical SRW Session cleanup changes are covered by separate tests and rollout verification. This does not enable generic hosting on any other cluster.",
+  "postRunValidationHardening": {
+    "scope": "Strict full-string checks additionally reject trailing newlines in Kubernetes label keys/values and named ports. No valid policy, egress assembly, Kubernetes builder or reconciliation behavior changed.",
+    "sourceFile": "src/orchestrator/services/manifest_harness_egress.py",
+    "liveRunSHA256": "791360f4b52912156644c290709a014770069809a9e24b6dde1dc8b2136963eb",
+    "finalSHA256": "7efe0ec6ba3d6f68fefaf966721963dfbc783a88c7f26f66b486843cabf27307",
+    "verification": "71 passed: tests/test_manifest_harness_egress.py, tests/test_manifest_hosting_helm.py, tests/test_manifest_service_gate.py, tests/test_native_manifest_gate.py. Ruff check and format check passed.",
+    "liveGateRepeatedAfterThisValidationOnlyChange": false
+  }
+}

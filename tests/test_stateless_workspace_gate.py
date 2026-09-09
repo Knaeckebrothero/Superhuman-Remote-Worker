@@ -627,6 +627,9 @@ async def test_stateless_config_patch_cannot_enable_pinned_only_session_class(
     }
     db = MagicMock()
     db.merge_thread_config_override = AsyncMock(return_value=True)
+    db.thread_configuration_transaction.return_value.__aenter__.return_value.fetchrow = AsyncMock(
+        return_value=thread
+    )
     monkeypatch.setattr(orch_main, "postgres_db", db)
 
     with pytest.raises(HTTPException, match="pinned-only") as exc:
@@ -725,6 +728,10 @@ async def test_stateless_config_cannot_mutate_workspace_tier():
         "execution_lane": "stateless",
         "metadata": _metadata(),
     }
+
+    db.thread_configuration_transaction.return_value.__aenter__.return_value.fetchrow = AsyncMock(
+        return_value=thread
+    )
 
     with (
         patch.object(orch_main, "postgres_db", db),
@@ -832,6 +839,10 @@ async def test_protected_config_cannot_mutate_runtime_class(fragment):
         },
     }
 
+    db.thread_configuration_transaction.return_value.__aenter__.return_value.fetchrow = AsyncMock(
+        return_value=thread
+    )
+
     with (
         patch.object(orch_main, "postgres_db", db),
         patch.object(orch_main, "log_security_event", audit),
@@ -868,6 +879,10 @@ async def test_malformed_protected_authority_blocks_config_before_persist(metada
         "execution_lane": "pinned",
         "metadata": metadata,
     }
+
+    db.thread_configuration_transaction.return_value.__aenter__.return_value.fetchrow = AsyncMock(
+        return_value=thread
+    )
 
     with (
         patch.object(orch_main, "postgres_db", db),

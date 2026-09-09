@@ -2612,28 +2612,21 @@ class TestAssignRouteIdentity:
         assert mine.include_in_schema == theirs.include_in_schema
         assert mine.deprecated == theirs.deprecated
 
-    def test_the_response_class_placeholder_still_renders_the_app_default(self):
-        """A router route keeps a ``DefaultPlaceholder`` response class.
+    def test_the_response_class_still_renders_the_app_default(self):
+        """FastAPI may resolve its placeholder when mounting the router.
 
-        ``@app.post`` resolves ``default_response_class`` at decoration time,
-        while a router route resolves it per request. That is the shape every
-        one of this repo's ~370 router-mounted routes already has, and the
-        rendered bytes are what actually has to be unchanged — so assert those
-        rather than the placeholder object.
-
-        Written while ``main`` still declared the route, this also asserted the
-        pre-extraction ``response_class`` was the resolved class. After
-        integration ``main.app`` serves the route through the router, so that
-        assertion could only ever have described the router route: it is gone,
-        and the byte comparison below — which is what the docstring says
-        matters — carries the case.
+        The response bytes must match the configured application response
+        class regardless of when FastAPI resolves that internal placeholder.
         """
         from fastapi import FastAPI
         from fastapi.datastructures import DefaultPlaceholder
         from fastapi.testclient import TestClient
 
         mine = self._extracted_route()
-        assert isinstance(mine.response_class, DefaultPlaceholder)
+        assert (
+            isinstance(mine.response_class, DefaultPlaceholder)
+            or mine.response_class is main.CustomJSONResponse
+        )
 
         payload = {"status": "assigned", "agent_id": "AID", "job_id": "JID"}
         app = FastAPI(default_response_class=main.CustomJSONResponse)

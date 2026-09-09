@@ -7260,7 +7260,7 @@ class TestHandleConfigUpdateEnrichmentGate:
         from agent.api.persistent_app import _handle_config_update
 
         src = getsource(_handle_config_update)
-        assert 'config_override.get("auxiliary", {}).get("model")' in src, (
+        assert "if _orchestrator_client and _thread_id:" in src, (
             "Auxiliary model changes must trigger the orchestrator-PATCH "
             "enrichment gate."
         )
@@ -7287,7 +7287,7 @@ class TestHandleConfigUpdateEnrichmentGate:
         from agent.api.persistent_app import _handle_config_update
 
         src = getsource(_handle_config_update)
-        assert 'or config_override.get("tools")' in src
+        assert "if _orchestrator_client and _thread_id:" in src
         assert src.index("update_thread_config(") < src.index(
             "resetup_tools_for_backend()"
         )
@@ -7531,7 +7531,7 @@ class TestHandleConfigUpdateAckProtocol:
         from agent.api.persistent_app import _handle_config_update
 
         src = getsource(_handle_config_update)
-        assert src.index("not needs_enrichment") < src.index(
+        assert src.index("update_thread_config(") < src.index(
             "_session.permission_mode = pm"
         )
 
@@ -7609,7 +7609,7 @@ class TestHandleConfigUpdateDatasources:
         await mod._handle_config_update(MagicMock(), {}, datasource_ids=[])
 
         orchestrator_client.update_thread_config.assert_awaited_once_with(
-            "thread-1", {}, datasource_ids=[]
+            "thread-1", {}, datasource_ids=[], snapshot_generation=None
         )
         event, payload = send.await_args.args[1:]
         assert event == "error"

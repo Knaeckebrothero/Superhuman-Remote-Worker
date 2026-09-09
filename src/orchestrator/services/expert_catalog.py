@@ -21,6 +21,7 @@ from orchestrator.schemas.expert_catalog import (
 from orchestrator.services.catalogue_resources import project_settings_subsection
 from orchestrator.services.config_overrides import deep_merge_dicts
 from shared.runtime.core.loader import (
+    ROOT_NAMES,
     canonical_config_name,
     chain_root,
     expert_phase_prompt_bodies,
@@ -33,10 +34,23 @@ from shared.runtime.core.loader import (
 )
 from shared.runtime.core.loader import INHERIT_MODEL
 from shared.runtime.core.tool_policy import enumerate_only_members
+from shared.runtime.core.srw_manifest_config import (
+    SRW_HARNESS_ADAPTER,
+    read_srw_config,
+    srw_private_config,
+    validate_srw_asset_name,
+)
 
 from orchestrator.services.expert_catalog_contracts import ExpertCatalogDependencies
 
 logger = logging.getLogger(__name__)
+
+
+def _private_layers(fragment: dict, layers: list[dict]) -> dict:
+    result = fragment
+    for layer in layers:
+        result = deep_merge_dicts(result, layer)
+    return result
 
 
 def role_base_or_empty(role: str) -> dict[str, Any]:
@@ -69,8 +83,7 @@ def expert_info_from_dir(entry: Path, *, library: bool = False) -> ExpertInfo | 
     if not entry.is_dir() or not config_path.exists():
         return None
     try:
-        with open(config_path) as f:
-            data = yaml.safe_load(f) or {}
+        data = read_srw_config(config_path)
 
         root = chain_root(str(config_path)) or canonical_config_name(
             str(data.get("$extends") or "worker_base")
@@ -243,6 +256,10 @@ def skill_row_to_meta(row: dict[str, Any]) -> dict[str, Any]:
 
 def db_expert_to_bundle_src(row: dict[str, Any]) -> dict[str, Any]:
     """Normalize a DB expert row into the bundle-source shape (JSONB str-tolerant)."""
+    if "harness_adapter" in row and row["harness_adapter"] != SRW_HARNESS_ADAPTER:
+        raise HTTPException(
+            409, "Export or copy this harness through its Expert manifest."
+        )
     cfg = row.get("config") or {}
     if isinstance(cfg, str):
         cfg = json.loads(cfg)
@@ -259,6 +276,16 @@ def db_expert_to_bundle_src(row: dict[str, Any]) -> dict[str, Any]:
         "tags": row.get("tags") or [],
         "config": cfg,
         "prompts": prm,
+        **(
+            {"harness_config_layers": row["harness_config_layers"]}
+            if row.get("harness_config_layers")
+            else {}
+        ),
+        **{
+            key: row[key]
+            for key in ("harness_config_name", "harness_asset_name")
+            if row.get(key)
+        },
     }
 
 
@@ -267,6 +294,22 @@ class ExpertCatalogService:
         self.deps = deps
         self.store = deps.store
         self.state = deps.state
+
+    async def bundled_manifest(self, expert_id: str) -> dict[str, Any] | None:
+        """Current saved revision for a bundled selector, after bootstrap."""
+        if self.deps.manifests is None:
+            return None
+        name = (
+            "subagent-" + expert_id.removeprefix("subagents/")
+            if expert_id.startswith("subagents/")
+            else expert_id
+        )
+        row = await self.deps.manifests.by_name(
+            "Expert", {"kind": "Catalog", "name": "shared"}, name
+        )
+        if row is None:
+            raise HTTPException(404, "The bundled Expert resource is unavailable.")
+        return row["document"]
 
     def scan_experts(self) -> list[ExpertInfo]:
         """Scan config/experts/ for expert configurations.
@@ -402,8 +445,52 @@ class ExpertCatalogService:
                     "storage_kind": "db",
                     "managed_key": r.get("managed_key"),
                     "owner_id": str(r["owner_id"]) if r.get("owner_id") else None,
+                    "harness_adapter": r.get("harness_adapter", SRW_HARNESS_ADAPTER),
+                    "manifest_uid": r.get("manifest_uid"),
                 }
                 for r in rows
+            ]
+        if self.deps.manifests is not None:
+            resources = await self.deps.manifests.list_scope(
+                {"kind": "Catalog", "name": "shared"}, kind="Expert"
+            )
+            by_name = {r["document"]["metadata"]["name"]: r for r in resources}
+            for item in result:
+                resource = (
+                    by_name.get(
+                        "subagent-" + item["name"].removeprefix("subagents/")
+                        if item["storage_kind"] == "library"
+                        else item["name"]
+                    )
+                    if item["storage_kind"] in {"bundled", "library"}
+                    else None
+                )
+                if resource:
+                    document = resource["document"]
+                    annotations = document["metadata"].get("annotations", {})
+                    for field in (
+                        "display_name",
+                        "description",
+                        "icon",
+                        "color",
+                        "expert_type",
+                    ):
+                        item[field] = annotations.get(
+                            "srw.io/" + field.replace("_", "-"), item[field]
+                        )
+                    item["tags"] = document["metadata"].get("tags", [])
+                    item["harness_adapter"] = document["spec"]["runtime"].get("adapter")
+                    item["manifest_uid"] = str(resource["id"])
+            bound = {
+                item["manifest_uid"]
+                for item in result
+                if item["storage_kind"] == "db" and item.get("manifest_uid")
+            }
+            result = [
+                item
+                for item in result
+                if item["storage_kind"] == "db"
+                or (item.get("manifest_uid") and item["manifest_uid"] not in bound)
             ]
         return result
 
@@ -475,11 +562,31 @@ class ExpertCatalogService:
             row = await self.store.get_expert_by_id(expert_id)
             if not row:
                 return {}
+            if (
+                "harness_adapter" in row
+                and row["harness_adapter"] != SRW_HARNESS_ADAPTER
+            ):
+                return {
+                    "id": str(row["id"]),
+                    "manifest": row["manifest"],
+                    "harness_adapter": row["harness_adapter"],
+                    "config": {},
+                    "settings_matrix": {},
+                    "effective_models": None,
+                    "instructions": None,
+                    "enumerate_only": {},
+                }
             # The role base, fully merged (expert_base + overlay) — the same base
             # `resolve_config` puts under a DB fragment at dispatch: the row's own
             # role, or the requested one for a cross-role preview.
             role_used = role or str(row["expert_type"])
             base = role_base_or_empty(role_used)
+            base_name = row.get("harness_config_name")
+            if base_name and canonical_config_name(base_name) not in ROOT_NAMES:
+                from orchestrator.services.config_overrides import validated_config_name
+
+                path, _ = resolve_config_path(validated_config_name(base_name))
+                base = load_and_merge_config(path, role=role_used)
             cfg = row.get("config") or {}
             if isinstance(cfg, str):
                 cfg = json.loads(cfg)
@@ -488,17 +595,21 @@ class ExpertCatalogService:
                 if include_account_defaults
                 else {}
             )
-            merged = prune_ignored_keys(
-                deep_merge_dicts(deep_merge_dicts(base, account_layer), cfg)
-            )
+            from shared.runtime.core.expert_resolution import build_expert_config
+
+            merged, _ = build_expert_config(deep_merge_dicts(base, account_layer), row)
+            merged = prune_ignored_keys(merged)
             for key in ("connections", "$ignore_keys"):
                 merged.pop(key, None)
             prompts = row.get("prompts") or {}
             if isinstance(prompts, str):
                 prompts = json.loads(prompts)
+            effective_leaf = _private_layers(cfg, row.get("harness_config_layers", []))
             effective = (
                 await self.compute_expert_effective_models(
-                    cfg.get("llm") or {}, user_id, cfg.get("subagents")
+                    effective_leaf.get("llm") or {},
+                    user_id,
+                    effective_leaf.get("subagents"),
                 )
                 if user_id
                 else None
@@ -516,6 +627,32 @@ class ExpertCatalogService:
             # with no resolved read can only send `true`, which 400s naming a rule
             # the user has no way to satisfy from the form.
             raw_matrix = self.deps.load_settings_matrix(self.deps.get_config_dir())
+            asset_prompts = {}
+            if row.get("harness_asset_name"):
+                _, asset_dir = resolve_config_path(
+                    validate_srw_asset_name(row["harness_asset_name"])
+                )
+                if not asset_dir:
+                    raise HTTPException(
+                        422, "The SRW Expert asset directory is unavailable."
+                    )
+                asset_dir = Path(asset_dir)
+                asset_matrix = asset_dir / "model_config_matrix.yaml"
+                if asset_matrix.exists():
+                    raw_matrix = deep_merge_dicts(
+                        raw_matrix,
+                        project_settings_subsection(
+                            yaml.safe_load(asset_matrix.read_text()) or {}
+                        ),
+                    )
+                for key, filename in (
+                    ("instructions", "instructions.md"),
+                    ("persona", "persona.txt"),
+                ):
+                    path = asset_dir / filename
+                    if path.is_file():
+                        asset_prompts[key] = path.read_text(encoding="utf-8")
+            asset_prompts.update(prompts)
             return {
                 "id": str(row["id"]),
                 "display_name": row["display_name"],
@@ -531,15 +668,18 @@ class ExpertCatalogService:
                 ),
                 "storage_kind": "db",
                 "managed_key": row.get("managed_key"),
+                "manifest": row.get("manifest"),
+                "harness_adapter": row.get("harness_adapter", SRW_HARNESS_ADAPTER),
                 "config": merged,
-                "instructions": prompts.get("instructions"),
-                "persona": prompts.get("persona"),
+                "instructions": asset_prompts.get("instructions"),
+                "persona": asset_prompts.get("persona"),
                 "enumerate_only": enumerate_only_members(),
                 "settings_matrix": raw_matrix,
                 "effective_models": effective,
                 "resolved_role": role_used,
             }
         config_dir = self.deps.get_config_dir()
+        private = {}
 
         # Load expert config
         if expert_id in {
@@ -587,8 +727,29 @@ class ExpertCatalogService:
             config_path = expert_dir / "config.yaml"
             if not expert_dir.is_dir() or not config_path.exists():
                 return {}
-            with open(config_path) as f:
-                expert_data = yaml.safe_load(f) or {}
+            saved_manifest = await self.bundled_manifest(
+                f"subagents/{expert_id}" if library_entry else expert_id
+            )
+            if (
+                saved_manifest
+                and saved_manifest["spec"]["runtime"].get("adapter")
+                != SRW_HARNESS_ADAPTER
+            ):
+                return {
+                    "manifest": saved_manifest,
+                    "harness_adapter": None,
+                    "config": {},
+                    "settings_matrix": {},
+                    "effective_models": None,
+                    "instructions": None,
+                    "enumerate_only": {},
+                }
+            private = srw_private_config(saved_manifest) if saved_manifest else {}
+            expert_data = (
+                private.get("config", {})
+                if saved_manifest
+                else read_srw_config(config_path)
+            )
 
             # Resolve $extends to the expert's parent chain — a role overlay on
             # expert_base for every bundled expert (another expert's chain is
@@ -601,7 +762,10 @@ class ExpertCatalogService:
             own_role = "session" if root == "session_base" else "worker"
             reroot_role = role or ("subagent" if library_entry else None)
             role_used = reroot_role or own_role
-            extends_name = str(expert_data.pop("$extends", "worker_base"))
+            extends_name = str(
+                private.get("config_name") or expert_data.pop("$extends", "worker_base")
+            )
+            expert_data.pop("$extends", None)
             parent_name, parent_role = reroot_extends(extends_name, reroot_role)
             parent_path, _ = resolve_config_path(parent_name)
             if Path(parent_path).is_file():
@@ -617,12 +781,29 @@ class ExpertCatalogService:
                 if include_account_defaults
                 else {},
             )
-            merged = prune_ignored_keys(deep_merge_dicts(base_layer, expert_data))
+            from shared.runtime.core.expert_resolution import build_expert_config
+
+            merged, _ = build_expert_config(
+                base_layer,
+                {
+                    "config": expert_data,
+                    "harness_config_layers": private.get("layers", []),
+                },
+            )
+            merged = prune_ignored_keys(merged)
             expert_config_dir = expert_dir
+            if private.get("asset_name"):
+                _, selected_asset_dir = resolve_config_path(private["asset_name"])
+                if not selected_asset_dir:
+                    raise HTTPException(
+                        422, "The SRW Expert asset directory is unavailable."
+                    )
+                expert_config_dir = Path(selected_asset_dir)
             # The expert's OWN llm fragment (leaf, pre-merge) — a model-agnostic
             # bundled expert has `llm: {}` here and resolves to the default floor.
-            expert_llm_leaf = expert_data.get("llm") or {}
-            expert_subagents = expert_data.get("subagents")
+            effective_leaf = _private_layers(expert_data, private.get("layers", []))
+            expert_llm_leaf = effective_leaf.get("llm") or {}
+            expert_subagents = effective_leaf.get("subagents")
 
         # Load the raw settings_matrix for the client to resolve per-model defaults.
         # Do NOT apply it to merged — the client resolves based on the user's model selection.
@@ -660,6 +841,8 @@ class ExpertCatalogService:
             template_path = config_dir / "prompts" / template_name
             if template_path.exists():
                 instructions_content = template_path.read_text(encoding="utf-8")
+        if "instructions" in private.get("prompts", {}):
+            instructions_content = private["prompts"]["instructions"]
 
         # Remove internal/sensitive keys from merged config
         for key in ("$extends", "$ignore_keys", "connections"):
@@ -679,6 +862,11 @@ class ExpertCatalogService:
             "settings_matrix": raw_matrix,
             "effective_models": effective,
             "resolved_role": role_used,
+            **(
+                {"persona": private["prompts"]["persona"]}
+                if "persona" in private.get("prompts", {})
+                else {}
+            ),
         }
 
     async def get_expert(
@@ -1088,7 +1276,7 @@ class ExpertCatalogService:
         config_path = expert_dir / "config.yaml"
         if not config_path.exists():
             return None
-        raw = yaml.safe_load(config_path.read_text()) or {}
+        raw = read_srw_config(config_path)
         extends = canonical_config_name(str(raw.pop("$extends", "worker_base")))
         raw.pop("connections", None)
         # Part 2: capture all prompt segments a fork should round-trip.
@@ -1116,6 +1304,29 @@ class ExpertCatalogService:
             "config": raw,
             "prompts": prompts,
         }
+
+    async def bundled_expert_source(self, expert_id: str) -> dict[str, Any] | None:
+        """Use the saved private fragment for copies; files supply prompt assets."""
+        bundle = self.bundled_expert_bundle(expert_id)
+        document = await self.bundled_manifest(expert_id)
+        if not bundle or document is None:
+            return bundle
+        if document["spec"]["runtime"].get("adapter") != SRW_HARNESS_ADAPTER:
+            raise HTTPException(
+                409, "Export or copy this harness through its Expert manifest."
+            )
+        private = srw_private_config(document)
+        config = private.get("config", {})
+        config.pop("$extends", None)
+        config.pop("connections", None)
+        bundle["config"] = config
+        bundle["prompts"].update(private.get("prompts", {}))
+        if private.get("layers"):
+            bundle["harness_config_layers"] = private["layers"]
+        for key in ("config_name", "asset_name"):
+            if private.get(key):
+                bundle["harness_" + key] = private[key]
+        return bundle
 
     async def list_skills(self, *, user: dict[str, Any]) -> list[dict[str, Any]]:
         """List skills: bundled (disk) + DB rows visible to the caller (owned + global),

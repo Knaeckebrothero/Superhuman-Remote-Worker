@@ -17,6 +17,18 @@ RUNTIME = "33333333-3333-4333-8333-333333333333"
 FINGERPRINT = "SHA256:" + ("A" * 43)
 
 
+@pytest.fixture(autouse=True)
+def history_cleanup():
+    # These route-only database fixtures contain no previous runtime ledger.
+    # The actual history/namespace proof is covered with migrated PostgreSQL in
+    # test_stateless_workspace_history_cleanup.py.
+    with patch(
+        "orchestrator.services.stateless_workspace_history_cleanup.reclaim_stateless_workspace_history",
+        new=AsyncMock(return_value=True),
+    ) as cleanup:
+        yield cleanup
+
+
 def _settled_thread() -> dict:
     return {
         "id": THREAD_ID,
@@ -867,7 +879,11 @@ async def test_exact_terminal_uid_acknowledges_then_deletes_through_finalizer_pa
 
 
 @pytest.mark.asyncio
-async def test_soft_end_to_permanent_reclaims_snapshot_before_row_delete() -> None:
+@pytest.mark.parametrize("historical_clean", (True, False))
+async def test_soft_end_to_permanent_reclaims_snapshot_before_row_delete(
+    history_cleanup, historical_clean
+) -> None:
+    history_cleanup.return_value = historical_clean
     thread = _settled_thread()
     db = _db_for_settled(thread, permanent=True)
     provisioner = _settled_cleanup_provisioner(
@@ -890,9 +906,22 @@ async def test_soft_end_to_permanent_reclaims_snapshot_before_row_delete() -> No
         patch.object(main, "gitea_client", SimpleNamespace(is_initialized=False)),
         patch.object(main, "_conclude_conference_if_any", AsyncMock()),
     ):
-        result = await main.end_thread(
-            THREAD_ID, SimpleNamespace(), permanent=True, force=True
-        )
+        if historical_clean:
+            result = await main.end_thread(
+                THREAD_ID, SimpleNamespace(), permanent=True, force=True
+            )
+        else:
+            with pytest.raises(HTTPException) as caught:
+                await main.end_thread(
+                    THREAD_ID, SimpleNamespace(), permanent=True, force=True
+                )
+            assert caught.value.status_code == 503
+            assert (
+                caught.value.detail
+                == "Historical workspace permanent cleanup is incomplete"
+            )
+            db.delete_thread.assert_not_awaited()
+            return
 
     assert result == {"status": "deleted"}
     # Permanent reclaim now runs through the durable 0198 cleanup intent, not a

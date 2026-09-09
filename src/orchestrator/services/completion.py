@@ -23,8 +23,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-import yaml
-
 from shared.job_freeze_types import (
     CONTINUE_AS_NEW_FREEZE_TYPES,
     ERROR_IMMUNE_FREEZE_TYPES,
@@ -191,8 +189,9 @@ def _resolve_config_section_from_disk(
     for path in expert_paths:
         if path.exists():
             try:
-                with open(path, encoding="utf-8") as f:
-                    expert = yaml.safe_load(f) or {}
+                from shared.runtime.core.srw_manifest_config import read_srw_config
+
+                expert = read_srw_config(path)
                 if isinstance(expert.get(section), dict):
                     result.update(expert[section])
             except Exception as e:

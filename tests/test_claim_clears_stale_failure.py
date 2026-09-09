@@ -59,6 +59,9 @@ async def db(pg_dsn):
     async with d.acquire() as conn:
         await conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS srw_execution_specs (
+                work_kind text, work_id uuid, harness_adapter text
+            );
             CREATE TABLE IF NOT EXISTS jobs (
                 id uuid PRIMARY KEY,
                 description text,

@@ -131,7 +131,7 @@ class _InventoryConnection:
             return (
                 None if workspace is None else {"workspace": copy.deepcopy(workspace)}
             )
-        if sql.startswith("SELECT status, completion_outcome_kind FROM jobs"):
+        if sql.startswith("SELECT status, completion_outcome_kind,"):
             # Job deletion reads the pre-delete status for the Officer claim
             # audit. This seam models workspace ownership only, so every
             # represented job reports the same terminal status.

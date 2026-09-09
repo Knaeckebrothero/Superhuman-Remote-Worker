@@ -183,6 +183,18 @@ def collect_roster_db_refs(layer: Any) -> Set[str]:
     return out
 
 
+def collect_roster_named_refs(layer: Any) -> Set[str]:
+    """Installed name selectors to bind to Catalog revisions on the server."""
+    return {
+        entry["$ref"].strip()
+        for entry in _raw_roster(layer).values()
+        if isinstance(entry, dict)
+        and isinstance(entry.get("$ref"), str)
+        and _DISK_REF_RE.fullmatch(entry["$ref"].strip())
+        and not is_db_ref(entry["$ref"])
+    }
+
+
 def validate_roster_fragment(subagents: Any) -> Set[str]:
     """Authoring-time check of a raw ``subagents`` block (expert save).
 
@@ -289,8 +301,10 @@ def _guard_extends_chain(name: str, ref: str, path: str) -> None:
             )
         seen.add(key)
         try:
-            raw = yaml.safe_load(Path(current).read_text(encoding="utf-8")) or {}
-        except (OSError, yaml.YAMLError) as exc:
+            from shared.runtime.core.srw_manifest_config import read_srw_config
+
+            raw = read_srw_config(current)
+        except (OSError, ValueError, yaml.YAMLError) as exc:
             raise RosterResolutionError(
                 f"subagents.roster.{name}: $ref {ref!r} — cannot read {current}: {exc}"
             ) from exc
@@ -330,6 +344,18 @@ def _load_disk_target(
 def _load_db_target(
     ctx: _Context, name: str, ref: str, row: Dict[str, Any]
 ) -> Tuple[Dict[str, Any], Set[str], Dict[str, Any], Optional[str]]:
+    if "harness_adapter" in row and row["harness_adapter"] != "srw/v1":
+        raise RosterResolutionError(
+            f"subagents.roster.{name}: a generic harness cannot run inside an SRW process"
+        )
+    config_name = row.get("harness_config_name")
+    if config_name and canonical_config_name(config_name) not in ROOT_NAMES:
+        raise RosterResolutionError(
+            f"subagents.roster.{name}: unsupported SRW config_name {config_name!r}; "
+            "stored roster targets must use expert_base, worker_base, session_base "
+            "or subagent_base so their authored settings can be re-rooted onto "
+            "subagent_base"
+        )
     from shared.runtime.core.expert_resolution import (
         build_expert_config,
         expert_layer_source,
@@ -346,6 +372,11 @@ def _load_db_target(
     fragment = normalize_llm_tiers(fragment, source=expert_layer_source(row))
     merged, prompts = build_expert_config(ctx.base, row)
     target_llm_keys = set((fragment.get("llm") or {}).keys())
+    for index, private_layer in enumerate(row.get("harness_config_layers", [])):
+        normalized = normalize_llm_tiers(
+            private_layer, source=f"{expert_layer_source(row)}:layer:{index}"
+        )
+        target_llm_keys |= set((normalized.get("llm") or {}).keys())
     for column in ("display_name", "description"):
         if not fragment.get(column) and row.get(column):
             merged[column] = row[column]
@@ -359,18 +390,28 @@ def _load_db_target(
         merged["_persona_source"] = "db"
         merged["_db_prompt_keys"] = [k for k, v in prompts.items() if v]
     meta = {"_ref": ref, "_ref_kind": "db", "_ref_name": row.get("name")}
-    return merged, target_llm_keys, meta, None
+    deployment_dir = None
+    selector = row.get("harness_asset_name")
+    if selector:
+        # A Catalog source may acquire a UUID when used as a Project default.
+        # Its settings remain frozen in the row; only its trusted harness asset
+        # directory supplies the bundled prompt files and model-family matrix.
+        _path, _kind, deployment_dir = _locate_disk_ref(name, selector)
+        meta["_deployment_dir"] = _portable_dir(deployment_dir)
+    return merged, target_llm_keys, meta, deployment_dir
 
 
 def _load_target(
     ctx: _Context, name: str, ref: str
 ) -> Tuple[Dict[str, Any], Set[str], Dict[str, Any], Optional[str]]:
-    if _UUID_RE.match(ref):
+    if _UUID_RE.match(ref) or any(
+        str(key).lower() == ref.lower() for key in ctx.db_refs
+    ):
         row = _lookup_row(ctx.db_refs, ref)
-        if row is None:
+        if not row:
             raise _DroppedEntry(
-                f"subagents.roster.{name}: $ref {ref!r} is a DB expert id with no "
-                "prefetched row (only the orchestrator resolves DB experts) — "
+                f"subagents.roster.{name}: $ref {ref!r} has no prefetched row "
+                "(only the orchestrator resolves stored Expert definitions) — "
                 "entry dropped"
             )
         return _load_db_target(ctx, name, ref, row)

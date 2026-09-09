@@ -1,85 +1,116 @@
-# yaml-language-server: $schema=../../schema.json
-# Critic - Proactive code review, quality gating, idea rejection
-$extends: worker_base
+apiVersion: srw/v1alpha1
+kind: Expert
+metadata:
+  name: critic
+  scope:
+    kind: Catalog
+    name: shared
+  annotations:
+    srw.io/display-name: Critic
+    srw.io/description: 'Quality gatekeeper. Reviews code diffs, evaluates Scholar
+      proposals,
 
-agent_id: critic
-display_name: Critic
-description: |
-  Quality gatekeeper. Reviews code diffs, evaluates Scholar proposals,
-  audits the codebase for tech debt, and runs tests. Nothing passes
-  without meeting the standard. Harsh, direct, evidence-based.
-icon: gavel
-color: "#f38ba8"
-tags:
+      audits the codebase for tech debt, and runs tests. Nothing passes
+
+      without meeting the standard. Harsh, direct, evidence-based.'
+    srw.io/icon: gavel
+    srw.io/color: '#f38ba8'
+    srw.io/expert-type: worker
+    srw.io/bundled-selector: critic
+  tags:
   - review
   - quality
   - gating
+  - worker
+spec:
+  runtime:
+    image: srw-agent:latest
+    adapter: srw/v1
+    config:
+      config_name: worker_base
+      asset_name: critic
+      config:
+        # Critic - Proactive code review, quality gating, idea rejection
+        $extends: worker_base
 
-# Built-in subagents (delegate_agent): evidence gatherers fanned out per
-# verification stream — subagents gather evidence, the critic renders the
-# verdict. `enabled` gates the tool binding; the children and their model live
-# in `subagents.roster` (model defaults to the parent's).
-delegation:
-  enabled: true
-  max_concurrent: 4
+        agent_id: critic
+        display_name: Critic
+        description: |
+          Quality gatekeeper. Reviews code diffs, evaluates Scholar proposals,
+          audits the codebase for tech debt, and runs tests. Nothing passes
+          without meeting the standard. Harsh, direct, evidence-based.
+        icon: gavel
+        color: "#f38ba8"
+        tags:
+          - review
+          - quality
+          - gating
 
-subagents:
-  default: verifier
-  roster:
-    explorer: {$ref: subagents/explorer}
-    verifier: {$ref: subagents/verifier}
+        # Built-in subagents (delegate_agent): evidence gatherers fanned out per
+        # verification stream — subagents gather evidence, the critic renders the
+        # verdict. `enabled` gates the tool binding; the children and their model live
+        # in `subagents.roster` (model defaults to the parent's).
+        delegation:
+          enabled: true
+          max_concurrent: 4
 
-workspace:
-  # Pinned: this expert's role needs a shell, and a session's account layer
-  # overrides expert_base's `sandbox` with the owner's default (platform
-  # default `virtual`, which strips shell/browser/git). Declaring it HERE
-  # sits above that layer; the New Session form shows it and the user may
-  # still change it. Jobs ignore this key (the workspace contract stamps
-  # the job tier from config_override). See tests/test_expert_defaults.py
-  # ::TestShellBoundBundledExpertsPinTheirTier.
-  backend: sandbox
-  structure:
-    - archive/
-    - documents/
-    - output/reviews/
-    - output/audits/
-    - notes/
-  git_versioning: true
+        subagents:
+          default: verifier
+          roster:
+            explorer: {$ref: subagents/explorer}
+            verifier: {$ref: subagents/verifier}
 
-tools:
-  workspace:
-    - read_file
-    - write_file
-    - list_files
-    - search_files
-    - file_exists
-    - get_document_info
-  core:
-    - next_phase_todos
-    - todo_complete
-    - todo_list
-    - request_replan
-    - mark_complete
-    - job_complete
-  shell:
-    - run_command
-    - cancel_command
-  # evaluation: injected via config_override for verification subjobs only
-  # git: intentionally absent. This agent has shell tools, and
-  # ToolsConfig.__post_init__ (src/shared/runtime/core/loader.py) suppresses the git_* group
-  # whenever shell is present — a shell can run git against ANY repository in
-  # the workspace, including repos/<name>/, which git_* cannot. Declaring them
-  # here would advertise tools the pod never binds.
-  delegation:
-    - delegate_agent
-    - wait_agent
-    - message_agent
-    - stop_agent
-    - list_agents
-  # SQL injected when system datasource attached (for querying job data)
-  sql: []
-  # Not needed
-  research: []
-  citation: []
-  graph: []
-  mongodb: []
+        workspace:
+          # Pinned: this expert's role needs a shell, and a session's account layer
+          # overrides expert_base's `sandbox` with the owner's default (platform
+          # default `virtual`, which strips shell/browser/git). Declaring it HERE
+          # sits above that layer; the New Session form shows it and the user may
+          # still change it. Jobs ignore this key (the workspace contract stamps
+          # the job tier from config_override). See tests/test_expert_defaults.py
+          # ::TestShellBoundBundledExpertsPinTheirTier.
+          backend: sandbox
+          structure:
+            - archive/
+            - documents/
+            - output/reviews/
+            - output/audits/
+            - notes/
+          git_versioning: true
+
+        tools:
+          workspace:
+            - read_file
+            - write_file
+            - list_files
+            - search_files
+            - file_exists
+            - get_document_info
+          core:
+            - next_phase_todos
+            - todo_complete
+            - todo_list
+            - request_replan
+            - mark_complete
+            - job_complete
+          shell:
+            - run_command
+            - cancel_command
+          # evaluation: injected via config_override for verification subjobs only
+          # git: intentionally absent. This agent has shell tools, and
+          # ToolsConfig.__post_init__ (src/shared/runtime/core/loader.py) suppresses the git_* group
+          # whenever shell is present — a shell can run git against ANY repository in
+          # the workspace, including repos/<name>/, which git_* cannot. Declaring them
+          # here would advertise tools the pod never binds.
+          delegation:
+            - delegate_agent
+            - wait_agent
+            - message_agent
+            - stop_agent
+            - list_agents
+          # SQL injected when system datasource attached (for querying job data)
+          sql: []
+          # Not needed
+          research: []
+          citation: []
+          graph: []
+          mongodb: []

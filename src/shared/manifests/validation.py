@@ -125,7 +125,11 @@ def _project_aliases(doc, number):
         for name, slot in team.get("slots", {}).items()
     )
     for path, binding in bindings:
-        for field, kind in (("expert", "experts"), ("workspace", "workspaces")):
+        for field, kind in (
+            ("expert", "experts"),
+            ("sessionExpert", "experts"),
+            ("workspace", "workspaces"),
+        ):
             alias = binding.get(field)
             if alias is not None and alias not in resources.get(kind, {}):
                 fail(

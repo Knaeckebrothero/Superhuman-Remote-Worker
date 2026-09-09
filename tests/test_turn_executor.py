@@ -2961,10 +2961,6 @@ class TestWriterLeaseFence:
 
 
 class TestCommitThenEffects:
-    @pytest.fixture
-    def harness(self, monkeypatch):
-        return Harness(monkeypatch)
-
     def test_answered_by_transcript_accepts_a_turn_completed_frame(self):
         # Carry-over from step 3: a final assistant message that carried a
         # tool call has no zero-tool-call row; the turn.completed frame for

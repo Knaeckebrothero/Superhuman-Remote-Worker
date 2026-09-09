@@ -1,129 +1,166 @@
-# yaml-language-server: $schema=../../schema.json
-# Product QA Tester - product-level usability, integration, and stability audit
-$extends: worker_base
+apiVersion: srw/v1alpha1
+kind: Expert
+metadata:
+  name: product-qa
+  scope:
+    kind: Catalog
+    name: shared
+  annotations:
+    srw.io/display-name: Product QA Tester
+    srw.io/description: 'Product-level QA auditor. Audits an application as a usable
+      product, not just
 
-agent_id: product-qa
-display_name: Product QA Tester
-description: |
-  Product-level QA auditor. Audits an application as a usable product, not just
-  as code. Finds bugs, broken setup, missing glue, absent UI/API/CLI surfaces,
-  integration gaps, demo blockers, documentation gaps, workflow holes, and
-  regression risks. Produces evidence-backed issue candidates with reproductions
-  and acceptance criteria for whoever triages and fixes them. Does not fix.
-icon: fact_check
-color: "#a6e3a1"
-tags:
+      as code. Finds bugs, broken setup, missing glue, absent UI/API/CLI surfaces,
+
+      integration gaps, demo blockers, documentation gaps, workflow holes, and
+
+      regression risks. Produces evidence-backed issue candidates with reproductions
+
+      and acceptance criteria for whoever triages and fixes them. Does not fix.'
+    srw.io/icon: fact_check
+    srw.io/color: '#a6e3a1'
+    srw.io/expert-type: worker
+    srw.io/bundled-selector: product-qa
+  tags:
   - qa
   - product
   - usability
   - integration
   - testing
+  - worker
+spec:
+  runtime:
+    image: srw-agent:latest
+    adapter: srw/v1
+    config:
+      config_name: worker_base
+      asset_name: product-qa
+      config:
+        # Product QA Tester - product-level usability, integration, and stability audit
+        $extends: worker_base
 
-llm:
-  reasoning_level: high
+        agent_id: product-qa
+        display_name: Product QA Tester
+        description: |
+          Product-level QA auditor. Audits an application as a usable product, not just
+          as code. Finds bugs, broken setup, missing glue, absent UI/API/CLI surfaces,
+          integration gaps, demo blockers, documentation gaps, workflow holes, and
+          regression risks. Produces evidence-backed issue candidates with reproductions
+          and acceptance criteria for whoever triages and fixes them. Does not fix.
+        icon: fact_check
+        color: "#a6e3a1"
+        tags:
+          - qa
+          - product
+          - usability
+          - integration
+          - testing
 
-# Built-in subagents (delegate_agent): independent product vectors fan out to
-# raw-evidence probes; the parent classifies and files. `enabled` gates the
-# tool binding; the roster defines the children and their budgets.
-delegation:
-  enabled: true
-  max_concurrent: 4
+        llm:
+          reasoning_level: high
 
-subagents:
-  default: probe
-  roster:
-    explorer: {$ref: subagents/explorer}
-    probe: {$ref: subagents/probe}
+        # Built-in subagents (delegate_agent): independent product vectors fan out to
+        # raw-evidence probes; the parent classifies and files. `enabled` gates the
+        # tool binding; the roster defines the children and their budgets.
+        delegation:
+          enabled: true
+          max_concurrent: 4
 
-workspace:
-  # Pinned: this expert's role needs a shell, and a session's account layer
-  # overrides expert_base's `sandbox` with the owner's default (platform
-  # default `virtual`, which strips shell/browser/git). Declaring it HERE
-  # sits above that layer; the New Session form shows it and the user may
-  # still change it. Jobs ignore this key (the workspace contract stamps
-  # the job tier from config_override). See tests/test_expert_defaults.py
-  # ::TestShellBoundBundledExpertsPinTheirTier.
-  backend: sandbox
-  structure:
-    - archive/
-    - documents/
-    - output/findings/
-    - output/repros/
-    - output/audits/
-    - notes/
-  git_versioning: true
+        subagents:
+          default: probe
+          roster:
+            explorer: {$ref: subagents/explorer}
+            probe: {$ref: subagents/probe}
 
-instruction_files:
-  # Phase skills restated: this list replaces the worker overlay's wholesale.
-  - skill: strategic-phase
-    trigger: phase_start:strategic
-    enforce: false
-  - skill: tactical-phase
-    trigger: phase_start:tactical
-    enforce: false
-  - skill: todo-guide
-    trigger: before_tool:next_phase_todos
-    enforce: true
-  - skill: verify-before-done
-    trigger: before_tool:todo_complete
-    enforce: true
-    phases: [tactical]
-    read_scope: phase
-    max_read_age_turns: 20
-  - skill: verify-before-done
-    trigger: before_tool:job_complete
-    enforce: true
-    phases: [strategic]
-    read_scope: phase
-    max_read_age_turns: 20
+        workspace:
+          # Pinned: this expert's role needs a shell, and a session's account layer
+          # overrides expert_base's `sandbox` with the owner's default (platform
+          # default `virtual`, which strips shell/browser/git). Declaring it HERE
+          # sits above that layer; the New Session form shows it and the user may
+          # still change it. Jobs ignore this key (the workspace contract stamps
+          # the job tier from config_override). See tests/test_expert_defaults.py
+          # ::TestShellBoundBundledExpertsPinTheirTier.
+          backend: sandbox
+          structure:
+            - archive/
+            - documents/
+            - output/findings/
+            - output/repros/
+            - output/audits/
+            - notes/
+          git_versioning: true
 
-tools:
-  workspace:
-    - read_file
-    - write_file
-    - edit_file
-    - list_files
-    - search_files
-    - file_exists
-    - get_document_info
-    - create_directory
-  core:
-    - next_phase_todos
-    - todo_complete
-    - todo_list
-    - request_replan
-    - mark_complete
-    - job_complete
-  shell:
-    - run_command
-    - cancel_command
-    - shell_read
-  # git: intentionally absent. This agent has shell tools, and
-  # ToolsConfig.__post_init__ (src/shared/runtime/core/loader.py) suppresses the git_* group
-  # whenever shell is present — a shell can run git against ANY repository in
-  # the workspace, including repos/<name>/, which git_* cannot. Declaring them
-  # here would advertise tools the pod never binds.
-  browser_direct:
-    - browser_navigate
-    - browser_snapshot
-    - browser_click
-    - browser_type
-    - browser_select
-    - browser_scroll
-    - browser_screenshot
-    - browser_back
-    - browser_close
-  research:
-    - web_search
-    - extract_webpage
-  # Spawn + background controls (each bound only with delegation.enabled).
-  delegation:
-    - delegate_agent
-    - wait_agent
-    - message_agent
-    - stop_agent
-    - list_agents
-  citation: []
-  graph: []
-  sql: []
-  mongodb: []
+        instruction_files:
+          # Phase skills restated: this list replaces the worker overlay's wholesale.
+          - skill: strategic-phase
+            trigger: phase_start:strategic
+            enforce: false
+          - skill: tactical-phase
+            trigger: phase_start:tactical
+            enforce: false
+          - skill: todo-guide
+            trigger: before_tool:next_phase_todos
+            enforce: true
+          - skill: verify-before-done
+            trigger: before_tool:todo_complete
+            enforce: true
+            phases: [tactical]
+            read_scope: phase
+            max_read_age_turns: 20
+          - skill: verify-before-done
+            trigger: before_tool:job_complete
+            enforce: true
+            phases: [strategic]
+            read_scope: phase
+            max_read_age_turns: 20
+
+        tools:
+          workspace:
+            - read_file
+            - write_file
+            - edit_file
+            - list_files
+            - search_files
+            - file_exists
+            - get_document_info
+            - create_directory
+          core:
+            - next_phase_todos
+            - todo_complete
+            - todo_list
+            - request_replan
+            - mark_complete
+            - job_complete
+          shell:
+            - run_command
+            - cancel_command
+            - shell_read
+          # git: intentionally absent. This agent has shell tools, and
+          # ToolsConfig.__post_init__ (src/shared/runtime/core/loader.py) suppresses the git_* group
+          # whenever shell is present — a shell can run git against ANY repository in
+          # the workspace, including repos/<name>/, which git_* cannot. Declaring them
+          # here would advertise tools the pod never binds.
+          browser_direct:
+            - browser_navigate
+            - browser_snapshot
+            - browser_click
+            - browser_type
+            - browser_select
+            - browser_scroll
+            - browser_screenshot
+            - browser_back
+            - browser_close
+          research:
+            - web_search
+            - extract_webpage
+          # Spawn + background controls (each bound only with delegation.enabled).
+          delegation:
+            - delegate_agent
+            - wait_agent
+            - message_agent
+            - stop_agent
+            - list_agents
+          citation: []
+          graph: []
+          sql: []
+          mongodb: []

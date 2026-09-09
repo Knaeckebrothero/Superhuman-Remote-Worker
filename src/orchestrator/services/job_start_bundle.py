@@ -48,6 +48,11 @@ from orchestrator.services.job_workspace_runtime import (
 from orchestrator.services.managed_repository_authority import (
     ManagedRepositoryAuthorityError,
 )
+from orchestrator.services.manifest_execution_snapshot import (
+    apply_srw_delivery_bindings,
+    read_execution,
+    srw_snapshot_config,
+)
 from shared.backend_kinds import LITE_BACKENDS
 from shared.pinned_session_identity import PinnedJobRecipient
 from shared.runtime.core.loader import canonical_config_name
@@ -66,6 +71,8 @@ FRESH_PINNED_RECIPIENT_ATTESTATION_DELAY_S = 0.25
 
 
 class JobStartBundleStore(Protocol):
+    async def fetchrow(self, query: str, *args: Any) -> Any: ...
+
     async def get_project_repositories(
         self, project_id: str
     ) -> list[dict[str, Any]]: ...
@@ -293,6 +300,13 @@ async def build_job_start_request(
         config_override = job.get("config_override")
         if isinstance(config_override, str):
             config_override = json.loads(config_override)
+        execution_snapshot = await read_execution(postgres_db, "Job", job_id)
+        frozen_blob = frozen_policy = None
+        if execution_snapshot is not None:
+            frozen_blob, frozen_policy = srw_snapshot_config(execution_snapshot)
+            # New work reads the admitted specification. The old columns are
+            # a historical compatibility projection, never a second source.
+            config_override = dict(frozen_policy)
 
         # Build remaining context (fields not extracted as dedicated params)
         extracted_keys = {
@@ -525,14 +539,49 @@ async def build_job_start_request(
                 )
             return None
 
-        # Orchestrator-resolved config (supersedes agent-side Decision 6): when
-        # experts are enabled, resolve the full config here with the same loader
-        # the agent uses, freeze the secret-free copy into jobs.resolved_config,
-        # and deliver a credential-injected blob. The agent hydrates it and skips
-        # local resolution. On ANY failure we fall back to config_name +
-        # config_override below — the blob's absence is always safe.
+        # Current work delivers its frozen snapshot with current authorization
+        # and transient credentials. Only historical jobs without a snapshot
+        # enter the former loader/compatibility branch below.
         resolved_config: dict[str, Any] | None = None
-        if dependencies.is_experts_db_enabled():
+        if execution_snapshot is not None:
+            try:
+                _resolved, _policy = apply_srw_delivery_bindings(
+                    frozen_blob, frozen_policy, config_override
+                )
+                if await dependencies.user_experts_enabled():
+                    await dependencies.enforce_dispatch_grants(
+                        _policy,
+                        runner_user_id=str(job["user_id"])
+                        if job.get("user_id")
+                        else None,
+                        project_ids=[str(job["project_id"])]
+                        if job.get("project_id")
+                        else [],
+                        runner_kind=str(job.get("runner_kind") or "user"),
+                    )
+                resolved_config = await dependencies.inject_blob_credentials(
+                    _resolved,
+                    lambda co: dependencies.inject_dispatch_credentials(
+                        job,
+                        co,
+                        include_kb_profile=has_knowledge_scope,
+                    ),
+                )
+                if persist_dispatch_state:
+                    await postgres_db.store_resolved_config(
+                        job_id, redact_config_override(_resolved)
+                    )
+            except dependencies.grant_denied_error as gd:
+                if persist_dispatch_state:
+                    await postgres_db.update_job_status(
+                        job_id,
+                        status="failed",
+                        error_message=dependencies.grant_violations_detail(
+                            gd.violations
+                        ),
+                    )
+                return None
+        elif dependencies.is_experts_db_enabled():
             try:
                 expert_row = None
                 if job.get("expert_id"):

@@ -15,6 +15,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import os
 import re
 import time
 import uuid
@@ -27,7 +28,9 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-CHAT_MODEL_ID = "e2e-chat"
+CHAT_MODEL_ID = os.environ.get("E2E_CHAT_MODEL_ID", "e2e-chat")
+if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,126}", CHAT_MODEL_ID):
+    raise RuntimeError("E2E_CHAT_MODEL_ID must be a lowercase test model identifier")
 EMBEDDING_MODEL_ID = "e2e-embedding"
 RERANK_MODEL_ID = "qwen3-reranker-8b"
 EMBEDDING_DIMENSIONS = 4096

@@ -634,8 +634,38 @@ class TestRosterReport:
 
     @pytest.mark.asyncio
     async def test_reports_the_materialised_roster(self, user_a, fake_db, fake_request):
+        from pathlib import Path
+        from uuid import UUID
+
+        import yaml
+
+        from shared.manifests.resolution import content_revision
         from tests.conftest import _UID_A
 
+        document = yaml.safe_load(
+            (
+                Path(__file__).resolve().parents[1]
+                / "config/subagents/explorer/config.yaml"
+            ).read_text()
+        )
+        description = "Read-only investigator from the saved Catalog revision."
+        document["spec"]["runtime"]["config"]["config"]["description"] = description
+        catalog = {
+            "id": UUID("44444444-2222-3333-4444-555555555555"),
+            "owner_id": None,
+            "document": document,
+            "resolved": document,
+            "resource_version": 2,
+            "revision": content_revision(document["spec"]),
+        }
+
+        async def stored_definition(query, *args):
+            if "FROM srw_resources" in query:
+                assert args == ("Expert", "Catalog", "shared", "subagent-explorer")
+                return catalog
+            return None
+
+        fake_db.fetchrow = AsyncMock(side_effect=stored_definition)
         expert_id = "11111111-2222-3333-4444-555555555555"
         fake_db.get_expert_by_id = AsyncMock(
             return_value={
@@ -658,6 +688,7 @@ class TestRosterReport:
         # A library `$ref` is materialised: the pane shows what the model sees.
         assert by_name["explorer"]["ref"] == "subagents/explorer"
         assert by_name["explorer"]["description"].startswith("Read-only investigator")
+        assert by_name["explorer"]["description"] == description
         assert by_name["scout"] == {
             "name": "scout",
             "description": "Inline scout.",

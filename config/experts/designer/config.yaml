@@ -1,102 +1,136 @@
-# yaml-language-server: $schema=../../schema.json
-# Designer - UI/UX design and prototyping
-$extends: worker_base
+apiVersion: srw/v1alpha1
+kind: Expert
+metadata:
+  name: designer
+  scope:
+    kind: Catalog
+    name: shared
+  annotations:
+    srw.io/display-name: Designer
+    srw.io/description: 'UI/UX design specialist. Analyzes existing interface patterns,
+      creates
 
-agent_id: designer
-display_name: Designer
-description: |
-  UI/UX design specialist. Analyzes existing interface patterns, creates
-  self-contained HTML/CSS mockups using the project's design system, and
-  outputs structured design specifications for developers to implement.
-  Focuses on visual consistency, usability, and component reuse.
-icon: palette
-color: "#f5c2e7"
-tags:
+      self-contained HTML/CSS mockups using the project''s design system, and
+
+      outputs structured design specifications for developers to implement.
+
+      Focuses on visual consistency, usability, and component reuse.'
+    srw.io/icon: palette
+    srw.io/color: '#f5c2e7'
+    srw.io/expert-type: worker
+    srw.io/bundled-selector: designer
+  tags:
   - design
   - ui
   - prototyping
   - mockups
+  - worker
+spec:
+  runtime:
+    image: srw-agent:latest
+    adapter: srw/v1
+    config:
+      config_name: worker_base
+      asset_name: designer
+      config:
+        # Designer - UI/UX design and prototyping
+        $extends: worker_base
 
-llm:
-  reasoning_level: high
+        agent_id: designer
+        display_name: Designer
+        description: |
+          UI/UX design specialist. Analyzes existing interface patterns, creates
+          self-contained HTML/CSS mockups using the project's design system, and
+          outputs structured design specifications for developers to implement.
+          Focuses on visual consistency, usability, and component reuse.
+        icon: palette
+        color: "#f5c2e7"
+        tags:
+          - design
+          - ui
+          - prototyping
+          - mockups
 
-workspace:
-  # Pinned: this expert's role needs a shell, and a session's account layer
-  # overrides expert_base's `sandbox` with the owner's default (platform
-  # default `virtual`, which strips shell/browser/git). Declaring it HERE
-  # sits above that layer; the New Session form shows it and the user may
-  # still change it. Jobs ignore this key (the workspace contract stamps
-  # the job tier from config_override). See tests/test_expert_defaults.py
-  # ::TestShellBoundBundledExpertsPinTheirTier.
-  backend: sandbox
-  structure:
-    - archive/
-    - documents/
-    - mockups/
-    - design_spec/
-    - reference/
-    - output/
-  git_versioning: true
+        llm:
+          reasoning_level: high
 
-instruction_files:
-  # Phase skills restated: this list replaces the worker overlay's wholesale.
-  - skill: strategic-phase
-    trigger: phase_start:strategic
-    enforce: false
-  - skill: tactical-phase
-    trigger: phase_start:tactical
-    enforce: false
-  - file: design_guide.md
-    trigger: phase_start:tactical
-    enforce: false  # Injected once per concrete tactical phase
-  - skill: verify-before-done
-    trigger: before_tool:todo_complete
-    enforce: true
-    phases: [tactical]
-    read_scope: phase
-    max_read_age_turns: 20
-  - skill: verify-before-done
-    trigger: before_tool:job_complete
-    enforce: true
-    phases: [strategic]
-    read_scope: phase
-    max_read_age_turns: 20
+        workspace:
+          # Pinned: this expert's role needs a shell, and a session's account layer
+          # overrides expert_base's `sandbox` with the owner's default (platform
+          # default `virtual`, which strips shell/browser/git). Declaring it HERE
+          # sits above that layer; the New Session form shows it and the user may
+          # still change it. Jobs ignore this key (the workspace contract stamps
+          # the job tier from config_override). See tests/test_expert_defaults.py
+          # ::TestShellBoundBundledExpertsPinTheirTier.
+          backend: sandbox
+          structure:
+            - archive/
+            - documents/
+            - mockups/
+            - design_spec/
+            - reference/
+            - output/
+          git_versioning: true
 
-tools:
-  workspace:
-    - read_file
-    - write_file
-    - edit_file
-    - list_files
-    - delete_file
-    - search_files
-    - file_exists
-    - move_file
-    - copy_file
-    - get_document_info
-    - create_directory
-  shell:
-    - run_command
-    - cancel_command
-    - shell_read
-  core:
-    - next_phase_todos
-    - todo_complete
-    - todo_list
-    - request_replan
-    - mark_complete
-    - job_complete
-  research:
-    - web_search
-    - extract_webpage
-  # git: intentionally absent. This agent has shell tools, and
-  # ToolsConfig.__post_init__ (src/shared/runtime/core/loader.py) suppresses the git_* group
-  # whenever shell is present — a shell can run git against ANY repository in
-  # the workspace, including repos/<name>/, which git_* cannot. Declaring them
-  # here would advertise tools the pod never binds.
-  # Not needed
-  delegation: []
-  citation: []
-  graph: []
-  sql: []
-  mongodb: []
+        instruction_files:
+          # Phase skills restated: this list replaces the worker overlay's wholesale.
+          - skill: strategic-phase
+            trigger: phase_start:strategic
+            enforce: false
+          - skill: tactical-phase
+            trigger: phase_start:tactical
+            enforce: false
+          - file: design_guide.md
+            trigger: phase_start:tactical
+            enforce: false  # Injected once per concrete tactical phase
+          - skill: verify-before-done
+            trigger: before_tool:todo_complete
+            enforce: true
+            phases: [tactical]
+            read_scope: phase
+            max_read_age_turns: 20
+          - skill: verify-before-done
+            trigger: before_tool:job_complete
+            enforce: true
+            phases: [strategic]
+            read_scope: phase
+            max_read_age_turns: 20
+
+        tools:
+          workspace:
+            - read_file
+            - write_file
+            - edit_file
+            - list_files
+            - delete_file
+            - search_files
+            - file_exists
+            - move_file
+            - copy_file
+            - get_document_info
+            - create_directory
+          shell:
+            - run_command
+            - cancel_command
+            - shell_read
+          core:
+            - next_phase_todos
+            - todo_complete
+            - todo_list
+            - request_replan
+            - mark_complete
+            - job_complete
+          research:
+            - web_search
+            - extract_webpage
+          # git: intentionally absent. This agent has shell tools, and
+          # ToolsConfig.__post_init__ (src/shared/runtime/core/loader.py) suppresses the git_* group
+          # whenever shell is present — a shell can run git against ANY repository in
+          # the workspace, including repos/<name>/, which git_* cannot. Declaring them
+          # here would advertise tools the pod never binds.
+          # Not needed
+          delegation: []
+          citation: []
+          graph: []
+          sql: []
+          mongodb: []

@@ -17,8 +17,6 @@ import copy
 import logging
 from typing import Awaitable, Callable, Optional
 
-import yaml
-
 from shared.runtime.core.loader import (
     INHERIT_MODEL,
     ROLE_ROOTS,
@@ -126,10 +124,32 @@ def resolve_config(
     ``capture`` would silence the dispatch check while still delivering the
     stripped capability.
     """
+    if (
+        expert_row
+        and "harness_adapter" in expert_row
+        and expert_row["harness_adapter"] != "srw/v1"
+    ):
+        raise ValueError(
+            "Generic Experts cannot be resolved by the SRW harness adapter"
+        )
+    if expert_row and expert_row.get("harness_config_name"):
+        from orchestrator.services.config_overrides import validated_config_name
+
+        base_config_name = validated_config_name(expert_row["harness_config_name"])
     role = expert_type if expert_type in ROLE_ROOTS else None
     if role is not None and canonical_config_name(base_config_name) in ROOT_NAMES:
         base_config_name = ROLE_ROOTS[role]
     base_path, deployment_dir = resolve_config_path(base_config_name)
+    if expert_row and expert_row.get("harness_asset_name"):
+        # Asset selection supplies prompt/matrix/skill files only. The saved
+        # Expert's actual base and authored leaf remain its sole configuration
+        # inputs; importing its original disk leaf would resurrect removed keys.
+        from shared.runtime.core.srw_manifest_config import validate_srw_asset_name
+
+        asset_name = validate_srw_asset_name(expert_row["harness_asset_name"])
+        _asset_path, deployment_dir = resolve_config_path(asset_name)
+        if not deployment_dir:
+            raise ValueError("SRW harness asset_name does not select installed assets")
 
     # A named bundled expert is logically an expert overlay, not the base layer.
     # Split its leaf from $extends so account fallbacks can sit above the real
@@ -140,8 +160,9 @@ def resolve_config(
     parent_path: str | None = None
     parent_role: str | None = None
     try:
-        with open(base_path, "r", encoding="utf-8") as f:
-            raw_leaf = yaml.safe_load(f) or {}
+        from shared.runtime.core.srw_manifest_config import read_srw_config
+
+        raw_leaf = read_srw_config(base_path)
         if (
             isinstance(raw_leaf, dict)
             and raw_leaf.get("$extends")
@@ -218,6 +239,9 @@ def resolve_config(
             expert_cfg, source=expert_layer_source(expert_row)
         )
         explicit_llm_keys |= set((expert_cfg.get("llm") or {}).keys())
+        for index, layer in enumerate(expert_row.get("harness_config_layers", [])):
+            layer = normalize_llm_tiers(layer, source=f"expert-private-layer:{index}")
+            explicit_llm_keys |= set((layer.get("llm") or {}).keys())
         data, prompts_override = build_expert_config(data, expert_row)
 
     # Every remaining authored layer, normalised at birth. Layer-local

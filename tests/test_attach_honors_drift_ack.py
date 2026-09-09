@@ -122,6 +122,7 @@ async def test_resolve_session_config_strips_the_delivered_blob_not_just_the_cap
     metadata = {"config_drift_ack": {"grant:shell_tools": "revoked"}}
 
     with (
+        patch("orchestrator.main.postgres_db.fetchrow", AsyncMock(return_value=None)),
         patch("orchestrator.main._is_experts_db_enabled", return_value=True),
         patch("orchestrator.main._user_experts_enabled", AsyncMock(return_value=True)),
         # R1.B05 lane P: same-module sibling of the resolve once main

@@ -273,7 +273,11 @@ async def test_combined_scoped_mutation_must_remain_exactly_one_project():
 
 
 @pytest.mark.asyncio
-async def test_create_job_materializes_links_in_job_transaction():
+async def test_create_job_materializes_links_in_job_transaction(monkeypatch):
+    monkeypatch.setattr(
+        "orchestrator.services.manifest_execution_snapshot.capture_execution",
+        AsyncMock(),
+    )
     conn = AsyncMock()
     conn.fetch.side_effect = [
         [{"id": UUID(DATASOURCE_ID), "policy_revision": 7}],
@@ -376,7 +380,11 @@ async def test_create_job_rejects_changed_policy_before_job_insert():
 
 
 @pytest.mark.asyncio
-async def test_create_thread_always_materializes_empty_selection_metadata():
+async def test_create_thread_always_materializes_empty_selection_metadata(monkeypatch):
+    monkeypatch.setattr(
+        "orchestrator.services.manifest_execution_snapshot.capture_execution",
+        AsyncMock(),
+    )
     conn = AsyncMock()
     conn.fetchrow.return_value = {"id": UUID(THREAD_ID)}
     db = _make_db(conn)
@@ -388,7 +396,11 @@ async def test_create_thread_always_materializes_empty_selection_metadata():
 
 
 @pytest.mark.asyncio
-async def test_create_thread_locks_policy_and_persists_revision_snapshot():
+async def test_create_thread_locks_policy_and_persists_revision_snapshot(monkeypatch):
+    monkeypatch.setattr(
+        "orchestrator.services.manifest_execution_snapshot.capture_execution",
+        AsyncMock(),
+    )
     conn = AsyncMock()
     conn.fetch.return_value = [{"id": UUID(DATASOURCE_ID), "policy_revision": 4}]
     conn.fetchrow.return_value = {"id": UUID(THREAD_ID)}
@@ -917,7 +929,10 @@ async def test_connector_owner_can_revoke_link_without_project_owner_role():
 @pytest.mark.asyncio
 async def test_delete_project_removes_native_kb_datasource_before_project_row():
     conn = AsyncMock()
-    conn.execute.side_effect = ["DELETE 0", "DELETE 1", "DELETE 1"]
+    # This Project has no saved resources, retained workspace or live execution.
+    conn.fetch.return_value = []
+    conn.fetchval.return_value = False
+    conn.execute.return_value = "DELETE 1"
     db = _make_db(conn)
 
     assert await db.delete_project(PROJECT_A)

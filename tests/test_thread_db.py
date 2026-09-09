@@ -309,6 +309,15 @@ class TestStatelessRetirementAcknowledgementSQL:
 class TestCreateThread:
     """Tests for create_thread method."""
 
+    @pytest.fixture(autouse=True)
+    def capture_boundary(self, monkeypatch):
+        # This class verifies INSERT shape; snapshot transactions and delivery
+        # have their own production-schema and capture tests.
+        monkeypatch.setattr(
+            "orchestrator.services.manifest_execution_snapshot.capture_execution",
+            AsyncMock(),
+        )
+
     @pytest.mark.asyncio
     async def test_returns_uuid_string(self):
         conn = _mock_conn()

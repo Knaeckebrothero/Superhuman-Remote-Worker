@@ -1,74 +1,107 @@
-# yaml-language-server: $schema=../../schema.json
-# Curator - Knowledge extraction specialist for project knowledge base
-$extends: worker_base
+apiVersion: srw/v1alpha1
+kind: Expert
+metadata:
+  name: curator
+  scope:
+    kind: Catalog
+    name: shared
+  annotations:
+    srw.io/display-name: Curator
+    srw.io/description: 'Knowledge extraction specialist. Runs as a persistent subjob
+      in parallel
 
-agent_id: curator
-display_name: Curator
-description: |
-  Knowledge extraction specialist. Runs as a persistent subjob in parallel
-  with working agents, extracting structured knowledge notes from job artifacts
-  (plan.md, archive/, memories, knowledge base). Writes to the project knowledge
-  base via kb_write/kb_update. See knowledge-base/knowledge/features/project_knowledge_base.md.
-icon: menu_book
-color: "#a6e3a1"
-tags:
+      with working agents, extracting structured knowledge notes from job artifacts
+
+      (plan.md, archive/, memories, knowledge base). Writes to the project knowledge
+
+      base via kb_write/kb_update. See knowledge-base/knowledge/features/project_knowledge_base.md.'
+    srw.io/icon: menu_book
+    srw.io/color: '#a6e3a1'
+    srw.io/expert-type: worker
+    srw.io/bundled-selector: curator
+  tags:
   - knowledge
   - curation
   - project
+  - worker
+spec:
+  runtime:
+    image: srw-agent:latest
+    adapter: srw/v1
+    config:
+      config_name: worker_base
+      asset_name: curator
+      config:
+        # Curator - Knowledge extraction specialist for project knowledge base
+        $extends: worker_base
 
-workspace:
-  structure:
-    - archive/
-    - documents/
-    - output/
-    - notes/
-  git_versioning: true
+        agent_id: curator
+        display_name: Curator
+        description: |
+          Knowledge extraction specialist. Runs as a persistent subjob in parallel
+          with working agents, extracting structured knowledge notes from job artifacts
+          (plan.md, archive/, memories, knowledge base). Writes to the project knowledge
+          base via kb_write/kb_update. See knowledge-base/knowledge/features/project_knowledge_base.md.
+        icon: menu_book
+        color: "#a6e3a1"
+        tags:
+          - knowledge
+          - curation
+          - project
 
-tools:
-  workspace:
-    - read_file
-    - write_file
-    - list_files
-    - search_files
-    - file_exists
-    - get_document_info
-  core:
-    - next_phase_todos
-    - todo_complete
-    - todo_list
-    - request_replan
-    - mark_complete
-    - job_complete
-  knowledge:
-    - kb_write
-    - kb_update
-    - kb_delete
-    - kb_read
-    - kb_search
-    - kb_grep
-    - kb_list
-    - kb_related
-    - kb_contradictions
-    - kb_provenance
-    - kb_unanswered
-    # Gardening: the curation prompts (config/prompts/curation_prompt*.txt)
-    # unconditionally call these as step 5. Granted 2026-08-02 per decision D9
-    # in knowledge-base/knowledge/issues/tool_configuration_defects_and_fix_roadmap.md — see
-    # knowledge-base/knowledge/issues/registered_tools_no_config_can_grant.md §3a. kb_export is
-    # deliberately NOT added here; see that doc / the task report for why.
-    - kb_lint
-    - kb_index
-  git:
-    - git_log
-    - git_show
-    - git_diff
-    - git_status
-    - git_tags
-  # Not needed
-  shell: []
-  research: []
-  citation: []
-  graph: []
-  sql: []
-  mongodb: []
-  evaluation: []
+        workspace:
+          structure:
+            - archive/
+            - documents/
+            - output/
+            - notes/
+          git_versioning: true
+
+        tools:
+          workspace:
+            - read_file
+            - write_file
+            - list_files
+            - search_files
+            - file_exists
+            - get_document_info
+          core:
+            - next_phase_todos
+            - todo_complete
+            - todo_list
+            - request_replan
+            - mark_complete
+            - job_complete
+          knowledge:
+            - kb_write
+            - kb_update
+            - kb_delete
+            - kb_read
+            - kb_search
+            - kb_grep
+            - kb_list
+            - kb_related
+            - kb_contradictions
+            - kb_provenance
+            - kb_unanswered
+            # Gardening: the curation prompts (config/prompts/curation_prompt*.txt)
+            # unconditionally call these as step 5. Granted 2026-08-02 per decision D9
+            # in knowledge-base/knowledge/issues/tool_configuration_defects_and_fix_roadmap.md — see
+            # knowledge-base/knowledge/issues/registered_tools_no_config_can_grant.md §3a. kb_export is
+            # deliberately NOT added here; see that doc / the task report for why.
+            - kb_lint
+            - kb_index
+          git:
+            - git_log
+            - git_show
+            - git_diff
+            - git_status
+            - git_tags
+          # Not needed
+          shell: []
+          research: []
+          citation: []
+          graph: []
+          sql: []
+          mongodb: []
+          evaluation: []

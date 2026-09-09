@@ -57,6 +57,19 @@ async def pg(pg_dsn, _schema_applied):
             "TRUNCATE completion_effects, completion_finalizer_leases, "
             "job_completion_commands, run_queue, jobs, agents CASCADE"
         )
+        # Seed after reset: TRUNCATE can reach grants through nullable FKs.
+        await conn.execute("""
+            INSERT INTO capability_grants(scope_kind,key,value_json) VALUES
+                ('global','shell_tools','true'),
+                ('global','delegation','true'),
+                ('global','autonomy_ceiling','"full"')
+            ON CONFLICT(scope_kind,scope_id,key) DO UPDATE SET value_json=EXCLUDED.value_json
+        """)
+    from orchestrator.services.manifest_experts import seed_bundled_expert_manifests
+
+    await seed_bundled_expert_manifests(
+        _pool_db(pool), Path(__file__).resolve().parents[1] / "config"
+    )
     try:
         yield pool
     finally:

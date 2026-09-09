@@ -1,99 +1,137 @@
-# yaml-language-server: $schema=../../schema.json
-# Developer - test-driven implementation. Spec first, tests first, code last.
-$extends: worker_base
+apiVersion: srw/v1alpha1
+kind: Expert
+metadata:
+  name: developer
+  scope:
+    kind: Catalog
+    name: shared
+  annotations:
+    srw.io/display-name: Developer
+    srw.io/description: 'Strict test-first implementation for briefs that explicitly
+      ask for TDD.
 
-agent_id: developer
-display_name: Developer
-description: |
-  Strict test-first implementation for briefs that explicitly ask for TDD.
-  Defines EARS acceptance criteria up front, writes failing tests, then writes
-  the minimum code that makes them pass, in a spec → red → green → refactor
-  cycle with phase-typed todos and strict file-scope discipline. Costs several
-  times the wall time of the engineer on ordinary work — for everyday code,
-  scripts and terminal tasks pick the engineer instead.
-icon: code
-color: "#89b4fa"
-tags:
+      Defines EARS acceptance criteria up front, writes failing tests, then writes
+
+      the minimum code that makes them pass, in a spec → red → green → refactor
+
+      cycle with phase-typed todos and strict file-scope discipline. Costs several
+
+      times the wall time of the engineer on ordinary work — for everyday code,
+
+      scripts and terminal tasks pick the engineer instead.'
+    srw.io/icon: code
+    srw.io/color: '#89b4fa'
+    srw.io/expert-type: worker
+    srw.io/bundled-selector: developer
+  tags:
   - coding
   - development
   - tdd
   - delegation
+  - worker
+spec:
+  runtime:
+    image: srw-agent:latest
+    adapter: srw/v1
+    config:
+      config_name: worker_base
+      asset_name: developer
+      config:
+        # Developer - test-driven implementation. Spec first, tests first, code last.
+        $extends: worker_base
 
-llm:
-  reasoning_level: high
+        agent_id: developer
+        display_name: Developer
+        description: |
+          Strict test-first implementation for briefs that explicitly ask for TDD.
+          Defines EARS acceptance criteria up front, writes failing tests, then writes
+          the minimum code that makes them pass, in a spec → red → green → refactor
+          cycle with phase-typed todos and strict file-scope discipline. Costs several
+          times the wall time of the engineer on ordinary work — for everyday code,
+          scripts and terminal tasks pick the engineer instead.
+        icon: code
+        color: "#89b4fa"
+        tags:
+          - coding
+          - development
+          - tdd
+          - delegation
 
-# Built-in subagents (delegate_agent) — parallel EXPLORATION, research and
-# bounded implementation work fanned out to the roster children; the parent
-# owns the code that lands. `enabled` gates the tool binding; which children
-# exist, their tools, write policy and budgets live in `subagents.roster`
-# (their model defaults to the parent's; per-job override via
-# config_override.subagents.llm).
-delegation:
-  enabled: true
-  max_concurrent: 4
+        llm:
+          reasoning_level: high
 
-subagents:
-  default: explorer
-  roster:
-    explorer: {$ref: subagents/explorer}
-    implementer: {$ref: subagents/implementer}
-    tester: {$ref: subagents/tester}
-    reviewer: {$ref: subagents/reviewer}
+        # Built-in subagents (delegate_agent) — parallel EXPLORATION, research and
+        # bounded implementation work fanned out to the roster children; the parent
+        # owns the code that lands. `enabled` gates the tool binding; which children
+        # exist, their tools, write policy and budgets live in `subagents.roster`
+        # (their model defaults to the parent's; per-job override via
+        # config_override.subagents.llm).
+        delegation:
+          enabled: true
+          max_concurrent: 4
 
-workspace:
-  # Pinned: this expert's role needs a shell, and a session's account layer
-  # overrides expert_base's `sandbox` with the owner's default (platform
-  # default `virtual`, which strips shell/browser/git). Declaring it HERE
-  # sits above that layer; the New Session form shows it and the user may
-  # still change it. Jobs ignore this key (the workspace contract stamps
-  # the job tier from config_override). See tests/test_expert_defaults.py
-  # ::TestShellBoundBundledExpertsPinTheirTier.
-  backend: sandbox
-  structure:
-    - archive/
-    - documents/
-    - output/
-  git_versioning: true
+        subagents:
+          default: explorer
+          roster:
+            explorer: {$ref: subagents/explorer}
+            implementer: {$ref: subagents/implementer}
+            tester: {$ref: subagents/tester}
+            reviewer: {$ref: subagents/reviewer}
 
-tools:
-  workspace:
-    - read_file
-    - write_file
-    - edit_file
-    - list_files
-    - search_files
-    - file_exists
-    - get_document_info
-  shell:
-    - run_command
-    - cancel_command
-    - shell_read
-  core:
-    - next_phase_todos
-    - todo_complete
-    - request_replan
-    - mark_complete
-    - job_complete
-  # git: intentionally absent. This agent has shell tools, and
-  # ToolsConfig.__post_init__ (src/shared/runtime/core/loader.py) suppresses the git_* group
-  # whenever shell is present — a shell can run git against ANY repository in
-  # the workspace, including repos/<name>/, which git_* cannot. Declaring them
-  # here would advertise tools the pod never binds.
-  # Websearch — a coder must be able to look things up (docs, APIs, error
-  # messages). browser_direct (step-by-step Chromium) is inherited from worker_base.
-  research:
-    - web_search
-    - extract_webpage
-    - crawl_website
-    - map_website
-    - research_topic
-  # Spawn + background controls (each bound only with delegation.enabled).
-  delegation:
-    - delegate_agent
-    - wait_agent
-    - message_agent
-    - stop_agent
-    - list_agents
-  # Disable unused tool categories
-  citation: []
-  graph: []
+        workspace:
+          # Pinned: this expert's role needs a shell, and a session's account layer
+          # overrides expert_base's `sandbox` with the owner's default (platform
+          # default `virtual`, which strips shell/browser/git). Declaring it HERE
+          # sits above that layer; the New Session form shows it and the user may
+          # still change it. Jobs ignore this key (the workspace contract stamps
+          # the job tier from config_override). See tests/test_expert_defaults.py
+          # ::TestShellBoundBundledExpertsPinTheirTier.
+          backend: sandbox
+          structure:
+            - archive/
+            - documents/
+            - output/
+          git_versioning: true
+
+        tools:
+          workspace:
+            - read_file
+            - write_file
+            - edit_file
+            - list_files
+            - search_files
+            - file_exists
+            - get_document_info
+          shell:
+            - run_command
+            - cancel_command
+            - shell_read
+          core:
+            - next_phase_todos
+            - todo_complete
+            - request_replan
+            - mark_complete
+            - job_complete
+          # git: intentionally absent. This agent has shell tools, and
+          # ToolsConfig.__post_init__ (src/shared/runtime/core/loader.py) suppresses the git_* group
+          # whenever shell is present — a shell can run git against ANY repository in
+          # the workspace, including repos/<name>/, which git_* cannot. Declaring them
+          # here would advertise tools the pod never binds.
+          # Websearch — a coder must be able to look things up (docs, APIs, error
+          # messages). browser_direct (step-by-step Chromium) is inherited from worker_base.
+          research:
+            - web_search
+            - extract_webpage
+            - crawl_website
+            - map_website
+            - research_topic
+          # Spawn + background controls (each bound only with delegation.enabled).
+          delegation:
+            - delegate_agent
+            - wait_agent
+            - message_agent
+            - stop_agent
+            - list_agents
+          # Disable unused tool categories
+          citation: []
+          graph: []

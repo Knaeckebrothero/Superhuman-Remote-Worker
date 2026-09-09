@@ -722,8 +722,9 @@ def load_and_merge_config(
         if _root_name_for_path(config_path) is not None:
             root_path, _ = resolve_config_path(ROLE_ROOTS[role])
             return load_and_merge_config(root_path)
-    with open(config_path, "r", encoding="utf-8") as f:
-        config_data = yaml.safe_load(f)
+    from shared.runtime.core.srw_manifest_config import read_srw_config
+
+    config_data = read_srw_config(config_path)
 
     # Normalisation seam 1 of 6: every bundled YAML and every link of the
     # $extends chain. Runs BEFORE the merge because expansion is layer-local —
@@ -6016,8 +6017,9 @@ def chain_root(config_path: str) -> Optional[str]:
             return None
         seen.add(current)
         try:
-            with open(current, "r", encoding="utf-8") as f:
-                raw = yaml.safe_load(f) or {}
+            from shared.runtime.core.srw_manifest_config import read_srw_config
+
+            raw = read_srw_config(current)
         except Exception:
             return None
         parent = raw.get("$extends") if isinstance(raw, dict) else None
@@ -6059,8 +6061,9 @@ def authored_llm_keys(config_path: str) -> Set[str]:
     """
     path = canonical_config_name(str(config_path))
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            raw = yaml.safe_load(f) or {}
+        from shared.runtime.core.srw_manifest_config import read_srw_config
+
+        raw = read_srw_config(path)
     except Exception:
         return set()
     if not isinstance(raw, dict):

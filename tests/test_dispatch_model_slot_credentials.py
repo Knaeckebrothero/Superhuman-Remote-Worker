@@ -1224,12 +1224,19 @@ class TestRosterPrefetch:
     HIDDEN_REF = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 
     @pytest.mark.asyncio
-    async def test_no_db_refs_means_no_db_calls(self, monkeypatch):
-        """Disk refs and rosterless layers never touch the database — the
-        common case costs nothing (and fake DBs in other suites never see it)."""
+    async def test_named_refs_read_catalog_without_uuid_visibility_calls(
+        self, monkeypatch
+    ):
+        """Shared Catalog selectors use their stored revision, not image files."""
         never = AsyncMock(side_effect=AssertionError("must not be called"))
         for name in ("get_expert_by_id", "get_expert_visible_by_id", "get_user"):
             monkeypatch.setattr(orchestrator.main.postgres_db, name, never)
+        canonical = {"manifest_uid": "catalog-revision", "config": {}}
+        read_catalog = AsyncMock(return_value=canonical)
+        monkeypatch.setattr(
+            "orchestrator.services.manifest_experts.bundled_expert_for_execution",
+            read_catalog,
+        )
 
         out = await orchestrator.main._prefetch_roster_refs(
             expert_row={
@@ -1239,7 +1246,10 @@ class TestRosterPrefetch:
             user_id="u",
         )
 
-        assert out == {}
+        assert out == {_LIBRARY_REF: canonical}
+        read_catalog.assert_awaited_once_with(
+            orchestrator.main.postgres_db, _LIBRARY_REF
+        )
         never.assert_not_awaited()
 
     @pytest.mark.asyncio

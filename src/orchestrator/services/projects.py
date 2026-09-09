@@ -309,7 +309,9 @@ async def list_projects(
                     "ORDER BY updated_at DESC LIMIT 100",
                     statuses,
                 )
-                projects = [dict(r) for r in rows]
+            from orchestrator.services.manifest_projects import hydrate_project_row
+
+            projects = [await hydrate_project_row(store, row) for row in rows]
         elif user_id is not None:
             projects = await store.get_projects_for_user(user_id, statuses=statuses)
         else:

@@ -211,6 +211,9 @@ def build_expert_config(base: dict, row: dict) -> tuple[dict, dict]:
     )
     from shared.runtime.core.tool_policy import normalize_tool_policy
 
+    if "harness_adapter" in row and row["harness_adapter"] != "srw/v1":
+        raise ValueError("Generic Experts cannot use the SRW configuration adapter")
+
     config = row.get("config") or {}
     prompts = row.get("prompts") or {}
     if isinstance(config, str):
@@ -236,6 +239,22 @@ def build_expert_config(base: dict, row: dict) -> tuple[dict, dict]:
     # marks this row's prompts as DB-authored, never to the row itself.
     config = strip_loader_owned_keys(config)
     merged = deep_merge(base, config)
+    layers = row.get("harness_config_layers", [])
+    if not isinstance(layers, list) or any(
+        not isinstance(layer, dict) for layer in layers
+    ):
+        raise ValueError("SRW harness layers must be an array of objects")
+    for index, layer in enumerate(layers):
+        source = f"{expert_layer_source(row)}:layer:{index}"
+        layer = strip_loader_owned_keys(
+            normalize_delegation_block(
+                normalize_llm_tiers(
+                    normalize_tool_policy(layer, source=source), source=source
+                ),
+                source=source,
+            )
+        )
+        merged = deep_merge(merged, layer)
     merged.pop("connections", None)  # belt-and-braces; deny-scan already ran at save
     return merged, prompts
 

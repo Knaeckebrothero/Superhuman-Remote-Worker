@@ -17,6 +17,12 @@ The Kubernetes Service publishes inference only. The harness reaches control wit
 `E2E_INFERENCE_API_KEY` are required process environment variables and come from the
 run-owned `srw-e2e-model-fixture` Secret; neither has a checked-in default.
 
+`E2E_CHAT_MODEL_ID` can replace the default `e2e-chat` wire ID with a unique
+lowercase test model name. The manifest cutover smoke uses this when registering
+its own temporary endpoint in an existing installation. The configured ID is the
+only accepted chat model and is advertised by `/v1/models`; other IDs continue to
+fail without being echoed into diagnostic records.
+
 ## Control contract
 
 Arm an isolated run before inference:

@@ -14,14 +14,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-import yaml
-
 from orchestrator.services.grants_service import resolve_grants_for
 from shared.runtime.core.expert_resolution import (
     validate_expert_persona_placeholders,
     with_role_tag,
 )
 from shared.runtime.core.loader import canonical_config_name, expert_phase_prompt_bodies
+from shared.runtime.core.srw_manifest_config import read_srw_config
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +100,7 @@ def load_seed_bundle(
     """Read one bundled expert as a raw DB overlay (never a merged snapshot)."""
     expert_dir = config_dir / "experts" / directory
     config_path = expert_dir / "config.yaml"
-    raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    raw = read_srw_config(config_path)
     if not isinstance(raw, dict):
         raise ValueError(f"Invalid managed expert config: {config_path}")
     # Both sides canonical: the public root names (`worker_base`/`session_base`)
@@ -318,7 +317,18 @@ async def resolve_root_expert(
                 project_id=project_id, expert_id=explicit_expert_id
             )
             if link:
-                project_override = _json_object(link.get("config_override")) or None
+                if link.get("project_manifest_composed"):
+                    from orchestrator.services.manifest_projects import (
+                        project_expert_for_execution,
+                    )
+
+                    frozen = await project_expert_for_execution(
+                        db, project_id, explicit_expert_id, expert_type
+                    )
+                    if frozen:
+                        explicit = ExpertSelection(expert=frozen, source="explicit")
+                else:
+                    project_override = _json_object(link.get("config_override")) or None
         return ExpertSelection(
             expert=explicit.expert,
             source="explicit",
@@ -333,7 +343,11 @@ async def resolve_root_expert(
             return ExpertSelection(
                 expert=project,
                 source="project",
-                project_override=_json_object(project.get("config_override")) or None,
+                project_override=(
+                    None
+                    if project.get("project_composed")
+                    else _json_object(project.get("config_override")) or None
+                ),
             )
 
     if await personal_defaults_allowed(

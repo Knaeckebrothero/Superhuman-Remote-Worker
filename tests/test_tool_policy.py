@@ -39,6 +39,7 @@ from shared.runtime.core.loader import (
     resolve_config_path,
 )
 from shared.runtime.core.session_tool_overrides import SESSION_TOOL_OVERRIDE_NAMES
+from shared.runtime.core.srw_manifest_config import srw_config_fragment
 from shared.runtime.core.tool_policy import (
     ENUMERATE_ONLY_CATEGORIES,
     MCP_WILDCARD,
@@ -99,6 +100,7 @@ def _raw_declarations() -> list[tuple[str, str, object]]:
         data = yaml.safe_load(path.read_text())
         if not isinstance(data, dict):
             continue
+        data = srw_config_fragment(data)
         tools = data.get("tools")
         if not isinstance(tools, dict):
             continue
@@ -306,7 +308,7 @@ class TestOnlyIsNeverIntersected:
 
     def test_centurions_declaration_survives_normalisation_intact(self):
         path = _CONFIG_DIR / "experts" / "centurion" / "config.yaml"
-        tools = yaml.safe_load(path.read_text())["tools"]
+        tools = srw_config_fragment(yaml.safe_load(path.read_text()))["tools"]
         for name in self._EXPLICIT_IN_CENTURION:
             category = TOOL_REGISTRY[name]["category"]
             raw = tools[category]
@@ -736,7 +738,7 @@ class TestShippedConfigsResolveUnchanged:
         path, _ = resolve_config_path(config_name)
 
         def raw_chain(p: str) -> dict:
-            data = yaml.safe_load(Path(p).read_text())
+            data = srw_config_fragment(yaml.safe_load(Path(p).read_text()))
             parent = data.pop("$extends", None)
             data.pop("$comment", None)
             if parent:

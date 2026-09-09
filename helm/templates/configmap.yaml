@@ -292,6 +292,10 @@ metadata:
   labels:
     {{- include "srw.labels" . | nindent 4 }}
 data:
+  MANIFEST_NETWORK_ISOLATION_VERIFIED: {{ .Values.manifestHosting.networkIsolationVerified | quote }}
+  MANIFEST_NAMESPACE: {{ .Values.manifestHosting.namespace | default (printf "%s-native" (include "srw.fullname" . | trunc 56 | trimSuffix "-")) | quote }}
+  MANIFEST_MAX_CONCURRENT_JOBS: {{ .Values.manifestHosting.maxConcurrentJobs | quote }}
+  MANIFEST_HARNESS_EGRESS: {{ toJson .Values.manifestHosting.harnessEgress | quote }}
   # PostgreSQL (App DB) — non-secret connection parts. The DSN is composed
   # at runtime from these + POSTGRES_USER/POSTGRES_PASSWORD (Secret), with
   # URL-quoting applied to the credentials. Storing a full DATABASE_URL in

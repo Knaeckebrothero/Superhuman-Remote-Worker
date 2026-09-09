@@ -100,7 +100,7 @@ def test_allowed_runtime_and_lightweight_dependencies_pass(boundary_tree):
     result = lint_boundaries(boundary_tree)
     assert result.returncode == 0, result.stdout + result.stderr
     # The generic manifest path also excludes the legacy harness adapter.
-    assert "Contracts: 18 kept, 0 broken" in result.stdout
+    assert "Contracts: 20 kept, 0 broken" in result.stdout
 
 
 @pytest.mark.parametrize(
@@ -149,6 +149,10 @@ def test_allowed_runtime_and_lightweight_dependencies_pass(boundary_tree):
         ("orchestrator/services/job_admission_creator.py", "orchestrator.main"),
         ("orchestrator/services/datasource_policy_errors.py", "orchestrator.main"),
         ("orchestrator/services/officer_metadata.py", "orchestrator.main"),
+        ("orchestrator/services/manifest_resources.py", "orchestrator.main"),
+        ("orchestrator/services/manifest_execution.py", "orchestrator.main"),
+        ("orchestrator/services/generic_harness_runtime.py", "shared.runtime.provider"),
+        ("orchestrator/services/manifest_workspace_runtime.py", "orchestrator.main"),
         (
             "orchestrator/services/infrastructure_activation_policy.py",
             "orchestrator.main",

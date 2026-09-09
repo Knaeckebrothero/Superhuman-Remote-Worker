@@ -201,7 +201,13 @@ async def test_delivered_pinned_workspace_generation_can_ack_retirement(
         presented_runtime_generation=str(thread["runtime_generation"]),
         presented_attach_token=ids["attach_token"],
     )
-    inject_credentials.assert_awaited_once()
+    # Delivery materializes both the compatibility override and the canonical
+    # resolved blob. Both credential lookups must retain the same recipient.
+    assert inject_credentials.await_count == 2
+    for call in inject_credentials.await_args_list:
+        assert call.kwargs["user_id"] == str(thread["user_id"])
+        assert call.kwargs["project_id"] == str(thread["project_id"])
+    assert payload["resolved_config"]["execution_snapshot"]["generation"] == 1
     retirement = await db.begin_pinned_thread_retirement(owner.id, permanent=False)
     assert await db.authorize_pinned_thread_retirement(
         owner.id,

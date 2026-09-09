@@ -10,8 +10,12 @@ requires-python = ">=3.11"
 # Images install their existing, separate requirements before --no-deps -e .
 dependencies = []
 
+[project.scripts]
+srw = "orchestrator.operator_cli.manifest_resources:main"
+
 [project.optional-dependencies]
 manifests = ["PyYAML>=6.0", "jsonschema>=4.18,<5"]
+cli = ["httpx>=0.27,<1", "PyYAML>=6.0", "jsonschema>=4.18,<5"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -78,6 +82,35 @@ forbidden_modules = ["shared.runtime"]
 name = "Generic manifest operations do not load application startup or the legacy harness"
 type = "forbidden"
 source_modules = ["orchestrator.routers.manifests", "orchestrator.schemas.manifests", "orchestrator.services.manifests"]
+forbidden_modules = ["orchestrator.main", "shared.runtime", "orchestrator.services.manifest_legacy"]
+
+[[tool.importlinter.contracts]]
+name = "Native resource orchestration does not import application startup"
+type = "forbidden"
+source_modules = [
+  "orchestrator.services.manifest_authority",
+  "orchestrator.services.manifest_resolution",
+  "orchestrator.services.manifest_resources",
+  "orchestrator.services.manifest_retirement",
+  "orchestrator.services.manifest_store",
+  "orchestrator.services.manifest_execution",
+  "orchestrator.services.manifest_execution_snapshot",
+  "orchestrator.services.manifest_session_delivery",
+  "orchestrator.services.manifest_experts",
+  "orchestrator.services.manifest_projects",
+  "orchestrator.services.manifest_workspaces",
+]
+forbidden_modules = ["orchestrator.main"]
+# Existing shared authorization helpers retain indirect composition lookups.
+allow_indirect_imports = true
+
+[[tool.importlinter.contracts]]
+name = "Generic image hosting does not load the reference harness"
+type = "forbidden"
+source_modules = [
+  "orchestrator.services.generic_harness_runtime",
+  "orchestrator.services.manifest_workspace_runtime",
+]
 forbidden_modules = ["orchestrator.main", "shared.runtime", "orchestrator.services.manifest_legacy"]
 
 [[tool.importlinter.contracts]]

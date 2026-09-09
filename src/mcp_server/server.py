@@ -204,7 +204,7 @@ def _format_action_error(action: str, target: str, error: Exception) -> str:
 # "12": one expert selector — create_job / create_project_job take `expert`
 # (a bundled expert id or a DB expert UUID, exactly as list_experts prints
 # it); config_name and expert_id stay as deprecated single-store aliases.
-MCP_TOOL_SCHEMA_REVISION = "12"
+MCP_TOOL_SCHEMA_REVISION = "13"
 _tool_schema_cache: tuple[list[dict[str, Any]], str] | None = None
 
 
@@ -507,6 +507,153 @@ async def get_expert(expert_id: str) -> str:
         return fmt.format_expert_detail(expert_id, data)
     except Exception as e:
         return fmt.format_monitoring_error(f"get expert '{expert_id}'", e)
+
+
+def _manifest_scope(scope_kind, scope_name):
+    if (scope_kind is None) != (scope_name is None):
+        raise ValueError("scope_kind and scope_name must be supplied together")
+    return {"kind": scope_kind, "name": scope_name} if scope_kind else None
+
+
+@mcp_tool
+async def manifest_validate(
+    source: str, format: Literal["yaml", "json"] = "yaml"
+) -> str:
+    """Validate SRW manifest JSON/YAML without creating resources or work.
+
+    Expert, WorkspaceTemplate, Connector, Project and Job use the SRW resource
+    schema. Opaque harness configuration and literal nulls are preserved.
+    """
+    try:
+        return json.dumps(
+            await _get_client().manifest_validate(source, format=format),
+            indent=2,
+            ensure_ascii=False,
+        )
+    except Exception as error:
+        return fmt.format_monitoring_error("validate manifests", error)
+
+
+@mcp_tool
+async def manifest_preview(
+    source: str,
+    format: Literal["yaml", "json"] = "yaml",
+    scope_kind: Literal["Account", "Project", "Catalog"] | None = None,
+    scope_name: str | None = None,
+    resolution: Literal["stored", "bundle"] = "stored",
+) -> str:
+    """Preview manifests with authorized stored references or only this bundle.
+
+    Stored preview returns planRevision for an optional later apply precondition.
+    Preview has no resource/execution side effects; pending admission checks are
+    reported explicitly. Scope names never grant access by themselves.
+    """
+    try:
+        result = await _get_client().manifest_preview(
+            source,
+            format=format,
+            default_scope=_manifest_scope(scope_kind, scope_name),
+            resolution=resolution,
+        )
+        return json.dumps(result, indent=2, ensure_ascii=False)
+    except Exception as error:
+        return fmt.format_monitoring_error("preview manifests", error)
+
+
+@mcp_tool
+async def manifest_apply(
+    source: str,
+    format: Literal["yaml", "json"] = "yaml",
+    scope_kind: Literal["Account", "Project", "Catalog"] | None = None,
+    scope_name: str | None = None,
+    expected_versions: dict[str, int] | None = None,
+    plan_revision: str | None = None,
+    idempotency_key: str | None = None,
+) -> str:
+    """Create/update authorized resources and admit Jobs in a manifest bundle.
+
+    Applying a Job may start its selected image and external work. Existing
+    resource updates require observed versions keyed by Kind/ScopeKind/ScopeName/name.
+    plan_revision can bind a reviewed stored preview; idempotency_key can recover
+    an identical apply request after a lost response. Mutations are never retried
+    by this client. Read current resources after an unknown outcome.
+    """
+    try:
+        result = await _get_client().manifest_apply(
+            source,
+            format=format,
+            default_scope=_manifest_scope(scope_kind, scope_name),
+            expected_versions=expected_versions,
+            plan_revision=plan_revision,
+            idempotency_key=idempotency_key,
+        )
+        return json.dumps(result, indent=2, ensure_ascii=False)
+    except Exception as error:
+        return fmt.format_monitoring_error("apply manifests", error)
+
+
+@mcp_tool
+async def manifest_list(
+    scope_kind: Literal["Account", "Project", "Catalog"] = "Account",
+    scope_name: str = "me",
+    kind: Literal["Expert", "WorkspaceTemplate", "Connector", "Project", "Job"]
+    | None = None,
+) -> str:
+    """List canonical manifest resources in an authorized account/project/catalog scope.
+
+    Results include resource UID, authored configuration, and resourceVersion for
+    optimistic updates. Stored credential values are never part of the response.
+    """
+    try:
+        result = await _get_client().list_manifest_resources(
+            scope_kind=scope_kind, scope_name=scope_name, kind=kind
+        )
+        return json.dumps(result, indent=2, ensure_ascii=False)
+    except Exception as error:
+        return fmt.format_monitoring_error("list manifest resources", error)
+
+
+@mcp_tool
+async def manifest_get(resource_id: str) -> str:
+    """Get an authorized resource by UID, including authored spec and observed version/status."""
+    try:
+        return json.dumps(
+            await _get_client().get_manifest_resource(resource_id),
+            indent=2,
+            ensure_ascii=False,
+        )
+    except Exception as error:
+        return fmt.format_monitoring_error("get manifest resource", error)
+
+
+@mcp_tool
+async def manifest_export(
+    resource_id: str, output_format: Literal["yaml", "json"] = "yaml"
+) -> str:
+    """Export one stored resource as portable authored JSON/YAML, preserving private config and refs."""
+    try:
+        result = await _get_client().export_manifest_resource(
+            resource_id, output_format=output_format
+        )
+        return result["source"]
+    except Exception as error:
+        return fmt.format_monitoring_error("export manifest resource", error)
+
+
+@mcp_tool
+async def manifest_delete(resource_id: str, expected_version: int) -> str:
+    """Delete an authorized resource only at the observed resourceVersion.
+
+    Active execution dependencies and project ownership can prevent deletion.
+    This is a resource operation; Job cancellation uses the existing cancel tool.
+    """
+    try:
+        result = await _get_client().delete_manifest_resource(
+            resource_id, expected_version=expected_version
+        )
+        return json.dumps(result, indent=2, ensure_ascii=False)
+    except Exception as error:
+        return fmt.format_monitoring_error("delete manifest resource", error)
 
 
 @mcp_tool

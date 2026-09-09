@@ -84,6 +84,7 @@ class SessionAttachPayloadDependencies:
     thread_accepts_runtime: Any
     thread_project_ids: Any
     store: Any
+    capture_session_config: Any = None
 
 
 async def assemble_session_attach_payload(
@@ -156,7 +157,7 @@ async def assemble_session_attach_payload(
     # on every attach (no freeze). None when experts are off / resolve fails →
     # the agent uses the config_name + config_override fallback below.
     resolved_config: dict[str, Any] | None = None
-    _sess_status: dict[str, Any] = {}
+    _sess_status: dict[str, Any] = {"_capture_manifest": True}
     try:
         _thread = await postgres_db.get_thread(thread_id)
     except Exception:
@@ -352,6 +353,18 @@ async def assemble_session_attach_payload(
             logger.info(
                 "Session attach: thread %s refused — protected cloud mount could "
                 "not be built",
+                thread_id,
+            )
+            return None
+
+    if dependencies.capture_session_config is not None:
+        try:
+            resolved_config = await dependencies.capture_session_config(
+                _thread, resolved_config, _sess_status, project_ids=project_ids
+            )
+        except HTTPException:
+            logger.warning(
+                "Session attach: configuration admission changed for %s; refusing",
                 thread_id,
             )
             return None

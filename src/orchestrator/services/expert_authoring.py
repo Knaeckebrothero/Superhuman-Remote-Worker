@@ -149,6 +149,16 @@ class ExpertAuthoringService:
                     tags=with_role_tag(src["expert_type"], src.get("tags")),
                     config=src.get("config") or {},
                     prompts=prompts,
+                    **(
+                        {"srw_layers": src["harness_config_layers"]}
+                        if src.get("harness_config_layers")
+                        else {}
+                    ),
+                    **{
+                        "srw_" + key: src["harness_" + key]
+                        for key in ("config_name", "asset_name")
+                        if src.get("harness_" + key)
+                    },
                 )
             except HTTPException:
                 raise
@@ -211,6 +221,8 @@ class ExpertAuthoringService:
         existing = await self.store.get_expert_by_id(expert_id)
         if not existing:
             raise HTTPException(status_code=404, detail="Expert not found")
+        if "harness_adapter" in existing and existing["harness_adapter"] != "srw/v1":
+            raise HTTPException(409, "Edit this harness through its Expert manifest.")
         if str(existing["owner_id"]) != str(user["id"]) and not user.get("is_admin"):
             raise HTTPException(
                 status_code=403, detail="Only the owner may edit this expert"
@@ -286,7 +298,7 @@ class ExpertAuthoringService:
                 raise HTTPException(status_code=404, detail="Expert not found")
             src = db_expert_to_bundle_src(row)
         else:
-            src = self.catalog.bundled_expert_bundle(expert_id)
+            src = await self.catalog.bundled_expert_source(expert_id)
             if not src:
                 raise HTTPException(status_code=404, detail="Expert not found")
         # A fork is a new write by a new principal, and the source row may be
@@ -332,10 +344,20 @@ class ExpertAuthoringService:
             )
             if not row:
                 raise HTTPException(status_code=404, detail="Expert not found")
+            if row.get("harness_config_layers") or row.get("harness_asset_name"):
+                raise HTTPException(
+                    409,
+                    "Export this Expert through its manifest to retain private layers and installed asset selections.",
+                )
             return to_export_bundle(db_expert_to_bundle_src(row))
-        bundle = self.catalog.bundled_expert_bundle(expert_id)
+        bundle = await self.catalog.bundled_expert_source(expert_id)
         if not bundle:
             raise HTTPException(status_code=404, detail="Expert not found")
+        if bundle.get("harness_config_layers") or bundle.get("harness_asset_name"):
+            raise HTTPException(
+                409,
+                "Export this Expert through its manifest to retain private layers and installed asset selections.",
+            )
         return to_export_bundle(bundle)
 
     async def import_expert(
@@ -486,7 +508,7 @@ class ExpertAuthoringService:
             )
 
         if body.expert_id and not self.catalog.deps.looks_like_uuid(body.expert_id):
-            source = self.catalog.bundled_expert_bundle(body.expert_id)
+            source = await self.catalog.bundled_expert_source(body.expert_id)
             if not source:
                 raise HTTPException(status_code=404, detail="Expert not found")
             if source["expert_type"] != expert_type:

@@ -18,6 +18,10 @@ Tests are named after u1_plan.md WP3. The failure policy is pinned twice:
 
 from __future__ import annotations
 
+from shared.runtime.core.srw_manifest_config import (
+    srw_config_fragment as _srw_config_fragment,
+)
+
 import json
 from pathlib import Path
 
@@ -274,8 +278,10 @@ def test_inherit_with_a_modelless_parent_is_left_and_recorded():
 
 
 def test_ref_bundled_expert_drops_parent_only_keys():
-    critic = yaml.safe_load(
-        (_CONFIG / "experts" / "critic" / "config.yaml").read_text(encoding="utf-8")
+    critic = _srw_config_fragment(
+        yaml.safe_load(
+            (_CONFIG / "experts" / "critic" / "config.yaml").read_text(encoding="utf-8")
+        )
     )
     entry = _entry({"roster": {"reviewer": {"$ref": "critic"}}}, "reviewer")
     # the critic's tools survive ...
@@ -311,8 +317,12 @@ def test_ref_bundled_expert_drops_parent_only_keys():
 
 
 def test_ref_library_entry():
-    explorer = yaml.safe_load(
-        (_CONFIG / "subagents" / "explorer" / "config.yaml").read_text(encoding="utf-8")
+    explorer = _srw_config_fragment(
+        yaml.safe_load(
+            (_CONFIG / "subagents" / "explorer" / "config.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
     )
     for ref in ("subagents/explorer", "explorer"):
         entry = _entry({"roster": {"explorer": {"$ref": ref}}}, "explorer")
@@ -329,6 +339,31 @@ def test_ref_library_entry():
         assert entry["llm"]["model"] == "claude-opus-4-1"  # its own `inherit`
         for dotted in _SUBAGENT_IGNORED:
             assert not _present(entry, dotted), dotted
+
+
+def test_bound_catalog_uuid_keeps_bundled_harness_asset_directory():
+    fragment = _srw_config_fragment(
+        yaml.safe_load((_CONFIG / "experts/developer/config.yaml").read_text())
+    )
+    row = _db_row(
+        name="developer",
+        config=fragment,
+        prompts={},
+        harness_adapter="srw/v1",
+        harness_config_name="worker_base",
+        harness_asset_name="developer",
+    )
+    by_name = _entry({"roster": {"builder": {"$ref": "developer"}}}, "builder")
+    by_id = _entry(
+        {"roster": {"builder": {"$ref": _UUID}}}, "builder", db_refs={_UUID: row}
+    )
+    assert by_id["_deployment_dir"] == by_name["_deployment_dir"]
+    # Optional unset fields can be represented by either absence or None after
+    # the private SRW merge; the routed/model-family values must agree.
+    assert {key: value for key, value in by_id["llm"].items() if value is not None} == {
+        key: value for key, value in by_name["llm"].items() if value is not None
+    }
+    assert by_id.get("prompts") == by_name.get("prompts")
 
 
 def test_ref_db_row_via_prefetched_map():
@@ -370,6 +405,47 @@ def test_ref_db_row_via_prefetched_map():
     )
     assert text_entry["llm"]["model"] == "claude-sonnet-4-5"
     assert text_entry["prompts"]["persona"] == "READER-PERSONA"
+
+
+@pytest.mark.parametrize(
+    "config_name",
+    [
+        "expert_base",
+        "worker_base",
+        "session_base",
+        "subagent_base",
+        "default",
+        "persistent_default",
+        "overlays/worker",
+    ],
+)
+def test_stored_roster_target_root_bases_re_root_onto_subagent(config_name):
+    row = _db_row(harness_adapter="srw/v1", harness_config_name=config_name)
+    entry = _entry(
+        {"roster": {"reader": {"$ref": _UUID}}}, "reader", db_refs={_UUID: row}
+    )
+    assert entry["llm"]["model"] == "claude-sonnet-4-5"
+    assert entry["tools"]["workspace"] == ["read_file"]
+    assert entry["memory"]["enabled"] is False
+    assert "backend" not in entry["workspace"]
+
+
+@pytest.mark.parametrize("config_name", ["developer", "custom-team-base"])
+def test_stored_roster_target_cannot_silently_ignore_non_root_base(config_name):
+    row = _db_row(harness_adapter="srw/v1", harness_config_name=config_name)
+    roster = {"roster": {"reader": {"$ref": _UUID}}}
+    with pytest.raises(
+        RosterResolutionError,
+        match=rf"subagents\.roster\.reader: unsupported SRW config_name '{config_name}'",
+    ):
+        _resolve(roster, db_refs={_UUID: row})
+
+    dropped = _resolve(roster, db_refs={_UUID: row}, on_missing="drop")
+    assert dropped["subagents"]["roster"] == {}
+    assert any(
+        "unsupported SRW config_name" in warning and config_name in warning
+        for warning in dropped[ROSTER_WARNINGS_KEY]
+    )
 
 
 def test_nested_roster_dropped():
@@ -772,7 +848,9 @@ def test_public_bases_carry_no_roster_and_the_rostered_experts_resolve_the_libra
             assert entry["_deployment_dir"] == f"config/subagents/{name}"
             assert resolve_config_path(entry["_ref"])[0] == str(library_leaf)
 
-            raw = yaml.safe_load(library_leaf.read_text(encoding="utf-8"))
+            raw = _srw_config_fragment(
+                yaml.safe_load(library_leaf.read_text(encoding="utf-8"))
+            )
             budgets = ChildBudgets.from_entry(entry, name)
             declared = raw.get("limits") or dict(
                 zip(

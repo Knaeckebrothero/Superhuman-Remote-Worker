@@ -179,7 +179,7 @@ def run():
         )
         validation = request("validate", body, headers=headers)
         require(
-            validation["valid"] and len(validation["documents"]) == 7,
+            validation["valid"] and len(validation["documents"]) == len(documents),
             "Public examples did not all validate.",
         )
         preview = request("preview", body, headers=headers)
@@ -225,7 +225,7 @@ def run():
             "Referenced credential scope changed.",
         )
         passed.append(
-            "real Keycloak authentication, packaged schema, and all seven example resources"
+            f"real Keycloak authentication, packaged schema, and all {len(documents)} example resources"
         )
         passed.append(
             "reference resolution, opaque harness settings, secret references, and pending admission checks"

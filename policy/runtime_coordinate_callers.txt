@@ -13,6 +13,7 @@
 #
 # <file>  <enclosing qualname>  <kind>  <callee>  <fingerprint>  #<ordinal>  <classification>
 
+src/orchestrator/main.py  _cancel_job_internal  http  client.post  b81e2e9fccf9  #1  exact-runtime-recipient
 src/orchestrator/main.py  _capture_workspace_snapshot_for_freeze  remote-effect  snapshot_service.capture_vm_snapshot  a8d60e53ae92  #1  contained-k8s
 src/orchestrator/main.py  _capture_workspace_snapshot_for_freeze  remote-effect  snapshot_service.capture_vm_snapshot  aeab2fb0c8df  #1  vm-authority
 src/orchestrator/main.py  _cascade_cancel_to_children._signal_cancel  http  client.post  e095cc0a7a8c  #1  exact-runtime-recipient
@@ -29,7 +30,6 @@ src/orchestrator/main.py  _resume_job_on_agent  http  client.get  8c74982a3556  
 src/orchestrator/main.py  _resume_job_on_agent  http  client.post  d1bd7131e5e1  #1  exact-runtime-recipient
 src/orchestrator/main.py  _send_session_attach_locked  http  client.post  ac47f8baff89  #1  exact-runtime-recipient
 src/orchestrator/main.py  _thread_turn_in_flight  http  client.post  5e8b40a94fa6  #1  exact-runtime-recipient
-src/orchestrator/main.py  cancel_job  http  client.post  b81e2e9fccf9  #1  exact-runtime-recipient
 src/orchestrator/main.py  get_agent_system_info  http  client.get  7e0ff1b83a17  #1  read-only-probe
 src/orchestrator/main.py  pause_job  http  client.post  c40208b4763b  #1  exact-runtime-recipient
 src/orchestrator/routers/thread_files.py  upload_files_to_thread  remote-effect  upload_files_to_attested_vm_workspace  8f1a01b30667  #1  fresh-k8s-attestation

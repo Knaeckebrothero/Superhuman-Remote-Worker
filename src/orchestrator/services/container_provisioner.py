@@ -5269,6 +5269,17 @@ class ContainerProvisioner:
             else None
         )
 
+    def workspace_cleanup_location(self, owner: WorkspaceOwner) -> dict[str, str]:
+        """The exact names this provisioner observes during cleanup capture."""
+
+        return {
+            "namespace": self._namespace,
+            "pod": owner.pod_name,
+            "seedConfigMap": self._seed_configmap_name(owner.pod_name),
+            "pvc": _pvc_name_for(owner),
+            "service": owner.pod_name,
+        }
+
     async def prepare_workspace_cleanup_intent(
         self,
         owner: WorkspaceOwner,
@@ -5425,6 +5436,7 @@ class ContainerProvisioner:
             seed_configmap_uid=identity.seed_configmap_uid,
             pvc_uid=identity.pvc_uid,
             service_uid=identity.service_uid,
+            resource_location=self.workspace_cleanup_location(owner),
         )
         return captured if isinstance(captured, dict) else claimed
 

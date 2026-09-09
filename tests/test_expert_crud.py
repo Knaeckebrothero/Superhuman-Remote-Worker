@@ -7,6 +7,10 @@ mockable here. Local env may be noisy (Py3.14, missing optional deps); CI
 (Py3.12) is the authoritative gate.
 """
 
+from shared.runtime.core.srw_manifest_config import (
+    srw_config_fragment as _srw_config_fragment,
+)
+
 from tests._expert_catalog import catalogue_service, catalogue_state, catalogue_route
 from orchestrator.routers import expert_catalog as expert_routes
 from orchestrator.schemas import expert_catalog as expert_schemas
@@ -427,11 +431,13 @@ async def test_list_type_filter_matches_tag(monkeypatch):
     )
     assert {"developer", "tagged-worker", "dual"} <= set(worker)  # dual: tagged
     assert "plain-session" not in worker and "subagents/explorer" not in worker
-    authored = yaml.safe_load(
-        (
-            Path(main_module.__file__).resolve().parents[2]
-            / "config/experts/developer/config.yaml"
-        ).read_text(encoding="utf-8")
+    authored = _srw_config_fragment(
+        yaml.safe_load(
+            (
+                Path(main_module.__file__).resolve().parents[2]
+                / "config/experts/developer/config.yaml"
+            ).read_text(encoding="utf-8")
+        )
     )["tags"]
     assert worker["developer"]["tags"] == [*authored, "worker"]
 

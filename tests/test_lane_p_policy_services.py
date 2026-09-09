@@ -1538,6 +1538,7 @@ def _session_deps(**overrides_):
         return _async
 
     store = MagicMock()
+    store.fetchrow = AsyncMock(return_value=None)
     store.get_user_settings = AsyncMock(return_value={})
     store.resolve_default_for_capability = AsyncMock(return_value=None)
     store.get_expert_by_id = AsyncMock(return_value=None)
@@ -1577,7 +1578,10 @@ class TestSessionConfigResolution:
         status: dict = {}
         assert (
             await sessioncfg.resolve_session_config(
-                {"id": "t"}, {}, status=status, dependencies=deps
+                {"id": "22222222-2222-4222-8222-222222222222"},
+                {},
+                status=status,
+                dependencies=deps,
             )
             is None
         )
@@ -1591,7 +1595,7 @@ class TestSessionConfigResolution:
         )
         status: dict = {}
         out = await sessioncfg.resolve_session_config(
-            {"id": "t", "user_id": None},
+            {"id": "22222222-2222-4222-8222-222222222222", "user_id": None},
             {"expert_id": "should-be-ignored"},
             status=status,
             resolve_base_when_experts_disabled=True,
@@ -1645,7 +1649,9 @@ class TestSessionConfigResolution:
         monkeypatch.setattr(sessioncfg, "resolve_config", spy)
         deps, _ = _session_deps()
         await sessioncfg.resolve_session_config(
-            {"id": "t", "user_id": "u"}, {}, dependencies=deps
+            {"id": "22222222-2222-4222-8222-222222222222", "user_id": "u"},
+            {},
+            dependencies=deps,
         )
         assert seen["called"] is True
         assert seen["base_defaults"] == {"llm": {"model": "sentinel-account-model"}}
@@ -1654,7 +1660,13 @@ class TestSessionConfigResolution:
     async def test_a_project_scoped_thread_skips_the_mount_lookup(self):
         deps, calls = _session_deps()
         await sessioncfg.resolve_session_config(
-            {"id": "t", "user_id": "u", "project_id": "p"}, {}, dependencies=deps
+            {
+                "id": "22222222-2222-4222-8222-222222222222",
+                "user_id": "u",
+                "project_id": "p",
+            },
+            {},
+            dependencies=deps,
         )
         assert "thread_project_ids" not in calls
 
@@ -1667,7 +1679,10 @@ class TestSessionConfigResolution:
         status: dict = {}
         with pytest.raises(grants.GrantDenied):
             await sessioncfg.resolve_session_config(
-                {"id": "t", "user_id": "u"}, {}, status=status, dependencies=deps
+                {"id": "22222222-2222-4222-8222-222222222222", "user_id": "u"},
+                {},
+                status=status,
+                dependencies=deps,
             )
         assert status["state"] == "denied"
         assert status["grant_violations"] == ["shell_tools: denied"]
@@ -1681,7 +1696,10 @@ class TestSessionConfigResolution:
         status: dict = {}
         assert (
             await sessioncfg.resolve_session_config(
-                {"id": "t", "user_id": "u"}, {}, status=status, dependencies=deps
+                {"id": "22222222-2222-4222-8222-222222222222", "user_id": "u"},
+                {},
+                status=status,
+                dependencies=deps,
             )
             is None
         )
@@ -1700,7 +1718,7 @@ class TestSessionConfigResolution:
         deps, _ = _session_deps()
         await sessioncfg.resolve_session_config(
             {
-                "id": "t",
+                "id": "22222222-2222-4222-8222-222222222222",
                 "user_id": "u",
                 "config_name": "11111111-1111-4111-8111-111111111111",
             },
@@ -1725,7 +1743,7 @@ class TestSessionConfigResolution:
 
         deps, _ = _session_deps(seed_registry_model_overrides=passthrough)
         await sessioncfg.resolve_session_config(
-            {"id": "t", "user_id": "u"},
+            {"id": "22222222-2222-4222-8222-222222222222", "user_id": "u"},
             {"config_override": {"stored": True}},
             config_override={"attach": True},
             dependencies=deps,
@@ -1749,7 +1767,9 @@ class TestSessionConfigResolution:
         monkeypatch.setattr(sessioncfg, "inject_blob_credentials", echo)
         deps, _ = _session_deps()
         out = await sessioncfg.resolve_session_config(
-            {"id": "t", "user_id": "u"}, {}, dependencies=deps
+            {"id": "22222222-2222-4222-8222-222222222222", "user_id": "u"},
+            {},
+            dependencies=deps,
         )
         assert out["agent"]["_fleet_management_disabled"] is True
 
@@ -1937,7 +1957,11 @@ class TestPrefetchRosterRefs:
 class TestSessionPreflights:
     @staticmethod
     def _thread(metadata):
-        return {"id": "t", "user_id": "u", "metadata": metadata}
+        return {
+            "id": "22222222-2222-4222-8222-222222222222",
+            "user_id": "u",
+            "metadata": metadata,
+        }
 
     @pytest.mark.asyncio
     async def test_malformed_metadata_json_is_a_409(self):
@@ -2023,7 +2047,7 @@ class TestSessionPreflights:
         deps, _ = _session_deps()
         with pytest.raises(HTTPException) as exc:
             await sessioncfg.require_supported_protected_session_class(
-                {"id": "t", "user_id": "u"},
+                {"id": "22222222-2222-4222-8222-222222222222", "user_id": "u"},
                 {"protected_cloud": True},
                 dependencies=deps,
             )
@@ -2037,7 +2061,7 @@ class TestSessionPreflights:
         deps, _ = _session_deps(gather_in_scope_skills=boom)
         with pytest.raises(HTTPException) as exc:
             await sessioncfg.require_supported_protected_session_class(
-                {"id": "t", "user_id": "u"},
+                {"id": "22222222-2222-4222-8222-222222222222", "user_id": "u"},
                 {"protected_cloud": True},
                 dependencies=deps,
             )
@@ -2047,7 +2071,7 @@ class TestSessionPreflights:
     async def test_a_thread_without_the_marker_is_not_class_checked(self):
         deps, calls = _session_deps()
         await sessioncfg.require_supported_protected_session_class(
-            {"id": "t"}, {}, dependencies=deps
+            {"id": "22222222-2222-4222-8222-222222222222"}, {}, dependencies=deps
         )
         assert calls == []
 

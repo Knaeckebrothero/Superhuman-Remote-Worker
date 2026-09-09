@@ -36,6 +36,9 @@ class ExpertCatalogStore(Protocol):
         config: dict[str, Any] | None = None,
         prompts: dict[str, Any] | None = None,
         is_global: bool = False,
+        srw_layers: list[dict[str, Any]] | None = None,
+        srw_config_name: str | None = None,
+        srw_asset_name: str | None = None,
     ) -> dict[str, Any]: ...
 
     async def get_expert_by_id(self, expert_id: str) -> dict[str, Any] | None: ...
@@ -238,3 +241,6 @@ class ExpertCatalogDependencies:
     ]
     looks_like_uuid: Callable[[str], bool]
     forge: ProjectExpertForge
+    # Production binds the canonical resource store. Pure catalogue fixtures
+    # may leave it absent when exercising only private harness formatting.
+    manifests: Any | None = None

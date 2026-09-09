@@ -125,6 +125,7 @@ class ThreadWorkspaceDeliveryDependencies:
     # guard is a field with a default, so a router resolves it through the
     # dependency object and a caller can substitute it explicitly.
     require_internal: Any = _require_internal
+    capture_session_config: Any = None
 
 
 def agent_canvas_workspace_capabilities(
@@ -889,7 +890,7 @@ async def agent_get_thread_workspace_locked(
     # merge above (which stays for the fallback). None when experts are off.
     # Session dispatch PEP (fail closed): a grant denial or resolve error must not
     # fall through to the unvetted config_override — refuse the attach (403).
-    _sess_status: dict[str, Any] = {}
+    _sess_status: dict[str, Any] = {"_capture_manifest": True}
     try:
         session_resolved = await _resolve_session_config(
             thread, metadata, status=_sess_status
@@ -1021,6 +1022,10 @@ async def agent_get_thread_workspace_locked(
     # Everything above this point crosses policy, workspace, repository and
     # cloud awaits. This is the actual credential-delivery boundary and the
     # final await before returning coordinates.
+    if dependencies.capture_session_config is not None:
+        session_resolved = await dependencies.capture_session_config(
+            thread, session_resolved, _sess_status, project_ids=project_ids
+        )
     final_thread = await postgres_db.get_thread(thread_id)
     if not _thread_accepts_runtime(final_thread):
         raise HTTPException(

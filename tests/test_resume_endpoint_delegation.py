@@ -155,7 +155,7 @@ class _FakeAsyncClient:
 @pytest.fixture
 def fake_conn(monkeypatch):
     """postgres_db.acquire() -> conn with a recorded execute()."""
-    conn = SimpleNamespace(execute=AsyncMock())
+    conn = SimpleNamespace(execute=AsyncMock(), fetchrow=AsyncMock(return_value=None))
 
     @asynccontextmanager
     async def _acquire():

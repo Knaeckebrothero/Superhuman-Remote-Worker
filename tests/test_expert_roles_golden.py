@@ -28,6 +28,10 @@ deliberately frozen.
 
 from __future__ import annotations
 
+from shared.runtime.core.srw_manifest_config import (
+    srw_config_fragment as _srw_config_fragment,
+)
+
 import copy
 import json
 from pathlib import Path
@@ -313,7 +317,7 @@ def pre_split_leaves(tmp_path_factory) -> dict[str, tuple[Path, str | None, str]
     out = {}
     for name, leaf, deployment_dir in _BUNDLED:
         role = _native_role(leaf)
-        raw = yaml.safe_load(leaf.read_text(encoding="utf-8"))
+        raw = _srw_config_fragment(yaml.safe_load(leaf.read_text(encoding="utf-8")))
         raw["$extends"] = str(_PRE_SPLIT[role].resolve())
         copy = tmp / f"{name}.yaml"
         copy.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
@@ -333,7 +337,7 @@ def test_pre_split_fixture_is_the_a8950251_base(role):
     fixture = _PRE_SPLIT[role]
     assert fixture.is_file()
     assert canonical_config_name(str(fixture)) == str(fixture)
-    raw = yaml.safe_load(fixture.read_text(encoding="utf-8"))
+    raw = _srw_config_fragment(yaml.safe_load(fixture.read_text(encoding="utf-8")))
     assert raw["agent_id"] == ROLE_ROOTS[role]
     assert "$extends" not in raw
 
@@ -393,7 +397,9 @@ def test_authored_llm_keys_of_a_root_match_the_pre_split_base(role):
     """The settings matrix must skip exactly the llm keys the framework base
     authored — now split over overlay + expert_base, so the union counts."""
     root_path, _ = resolve_config_path(ROLE_ROOTS[role])
-    raw = yaml.safe_load(_PRE_SPLIT[role].read_text(encoding="utf-8"))
+    raw = _srw_config_fragment(
+        yaml.safe_load(_PRE_SPLIT[role].read_text(encoding="utf-8"))
+    )
     assert authored_llm_keys(root_path) == set(raw["llm"])
     assert authored_llm_keys(str(_PRE_SPLIT[role])) == set(raw["llm"])
 
@@ -438,7 +444,9 @@ def test_bundled_expert_effective_config_is_identical(name, pre_split_leaves):
 
 @pytest.fixture(scope="module")
 def subagent_ignored() -> list[str]:
-    raw = yaml.safe_load((_CONFIG / "overlays" / "subagent.yaml").read_text())
+    raw = _srw_config_fragment(
+        yaml.safe_load((_CONFIG / "overlays" / "subagent.yaml").read_text())
+    )
     declared = raw[IGNORE_KEYS_DIRECTIVE]
     assert _NOTE_IGNORED <= set(declared), "the note's parent-only keys are the floor"
     return declared
@@ -448,7 +456,10 @@ def subagent_ignored() -> list[str]:
 def test_every_bundled_expert_resolves_in_the_subagent_role(name, subagent_ignored):
     leaf, deployment_dir = next((p, d) for n, p, d in _BUNDLED if n == name)
     data = load_and_merge_config(str(leaf), role="subagent")
-    assert data["agent_id"] == yaml.safe_load(leaf.read_text())["agent_id"]
+    assert (
+        data["agent_id"]
+        == _srw_config_fragment(yaml.safe_load(leaf.read_text()))["agent_id"]
+    )
     assert data[IGNORE_KEYS_DIRECTIVE] == subagent_ignored
     for dotted in subagent_ignored:
         assert not _dotted_present(data, dotted), f"{name}: {dotted} survived"
@@ -467,7 +478,7 @@ def test_subagent_role_keeps_the_experts_tools_and_drops_the_parent_only_keys():
     """``$ref: critic`` semantics: the critic's tools survive, its
     workspace.backend / verification / autonomy do not (D4)."""
     critic = _CONFIG / "experts" / "critic" / "config.yaml"
-    own = yaml.safe_load(critic.read_text())
+    own = _srw_config_fragment(yaml.safe_load(critic.read_text()))
     data = load_and_merge_config(str(critic), role="subagent")
     assert data["tools"]["shell"] == own["tools"]["shell"]
     assert "backend" not in data["workspace"]
@@ -496,7 +507,7 @@ def test_session_expert_as_worker_carries_the_worker_keys():
 def test_worker_expert_as_session_uses_the_session_overlay_and_drops_nothing():
     developer = _CONFIG / "experts" / "developer" / "config.yaml"
     assert _native_role(developer) == "worker"
-    own = yaml.safe_load(developer.read_text())
+    own = _srw_config_fragment(yaml.safe_load(developer.read_text()))
     data = load_and_merge_config(str(developer), role="session")
     session = load_role_base("session")
     assert data["agent_id"] == "developer"
@@ -735,7 +746,7 @@ def test_library_entry_resolves_in_the_subagent_role(name, subagent_ignored):
     exactly its declared tools, carries the `subagent` tag, inherits the
     parent's model by default, and parses like any config."""
     leaf = next(p for p in _LIBRARY if p.parent.name == name)
-    own = yaml.safe_load(leaf.read_text(encoding="utf-8"))
+    own = _srw_config_fragment(yaml.safe_load(leaf.read_text(encoding="utf-8")))
     assert canonical_config_name(str(own["$extends"])) == EXPERT_BASE
     assert chain_root(str(leaf)) == EXPERT_BASE
     assert "subagent" in own["tags"]
@@ -769,7 +780,7 @@ def test_library_entry_is_read_only_when_loaded_standalone(name):
     from agent.tools.registry import TOOL_REGISTRY
 
     leaf = next(p for p in _LIBRARY if p.parent.name == name)
-    own = yaml.safe_load(leaf.read_text(encoding="utf-8"))
+    own = _srw_config_fragment(yaml.safe_load(leaf.read_text(encoding="utf-8")))
     floor_path, floor_dir = resolve_config_path(ROLE_ROOTS["subagent"])
     floor = set(get_all_tool_names(load_agent_config(floor_path, floor_dir)))
     cfg = load_agent_config(str(leaf), str(leaf.parent))

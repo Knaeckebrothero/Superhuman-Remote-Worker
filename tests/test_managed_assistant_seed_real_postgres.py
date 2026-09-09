@@ -4,6 +4,7 @@ import asyncio
 from copy import deepcopy
 import json
 from pathlib import Path
+from uuid import uuid4
 
 import asyncpg
 import pytest
@@ -48,6 +49,14 @@ async def schema_applied(pg_dsn):
         await conn.execute(
             (ROOT / "src/orchestrator/database/schema_current.sql").read_text()
         )
+        await conn.execute("SET search_path TO public")
+        if not await conn.fetchval("SELECT to_regclass('srw_resources')"):
+            await conn.execute(
+                (
+                    ROOT
+                    / "src/orchestrator/database/migrations/app/0234_manifest_resources.sql"
+                ).read_text()
+            )
     finally:
         await conn.close()
 
@@ -57,7 +66,7 @@ async def db(pg_dsn, schema_applied):
     store = PostgresDB(connection_string=pg_dsn, min_connections=1, max_connections=4)
     await store.connect()
     try:
-        await store.execute("TRUNCATE experts CASCADE")
+        await store.execute("TRUNCATE srw_resources, experts CASCADE")
         yield store
     finally:
         await store.close()
@@ -85,12 +94,55 @@ async def _legacy(db, *, roster=None, seed_version=2, prompts=None):
 
 
 def _config(row):
-    return json.loads(row["config"])
+    return (
+        json.loads(row["config"])
+        if isinstance(row["config"], str)
+        else deepcopy(row["config"])
+    )
+
+
+class HistoricalExpertStore:
+    """Raw pre-manifest rows for exercising migration 0229 in its own era."""
+
+    def __init__(self, db):
+        self.db = db
+
+    def __getattr__(self, name):
+        return getattr(self.db, name)
+
+    async def upsert_managed_expert(self, **fields):
+        row = await self.db.fetchrow(
+            """INSERT INTO experts (name,display_name,description,icon,color,tags,expert_type,
+            config,prompts,is_global,managed_key,seed_version)
+            VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,TRUE,$10,$11) RETURNING *""",
+            fields["name"],
+            fields["display_name"],
+            fields["description"],
+            fields["icon"],
+            fields["color"],
+            fields["tags"],
+            fields["expert_type"],
+            json.dumps(fields["config"]),
+            json.dumps(fields["prompts"]),
+            fields["managed_key"],
+            fields["seed_version"],
+        )
+        return dict(row), True
+
+    async def get_expert_by_managed_key(self, key):
+        row = await self.db.fetchrow("SELECT * FROM experts WHERE managed_key=$1", key)
+        return dict(row) if row else None
+
+
+@pytest.fixture
+def legacy_db(db):
+    return HistoricalExpertStore(db)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("seed_version", [1, 2, 3])
-async def test_setup_guidance_updates_unchanged_persona_once(db, seed_version):
+async def test_setup_guidance_updates_unchanged_persona_once(legacy_db, seed_version):
+    db = legacy_db
     before = await _legacy(
         db,
         seed_version=seed_version,
@@ -134,7 +186,10 @@ async def test_setup_guidance_updates_unchanged_persona_once(db, seed_version):
         {"instructions": "No persona override"},
     ],
 )
-async def test_setup_guidance_preserves_operator_and_nontext_personas(db, prompts):
+async def test_setup_guidance_preserves_operator_and_nontext_personas(
+    legacy_db, prompts
+):
+    db = legacy_db
     before = await _legacy(db, prompts=prompts)
 
     await db.execute(SETUP_GUIDANCE_MIGRATION.read_text())
@@ -143,7 +198,8 @@ async def test_setup_guidance_preserves_operator_and_nontext_personas(db, prompt
 
 
 @pytest.mark.asyncio
-async def test_setup_guidance_rechecks_concurrent_persona_edit(db):
+async def test_setup_guidance_rechecks_concurrent_persona_edit(legacy_db):
+    db = legacy_db
     await _legacy(db, prompts={"persona": PREVIOUS_PERSONA})
     async with db.acquire() as editor:
         blocker = await editor.fetchval("SELECT pg_backend_pid()")
@@ -199,7 +255,15 @@ async def test_exact_v2_roster_repairs_once_preserving_other_content_and_pointer
     assert _config(after) == expected_config
     assert after["seed_version"] == 3
     assert after["version"] == before["version"] + 1
-    for key in before.keys() - {"config", "version", "seed_version", "updated_at"}:
+    for key in before.keys() - {
+        "config",
+        "version",
+        "seed_version",
+        "updated_at",
+        "manifest",
+        "manifest_revision",
+        "manifest_resource_version",
+    }:
         assert after[key] == before[key], key
     pointer = await db.get_application_expert_default("session")
     assert pointer["id"] == selected["id"]
@@ -255,32 +319,31 @@ async def test_waiting_upgrade_rechecks_operator_edit_after_row_lock(db, edit_ro
     async with db.acquire() as editor:
         blocker = await editor.fetchval("SELECT pg_backend_pid()")
         async with editor.transaction():
+            config = _config(stale_row)
+            prompts = deepcopy(stale_row["prompts"])
             if edit_roster:
-                await editor.execute(
-                    """UPDATE experts SET config = jsonb_set(
-                           config, '{subagents,roster,implementer,description}',
-                           '"Concurrent operator edit"'::jsonb
-                       ), version = version + 1 WHERE managed_key = $1""",
-                    KEY,
+                config["subagents"]["roster"]["implementer"]["description"] = (
+                    "Concurrent operator edit"
                 )
             else:
-                await editor.execute(
-                    """UPDATE experts SET config = config ||
-                           '{"concurrent_operator_key": "preserve"}'::jsonb,
-                           prompts = '{"persona": "Concurrent persona"}'::jsonb,
-                           version = version + 1 WHERE managed_key = $1""",
+                config["concurrent_operator_key"] = "preserve"
+                prompts = {"persona": "Concurrent persona"}
+            from orchestrator.services.manifest_experts import persist_expert_resource
+
+            async with db.using_connection(editor):
+                await db._lock_expert_catalog()
+                raw = await editor.fetchrow(
+                    "UPDATE experts SET version=version+1 WHERE managed_key=$1 RETURNING *",
                     KEY,
                 )
-            operator_row = dict(
-                await editor.fetchrow(
-                    "SELECT * FROM experts WHERE managed_key = $1", KEY
+                operator_row = await persist_expert_resource(
+                    db, {**dict(raw), "config": config, "prompts": prompts}
                 )
-            )
             task = asyncio.create_task(
                 upgrade_managed_seed(db, spec=SPEC, bundle=_bundle(), row=stale_row)
             )
             try:
-                # Prove the repair actually waits on the editor's row lock,
+                # Prove the repair actually waits on the editor's catalog lock,
                 # then commit the operator edit so PostgreSQL must recheck.
                 async with asyncio.timeout(10):
                     while not await db.fetchval(
@@ -309,3 +372,77 @@ async def test_waiting_upgrade_rechecks_operator_edit_after_row_lock(db, edit_ro
         assert after["prompts"] == operator_row["prompts"]
         assert after["seed_version"] == 3
         assert after["version"] == operator_row["version"] + 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scope_kind", ["Account", "Project", "Catalog"])
+async def test_native_expert_binding_preserves_scope_visibility(db, scope_kind):
+    from orchestrator.services.manifest_experts import sync_expert_identity
+    from orchestrator.services.manifest_store import ManifestStore
+    from shared.manifests import preview_documents
+    from shared.manifests.resolution import content_revision
+
+    project_id = await db.fetchval(
+        "INSERT INTO projects(name) VALUES('Native Expert scope') RETURNING id"
+    )
+    owner = await db.fetchval(
+        "INSERT INTO users(display_name,default_project_id) VALUES('Manifest owner',$1) RETURNING id",
+        project_id,
+    )
+    outsider = await db.fetchval(
+        "INSERT INTO users(display_name,default_project_id) VALUES('Other user',$1) RETURNING id",
+        project_id,
+    )
+    scope_name = (
+        "shared"
+        if scope_kind == "Catalog"
+        else str(project_id if scope_kind == "Project" else owner)
+    )
+    document = {
+        "apiVersion": "srw/v1alpha1",
+        "kind": "Expert",
+        "metadata": {
+            "name": "generic-" + str(uuid4())[:8],
+            "scope": {"kind": scope_kind, "name": scope_name},
+            "annotations": {
+                "srw.io/bundled-selector": "assistant",
+                "is_global": "true",
+            },
+        },
+        "spec": {
+            "runtime": {
+                "image": "example.invalid/custom:fixed",
+                "config": {"tools": {"my-tool": None}},
+            }
+        },
+    }
+    store = ManifestStore(db)
+    resolved = preview_documents([document])["resolved"][0]
+    async with db.transaction_scope():
+        await store.lock_catalog()
+        await store.lock_identity(document)
+        resource, _ = await store.save(
+            document,
+            resolved,
+            content_revision(resolved["spec"]),
+            [],
+            owner_id=owner,
+            project_id=project_id if scope_kind == "Project" else None,
+        )
+        await sync_expert_identity(db, resource)
+    linked = await store.by_id(resource["id"])
+    assert linked["linked_id"] is not None
+    owned = await db.get_expert_visible_by_id(
+        str(linked["linked_id"]), user_id=str(owner)
+    )
+    assert owned["manifest"] == document
+    assert owned["config"] == {} and owned["harness_adapter"] is None
+    other = await db.get_expert_visible_by_id(
+        str(linked["linked_id"]), user_id=str(outsider)
+    )
+    assert bool(other) == (scope_kind == "Catalog")
+    if scope_kind == "Project":
+        linked_project = await db.get_project_linked_expert(
+            str(project_id), str(linked["linked_id"])
+        )
+        assert linked_project["manifest"] == document

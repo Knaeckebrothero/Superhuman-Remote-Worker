@@ -227,6 +227,21 @@ async def db(pg_dsn, _schema_applied, monkeypatch):
             "TRUNCATE job_message_routes, session_wake_events, message_log, "
             "jobs, project_officers, threads, projects CASCADE"
         )
+        # TRUNCATE reaches users and capability_grants through their FKs,
+        # including nullable granted_by; seed after resetting every test.
+        await conn.execute("""
+            INSERT INTO capability_grants(scope_kind,key,value_json) VALUES
+                ('global','shell_tools','true'),
+                ('global','delegation','true'),
+                ('global','vm_workspace','true'),
+                ('global','autonomy_ceiling','"full"')
+            ON CONFLICT(scope_kind,scope_id,key) DO UPDATE SET value_json=EXCLUDED.value_json
+        """)
+    from orchestrator.services.manifest_experts import seed_bundled_expert_manifests
+
+    await seed_bundled_expert_manifests(
+        store, Path(__file__).resolve().parents[1] / "config"
+    )
     try:
         yield store
     finally:
@@ -254,6 +269,7 @@ async def _seed_post(
 ) -> dict[str, str]:
     project_id = uuid4()
     thread_id = uuid4()
+    owner_id = uuid4()
     runtime_officer = {
         "enabled": True,
         "auto_pull": auto_pull,
@@ -268,6 +284,17 @@ async def _seed_post(
         await conn.execute(
             "INSERT INTO projects (id, name) VALUES ($1, 'post tx proof')",
             project_id,
+        )
+        # Config edits now publish a canonical Project under its actual owner.
+        await conn.execute(
+            "INSERT INTO users(id,display_name,is_approved,default_project_id) VALUES($1,'Post owner',TRUE,$2)",
+            owner_id,
+            project_id,
+        )
+        await conn.execute(
+            "INSERT INTO project_members(project_id,user_id,role) VALUES($1,$2,'owner')",
+            project_id,
+            owner_id,
         )
         await conn.execute(
             """

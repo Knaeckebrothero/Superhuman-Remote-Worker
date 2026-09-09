@@ -1232,9 +1232,39 @@ class TestPreviewRoster:
     async def test_preview_reports_the_expert_roster(
         self, user_a, fake_db, fake_request
     ):
+        from pathlib import Path
+        from uuid import UUID
+
+        import yaml
+
         from orchestrator.main import ToolGroupPreviewRequest, preview_tool_groups
+        from shared.manifests.resolution import content_revision
         from tests.conftest import _UID_A
 
+        document = yaml.safe_load(
+            (
+                Path(__file__).resolve().parents[1]
+                / "config/subagents/reader/config.yaml"
+            ).read_text()
+        )
+        description = "Reader from the saved Catalog revision."
+        document["spec"]["runtime"]["config"]["config"]["description"] = description
+        catalog = {
+            "id": UUID("44444444-2222-3333-4444-555555555555"),
+            "owner_id": None,
+            "document": document,
+            "resolved": document,
+            "resource_version": 2,
+            "revision": content_revision(document["spec"]),
+        }
+
+        async def stored_definition(query, *args):
+            if "FROM srw_resources" in query:
+                assert args == ("Expert", "Catalog", "shared", "subagent-reader")
+                return catalog
+            return None
+
+        fake_db.fetchrow = AsyncMock(side_effect=stored_definition)
         expert_id = "11111111-2222-3333-4444-555555555555"
         fake_db.get_expert_by_id = AsyncMock(
             return_value={
@@ -1278,4 +1308,5 @@ class TestPreviewRoster:
         assert with_roster["subagents"]["default"] == "reader"
         assert [e["name"] for e in with_roster["subagents"]["roster"]] == ["reader"]
         assert with_roster["subagents"]["roster"][0]["ref"] == "subagents/reader"
+        assert with_roster["subagents"]["roster"][0]["description"] == description
         assert bare["subagents"] == {"default": None, "roster": []}

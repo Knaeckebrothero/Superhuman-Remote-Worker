@@ -78,6 +78,7 @@ def _credential_passthrough(_job_row, config, **_kwargs):
 @pytest.mark.asyncio
 async def test_fresh_dispatch_payload_uses_resolved_repository_uuid():
     with (
+        patch.object(orch_main.postgres_db, "fetchrow", AsyncMock(return_value=None)),
         patch.object(
             orch_main,
             "_resolve_authorized_job_datasources",
@@ -139,6 +140,7 @@ async def test_resume_payload_uses_resolved_repository_uuid():
     _Client.posts = []
     job = _job(status="paused")
     conn = MagicMock()
+    conn.fetchrow = AsyncMock(return_value=None)
     conn.execute = AsyncMock()
 
     @asynccontextmanager

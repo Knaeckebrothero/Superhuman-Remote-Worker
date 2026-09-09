@@ -9,6 +9,10 @@ Design: knowledge-base/knowledge/features/agent_skills.md (Slice 3).
 Plan:   knowledge-base/knowledge/superpowers/plans/2026-06-19-skills-slice-3.md
 """
 
+from shared.runtime.core.srw_manifest_config import (
+    srw_config_fragment as _srw_config_fragment,
+)
+
 import pytest
 
 from shared.runtime.core.loader import InstructionFileEntry, load_agent_config_from_dict
@@ -270,7 +274,9 @@ def test_research_guide_skill_exists_and_parses():
 def test_scholar_binds_research_guide_as_skill():
     import yaml
 
-    cfg = yaml.safe_load(_P("config/experts/scholar/config.yaml").read_text())
+    cfg = _srw_config_fragment(
+        yaml.safe_load(_P("config/experts/scholar/config.yaml").read_text())
+    )
     entries = cfg["instruction_files"]
     research = [e for e in entries if e.get("skill") == "research-guide"]
     assert len(research) == 1
@@ -308,7 +314,7 @@ def _bindings_source(config_path: str) -> dict:
 
     if config_path == "worker_base":
         return load_role_base("worker")
-    return yaml.safe_load(_P(config_path).read_text())
+    return _srw_config_fragment(yaml.safe_load(_P(config_path).read_text()))
 
 
 def test_worker_base_binds_todo_guide_as_skill():
@@ -324,8 +330,10 @@ def test_worker_base_binds_todo_guide_as_skill():
 def test_interactive_designer_uses_an_action_gate_not_setup_injection():
     import yaml
 
-    cfg = yaml.safe_load(
-        _P("config/experts/designer-interactive/config.yaml").read_text()
+    cfg = _srw_config_fragment(
+        yaml.safe_load(
+            _P("config/experts/designer-interactive/config.yaml").read_text()
+        )
     )
     assert cfg["instruction_files"] == [
         {

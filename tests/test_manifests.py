@@ -61,7 +61,7 @@ def test_all_public_examples_validate_and_resolve_without_mutating_input():
     ]
     original = deepcopy(documents)
     result = preview_documents(documents)
-    assert len(result["documents"]) == 7
+    assert len(result["documents"]) == len(documents) >= 9
     assert documents == original == result["documents"]
     assert result["admissionReady"] is False
     assert result["effects"] == []

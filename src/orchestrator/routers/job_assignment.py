@@ -26,6 +26,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 
 from orchestrator.services.dispatch_guards import resume_lane_applies
 from orchestrator.services.job_workspace_runtime import WORKSPACE_CONTEXT_KEYS
+from orchestrator.services.manifest_runtime_ownership import require_srw_runtime
 from shared.workspace_contract import resolve_workspace_runtime
 
 router = APIRouter()
@@ -118,6 +119,7 @@ async def assign_job_to_agent(
         job = await postgres_db.get_job(job_id)
         if not job:
             raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+        require_srw_runtime(job)
 
         if job.get("execution_lane", "pinned") != "pinned":
             raise HTTPException(

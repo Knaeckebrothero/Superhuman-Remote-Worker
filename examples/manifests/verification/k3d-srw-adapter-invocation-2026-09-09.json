@@ -1,0 +1,186 @@
+{
+  "gate": "manifest-srw-adapter-smoke",
+  "context": "k3d-srw",
+  "gateIdentity": "cutover-e6fd4e2eb48e-",
+  "startedAt": "2026-09-09T11:35:55.758881+00:00",
+  "status": "passed",
+  "scope": "Real SRW worker Job and stateless Session over HTTP, SSE, sandbox workspace and stored snapshots",
+  "deployment": {
+    "pod": "srw-orchestrator-6cd5598d64-899dj",
+    "imageID": "srw-registry:5000/srw-orchestrator@sha256:092db2f46ea3e95101aaec27bbdc75f29e07c73d1270bbc642f6771eff6277f2",
+    "sourceFilesMatched": 62,
+    "sourceDigest": "aa70f6b00d36db7efaf963ccb817cec1eefe0a1b4934b1045a9fb3addf4cfa14",
+    "nativeHostingEnabled": false,
+    "nativeNamespace": "srw-native"
+  },
+  "agents": [
+    {
+      "pod": "srw-agent-stateless-57f77fc6c8-29lnp",
+      "uid": "2ac0d69a-141c-4124-9d52-0b36e34bcc55",
+      "image": "srw-registry:5000/srw-agent:tilt-a2242c3a891301a2",
+      "sourceFilesMatched": 4
+    },
+    {
+      "pod": "srw-agent-stateless-57f77fc6c8-85skr",
+      "uid": "83d31e69-de2f-437e-8726-2aa4e2b3b121",
+      "image": "srw-registry:5000/srw-agent:tilt-a2242c3a891301a2",
+      "sourceFilesMatched": 4
+    }
+  ],
+  "fixtureImage": "srw-registry:5000/srw-manifest-fixture@sha256:608c1346f89c55cd43d0f1432634b19494ce21a824739fe510aea8b21848d806",
+  "temporaryAdmin": {
+    "username": "srw-manifest-admin-8e65d77a4e91",
+    "oauthClientID": "6e966b39-903e-4c59-8fc4-1f1286701617",
+    "keycloakID": "4c0ed7ce-6417-483d-a148-7c91b09635fe",
+    "applicationID": "6fb7e659-bb30-424b-9524-628d2ed3a446",
+    "identityRevoked": true,
+    "identityDeleted": true,
+    "applicationUserDeleted": true,
+    "oauthClientDeleted": true,
+    "defaultProjectRemoved": true,
+    "externalProfileResidue": "Normal JIT cloud/Gitea profiles may outlive the application user; no external account deletion API is assumed."
+  },
+  "checks": [
+    "Role-authenticated owned provider/model registration preserves configured and effective defaults",
+    "Native SRW manifest Job completes through the real worker and reapply preserves its execution identity",
+    "Stateless Session first attach, frozen source edit, next-turn PATCH and End/Resume preserve the admitted contract"
+  ],
+  "cleanup": {
+    "complete": true,
+    "stage": "complete",
+    "workloads": [
+      {
+        "kind": "Session",
+        "workID": "dfe52f84-d13b-480f-b2dd-69882c348a32",
+        "statuses": [
+          {
+            "method": "GET",
+            "status": 200
+          },
+          {
+            "method": "DELETE",
+            "status": 503
+          },
+          {
+            "method": "GET",
+            "status": 200
+          },
+          {
+            "method": "DELETE",
+            "status": 200
+          },
+          {
+            "method": "GET",
+            "status": 404
+          }
+        ],
+        "absent": true
+      },
+      {
+        "kind": "Job",
+        "workID": "e8cab008-b01a-49d6-85fb-6baac4790fc6",
+        "statuses": [
+          {
+            "method": "GET",
+            "status": 200
+          },
+          {
+            "method": "DELETE",
+            "status": 200
+          },
+          {
+            "method": "GET",
+            "status": 404
+          }
+        ],
+        "absent": true
+      }
+    ],
+    "workloadsAndCatalogRemoved": true
+  },
+  "job": {
+    "workID": "e8cab008-b01a-49d6-85fb-6baac4790fc6",
+    "snapshot": {
+      "id": "aef86c49-3045-469a-a5c7-06b613420b10",
+      "generation": 1,
+      "revision": "sha256:34f4482aafdf5072ed36f8f0f1897a9aee20351e314d0c8c8e9ec18b1a5de7a9",
+      "adapter": "srw/v1",
+      "image": "srw-registry:5000/srw-agent:tilt-a2242c3a891301a2",
+      "model": "zz-srw-manifest-e6fd4e2eb48e",
+      "temperature": 0.17,
+      "sourceDigest": "23a9b2ccda3764c3d4eda349ef012dcc33318d6bf5295553c0c2853c7ca6f756"
+    },
+    "provider": {
+      "consumed_required_responses": 0,
+      "worker_job_tool_steps": 12,
+      "unexpected_count": 0,
+      "pending_calls": 0
+    }
+  },
+  "session": {
+    "workID": "dfe52f84-d13b-480f-b2dd-69882c348a32",
+    "original": {
+      "id": "307f124e-7450-43d1-bccb-0c2a7203fac6",
+      "generation": 1,
+      "revision": "sha256:7f124da808f182acbf31a224a1e91030b30452ed8984230d4e9b3494a469d700",
+      "adapter": "srw/v1",
+      "image": "srw-registry:5000/srw-agent:tilt-a2242c3a891301a2",
+      "model": "zz-srw-manifest-e6fd4e2eb48e",
+      "temperature": 0.17,
+      "sourceDigest": "742f50f0dae87705fc1acd27302b3b5f5f7163a16539455a92fe5ba716010067",
+      "thread": {
+        "execution_lane": "stateless",
+        "status": "active",
+        "generation": "91ba85ca-aa15-4ef2-beba-575f889cfd5e",
+        "total_turns": 1
+      }
+    },
+    "patched": {
+      "id": "307f124e-7450-43d1-bccb-0c2a7203fac6",
+      "generation": 2,
+      "revision": "sha256:87acc8fe9d2e73c8259934ee3580b1d4b214c789fa25e5cfe412b61a707aa26f",
+      "adapter": "srw/v1",
+      "image": "srw-registry:5000/srw-agent:tilt-a2242c3a891301a2",
+      "model": "zz-srw-manifest-e6fd4e2eb48e",
+      "temperature": 0.42,
+      "sourceDigest": "742f50f0dae87705fc1acd27302b3b5f5f7163a16539455a92fe5ba716010067",
+      "thread": {
+        "execution_lane": "stateless",
+        "status": "active",
+        "generation": "91ba85ca-aa15-4ef2-beba-575f889cfd5e",
+        "total_turns": 1
+      }
+    },
+    "resumed": {
+      "id": "307f124e-7450-43d1-bccb-0c2a7203fac6",
+      "generation": 2,
+      "revision": "sha256:87acc8fe9d2e73c8259934ee3580b1d4b214c789fa25e5cfe412b61a707aa26f",
+      "adapter": "srw/v1",
+      "image": "srw-registry:5000/srw-agent:tilt-a2242c3a891301a2",
+      "model": "zz-srw-manifest-e6fd4e2eb48e",
+      "temperature": 0.42,
+      "sourceDigest": "742f50f0dae87705fc1acd27302b3b5f5f7163a16539455a92fe5ba716010067",
+      "thread": {
+        "execution_lane": "stateless",
+        "status": "active",
+        "generation": "72f1078f-2d24-4c1c-98e9-8f2cabdf1017",
+        "total_turns": 3
+      }
+    },
+    "provider": {
+      "consumed_required_responses": 3,
+      "worker_job_tool_steps": 0,
+      "unexpected_count": 0,
+      "pending_calls": 0
+    }
+  },
+  "ownedWorkIDs": {
+    "job": "e8cab008-b01a-49d6-85fb-6baac4790fc6",
+    "session": "dfe52f84-d13b-480f-b2dd-69882c348a32"
+  },
+  "fixtureNamespace": {
+    "name": "srw-adapter-gate-79a27b3cce64",
+    "uid": "7ed9ebc5-da0f-453c-a7d8-2da97a19f4fe"
+  },
+  "finishedAt": "2026-09-09T11:39:07.682699+00:00"
+}

@@ -58,6 +58,19 @@ async def db(pg_dsn, _schema_applied, monkeypatch):
         await conn.execute(
             "TRUNCATE project_loops, job_datasources, jobs, projects CASCADE"
         )
+        # The reset cascades through users to their grant-author FK as well.
+        await conn.execute("""
+            INSERT INTO capability_grants(scope_kind,key,value_json) VALUES
+                ('global','shell_tools','true'),
+                ('global','delegation','true'),
+                ('global','autonomy_ceiling','"full"')
+            ON CONFLICT(scope_kind,scope_id,key) DO UPDATE SET value_json=EXCLUDED.value_json
+        """)
+    from orchestrator.services.manifest_experts import seed_bundled_expert_manifests
+
+    await seed_bundled_expert_manifests(
+        store, Path(__file__).resolve().parents[1] / "config"
+    )
     try:
         yield store
     finally:

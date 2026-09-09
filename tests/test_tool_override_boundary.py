@@ -52,6 +52,10 @@ Design: knowledge-base/knowledge/features/tool_config_policy_vs_membership.md.
 
 from __future__ import annotations
 
+from shared.runtime.core.srw_manifest_config import (
+    srw_config_fragment as _srw_config_fragment,
+)
+
 from tests._expert_catalog import catalogue_route
 from orchestrator.services import expert_authoring as expert_authoring_module
 from orchestrator.routers import expert_catalog as expert_routes
@@ -768,13 +772,10 @@ def _thread_create_body(main, config_override):
     return main.ThreadCreateRequest(title="t", config_override=config_override)
 
 
-def _persisted_thread_override(conn) -> dict:
+def _persisted_thread_override(db) -> dict:
     """The `tools` block as it lands in threads.metadata — the durable
     artifact, and the thing the user's untick has to survive into."""
-    import json
-
-    payload = json.loads(conn.execute.await_args.args[2])
-    return payload["config_override"]
+    return db.create_thread.await_args.kwargs["initial_metadata"]["config_override"]
 
 
 class TestSessionCreateBoundary:
@@ -1140,7 +1141,7 @@ class TestSessionCreateBoundary:
             await asyncio.sleep(0)
 
         assert db.create_thread.await_args.kwargs["execution_lane"] == "pinned"
-        persisted = _persisted_thread_override(conn)
+        persisted = _persisted_thread_override(db)
         assert persisted["officer"] == {
             "enabled": True,
             "conference": False,
@@ -1271,20 +1272,20 @@ class TestSessionCreateBoundary:
         copied across only if it was one of the original groups, so this key never
         reached `threads.metadata.config_override` and the agent bound research
         tools anyway."""
-        main, _, conn, _ = session_create_env
+        main, db, conn, _ = session_create_env
 
         await main.create_thread(
             _thread_create_body(main, {"tools": {"research": [], "git": []}}),
             MagicMock(),
         )
 
-        persisted = _persisted_thread_override(conn)
+        persisted = _persisted_thread_override(db)
         assert persisted["tools"]["research"] == []
         assert persisted["tools"]["git"] == []
 
     @pytest.mark.asyncio
     async def test_the_whole_form_deselect_survives(self, session_create_env):
-        main, _, conn, _ = session_create_env
+        main, db, conn, _ = session_create_env
 
         await main.create_thread(
             _thread_create_body(
@@ -1293,7 +1294,7 @@ class TestSessionCreateBoundary:
             MagicMock(),
         )
 
-        persisted = _persisted_thread_override(conn)
+        persisted = _persisted_thread_override(db)
         assert set(persisted["tools"]) == set(COCKPIT_SESSION_CATEGORIES)
         assert all(v == [] for v in persisted["tools"].values())
 
@@ -1357,6 +1358,24 @@ def session_patch_env(monkeypatch):
         record_security_event=AsyncMock(),
         resolve_api_keys_for_job=AsyncMock(return_value={}),
         resolve_datasources_for_thread=AsyncMock(return_value=[]),
+    )
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def transaction_scope(_thread_id):
+        yield SimpleNamespace(
+            fetchrow=AsyncMock(
+                side_effect=lambda query, *_: None
+                if "srw_execution_specs" in query
+                else thread_row
+            )
+        )
+
+    db.thread_configuration_transaction = transaction_scope
+    db.refresh_session_execution = AsyncMock(
+        side_effect=lambda _thread_id, *, conn, config_override: {
+            "delivery_override": config_override
+        }
     )
     monkeypatch.setattr(main, "postgres_db", db)
     monkeypatch.setattr(main, "require_internal", AsyncMock())
@@ -2176,8 +2195,8 @@ class TestExpertWriteBoundary:
         pass or the gate has broken onboarding."""
         import yaml
 
-        config = yaml.safe_load(
-            Path(f"config/experts/{expert}/config.yaml").read_text()
+        config = _srw_config_fragment(
+            yaml.safe_load(Path(f"config/experts/{expert}/config.yaml").read_text())
         )
         config.pop("$extends", None)
         validate_tool_override_fragment(config)

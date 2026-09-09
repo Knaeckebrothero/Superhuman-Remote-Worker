@@ -420,7 +420,9 @@ async def test_no_spend_callback_survives_real_live_config_rebuild(monkeypatch):
         refresh_context_limits=MagicMock(),
     )
     client = SimpleNamespace(
-        update_thread_config=AsyncMock(return_value={}),
+        update_thread_config=AsyncMock(
+            side_effect=lambda _thread_id, config, **_: config
+        ),
         maintain_runtime_actor=AsyncMock(),
     )
     monkeypatch.setattr(persistent_app, "_session", session)

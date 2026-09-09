@@ -22,6 +22,10 @@ Pinned here:
   without the repo tools, and the bootstrap todo file still parses as YAML.
 """
 
+from shared.runtime.core.srw_manifest_config import (
+    srw_config_fragment as _srw_config_fragment,
+)
+
 import re
 from pathlib import Path
 
@@ -147,8 +151,12 @@ def test_developer_working_directories_table_names_the_clone_path():
 
 
 def test_developer_bootstrap_todo_reads_readme_before_exploring():
-    data = yaml.safe_load(
-        (_DEVELOPER_DIR / "strategic_todos_initial.yaml").read_text(encoding="utf-8")
+    data = _srw_config_fragment(
+        yaml.safe_load(
+            (_DEVELOPER_DIR / "strategic_todos_initial.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
     )
     todos = {t["id"]: t["content"] for t in data["todos"]}
     explore = todos[2]

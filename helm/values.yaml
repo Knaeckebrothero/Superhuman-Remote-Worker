@@ -122,6 +122,19 @@ provenance:
 # =============================================================================
 # Orchestrator
 # =============================================================================
+manifestHosting:
+  # Enable only after verifying that the cluster's CNI isolates new pods from
+  # the first instruction. The bundled k3d k3s v1.31.5 profile fails this gate.
+  networkIsolationVerified: false
+  # Empty selects <release fullname>-native. This must be a dedicated namespace.
+  namespace: ""
+  maxConcurrentJobs: 10
+  # Operator-approved Kubernetes NetworkPolicy egress rules for generic harnesses.
+  # [] denies direct traffic, including DNS; an attached workspace adds only SSH.
+  # Explicitly select the provider/gateway and any needed DNS destination.
+  # Rules apply to new attempts. Cancel active attempts for immediate revocation.
+  harnessEgress: []
+
 orchestrator:
   # -- 1 replica by default. NOT a statement about what HA needs: leader
   # election (M1) makes replicas:2 correctness-safe and removes the
@@ -132,6 +145,11 @@ orchestrator:
   # 2+ on any cluster with more than one node; the PDB below follows
   # automatically, and `databases.profile: ha` is the data-tier counterpart.
   replicas: 1
+  # -- The manifest migration moves Expert and Project configuration out of
+  # legacy columns. Recreate prevents older orchestrator readers from serving
+  # after that data migration. Keep true for the first manifest rollout; this
+  # can be cleared on a subsequent rollout containing only manifest-aware code.
+  manifestContractCutoverEnabled: true
   # -- One-shot acknowledgement for the drained pinned-runtime authority
   # migration. Keep false during an ordinary rolling upgrade: a new pod then
   # refuses pending migration 0185 while the old ready pod keeps serving.

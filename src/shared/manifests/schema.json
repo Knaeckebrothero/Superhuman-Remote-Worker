@@ -343,7 +343,8 @@
             "not": {
               "enum": [
                 "SRW_CONFIG_FILE",
-                "SRW_TASK_FILE"
+                "SRW_TASK_FILE",
+                "SRW_BINDINGS_FILE"
               ]
             }
           },
@@ -376,6 +377,11 @@
               "$ref": "#/$defs/Probe"
             }
           }
+        },
+        "adapter": {
+          "enum": [
+            "srw/v1"
+          ]
         }
       }
     },
@@ -809,6 +815,9 @@
         },
         "connectors": {
           "$ref": "#/$defs/AliasList"
+        },
+        "sessionExpert": {
+          "$ref": "#/$defs/Name"
         }
       }
     },
@@ -912,8 +921,17 @@
                 }
               },
               "then": {
-                "required": [
-                  "jobPolicy"
+                "anyOf": [
+                  {
+                    "required": [
+                      "jobPolicy"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "controller"
+                    ]
+                  }
                 ]
               }
             }
@@ -953,6 +971,23 @@
                 },
                 "autoPull": {
                   "type": "boolean"
+                }
+              }
+            },
+            "controller": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "type",
+                "config"
+              ],
+              "properties": {
+                "type": {
+                  "const": "srw/officer-v1"
+                },
+                "config": {
+                  "type": "object",
+                  "additionalProperties": true
                 }
               }
             }

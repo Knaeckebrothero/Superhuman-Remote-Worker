@@ -301,6 +301,7 @@ GET    /api/jobs/{job_id}/usage                                                 
 GET    /api/jobs/{job_id}/version                                                       gated:require_job_access
 GET    /api/jobs/{job_id}/workspace-status                                              internal:require_internal
 POST   /api/jobs/{target_job_id}/verification/rounds                                    internal:require_internal
+POST   /api/manifests/apply                                                             gated:require_approved_user
 POST   /api/manifests/export                                                            gated:require_approved_user
 POST   /api/manifests/preview                                                           gated:require_approved_user
 GET    /api/manifests/schema                                                            gated:require_approved_user
@@ -426,6 +427,11 @@ POST   /api/projects/{project_id}/repositories                                  
 DELETE /api/projects/{project_id}/repositories/{repo_id}                                gated:require_project_owner
 PATCH  /api/projects/{project_id}/repositories/{repo_id}                                gated:require_project_owner
 GET    /api/requests/{doc_id}                                                           gated:require_job_access
+PUT    /api/resource-secrets/{name}                                                     gated:require_approved_user
+GET    /api/resources                                                                   gated:require_approved_user
+DELETE /api/resources/{resource_id}                                                     gated:require_approved_user
+GET    /api/resources/{resource_id}                                                     gated:require_approved_user
+POST   /api/resources/{resource_id}/outcome                                             gated:require_approved_user
 POST   /api/runtime-actors/authorize                                                    internal:require_internal
 POST   /api/runtime-actors/refresh                                                      internal:require_internal
 GET    /api/sessions/{thread_id}/connection                                             gated:require_approved_user
@@ -505,6 +511,8 @@ POST   /api/vms                                                                 
 DELETE /api/vms/{job_id}                                                                gated:require_job_access
 GET    /api/vms/{job_id}                                                                gated:require_job_access
 GET    /api/voice/capabilities                                                          gated:require_approved_user
+DELETE /api/workspace-instances/{instance_id}                                           gated:require_approved_user
+GET    /api/workspace-instances/{instance_id}                                           gated:require_approved_user
 GET    /api/workspace/status                                                            admin:_require_admin
 POST   /auth/backchannel-logout                                                         public:OIDC back-channel logout — authenticated by Keycloak's signed logout_token
 GET    /auth/callback                                                                   public:OIDC redirect_uri — authenticates by exchanging the Keycloak code

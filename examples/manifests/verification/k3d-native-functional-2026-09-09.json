@@ -1,0 +1,47 @@
+{
+  "result": "passed-functional-only",
+  "coldStartIsolationAccepted": false,
+  "context": "k3d-srw",
+  "nodes": [
+    "k3d-srw-server-0"
+  ],
+  "namespaceRemoved": "srw-native-gate-736a10566b45",
+  "checks": [
+    "unmodified BusyBox image CMD completes without SRW hooks",
+    "opaque config preserves nulls; generic image has no ambient SRW/API credentials or workspace mount",
+    "failed attempt leaves initialized data; old workspace and orphan process are fenced before retry",
+    "retry reuses exact PVC and initializes once; rotated keys reject stale client and host identities",
+    "running process cleanup is fenced; wrong UID cannot cancel; exact-UID cancellation terminates before removal",
+    "retained instance crosses execution IDs; cancelled workspace descendants stop; explicit release pins PVC UID",
+    "lost retained storage is rejected instead of silently replaced"
+  ],
+  "images": {
+    "workspace": {
+      "localImageID": "sha256:dec082b4bc75dd1517792974d050b7af307264b4d71386f60faf7e016a88aaec",
+      "registryDigest": "sha256:dec082b4bc75dd1517792974d050b7af307264b4d71386f60faf7e016a88aaec"
+    },
+    "busybox": {
+      "localImageID": "sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662",
+      "registryDigest": "sha256:b7f3d86d6e84fc17718c48bcde1450807faa2d56704205c697b4bd5df7b9e29f"
+    },
+    "ssh": {
+      "localImageID": "sha256:6f3b5029566da8e90b24945933dcd806be866b64b1e706f51828bf84faccf21b",
+      "registryDigest": "sha256:1e9d9a40acbd02aeb3cb005ff43f9e51ac09ba0c241bb2298f811d3f426a2ffd"
+    },
+    "python": {
+      "localImageID": "sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea",
+      "registryDigest": "sha256:2fe5997d249a808b8eeea52c58a1dbffbba28754dc11699ef5c029f2d818ce79"
+    }
+  },
+  "observedImageIDs": {
+    "srw-run-7717025e45414f968521c0a59d961a3e-a1": "docker.io/library/busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662",
+    "srw-run-46de7d2cfa744ee28676a2067d628c62-a1": "srw-registry:5000/srw-native-gate-python@sha256:2fe5997d249a808b8eeea52c58a1dbffbba28754dc11699ef5c029f2d818ce79",
+    "srw-ws-0847e140894b4416bab333a23645d1a5-g1": "srw-registry:5000/srw-native-gate-workspace@sha256:dec082b4bc75dd1517792974d050b7af307264b4d71386f60faf7e016a88aaec",
+    "srw-run-29e26f64295d4566b5d705c6a4d5630a-a1": "srw-registry:5000/srw-native-gate-ssh@sha256:1e9d9a40acbd02aeb3cb005ff43f9e51ac09ba0c241bb2298f811d3f426a2ffd",
+    "srw-ws-0847e140894b4416bab333a23645d1a5-g2": "srw-registry:5000/srw-native-gate-workspace@sha256:dec082b4bc75dd1517792974d050b7af307264b4d71386f60faf7e016a88aaec",
+    "srw-run-29e26f64295d4566b5d705c6a4d5630a-a2": "srw-registry:5000/srw-native-gate-ssh@sha256:1e9d9a40acbd02aeb3cb005ff43f9e51ac09ba0c241bb2298f811d3f426a2ffd",
+    "srw-ws-0847e140894b4416bab333a23645d1a5-g3": "srw-registry:5000/srw-native-gate-workspace@sha256:dec082b4bc75dd1517792974d050b7af307264b4d71386f60faf7e016a88aaec",
+    "srw-run-1743c7ff38394592a274fe7a86401eba-a1": "srw-registry:5000/srw-native-gate-ssh@sha256:1e9d9a40acbd02aeb3cb005ff43f9e51ac09ba0c241bb2298f811d3f426a2ffd"
+  },
+  "scope": "Real Kubernetes adapters with a durable test identity ledger; not production API/admission/Postgres lifecycle integration."
+}

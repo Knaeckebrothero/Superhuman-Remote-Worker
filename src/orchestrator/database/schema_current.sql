@@ -3784,6 +3784,42 @@ COMMENT ON FUNCTION public.enforce_managed_thread_repository_url_authority() IS 
 
 
 --
+-- Name: enforce_manifest_job_dispatch(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.enforce_manifest_job_dispatch() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    manifest_execution_id UUID;
+    attempt_row srw_execution_attempts%ROWTYPE;
+BEGIN
+    SELECT id INTO manifest_execution_id FROM srw_execution_specs
+      WHERE work_kind='Job' AND work_id=NEW.id AND harness_adapter='generic';
+    IF manifest_execution_id IS NULL THEN RETURN NEW; END IF;
+    IF NEW.assigned_agent_id IS NOT NULL OR NEW.lease_expires_at IS NOT NULL
+       OR NEW.execution_lane IS DISTINCT FROM 'pinned' THEN
+        RAISE EXCEPTION USING ERRCODE='23514', CONSTRAINT='manifest_job_controller_ownership',
+          MESSAGE='Generic manifest work cannot be claimed by an SRW agent or worker lease';
+    END IF;
+    SELECT * INTO attempt_row FROM srw_execution_attempts
+      WHERE execution_id=manifest_execution_id
+      ORDER BY attempt DESC LIMIT 1;
+    IF NEW.status='processing' AND (attempt_row.pod_uid IS NULL OR attempt_row.phase<>'Running') THEN
+        RAISE EXCEPTION USING ERRCODE='23514', CONSTRAINT='manifest_job_attempt_authority',
+          MESSAGE='Generic processing requires a recorded running attempt and pod identity';
+    END IF;
+    IF NEW.status='completed' AND (attempt_row.cleaned_at IS NULL OR
+       COALESCE(attempt_row.reported_outcome,attempt_row.phase) IS DISTINCT FROM 'Succeeded') THEN
+        RAISE EXCEPTION USING ERRCODE='23514', CONSTRAINT='manifest_job_outcome_authority',
+          MESSAGE='Generic completion requires a recorded outcome and fenced process cleanup';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: enforce_officer_post_thread_repository_authority(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -12114,6 +12150,37 @@ $$;
 
 
 --
+-- Name: protect_workspace_cleanup_capture_location(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_workspace_cleanup_capture_location() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF OLD.resource_location IS NOT NULL AND (
+        NEW.resource_location IS DISTINCT FROM OLD.resource_location
+        OR NEW.runtime_incarnation IS DISTINCT FROM OLD.runtime_incarnation
+        OR NEW.pod_uid IS DISTINCT FROM OLD.pod_uid
+        OR NEW.seed_configmap_uid IS DISTINCT FROM OLD.seed_configmap_uid
+        OR NEW.pvc_uid IS DISTINCT FROM OLD.pvc_uid
+        OR NEW.service_uid IS DISTINCT FROM OLD.service_uid
+    ) THEN
+        RAISE EXCEPTION USING ERRCODE = '23514',
+            CONSTRAINT = 'workspace_cleanup_capture_location_immutable',
+            MESSAGE = 'Captured workspace resource locations and UIDs are immutable';
+    END IF;
+    IF OLD.capture_complete AND OLD.resource_location IS NULL
+       AND NEW.resource_location IS NOT NULL THEN
+        RAISE EXCEPTION USING ERRCODE = '23514',
+            CONSTRAINT = 'workspace_cleanup_capture_location_no_backfill',
+            MESSAGE = 'A completed historical capture cannot acquire inferred resource locations';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: protected_cloud_try_jsonb(text); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -12635,6 +12702,7 @@ BEGIN
           AND NOT EXISTS (SELECT 1 FROM public.managed_repository_workspace_cleanup_intents AS newer
               WHERE newer.owner_kind='thread' AND newer.owner_id=requested_owner
                 AND newer.scope='workspace_container'
+                AND newer.runtime_incarnation::TEXT=requested_runtime
                 AND newer.intent_generation > intent.intent_generation)) THEN
         RETURN FALSE;
     END IF;
@@ -12987,6 +13055,7 @@ BEGIN
       FROM public.managed_repository_workspace_cleanup_intents
      WHERE owner_kind = 'thread' AND owner_id = requested_owner
        AND scope = 'workspace_container'
+       AND runtime_incarnation::TEXT = requested_runtime
      ORDER BY intent_generation DESC LIMIT 1 FOR SHARE;
     IF NOT FOUND OR (
         intent.runtime_incarnation::TEXT = requested_runtime
@@ -13000,6 +13069,45 @@ BEGIN
         AND intent.settled_at IS NOT NULL
         AND intent.capture_complete AND intent.resources_captured_at IS NOT NULL
         AND intent.pod_uid = intent.runtime_incarnation) IS NOT TRUE THEN
+        RETURN FALSE;
+    END IF;
+    -- Historical receipts append proof for older exact UIDs without replacing
+    -- the current terminal workspace projection. A retry may cross those rows
+    -- only after their complete terminal proof has settled under this same
+    -- permanent owner/queue generation. Pending, preserved, stale and unrelated
+    -- newer intents still fence replay.
+    IF EXISTS (
+        SELECT 1
+          FROM public.managed_repository_workspace_cleanup_intents AS newer
+         WHERE newer.owner_kind = 'thread' AND newer.owner_id = requested_owner
+           AND newer.scope = 'workspace_container'
+           AND newer.intent_generation > intent.intent_generation
+           AND (
+               newer.intent_source = 'historical'
+               AND newer.runtime_incarnation::TEXT <> requested_runtime
+               AND newer.thread_runtime_generation = owner_row.runtime_generation
+               AND newer.terminal_queue_token = queue_row.lease_token
+               AND newer.resource_policy = 'terminal_reclaim'
+               AND newer.reclaim_shared_resources
+               AND newer.target_disposition = 'deleted'
+               AND newer.result_kind = 'settled'
+               AND newer.phase = 'settled'
+               AND newer.cleanup_completed_at IS NOT NULL
+               AND newer.settled_at IS NOT NULL
+               AND newer.projection_transaction_id IS NOT NULL
+               AND newer.capture_complete
+               AND newer.resources_captured_at IS NOT NULL
+               AND newer.pod_uid = newer.runtime_incarnation
+               AND EXISTS (
+                   SELECT 1 FROM public.managed_repository_process_zero_receipts AS receipt
+                    WHERE receipt.owner_kind = 'thread'
+                      AND receipt.owner_id = requested_owner
+                      AND receipt.scope = 'workspace_container'
+                      AND receipt.provisioner = 'k8s'
+                      AND receipt.runtime_incarnation = newer.runtime_incarnation::TEXT
+               )
+           ) IS NOT TRUE
+    ) THEN
         RETURN FALSE;
     END IF;
     IF EXISTS (SELECT 1 FROM public.managed_repository_workspace_creation_reservations
@@ -14953,6 +15061,7 @@ CREATE TABLE public.experts (
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     managed_key character varying(100),
     seed_version integer,
+    manifest_resource_id uuid,
     CONSTRAINT experts_expert_type_check CHECK (((expert_type)::text = ANY ((ARRAY['worker'::character varying, 'session'::character varying])::text[]))),
     CONSTRAINT experts_managed_owner_check CHECK ((((managed_key IS NULL) AND (owner_id IS NOT NULL)) OR ((managed_key IS NOT NULL) AND (owner_id IS NULL) AND (is_global = true))))
 );
@@ -16108,6 +16217,7 @@ CREATE TABLE public.managed_repository_workspace_cleanup_intents (
     projection_transaction_id bigint,
     settled_at timestamp with time zone,
     result_kind text,
+    resource_location jsonb,
     CONSTRAINT managed_repository_workspace_cleanup_admission_source_check CHECK ((admission_source = ANY (ARRAY['automatic'::text, 'explicit'::text]))),
     CONSTRAINT managed_repository_workspace_cleanup_claim_shape_check CHECK (((attempts >= 0) AND (claim_token >= 0) AND (((claimed_by IS NULL) AND (claim_expires_at IS NULL)) OR ((claimed_by IS NOT NULL) AND (claim_expires_at IS NOT NULL) AND (claim_token > 0))))),
     CONSTRAINT managed_repository_workspace_cleanup_owner_kind_check CHECK ((owner_kind = ANY (ARRAY['job'::text, 'thread'::text]))),
@@ -16120,7 +16230,8 @@ CREATE TABLE public.managed_repository_workspace_cleanup_intents (
     CONSTRAINT managed_repository_workspace_cleanup_source_check CHECK ((intent_source = ANY (ARRAY['current'::text, 'historical'::text, 'orphan'::text]))),
     CONSTRAINT managed_repository_workspace_cleanup_target_check CHECK ((((target_disposition = 'ambiguous'::text) AND (resource_policy = 'preserve'::text) AND (phase = 'ambiguous'::text) AND (capture_complete IS FALSE) AND (seed_configmap_uid IS NULL) AND (pvc_uid IS NULL) AND (service_uid IS NULL) AND (suspended_at IS NULL) AND (snapshot_restore_required IS FALSE)) OR ((scope = 'workspace_container'::text) AND (target_disposition = ANY (ARRAY['deleted'::text, 'suspended'::text])) AND ((target_disposition <> 'suspended'::text) OR (resource_policy = 'preserve'::text)) AND ((resource_policy <> 'terminal_reclaim'::text) OR (target_disposition = 'deleted'::text))) OR ((scope = 'ide'::text) AND (owner_kind = 'job'::text) AND (target_disposition = ANY (ARRAY['expired'::text, 'deleted'::text])) AND ((resource_policy = 'preserve'::text) OR ((resource_policy = 'terminal_reclaim'::text) AND (target_disposition = 'deleted'::text))) AND (suspended_at IS NULL) AND (snapshot_restore_required IS FALSE) AND (pvc_uid IS NULL) AND (service_uid IS NULL)))),
     CONSTRAINT managed_repository_workspace_cleanup_terminal_admission_check CHECK (((terminal_admission_transaction_id IS NULL) OR ((intent_source = 'current'::text) AND (admission_source = 'explicit'::text) AND (target_disposition = 'deleted'::text) AND ((lifecycle_fingerprint ->> 'admitted_by'::text) = 'terminal_owner_transition'::text)))),
-    CONSTRAINT managed_repository_workspace_cleanup_thread_generation_shape CHECK ((((owner_kind = 'job'::text) AND (thread_runtime_generation IS NULL)) OR ((owner_kind = 'thread'::text) AND (thread_runtime_generation IS NOT NULL))))
+    CONSTRAINT managed_repository_workspace_cleanup_thread_generation_shape CHECK ((((owner_kind = 'job'::text) AND (thread_runtime_generation IS NULL)) OR ((owner_kind = 'thread'::text) AND (thread_runtime_generation IS NOT NULL)))),
+    CONSTRAINT workspace_cleanup_resource_location_shape CHECK (((resource_location IS NULL) OR ((scope = 'workspace_container'::text) AND capture_complete AND (resources_captured_at IS NOT NULL) AND (jsonb_typeof(resource_location) = 'object'::text) AND (resource_location ?& ARRAY['namespace'::text, 'pod'::text, 'seedConfigMap'::text, 'pvc'::text, 'service'::text]) AND ((resource_location - ARRAY['namespace'::text, 'pod'::text, 'seedConfigMap'::text, 'pvc'::text, 'service'::text]) = '{}'::jsonb) AND (jsonb_typeof((resource_location -> 'namespace'::text)) = 'string'::text) AND ((length((resource_location ->> 'namespace'::text)) >= 1) AND (length((resource_location ->> 'namespace'::text)) <= 63)) AND ((resource_location ->> 'namespace'::text) ~ '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'::text) AND (jsonb_typeof((resource_location -> 'pod'::text)) = 'string'::text) AND ((length((resource_location ->> 'pod'::text)) >= 1) AND (length((resource_location ->> 'pod'::text)) <= 253)) AND ((resource_location ->> 'pod'::text) ~ '^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$'::text) AND (jsonb_typeof((resource_location -> 'seedConfigMap'::text)) = 'string'::text) AND ((length((resource_location ->> 'seedConfigMap'::text)) >= 1) AND (length((resource_location ->> 'seedConfigMap'::text)) <= 253)) AND ((resource_location ->> 'seedConfigMap'::text) ~ '^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$'::text) AND (jsonb_typeof((resource_location -> 'pvc'::text)) = 'string'::text) AND ((length((resource_location ->> 'pvc'::text)) >= 1) AND (length((resource_location ->> 'pvc'::text)) <= 253)) AND ((resource_location ->> 'pvc'::text) ~ '^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$'::text) AND (jsonb_typeof((resource_location -> 'service'::text)) = 'string'::text) AND ((length((resource_location ->> 'service'::text)) >= 1) AND (length((resource_location ->> 'service'::text)) <= 253)) AND ((resource_location ->> 'service'::text) ~ '^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$'::text))))
 );
 
 
@@ -16129,6 +16240,13 @@ CREATE TABLE public.managed_repository_workspace_cleanup_intents (
 --
 
 COMMENT ON TABLE public.managed_repository_workspace_cleanup_intents IS 'Restart-safe exact Kubernetes cleanup authority persisted before external deletion and settled atomically with the exact owner projection.';
+
+
+--
+-- Name: COLUMN managed_repository_workspace_cleanup_intents.resource_location; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.managed_repository_workspace_cleanup_intents.resource_location IS 'Namespace and immutable Kubernetes resource names observed with this UID capture; NULL historical captures remain unproven.';
 
 
 --
@@ -16970,6 +17088,7 @@ CREATE TABLE public.projects (
     main_cloud_folder_handle text,
     network_tier text DEFAULT 'internet-only'::text NOT NULL,
     main_cloud_backend_instance_id uuid,
+    manifest_resource_id uuid,
     CONSTRAINT projects_network_tier_check CHECK ((network_tier = ANY (ARRAY['internet-only'::text, 'home-allowed'::text]))),
     CONSTRAINT valid_project_status CHECK (((status)::text = ANY ((ARRAY['active'::character varying, 'archived'::character varying])::text[])))
 );
@@ -18011,6 +18130,97 @@ COMMENT ON TABLE public.skills IS 'DB-backed user/admin Agent Skills (overlay ov
 
 
 --
+-- Name: srw_execution_attempts; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.srw_execution_attempts (
+    execution_id uuid NOT NULL,
+    attempt bigint NOT NULL,
+    pod_name text NOT NULL,
+    pod_uid text,
+    phase text NOT NULL,
+    exit_code integer,
+    image_id text,
+    reported_outcome text,
+    cleaned_at timestamp with time zone,
+    started_at timestamp with time zone DEFAULT now() NOT NULL,
+    finished_at timestamp with time zone,
+    CONSTRAINT srw_execution_attempts_attempt_check CHECK ((attempt > 0)),
+    CONSTRAINT srw_execution_attempts_phase_check CHECK ((phase = ANY (ARRAY['Preparing'::text, 'Running'::text, 'Succeeded'::text, 'Failed'::text, 'Cancelling'::text, 'Cancelled'::text]))),
+    CONSTRAINT srw_execution_attempts_reported_outcome_check CHECK ((reported_outcome = ANY (ARRAY['Succeeded'::text, 'Failed'::text])))
+);
+
+
+--
+-- Name: srw_execution_spec_revisions; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.srw_execution_spec_revisions (
+    execution_id uuid NOT NULL,
+    generation bigint NOT NULL,
+    document jsonb NOT NULL,
+    resolved jsonb NOT NULL,
+    dependencies jsonb DEFAULT '[]'::jsonb NOT NULL,
+    revision text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: srw_execution_specs; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.srw_execution_specs (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    resource_id uuid,
+    resource_version bigint,
+    work_kind text NOT NULL,
+    work_id uuid NOT NULL,
+    owner_id uuid,
+    project_ids uuid[] DEFAULT '{}'::uuid[] NOT NULL,
+    document jsonb NOT NULL,
+    resolved jsonb NOT NULL,
+    dependencies jsonb DEFAULT '[]'::jsonb NOT NULL,
+    revision text NOT NULL,
+    harness_adapter text NOT NULL,
+    generation bigint DEFAULT 1 NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT srw_execution_specs_work_kind_check CHECK ((work_kind = ANY (ARRAY['Job'::text, 'Session'::text])))
+);
+
+
+--
+-- Name: TABLE srw_execution_specs; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.srw_execution_specs IS 'Server-authorized immutable configuration; jobs/threads retain lifecycle authority.';
+
+
+--
+-- Name: srw_execution_workspace_bindings; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.srw_execution_workspace_bindings (
+    execution_id uuid NOT NULL,
+    instance_id uuid NOT NULL
+);
+
+
+--
+-- Name: srw_manifest_operations; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.srw_manifest_operations (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    owner_id uuid NOT NULL,
+    idempotency_key text,
+    request_revision text NOT NULL,
+    result jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
 -- Name: srw_pre_auth_states; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -18030,6 +18240,78 @@ CREATE TABLE public.srw_pre_auth_states (
 --
 
 COMMENT ON TABLE public.srw_pre_auth_states IS 'Server-side OAuth state + PKCE verifier between /auth/login and /auth/callback. 5-minute TTL, single-use via consumed_at CAS.';
+
+
+--
+-- Name: srw_resource_revisions; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.srw_resource_revisions (
+    resource_id uuid NOT NULL,
+    resource_version bigint NOT NULL,
+    document jsonb NOT NULL,
+    resolved jsonb NOT NULL,
+    revision text NOT NULL,
+    dependencies jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: srw_resource_secrets; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.srw_resource_secrets (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    scope_kind text NOT NULL,
+    scope_name text NOT NULL,
+    name text NOT NULL,
+    owner_id uuid,
+    ciphertext text NOT NULL,
+    keys text[] NOT NULL,
+    version bigint DEFAULT 1 NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT srw_resource_secrets_retired_owner_check CHECK (((owner_id IS NOT NULL) OR (scope_kind = 'Project'::text))),
+    CONSTRAINT srw_resource_secrets_scope_kind_check CHECK ((scope_kind = ANY (ARRAY['Account'::text, 'Project'::text])))
+);
+
+
+--
+-- Name: srw_resources; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.srw_resources (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    kind text NOT NULL,
+    scope_kind text NOT NULL,
+    scope_name text NOT NULL,
+    name text NOT NULL,
+    owner_id uuid,
+    project_id uuid,
+    linked_id uuid,
+    managed_by uuid,
+    resource_version bigint DEFAULT 1 NOT NULL,
+    document jsonb NOT NULL,
+    resolved jsonb NOT NULL,
+    revision text NOT NULL,
+    dependencies jsonb DEFAULT '[]'::jsonb NOT NULL,
+    active_revision text,
+    deleted_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT srw_resources_document_check CHECK ((jsonb_typeof(document) = 'object'::text)),
+    CONSTRAINT srw_resources_kind_check CHECK ((kind = ANY (ARRAY['Expert'::text, 'WorkspaceTemplate'::text, 'Connector'::text, 'Project'::text, 'Job'::text]))),
+    CONSTRAINT srw_resources_resolved_check CHECK ((jsonb_typeof(resolved) = 'object'::text)),
+    CONSTRAINT srw_resources_resource_version_check CHECK ((resource_version > 0)),
+    CONSTRAINT srw_resources_scope_kind_check CHECK ((scope_kind = ANY (ARRAY['Account'::text, 'Project'::text, 'Catalog'::text])))
+);
+
+
+--
+-- Name: TABLE srw_resources; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.srw_resources IS 'Canonical SRW authored resources; definition changes never replay an existing Job execution.';
 
 
 --
@@ -18080,6 +18362,33 @@ COMMENT ON COLUMN public.srw_sessions.absolute_expires_at IS 'Anchored to Keyclo
 --
 
 COMMENT ON COLUMN public.srw_sessions.last_seen_at IS 'Idle timeout anchor: validator rejects if last_seen_at + idle < now(). Touched on every authenticated request.';
+
+
+--
+-- Name: srw_workspace_instances; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.srw_workspace_instances (
+    id uuid NOT NULL,
+    owner_id uuid,
+    project_id uuid,
+    recipe jsonb NOT NULL,
+    revision text NOT NULL,
+    pvc_name text NOT NULL,
+    pvc_uid text,
+    generation bigint DEFAULT 0 NOT NULL,
+    execution_id uuid,
+    active_attempt bigint,
+    pod_name text,
+    pod_uid text,
+    initialized boolean DEFAULT false NOT NULL,
+    image_id text,
+    ssh_ciphertext text,
+    status text DEFAULT 'Reserved'::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT srw_workspace_instances_retired_owner_check CHECK (((owner_id IS NOT NULL) OR ((status = 'Released'::text) AND (execution_id IS NULL) AND (pod_uid IS NULL))))
+);
 
 
 --
@@ -21614,6 +21923,70 @@ ALTER TABLE ONLY public.skills
 
 
 --
+-- Name: srw_execution_attempts srw_execution_attempts_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.srw_execution_attempts
+    ADD CONSTRAINT srw_execution_attempts_pkey PRIMARY KEY (execution_id, attempt);
+
+
+--
+-- Name: srw_execution_attempts srw_execution_attempts_pod_name_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.srw_execution_attempts
+    ADD CONSTRAINT srw_execution_attempts_pod_name_key UNIQUE (pod_name);
+
+
+--
+-- Name: srw_execution_spec_revisions srw_execution_spec_revisions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.srw_execution_spec_revisions
+    ADD CONSTRAINT srw_execution_spec_revisions_pkey PRIMARY KEY (execution_id, generation);
+
+
+--
+-- Name: srw_execution_specs srw_execution_specs_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.srw_execution_specs
+    ADD CONSTRAINT srw_execution_specs_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: srw_execution_specs srw_execution_specs_work_kind_work_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.srw_execution_specs
+    ADD CONSTRAINT srw_execution_specs_work_kind_work_id_key UNIQUE (work_kind, work_id);
+
+
+--
+-- Name: srw_execution_workspace_bindings srw_execution_workspace_bindings_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.srw_execution_workspace_bindings
+    ADD CONSTRAINT srw_execution_workspace_bindings_pkey PRIMARY KEY (execution_id);
+
+
+--
+-- Name: srw_manifest_operations srw_manifest_operations_owner_id_idempotency_key_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.srw_manifest_operations
+    ADD CONSTRAINT srw_manifest_operations_owner_id_idempotency_key_key UNIQUE (owner_id, idempotency_key);
+
+
+--
+-- Name: srw_manifest_operations srw_manifest_operations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.srw_manifest_operations
+    ADD CONSTRAINT srw_manifest_operations_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: srw_pre_auth_states srw_pre_auth_states_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -21622,11 +21995,51 @@ ALTER TABLE ONLY public.srw_pre_auth_states
 
 
 --
+-- Name: srw_resource_revisions srw_resource_revisions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.srw_resource_revisions
+    ADD CONSTRAINT srw_resource_revisions_pkey PRIMARY KEY (resource_id, resource_version);
+
+
+--
+-- Name: srw_resource_secrets srw_resource_secrets_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.srw_resource_secrets
+    ADD CONSTRAINT srw_resource_secrets_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: srw_resource_secrets srw_resource_secrets_scope_kind_scope_name_name_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.srw_resource_secrets
+    ADD CONSTRAINT srw_resource_secrets_scope_kind_scope_name_name_key UNIQUE (scope_kind, scope_name, name);
+
+
+--
+-- Name: srw_resources srw_resources_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.srw_resources
+    ADD CONSTRAINT srw_resources_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: srw_sessions srw_sessions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.srw_sessions
     ADD CONSTRAINT srw_sessions_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: srw_workspace_instances srw_workspace_instances_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.srw_workspace_instances
+    ADD CONSTRAINT srw_workspace_instances_pkey PRIMARY KEY (id);
 
 
 --
@@ -24059,6 +24472,55 @@ CREATE INDEX schema_migrations_dirty_idx ON public.schema_migrations USING btree
 
 
 --
+-- Name: srw_execution_specs_resource_job; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX srw_execution_specs_resource_job ON public.srw_execution_specs USING btree (resource_id) WHERE ((work_kind = 'Job'::text) AND (resource_id IS NOT NULL));
+
+
+--
+-- Name: srw_resource_revisions_digest; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX srw_resource_revisions_digest ON public.srw_resource_revisions USING btree (resource_id, revision);
+
+
+--
+-- Name: srw_resources_identity; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX srw_resources_identity ON public.srw_resources USING btree (kind, scope_kind, scope_name, name) WHERE (deleted_at IS NULL);
+
+
+--
+-- Name: srw_resources_link; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX srw_resources_link ON public.srw_resources USING btree (kind, linked_id) WHERE ((linked_id IS NOT NULL) AND (deleted_at IS NULL));
+
+
+--
+-- Name: srw_resources_owner; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX srw_resources_owner ON public.srw_resources USING btree (owner_id) WHERE (deleted_at IS NULL);
+
+
+--
+-- Name: srw_resources_project; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX srw_resources_project ON public.srw_resources USING btree (project_id) WHERE (deleted_at IS NULL);
+
+
+--
+-- Name: srw_workspace_instances_owner; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX srw_workspace_instances_owner ON public.srw_workspace_instances USING btree (owner_id);
+
+
+--
 -- Name: storage_asset_coverage_gaps_open_uq; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -25375,6 +25837,13 @@ CREATE TRIGGER trg_managed_thread_repository_url_authority BEFORE INSERT OR UPDA
 
 
 --
+-- Name: jobs trg_manifest_job_dispatch; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_manifest_job_dispatch BEFORE UPDATE OF status, assigned_agent_id, lease_expires_at, execution_lane ON public.jobs FOR EACH ROW EXECUTE FUNCTION public.enforce_manifest_job_dispatch();
+
+
+--
 -- Name: project_officers trg_officer_post_thread_repository_authority; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -25498,6 +25967,13 @@ CREATE TRIGGER trg_vm_remote_operation_protocol_forward_only BEFORE DELETE OR UP
 --
 
 CREATE TRIGGER trg_vm_remote_operation_protocol_no_truncate BEFORE TRUNCATE ON public.vm_remote_operation_protocol_gate FOR EACH STATEMENT EXECUTE FUNCTION public.prevent_vm_remote_operation_protocol_rollback();
+
+
+--
+-- Name: managed_repository_workspace_cleanup_intents trg_workspace_cleanup_protect_capture_location; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_workspace_cleanup_protect_capture_location BEFORE UPDATE ON public.managed_repository_workspace_cleanup_intents FOR EACH ROW EXECUTE FUNCTION public.protect_workspace_cleanup_capture_location();
 
 
 --
@@ -26040,6 +26516,14 @@ ALTER TABLE ONLY public.expert_default_audit
 
 ALTER TABLE ONLY public.expert_default_audit
     ADD CONSTRAINT expert_default_audit_target_user_id_fkey FOREIGN KEY (target_user_id) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: experts experts_manifest_resource_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.experts
+    ADD CONSTRAINT experts_manifest_resource_id_fkey FOREIGN KEY (manifest_resource_id) REFERENCES public.srw_resources(id) ON DELETE RESTRICT;
 
 
 --
@@ -26587,6 +27071,14 @@ ALTER TABLE ONLY public.projects
 
 
 --
+-- Name: projects projects_manifest_resource_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.projects
+    ADD CONSTRAINT projects_manifest_resource_id_fkey FOREIGN KEY (manifest_resource_id) REFERENCES public.srw_resources(id) ON DELETE RESTRICT;
+
+
+--
 -- Name: config_overrides prompt_overrides_created_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -26875,11 +27367,131 @@ ALTER TABLE ONLY public.skills
 
 
 --
+-- Name: srw_execution_attempts srw_execution_attempts_execution_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.srw_execution_attempts
+    ADD CONSTRAINT srw_execution_attempts_execution_id_fkey FOREIGN KEY (execution_id) REFERENCES public.srw_execution_specs(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: srw_execution_spec_revisions srw_execution_spec_revisions_execution_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.srw_execution_spec_revisions
+    ADD CONSTRAINT srw_execution_spec_revisions_execution_id_fkey FOREIGN KEY (execution_id) REFERENCES public.srw_execution_specs(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: srw_execution_specs srw_execution_specs_owner_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.srw_execution_specs
+    ADD CONSTRAINT srw_execution_specs_owner_id_fkey FOREIGN KEY (owner_id) REFERENCES public.users(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: srw_execution_specs srw_execution_specs_resource_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.srw_execution_specs
+    ADD CONSTRAINT srw_execution_specs_resource_id_fkey FOREIGN KEY (resource_id) REFERENCES public.srw_resources(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: srw_execution_workspace_bindings srw_execution_workspace_bindings_execution_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.srw_execution_workspace_bindings
+    ADD CONSTRAINT srw_execution_workspace_bindings_execution_id_fkey FOREIGN KEY (execution_id) REFERENCES public.srw_execution_specs(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: srw_execution_workspace_bindings srw_execution_workspace_bindings_instance_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.srw_execution_workspace_bindings
+    ADD CONSTRAINT srw_execution_workspace_bindings_instance_id_fkey FOREIGN KEY (instance_id) REFERENCES public.srw_workspace_instances(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: srw_manifest_operations srw_manifest_operations_owner_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.srw_manifest_operations
+    ADD CONSTRAINT srw_manifest_operations_owner_id_fkey FOREIGN KEY (owner_id) REFERENCES public.users(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: srw_resource_revisions srw_resource_revisions_resource_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.srw_resource_revisions
+    ADD CONSTRAINT srw_resource_revisions_resource_id_fkey FOREIGN KEY (resource_id) REFERENCES public.srw_resources(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: srw_resource_secrets srw_resource_secrets_owner_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.srw_resource_secrets
+    ADD CONSTRAINT srw_resource_secrets_owner_id_fkey FOREIGN KEY (owner_id) REFERENCES public.users(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: srw_resources srw_resources_managed_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.srw_resources
+    ADD CONSTRAINT srw_resources_managed_by_fkey FOREIGN KEY (managed_by) REFERENCES public.srw_resources(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: srw_resources srw_resources_owner_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.srw_resources
+    ADD CONSTRAINT srw_resources_owner_id_fkey FOREIGN KEY (owner_id) REFERENCES public.users(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: srw_resources srw_resources_project_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.srw_resources
+    ADD CONSTRAINT srw_resources_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id) ON DELETE RESTRICT;
+
+
+--
 -- Name: srw_sessions srw_sessions_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.srw_sessions
     ADD CONSTRAINT srw_sessions_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: srw_workspace_instances srw_workspace_instances_execution_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.srw_workspace_instances
+    ADD CONSTRAINT srw_workspace_instances_execution_id_fkey FOREIGN KEY (execution_id) REFERENCES public.srw_execution_specs(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: srw_workspace_instances srw_workspace_instances_owner_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.srw_workspace_instances
+    ADD CONSTRAINT srw_workspace_instances_owner_id_fkey FOREIGN KEY (owner_id) REFERENCES public.users(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: srw_workspace_instances srw_workspace_instances_project_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.srw_workspace_instances
+    ADD CONSTRAINT srw_workspace_instances_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id) ON DELETE RESTRICT;
 
 
 --

@@ -66,6 +66,20 @@ async def prepare(deps, scope, *, origin="user_rest", **fields):
     )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("origin", ["user_rest", "internal_rest"])
+async def test_generic_expert_requires_native_job_before_private_merging(
+    deps, scope, origin
+):
+    deps.resolve_worker_expert.return_value = ExpertSelection(
+        {"id": EXPERT, "harness_adapter": None, "config": {}}, "application"
+    )
+    with pytest.raises(HTTPException) as denied:
+        await prepare(deps, scope, origin=origin)
+    assert denied.value.status_code == 409
+    assert "native manifest Job admission" in denied.value.detail
+
+
 def test_config_import_does_not_load_auth_database_or_application_startup():
     probe = subprocess.run(
         [

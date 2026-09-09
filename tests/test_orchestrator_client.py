@@ -859,17 +859,21 @@ class TestUpdateThreadConfig:
                 )
             )
             await client.update_thread_config(
-                "thread-1", {}, datasource_ids=["ds-a", "ds-b"]
+                "thread-1", {}, datasource_ids=["ds-a", "ds-b"], snapshot_generation=3
             )
             assert mock_client.patch.call_args.kwargs["json"] == {
                 "config_override": {},
                 "datasource_ids": ["ds-a", "ds-b"],
+                "snapshot_patch_protocol": 1,
+                "snapshot_generation": 3,
             }
 
             await client.update_thread_config("thread-1", {}, datasource_ids=[])
             assert mock_client.patch.call_args.kwargs["json"] == {
                 "config_override": {},
                 "datasource_ids": [],
+                "snapshot_patch_protocol": 1,
+                "snapshot_generation": None,
             }
 
     @pytest.mark.asyncio

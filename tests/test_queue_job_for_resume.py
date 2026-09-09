@@ -65,6 +65,9 @@ async def db(pg_dsn):
         # touches so the dispatcher-visibility contract can be asserted here.
         await conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS srw_execution_specs (
+                work_kind text, work_id uuid, harness_adapter text
+            );
             CREATE TABLE IF NOT EXISTS jobs (
                 id uuid PRIMARY KEY,
                 description text,

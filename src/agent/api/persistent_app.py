@@ -3309,8 +3309,10 @@ def _sanitize_live_session_config_override(
     # Loader-owned provenance keys are never a live-update surface (see
     # strip_loader_owned_keys) — dropped, not honoured.
     from shared.runtime.core.loader import strip_loader_owned_keys
+    from shared.runtime.core.session_config_patch import validate_session_settings_patch
 
     sanitized = strip_loader_owned_keys(dict(config_override))
+    validate_session_settings_patch(sanitized)
     interactive = sanitized.get("interactive")
     if isinstance(interactive, dict) and {
         "permission_mode",
@@ -4696,6 +4698,7 @@ async def _attach_session_inner(
         # Raw payload kept as the live-change diff baseline (Slice B).
         datasource_configs=list(datasources or []),
     )
+    _session.execution_snapshot = (resolved_config or {}).get("execution_snapshot")
     # PersistentSession now owns every local/remote cleanup handle. The
     # construction-only context must not survive into pool reuse.
     _failed_attach_workspace_cleanup_context = None
@@ -15500,7 +15503,13 @@ async def _handle_config_update(
     """
     global _session, _orchestrator_client, _thread_id
 
+    saved_snapshot = None
+
     async def _send_error(message: str, detail: Optional[str] = None) -> None:
+        if saved_snapshot is not None:
+            detail = (detail + " " if detail else "") + (
+                "The settings were saved; reattach the session to activate the saved configuration."
+            )
         payload: Dict[str, Any] = {"message": message}
         if detail:
             payload["detail"] = detail
@@ -15551,57 +15560,40 @@ async def _handle_config_update(
         # credential-bearing slot is changing (chat model, auxiliary model,
         # or embedding env keys). The PATCH endpoint enriches the override
         # with the right base_url + api_key (custom/system endpoint or
-        # built-in provider key) and returns the merged dict. Skip the
-        # round trip for purely cosmetic changes (permission_mode,
-        # temperature-only edits).
+        # built-in provider key) and returns the merged dict. Every managed
+        # change must commit its generation before any local mutation.
         embedding_env_keys = (
             "EMBEDDING_PROVIDER",
             "EMBEDDING_MODEL",
             "EMBEDDING_BASE_URL",
             "EMBEDDING_API_KEY",
         )
-        env_block = config_override.get("env_keys") or {}
         ds_update = datasource_ids is not None
-        needs_enrichment = bool(
-            config_override.get("llm", {}).get("model")
-            or config_override.get("auxiliary", {}).get("model")
-            or any(k in env_block for k in embedding_env_keys)
-            # Tool changes are not credential-bearing, but they are an
-            # authorization boundary.  They must pass through the
-            # orchestrator's owner-grant validation and durable merge before
-            # this runtime reloads anything locally.
-            or config_override.get("tools")
-            # Workspace tier and Officer mode are runtime-class boundaries.
-            # Ordinary sessions still send them to the orchestrator before
-            # any local merge; protected sessions were refused above.
-            or security_runtime_update
-            # Datasource changes are BOTH: authorization (owner access +
-            # datasource_tools grant on the derived flip) and credentials
-            # (connection payloads only ever come from the orchestrator).
-            or ds_update
-        )
         tools_update = bool(config_override.get("tools"))
         authorization_update = tools_update or ds_update or security_runtime_update
         effective_override = config_override
-        if _orchestrator_client and _thread_id and needs_enrichment:
+        if _orchestrator_client and _thread_id:
             try:
+                execution_snapshot = getattr(_session, "execution_snapshot", None)
                 enriched = await _orchestrator_client.update_thread_config(
-                    _thread_id, config_override, datasource_ids=datasource_ids
+                    _thread_id,
+                    config_override,
+                    datasource_ids=datasource_ids,
+                    snapshot_generation=(
+                        execution_snapshot.get("generation")
+                        if isinstance(execution_snapshot, dict)
+                        else None
+                    ),
                 )
                 if enriched is not None:
                     effective_override = enriched
                 else:
-                    if authorization_update:
-                        await _send_error(
-                            "Session connector update was rejected"
-                            if ds_update
-                            else "Session config update was rejected"
-                        )
-                        return
-                    logger.warning(
-                        "Orchestrator config enrichment failed; falling back to "
-                        "raw override (custom endpoints may misroute)"
+                    await _send_error(
+                        "Session connector update was rejected"
+                        if ds_update
+                        else "Session config update was rejected"
                     )
+                    return
             except ThreadConfigUpdateDenied as e:
                 # A deliberate 4xx (grant denial, invalid override) — surface
                 # the orchestrator's detail and never apply locally. This also
@@ -15610,14 +15602,12 @@ async def _handle_config_update(
                 await _send_error("Session config update rejected", detail=e.detail)
                 return
             except Exception:
-                if authorization_update:
-                    await _send_error(
-                        "Session connector update could not be authorized"
-                        if ds_update
-                        else "Session config update could not be authorized"
-                    )
-                    return
-                logger.warning("Config persistence to orchestrator failed (non-fatal)")
+                await _send_error(
+                    "Session connector update could not be authorized"
+                    if ds_update
+                    else "Session config update could not be saved"
+                )
+                return
         elif authorization_update:
             # A tool/datasource update without the authoritative orchestrator
             # is unsafe: local loading cannot evaluate owner capability grants,
@@ -15628,6 +15618,11 @@ async def _handle_config_update(
                 else "Session config update could not be authorized"
             )
             return
+
+        from shared.runtime.core.session_config_patch import RESOLVED_PATCH_MARKER
+
+        effective_override = dict(effective_override)
+        saved_snapshot = effective_override.pop(RESOLVED_PATCH_MARKER, None)
 
         # Slice B: fetch the enriched datasource payloads BEFORE any local
         # mutation, so a fetch failure leaves the runtime consistent (the
@@ -15668,7 +15663,7 @@ async def _handle_config_update(
 
         # Re-apply settings_matrix when LLM config changes so model-family
         # defaults (temperature, top_p, limits) are resolved correctly.
-        if effective_override.get("llm"):
+        if effective_override.get("llm") and saved_snapshot is None:
             override_llm_keys = set(effective_override["llm"].keys())
             _apply_settings_matrix(
                 merged, override_llm_keys, _session.config._deployment_dir
@@ -15849,23 +15844,6 @@ async def _handle_config_update(
                 ),
             )
 
-        # Persist updates that didn't go through the enrichment PATCH above
-        # (cosmetic-only changes like permission_mode, narration_mode,
-        # temperature-without-model edits). Runs BEFORE the local
-        # permission-mode apply: permission_mode is grant-gated
-        # orchestrator-side, so a 4xx denial here must stop the runtime
-        # from applying an escalation the durable config rejected.
-        if _orchestrator_client and _thread_id and not needs_enrichment:
-            try:
-                await _orchestrator_client.update_thread_config(
-                    _thread_id, config_override
-                )
-            except ThreadConfigUpdateDenied as e:
-                await _send_error("Session config update rejected", detail=e.detail)
-                return
-            except Exception:
-                logger.warning("Config persistence to orchestrator failed (non-fatal)")
-
         # Update permission mode if included.
         # _session may have been detached concurrently — bail out cleanly
         # instead of AttributeError'ing on assignment.
@@ -15878,6 +15856,8 @@ async def _handle_config_update(
         nm = (config_override.get("interactive") or {}).get("narration_mode")
         if nm and nm in ("silent", "verbose", "auto"):
             _session.narration_mode = nm
+        if saved_snapshot is not None:
+            _session.execution_snapshot = saved_snapshot
 
         # Acknowledge with resolved values — broadcast to every subscriber
         # (all viewers should converge on the new config, and the frame lands

@@ -3223,6 +3223,8 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
     """Build and push a fresh job to a registered pinned agent."""
     job_id = str(job["id"])
     agent_id = str(agent["id"])
+    if not uses_srw_runtime(job):
+        return False
 
     # Defense in depth for callers that bypass get_dispatchable_jobs (notably
     # the manual admin assignment endpoint). A stateless row must never be
@@ -3384,6 +3386,8 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
 
     job_id = str(job["id"])
     agent_id = str(agent["id"])
+    if not uses_srw_runtime(job):
+        return False
 
     # Same coexistence fence as the fresh-start helper. Resume is a direct
     # POST to a registered pod and therefore belongs exclusively to pinned jobs.
@@ -3504,6 +3508,18 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
         if isinstance(config_override, str):
             config_override = json.loads(config_override)
 
+        from orchestrator.services.manifest_execution_snapshot import (
+            apply_srw_delivery_bindings,
+            read_execution,
+            srw_snapshot_config,
+        )
+
+        execution_snapshot = await read_execution(postgres_db, "Job", job_id)
+        frozen_blob = frozen_policy = None
+        if execution_snapshot is not None:
+            frozen_blob, frozen_policy = srw_snapshot_config(execution_snapshot)
+            config_override = dict(frozen_policy)
+
         if resolved_ds:
             config_override = _build_datasource_tool_override(
                 resolved_ds, config_override
@@ -3611,7 +3627,7 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
         # remains the compatibility switch for resolved-config delivery.
         experts_db_enabled = _is_experts_db_enabled()
         resolved_resume_supported = False
-        if experts_db_enabled:
+        if experts_db_enabled or execution_snapshot is not None:
             ready_url = f"http://{agent['pod_ip']}:{agent['pod_port']}/ready"
             try:
                 async with httpx.AsyncClient(timeout=5.0) as client:
@@ -3635,7 +3651,38 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
                 )
         user_experts_enabled = await _user_experts_enabled()
         resolved_config: dict[str, Any] | None = None
-        if resolved_resume_supported or user_experts_enabled:
+        if execution_snapshot is not None:
+            if not resolved_resume_supported:
+                logger.info(
+                    "Resume requires a snapshot-capable SRW recipient for job %s",
+                    job_id,
+                )
+                return False
+            try:
+                _resolved, _policy = apply_srw_delivery_bindings(
+                    frozen_blob, frozen_policy, config_override
+                )
+                if user_experts_enabled:
+                    await _enforce_dispatch_grants(
+                        _policy,
+                        runner_user_id=str(job["user_id"])
+                        if job.get("user_id")
+                        else None,
+                        project_ids=[str(job["project_id"])]
+                        if job.get("project_id")
+                        else [],
+                        runner_kind=str(job.get("runner_kind") or "user"),
+                    )
+                resolved_config = await inject_blob_credentials(
+                    _resolved,
+                    lambda co: _inject_dispatch_credentials(
+                        job, co, include_kb_profile=has_knowledge_scope
+                    ),
+                )
+            except GrantDenied as gd:
+                logger.warning("Resume denied for job %s: %s", job_id, gd)
+                return False
+        elif resolved_resume_supported or user_experts_enabled:
             try:
                 _rbase = canonical_config_name(job.get("config_name") or "worker_base")
                 _rcap: dict = {}
@@ -3930,6 +3977,8 @@ async def _initiate_pause(job: dict) -> None:
     The actual dispatch of the high-priority job happens on the next dispatcher cycle.
     """
 
+    if not uses_srw_runtime(job):
+        return
     job_id = str(job["id"])
     agent_id = str(job.get("assigned_agent_id", ""))
 
@@ -5033,6 +5082,14 @@ async def _acknowledge_retiring_failed_attach(
     return receipt is not None or await _settled_readback()
 
 
+async def _capture_session_delivery(thread, resolved, status, *, project_ids):
+    from orchestrator.services.manifest_session_delivery import capture_session_delivery
+
+    return await capture_session_delivery(
+        postgres_db, thread, resolved, status, project_ids=project_ids
+    )
+
+
 def _session_attach_payload_dependencies() -> (
     session_attach_payload.SessionAttachPayloadDependencies
 ):
@@ -5056,6 +5113,7 @@ def _session_attach_payload_dependencies() -> (
         ro_mount_matches_protected_selection=_ro_mount_matches_protected_selection,
         thread_accepts_runtime=_thread_accepts_runtime,
         thread_project_ids=_thread_project_ids,
+        capture_session_config=_capture_session_delivery,
     )
 
 
@@ -5658,6 +5716,11 @@ from orchestrator.services.session_tool_policy import (  # noqa: E402
 
 from orchestrator.services.session_tool_policy import (  # noqa: E402
     with_validated_tool_overrides as _with_validated_tool_overrides,
+)
+from orchestrator.services.manifest_runtime_ownership import (  # noqa: E402
+    require_srw_expert_configuration,
+    require_srw_runtime,
+    uses_srw_runtime,
 )
 
 
@@ -8863,6 +8926,11 @@ async def _try_dispatch_pending_jobs() -> None:
     registers as ready. Jobs with a ready VM get workspace config injected
     into config_override before dispatch.
     """
+    if (
+        getattr(postgres_db, "manifests_ready", False) is True
+        and agent_provisioner._k8s_available
+    ):
+        await _manifest_execution_service().reconcile()
     if not AUTO_ASSIGN_ENABLED and not STATELESS_WORKER_ENABLED:
         return
 
@@ -9937,9 +10005,23 @@ async def lifespan(app: FastAPI):
     # checksum drift or a dirty row from a prior failure (see
     # knowledge-base/knowledge/db_migration.md §Operational runbook for repair steps).
     await postgres_db.apply_migrations()
+    from orchestrator.services.manifest_experts import (
+        installed_srw_image,
+        migrate_stored_experts,
+        seed_bundled_expert_manifests,
+    )
+
+    postgres_db.manifest_runtime_image = installed_srw_image()
+    postgres_db.manifest_skills_provider = _gather_in_scope_skills
+    await migrate_stored_experts(postgres_db)
     managed_defaults = await seed_managed_default_experts(
         postgres_db, _get_config_dir()
     )
+    await seed_bundled_expert_manifests(postgres_db, _get_config_dir())
+    from orchestrator.services.manifest_projects import migrate_projects
+
+    await migrate_projects(postgres_db)
+    postgres_db.manifests_ready = True
     logger.info(
         "Managed expert defaults ready: worker=%s session=%s",
         managed_defaults.get("worker"),
@@ -13289,6 +13371,7 @@ async def delete_job(request: Request, job_id: str) -> dict[str, Any]:
     Plain project membership is not enough — mirrors G3 sudo-authority gate.
     """
     caller, job = await require_job_access(request, postgres_db, job_id)
+    require_srw_runtime(job)
     if not caller.get("is_admin"):
         is_job_owner = str(job.get("user_id") or "") == str(caller["id"])
         is_project_owner = False
@@ -13516,6 +13599,16 @@ async def _cascade_cancel_to_children(job_id: str) -> bool:
     children = await postgres_db.get_descendant_jobs(job_id, include_cancelled=True)
     if not children:
         return True
+    native_settled = True
+    for child in children:
+        if not uses_srw_runtime(child):
+            native_settled = (
+                await _manifest_execution_service().cancel(str(child["id"]))
+                and native_settled
+            )
+    children = [child for child in children if uses_srw_runtime(child)]
+    if not children:
+        return native_settled
 
     # Signal processing agents concurrently
     async def _signal_cancel(child: dict) -> bool:
@@ -13660,7 +13753,7 @@ async def _cascade_cancel_to_children(job_id: str) -> bool:
             )
 
     logger.info(f"Cascade-cancelled {len(children)} descendant(s) of job {job_id}")
-    return pinned_settled and stateless_settled
+    return pinned_settled and stateless_settled and native_settled
 
 
 async def _cascade_pause_to_children(job_id: str) -> None:
@@ -13671,7 +13764,9 @@ async def _cascade_pause_to_children(job_id: str) -> None:
     the dispatcher's ancestor guard.
     """
     children = await postgres_db.get_descendant_jobs(job_id)
-    processing = [c for c in children if c["status"] == "processing"]
+    processing = [
+        c for c in children if c["status"] == "processing" and uses_srw_runtime(c)
+    ]
     if not processing:
         return
     pinned_processing = [
@@ -13880,6 +13975,14 @@ async def cancel_job(request: Request, job_id: str) -> dict[str, str]:
     to the agent pod.
     """
     _, job = await require_internal_or_job_access(request, postgres_db, job_id)
+    return await _cancel_job_internal(job_id, job=job)
+
+
+async def _cancel_job_internal(job_id: str, *, job: dict) -> dict[str, str]:
+    """Cancel already-authorized work through its existing runtime fences."""
+    if getattr(postgres_db, "manifests_ready", False) is True:
+        if await _manifest_execution_service().cancel(job_id):
+            return {"status": "cancelled"}
     pinned_cancel_committed = False
 
     try:
@@ -14131,6 +14234,7 @@ async def pause_job(request: Request, job_id: str) -> dict[str, str]:
     when an agent becomes available.
     """
     _, job = await require_internal_or_job_access(request, postgres_db, job_id)
+    require_srw_runtime(job)
     try:
         if job["status"] != "processing":
             raise HTTPException(
@@ -14276,6 +14380,8 @@ async def agent_release_job(
     await require_internal(request)
     try:
         job = await postgres_db.get_job(job_id)
+        if job is not None:
+            require_srw_runtime(job)
         lease_recovery_pending = False
         if not job:
             success = False
@@ -18155,6 +18261,20 @@ async def _resume_job_internal(
     notification ``review_queue.resume`` / ``budget_exceeded.resume`` handlers
     can call it directly. ``req`` is only needed on the internal-actor branch
     (no ``user``), which a notification action never takes."""
+    require_srw_runtime(job)
+    canonical_policy = None
+    if job.get("execution_harness_adapter") == "srw/v1":
+        from orchestrator.services.manifest_execution_snapshot import (
+            read_execution,
+            srw_snapshot_config,
+        )
+
+        snapshot = await read_execution(postgres_db, "Job", job_id)
+        if snapshot is None:
+            raise HTTPException(
+                409, "The admitted execution configuration is unavailable."
+            )
+        _, canonical_policy = srw_snapshot_config(snapshot)
     if request is None:
         request = JobResumeRequest()
     if job.get("completion_outcome_kind") == "blocked_undelivered":
@@ -18210,32 +18330,33 @@ async def _resume_job_internal(
     # except clause below for exactly which exceptions land in which bucket.
     if await _user_experts_enabled():
         try:
-            _rco = job.get("config_override")
-            if isinstance(_rco, str):
-                _rco = json.loads(_rco)
-            _rbase = canonical_config_name(job.get("config_name") or "worker_base")
-            _rcap: dict = {}
-            _rexpert_row = (
-                await postgres_db.get_expert_by_id(str(job["expert_id"]))
-                if job.get("expert_id")
-                else None
-            )
-            resolve_config(
-                base_config_name=_rbase,
-                base_defaults=await _resolve_default_models(job.get("user_id")),
-                expert_row=_rexpert_row,
-                request_override=_rco,
-                expert_type="worker",
-                capture=_rcap,
-                db_refs=await _prefetch_roster_refs(
+            _rcap: dict = {"merged_fragment": canonical_policy}
+            if canonical_policy is None:
+                _rco = job.get("config_override")
+                if isinstance(_rco, str):
+                    _rco = json.loads(_rco)
+                _rbase = canonical_config_name(job.get("config_name") or "worker_base")
+                _rexpert_row = (
+                    await postgres_db.get_expert_by_id(str(job["expert_id"]))
+                    if job.get("expert_id")
+                    else None
+                )
+                resolve_config(
+                    base_config_name=_rbase,
+                    base_defaults=await _resolve_default_models(job.get("user_id")),
                     expert_row=_rexpert_row,
-                    overrides=(_rco,),
-                    user_id=str(job["user_id"]) if job.get("user_id") else None,
-                    project_ids=[str(job["project_id"])]
-                    if job.get("project_id")
-                    else [],
-                ),
-            )
+                    request_override=_rco,
+                    expert_type="worker",
+                    capture=_rcap,
+                    db_refs=await _prefetch_roster_refs(
+                        expert_row=_rexpert_row,
+                        overrides=(_rco,),
+                        user_id=str(job["user_id"]) if job.get("user_id") else None,
+                        project_ids=[str(job["project_id"])]
+                        if job.get("project_id")
+                        else [],
+                    ),
+                )
             await _enforce_dispatch_grants(
                 _rcap["merged_fragment"],
                 runner_user_id=str(job["user_id"]) if job.get("user_id") else None,
@@ -18818,6 +18939,7 @@ async def _approve_job_internal(
 ) -> dict[str, Any]:
     """Core of :func:`approve_job` after the access gate — request-free so the
     notification ``review_queue.approve`` handler can call it directly."""
+    require_srw_runtime(job)
     if request is None:
         request = JobApproveRequest()
     await _guard_completion_control(job_id, source="public_approve")
@@ -19169,6 +19291,7 @@ async def _upgrade_job_to_vm_internal(
         job = await postgres_db.get_job(job_id)
         if not job:
             raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+        require_srw_runtime(job)
         if _redispatch_livelock_trip(job) is not None:
             raise HTTPException(
                 status_code=409,
@@ -19492,6 +19615,7 @@ async def _resume_job_without_vm_internal(
     job = await postgres_db.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+    require_srw_runtime(job)
     if _redispatch_livelock_trip(job) is not None:
         raise HTTPException(
             status_code=409,
@@ -19724,6 +19848,8 @@ async def _internal_resume_job(
     job = await postgres_db.get_job(job_id)
     if not job:
         logger.warning(f"_internal_resume_job: job {job_id} not found")
+        return False
+    if not uses_srw_runtime(job):
         return False
     observed_status = str(job.get("status") or "")
     if expected_status is not None and observed_status != expected_status:
@@ -25887,6 +26013,7 @@ async def _complete_job_legacy(
         job = await postgres_db.get_job(job_id)
         if not job:
             raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+        require_srw_runtime(job)
         completion_entry_status = str(job.get("status") or "")
         if _effect_runner is not None:
             resolved_entry_status = str(
@@ -28849,6 +28976,7 @@ async def _record_completion_decision_impl(
     job = await postgres_db.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    require_srw_runtime(job)
 
     if job.get("status") in ("completed", "failed", "cancelled"):
         raise HTTPException(
@@ -29380,6 +29508,7 @@ async def agent_create_thread(
                     detail="No application session expert default is configured",
                 )
 
+        require_srw_expert_configuration(selected_expert, interactive=True)
         create_capture: dict[str, Any] = {}
         resolve_config(
             base_config_name=config_name,
@@ -29397,12 +29526,22 @@ async def agent_create_thread(
         if effective_backend:
             config_override = {"workspace": {"backend": effective_backend}}
 
+        metadata_patch: dict[str, Any] = {"config_override": config_override}
+        if selected_expert:
+            metadata_patch.update(
+                {
+                    "expert_id": str(selected_expert["id"]),
+                    "expert_selection_source": "application",
+                }
+            )
+
         thread_id = await postgres_db.create_thread(
             user_id=None,
             config_name=config_name,
             permission_mode=body.permission_mode,
             narration_mode=effective_narration_mode,
             title=body.title,
+            initial_metadata=metadata_patch,
             datasource_ids=[],
             datasource_selection_provenance={
                 "origin": "system_empty",
@@ -29415,28 +29554,6 @@ async def agent_create_thread(
                 "materialized_at": datetime.now(timezone.utc).isoformat(),
             },
         )
-
-        metadata_patch: dict[str, Any] = {}
-        if selected_expert:
-            metadata_patch.update(
-                {
-                    "expert_id": str(selected_expert["id"]),
-                    "expert_selection_source": "application",
-                }
-            )
-        if config_override:
-            metadata_patch["config_override"] = config_override
-        if metadata_patch:
-            async with postgres_db.acquire() as conn:
-                await conn.execute(
-                    """
-                    UPDATE threads
-                    SET metadata = COALESCE(metadata, '{}') || $2::jsonb
-                    WHERE id = $1
-                    """,
-                    thread_id,
-                    json.dumps(metadata_patch),
-                )
 
         # Create Gitea repo for workspace versioning
         if not gitea_client.is_initialized and gitea_client.is_configured:
@@ -30108,6 +30225,7 @@ def _thread_workspace_delivery_dependencies() -> (
         virtual_workspace_rclone_spec=_virtual_workspace_rclone_spec,
         vm_workspaces_on_pod_network=vm_workspaces_on_pod_network,
         require_internal=require_internal,
+        capture_session_config=_capture_session_delivery,
     )
 
 
@@ -33184,6 +33302,8 @@ async def agent_release_thread_agent(
 
 class AgentThreadConfigUpdateRequest(BaseModel):
     config_override: dict[str, Any]
+    snapshot_patch_protocol: Literal[1] | None = None
+    snapshot_generation: int | None = Field(default=None, ge=1)
     # Live datasource change (live_session_settings.md Slice B): the desired
     # FULL selection, matching create semantics. None = no datasource change;
     # [] = detach all.
@@ -33214,6 +33334,72 @@ def _config_change_summary(
 
 
 async def _apply_thread_config_update(
+    thread_id: str,
+    thread_row: dict[str, Any] | None,
+    config_override: dict[str, Any],
+    datasource_ids: list[str] | None,
+    *,
+    request: Request,
+    actor: dict[str, Any] | None,
+    managed_runtime: bool = False,
+    snapshot_patch_protocol: int | None = None,
+    snapshot_generation: int | None = None,
+) -> tuple[dict[str, Any], list[str] | None]:
+    """Commit accepted settings, connector selection and one spec generation."""
+    if thread_row is not None:
+        require_srw_runtime(thread_row)
+    from shared.runtime.core.session_config_patch import validate_session_settings_patch
+
+    try:
+        validate_session_settings_patch(config_override)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    interactive = config_override.get("interactive")
+    if isinstance(interactive, dict) and {
+        "permission_mode",
+        "narration_mode",
+    }.intersection(interactive):
+        raise HTTPException(
+            409,
+            "permission_mode and narration_mode must use the ordered session control endpoint",
+        )
+    async with postgres_db.thread_configuration_transaction(thread_id) as conn:
+        # Serialize config updates; never render a mixed before/after selection.
+        current = await conn.fetchrow(
+            "SELECT * FROM threads WHERE id=$1 FOR UPDATE", UUID(str(thread_id))
+        )
+        if current is None:
+            raise HTTPException(404, "Thread not found")
+        if managed_runtime:
+            from orchestrator.services.manifest_execution_snapshot import read_execution
+
+            execution = await read_execution(conn, "Session", thread_id)
+            if execution is not None and (
+                snapshot_patch_protocol != 1
+                or snapshot_generation != execution["generation"]
+            ):
+                raise HTTPException(
+                    409,
+                    "Session configuration changed; reattach to load its current generation before editing settings.",
+                )
+        result = await _apply_thread_config_update_locked(
+            thread_id,
+            dict(current),
+            config_override,
+            datasource_ids,
+            request=request,
+            actor=actor,
+        )
+        try:
+            saved = await postgres_db.refresh_session_execution(
+                thread_id, conn=conn, config_override=result[0]
+            )
+        except DatasourceMaterializationAuthorizationError as exc:
+            raise HTTPException(403, str(exc)) from exc
+        return saved["delivery_override"], result[1]
+
+
+async def _apply_thread_config_update_locked(
     thread_id: str,
     thread_row: dict[str, Any] | None,
     config_override: dict[str, Any],
@@ -33319,19 +33505,6 @@ async def _apply_thread_config_update(
                         "through generic config mutation"
                     ),
                 )
-
-    interactive = config_override.get("interactive")
-    if isinstance(interactive, dict) and {
-        "permission_mode",
-        "narration_mode",
-    }.intersection(interactive):
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "permission_mode and narration_mode must use the ordered "
-                "session control endpoint"
-            ),
-        )
 
     if "tools" in config_override:
         # Runtime updates use the same registry vocabulary as session creation
@@ -33599,6 +33772,13 @@ async def _apply_thread_config_update(
         detail=change_summary,
         request=request,
     )
+    if selected_ds_ids is not None:
+        # The snapshot policy and pinned merge use the same authorized derived
+        # categories. Persisted author overrides still omit this live binding.
+        config_override = {
+            **config_override,
+            "tools": grant_fragment.get("tools", {}),
+        }
     return config_override, selected_ds_ids
 
 
@@ -33699,6 +33879,9 @@ async def agent_update_thread_config(
             body.datasource_ids,
             request=request,
             actor=None,
+            managed_runtime=True,
+            snapshot_patch_protocol=body.snapshot_patch_protocol,
+            snapshot_generation=body.snapshot_generation,
         )
         return {
             "status": "updated",
@@ -34894,6 +35077,7 @@ async def create_thread(
                     is_admin=bool(user.get("is_admin")),
                 )
                 selected_expert_row = selection.expert
+                require_srw_expert_configuration(selected_expert_row, interactive=True)
                 selected_expert_id = str(selection.expert["id"])
                 project_expert_override = selection.project_override
                 config_name = "session_base"
@@ -35367,9 +35551,7 @@ async def create_thread(
         # it in the thread INSERT transaction together with the opening event,
         # even on the pinned lane, so no reconciler can observe a created review
         # thread before its exact delivery constraint exists.
-        metadata_at_create = stateless_initial_metadata or trusted_seed is not None
-        if metadata_at_create:
-            create_kwargs["initial_metadata"] = metadata_patch
+        create_kwargs["initial_metadata"] = metadata_patch
         thread_id = await postgres_db.create_thread(**create_kwargs)
         created_runtime_authority = thread_runtime_authority(
             await postgres_db.get_thread(str(thread_id))
@@ -35379,18 +35561,6 @@ async def create_thread(
                 status_code=409,
                 detail="Thread runtime changed during create admission",
             )
-
-        if metadata_patch and not metadata_at_create:
-            async with postgres_db.acquire() as conn:
-                await conn.execute(
-                    """
-                    UPDATE threads
-                    SET metadata = COALESCE(metadata, '{}') || $2::jsonb
-                    WHERE id = $1
-                    """,
-                    thread_id,
-                    json.dumps(metadata_patch),
-                )
 
         # Officer post registration (officer_post.md §4): link the new
         # incarnation on the project's post so the row can never disagree
@@ -38574,6 +38744,17 @@ async def _end_thread_flow(
                             status_code=503,
                             detail=("Terminal virtual workspace cleanup is incomplete"),
                         )
+                from orchestrator.services.stateless_workspace_history_cleanup import (
+                    reclaim_stateless_workspace_history,
+                )
+
+                if not await reclaim_stateless_workspace_history(
+                    postgres_db, container_provisioner, thread_id
+                ):
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Historical workspace permanent cleanup is incomplete",
+                    )
                 await _delete_auxiliary_state(fresh_thread)
                 await postgres_db.delete_thread(thread_id)
                 return {"status": "deleted"}
@@ -38773,6 +38954,7 @@ async def resume_thread(
     knowledge-history/done/session_config_drift_resume.md.
     """
     user, thread = await require_thread_owner(request, postgres_db, thread_id)
+    require_srw_runtime(thread)
     from shared.run_queue import LANE_PINNED, LANE_STATELESS
 
     execution_lane = thread.get("execution_lane")
@@ -43109,21 +43291,95 @@ def _config_catalog_dependencies() -> config_catalog_routes.ConfigCatalogDepende
 
 def _manifest_dependencies() -> manifest_routes.ManifestDependencies:
     from orchestrator.services.manifests import ManifestService
+    from orchestrator.services.manifest_resources import ManifestResourceService
 
     async def approved_user(request: Request) -> dict[str, Any]:
         return await require_approved_user(request, postgres_db)
 
+    async def admit_manifest(prepared, resource, user, *, request=None):
+        return await _manifest_execution_service().admit(
+            prepared, resource, user, request=request
+        )
+
+    async def activate_project(prepared, user, *, request=None, validate_only):
+        from orchestrator.services.manifest_projects import validate_project_activation
+
+        return await validate_project_activation(
+            postgres_db,
+            prepared,
+            user,
+            request=request,
+            validate_only=validate_only,
+            validate_post_patch=_validated_officer_post_patch,
+            enforce_auto_pull=_enforce_officer_auto_pull_release,
+        )
+
     return manifest_routes.ManifestDependencies(
-        service=ManifestService(), require_approved_user=approved_user
+        service=ManifestService(),
+        require_approved_user=approved_user,
+        resources=ManifestResourceService(
+            postgres_db, admit_job=admit_manifest, project_activation=activate_project
+        ),
+        execution=_manifest_execution_service,
+        trigger_dispatch=_trigger_dispatch,
+    )
+
+
+def _manifest_execution_service():
+    from kubernetes.client import NetworkingV1Api
+    from orchestrator.services.generic_harness_runtime import GenericHarnessRuntime
+    from orchestrator.services.manifest_execution import ManifestExecutionService
+    from orchestrator.services.manifest_workspace_runtime import (
+        ManifestWorkspaceRuntime,
+    )
+    from orchestrator.services.manifest_workspaces import ManifestWorkspaceService
+
+    if not agent_provisioner._k8s_available:
+        raise HTTPException(503, "Kubernetes manifest hosting is unavailable.")
+    network_api = NetworkingV1Api()
+    namespace = os.environ.get(
+        "MANIFEST_NAMESPACE", agent_provisioner._namespace + "-native"
+    )
+    workspace_namespace = namespace
+    workspaces = ManifestWorkspaceService(
+        postgres_db,
+        ManifestWorkspaceRuntime(
+            container_provisioner._core_api, network_api, namespace=workspace_namespace
+        ),
+        namespace=workspace_namespace,
+        default_image=container_provisioner._workspace_image,
+        storage_class_name=container_provisioner._storage_class,
+        harness_namespace=namespace,
+    )
+    return ManifestExecutionService(
+        postgres_db,
+        runtime=GenericHarnessRuntime(
+            agent_provisioner._core_api, network_api, namespace=namespace
+        ),
+        namespace=namespace,
+        workspace=workspaces,
+        srw_image=agent_provisioner._agent_image,
+        authorize_datasources=_authorize_thread_datasource_selection,
+        cancel_srw=lambda job: _cancel_job_internal(str(job["id"]), job=job),
+        native_hosting_enabled=os.environ.get(
+            "MANIFEST_NETWORK_ISOLATION_VERIFIED", "false"
+        ).lower()
+        == "true",
+        harness_egress=os.environ.get("MANIFEST_HARNESS_EGRESS", "[]"),
     )
 
 
 def _expert_catalog_service() -> ExpertCatalogService:
     """Bind current stores/policy to this application's shared catalogue state."""
     resources = app.state.catalogue_resources
+    from orchestrator.services.manifest_store import ManifestStore
+
     return ExpertCatalogService(
         ExpertCatalogDependencies(
             store=postgres_db,
+            manifests=ManifestStore(postgres_db)
+            if getattr(postgres_db, "manifests_ready", False) is True
+            else None,
             state=app.state.expert_catalog_state,
             get_config_dir=resources.get_config_dir,
             load_settings_matrix=resources.load_settings_matrix,

@@ -16,8 +16,8 @@ Superhuman Remote Worker (SRW) is a self-hosted runtime for AI work, from a
 help-desk assistant with no tools to a week-long autonomous project. It has
 three building bricks and an engine that puts them together:
 
-- an **expert** — who the agent is: a prompt, a model and a set of tools, in one
-  YAML file;
+- an **expert** — the harness image and its private settings. The included SRW
+  harness supplies configurable prompts, models and tools;
 - a **workspace** — where the work happens: none, files in your object store, a
   throwaway pod, or a VM with its own kernel;
 - a **connector** — what it can reach: a repository, a database, a cloud folder,
@@ -28,6 +28,12 @@ not a brick: it queues the job, issues the credentials, runs the workspace,
 keeps the audit trail, and hands back a reviewable result and a receipt.
 Sessions, projects, officers and subagents are the same three bricks,
 combined.
+
+The [`srw/v1alpha1` resource manifests](examples/manifests/README.md) define
+Experts, WorkspaceTemplates, Connectors, Projects and Jobs in JSON or YAML.
+The same resource API serves `srw` CLI commands and MCP operations. See the
+examples for reference and inline configuration, versioned apply, workspace
+retention, migration behavior and current hosting requirements.
 
 The model is replaceable. The execution, memory, permissions, observability,
 and recovery layers around it are the product.

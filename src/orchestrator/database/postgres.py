@@ -540,6 +540,25 @@ _TASK_TRANSACTION_SCOPE: ContextVar[_TaskTransactionScope | None] = ContextVar(
 )
 
 
+@dataclass(frozen=True, slots=True)
+class _TaskDatasourceLock:
+    database: "PostgresDB"
+    key: int
+    owner_task: asyncio.Task[Any]
+
+
+_TASK_DATASOURCE_LOCKS: ContextVar[tuple[_TaskDatasourceLock, ...]] = ContextVar(
+    "postgres_task_datasource_locks", default=()
+)
+
+
+def _thread_config_lock_key(thread_id: str) -> int:
+    digest = hashlib.blake2b(
+        b"config_override:" + thread_id.encode(), digest_size=8
+    ).digest()
+    return int.from_bytes(digest, byteorder="big", signed=True)
+
+
 def _strict_json_object(value: Any, *, label: str) -> dict[str, Any]:
     """Return one JSON object without treating malformed falsey values as empty."""
 
@@ -3020,6 +3039,44 @@ class PostgresDB:
                 finally:
                     _TASK_TRANSACTION_SCOPE.reset(token)
 
+    @asynccontextmanager
+    async def using_connection(self, conn):
+        """Bind helper calls to a caller-owned transaction without opening one.
+
+        Admission owners such as Officer already hold locks on ``conn``. They
+        must not acquire a second connection when rendering and recording an
+        execution specification. Child tasks do not inherit this authority.
+        """
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("using_connection requires an asyncio task")
+        scope = _TASK_TRANSACTION_SCOPE.get()
+        if (
+            scope is not None
+            and scope.database is self
+            and scope.owner_task is task
+            and scope.connection is not conn
+        ):
+            raise RuntimeError("Cannot replace an active task transaction connection")
+        token = _TASK_TRANSACTION_SCOPE.set(
+            _TaskTransactionScope(database=self, connection=conn, owner_task=task)
+        )
+        try:
+            yield conn
+        finally:
+            _TASK_TRANSACTION_SCOPE.reset(token)
+
+    @asynccontextmanager
+    async def thread_configuration_transaction(self, thread_id: str):
+        """Acquire delivery/config locks before materializing one session revision."""
+        async with self.thread_datasource_lock(thread_id):
+            async with self.transaction_scope() as conn:
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock($1)",
+                    _thread_config_lock_key(thread_id),
+                )
+                yield conn
+
     async def execute(self, query: str, *args) -> str:
         """Execute a query without returning results.
 
@@ -3655,7 +3712,14 @@ class PostgresDB:
             row = await conn.fetchrow(
                 """
                 SELECT j.id, j.status, j.completion_outcome_kind,
-                       j.config_name, j.expert_id, j.config_override, j.resolved_config,
+                       j.config_name, j.expert_id, j.config_override,
+                       execution.harness_adapter AS execution_harness_adapter,
+                       COALESCE(
+                           CASE WHEN execution.harness_adapter = 'srw/v1' THEN
+                               execution.resolved #> '{spec,execution,expert,inline,runtime,config,resolved}'
+                           END,
+                           j.resolved_config
+                       ) AS resolved_config,
                        j.assigned_agent_id, j.user_id,
                        j.project_id, j.parent_job_id, j.priority,
                        j.branch_name, j.repo_name, j.merge_status, j.repo_merge_statuses,
@@ -3670,6 +3734,8 @@ class PostgresDB:
                        (p.main_cloud_folder_handle IS NOT NULL) AS project_has_cloud_folder
                 FROM jobs j
                 LEFT JOIN projects p ON p.id = j.project_id
+                LEFT JOIN srw_execution_specs execution
+                    ON execution.work_kind='Job' AND execution.work_id=j.id
                 WHERE j.id = $1
                 """,
                 uuid_val,
@@ -3712,6 +3778,7 @@ class PostgresDB:
         requested_workspace_backend: Any = _WORKSPACE_REQUEST_UNSET,
         workspace_assignment_source: str | None = None,
         delivery_contract: Mapping[str, Any] | None = None,
+        execution_manifest: Mapping[str, Any] | None = None,
         conn: Any = None,
     ) -> Dict[str, Any]:
         """Create a new job.
@@ -4027,6 +4094,30 @@ class PostgresDB:
                     json.dumps(prepared_contract.get("pr_bindings") or []),
                     str(prepared_contract.get("digest") or ""),
                 )
+            from orchestrator.services.manifest_execution_snapshot import (
+                capture_execution,
+            )
+
+            await capture_execution(
+                self,
+                active_conn,
+                work_kind="Job",
+                work_id=str(written["id"]),
+                owner_id=user_id,
+                project_ids=[project_id] if project_id else [],
+                execution_manifest=dict(execution_manifest)
+                if execution_manifest is not None
+                else None,
+                config_name=config_name,
+                expert_id=expert_id,
+                config_override=config_override,
+                description=description,
+                datasource_ids=[str(value) for value in datasource_uuids],
+                policy_revisions={
+                    str(key): value for key, value in policy_snapshot.items()
+                },
+                runner_kind=runner_kind,
+            )
             return written
 
         if conn is not None:
@@ -4036,15 +4127,13 @@ class PostgresDB:
             row = await _write(conn)
         else:
             async with self.acquire() as owned_conn:
-                async with _transaction_if(
-                    owned_conn,
-                    bool(datasource_uuids)
-                    or authority_user_id is not None
-                    or prepared_contract is not None,
-                ):
+                async with owned_conn.transaction():
                     row = await _write(owned_conn)
 
         result = dict(row)
+        result["execution_harness_adapter"] = (execution_manifest or {}).get(
+            "harness_adapter", "srw/v1"
+        )
         result["workspace_contract"] = workspace_contract_projection(
             {"context": context, "config_override": config_override},
             vm_mode=vm_mode_from_env(),
@@ -4158,11 +4247,19 @@ class PostgresDB:
                     uuid_val,
                 )
                 deleting_job = await conn.fetchrow(
-                    "SELECT status, completion_outcome_kind "
+                    "SELECT status, completion_outcome_kind, "
+                    "(SELECT execution.harness_adapter FROM srw_execution_specs execution "
+                    " WHERE execution.work_kind='Job' AND execution.work_id=jobs.id) "
+                    "AS execution_harness_adapter "
                     "FROM jobs WHERE id = $1 FOR UPDATE",
                     uuid_val,
                 )
                 if deleting_job is not None:
+                    from orchestrator.services.manifest_runtime_ownership import (
+                        require_srw_runtime,
+                    )
+
+                    require_srw_runtime(deleting_job)
                     # Deletion is never a release. This update and the jobs
                     # DELETE share the transaction, so a fault cannot leave an
                     # audit tombstone for a job row that survived (or erase the
@@ -4896,6 +4993,9 @@ class PostgresDB:
                         assigned_agent_id = NULL,
                         updated_at = CURRENT_TIMESTAMP
                     WHERE id = $1 AND status = 'processing'
+                      AND NOT EXISTS (SELECT 1 FROM srw_execution_specs execution
+                          WHERE execution.work_kind='Job' AND execution.work_id=jobs.id
+                            AND execution.harness_adapter <> 'srw/v1')
                     """,
                     uuid_val,
                 )
@@ -4912,6 +5012,9 @@ class PostgresDB:
                     assigned_agent_id = NULL,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = $1 AND status = 'processing'
+                  AND NOT EXISTS (SELECT 1 FROM srw_execution_specs execution
+                      WHERE execution.work_kind='Job' AND execution.work_id=jobs.id
+                        AND execution.harness_adapter <> 'srw/v1')
                   AND execution_lane = 'pinned'
                   {owner_guard}
                   AND NOT ({_completion_control_active_sql("context")})
@@ -8230,7 +8333,10 @@ class PostgresDB:
                     JOIN descendants d ON j.parent_job_id = d.id
                     WHERE d.depth < 20
                 )
-                SELECT *
+                SELECT descendants.*,
+                    (SELECT execution.harness_adapter FROM srw_execution_specs execution
+                     WHERE execution.work_kind='Job' AND execution.work_id=descendants.id)
+                    AS execution_harness_adapter
                 FROM descendants
                 WHERE status NOT IN ('completed', 'failed', 'cancelled')
                    OR ($2::boolean AND status = 'cancelled')
@@ -16954,6 +17060,7 @@ class PostgresDB:
         seed_configmap_uid: str | None,
         pvc_uid: str | None,
         service_uid: str | None,
+        resource_location: dict[str, str] | None = None,
     ) -> dict[str, Any] | None:
         """Attach one explicit present/absent resource tuple to a lease."""
 
@@ -16977,6 +17084,48 @@ class PostgresDB:
         seed_uid, claim_uid, service_resource_uid = parsed_resources
         async with self.acquire() as conn:
             async with conn.transaction():
+                if resource_location is not None:
+                    if (
+                        not isinstance(resource_location, dict)
+                        or set(resource_location)
+                        != {"namespace", "pod", "seedConfigMap", "pvc", "service"}
+                        or any(
+                            not isinstance(value, str) or not value
+                            for value in resource_location.values()
+                        )
+                    ):
+                        return None
+                    observed = await conn.fetchrow(
+                        "SELECT owner_kind,owner_id,scope FROM "
+                        "managed_repository_workspace_cleanup_intents WHERE id=$1",
+                        intent_uuid,
+                    )
+                    if observed is None or observed["scope"] != "workspace_container":
+                        return None
+                    table = "threads" if observed["owner_kind"] == "thread" else "jobs"
+                    column = (
+                        "metadata" if observed["owner_kind"] == "thread" else "context"
+                    )
+                    owner = await conn.fetchrow(
+                        f"SELECT {column} AS state FROM {table} WHERE id=$1 FOR UPDATE",
+                        observed["owner_id"],
+                    )
+                    if owner is None:
+                        return None
+                    state = _strict_json_object(owner["state"], label=column)
+                    workspace = state.get("workspace_container")
+                    settled = state.get("_stateless_workspace_retirement_settled")
+                    if not isinstance(workspace, dict) or (
+                        workspace.get("namespace") != resource_location["namespace"]
+                        or workspace.get("pod_name")
+                        not in {None, resource_location["pod"]}
+                        or not (
+                            workspace.get("_runtime_incarnation") == runtime
+                            or isinstance(settled, dict)
+                            and settled.get("runtime_incarnation") == runtime
+                        )
+                    ):
+                        return None
                 intent = await conn.fetchrow(
                     "SELECT * FROM managed_repository_workspace_cleanup_intents "
                     "WHERE id = $1 FOR UPDATE",
@@ -16998,12 +17147,19 @@ class PostgresDB:
                 ):
                     return None
                 if intent.get("capture_complete") is True:
+                    captured_location = intent.get("resource_location")
+                    if isinstance(captured_location, str):
+                        captured_location = json.loads(captured_location)
                     if (
                         str(intent.get("seed_configmap_uid") or "")
                         == str(seed_uid or "")
                         and str(intent.get("pvc_uid") or "") == str(claim_uid or "")
                         and str(intent.get("service_uid") or "")
                         == str(service_resource_uid or "")
+                        and (
+                            resource_location is None
+                            or captured_location == resource_location
+                        )
                     ):
                         return dict(intent)
                     return None
@@ -17011,6 +17167,7 @@ class PostgresDB:
                     "UPDATE managed_repository_workspace_cleanup_intents "
                     "SET seed_configmap_uid = $2, pvc_uid = $3, "
                     "service_uid = $4, capture_complete = TRUE, "
+                    "resource_location = $7::jsonb, "
                     "resources_captured_at = now(), phase = 'captured' "
                     "WHERE id = $1 AND capture_complete IS FALSE "
                     "AND claimed_by = $5 AND claim_token = $6 "
@@ -17021,6 +17178,9 @@ class PostgresDB:
                     service_resource_uid,
                     claimant,
                     claim_token,
+                    json.dumps(resource_location)
+                    if resource_location is not None
+                    else None,
                 )
                 return dict(row) if row is not None else None
 
@@ -19832,10 +19992,7 @@ class PostgresDB:
         # never queue behind the (potentially minutes-long) provisioning
         # lock in thread_advisory_lock, and taken on this same connection
         # so no second pool slot is held while waiting.
-        h = hashlib.blake2b(
-            b"config_override:" + thread_id.encode(), digest_size=8
-        ).digest()
-        lock_key = int.from_bytes(h, byteorder="big", signed=True)
+        lock_key = _thread_config_lock_key(thread_id)
 
         async with self.acquire() as conn:
             async with conn.transaction():
@@ -21131,6 +21288,9 @@ class PostgresDB:
                   -- the sole rescue authority for stateless worker jobs.
                   -- Whitelist pinned so unknown future lanes fail closed.
                   AND jobs.execution_lane = 'pinned'
+                  AND NOT EXISTS (SELECT 1 FROM srw_execution_specs execution
+                      WHERE execution.work_kind='Job' AND execution.work_id=jobs.id
+                        AND execution.harness_adapter <> 'srw/v1')
                   -- Leased rows belong exclusively to
                   -- recover_expired_lease_jobs. This predicate is the
                   -- authority partition; detector ordering is not relied on.
@@ -21161,6 +21321,9 @@ class PostgresDB:
                     updated_at = CURRENT_TIMESTAMP
                 WHERE status = 'waiting'
                   AND jobs.execution_lane = 'pinned'
+                  AND NOT EXISTS (SELECT 1 FROM srw_execution_specs execution
+                      WHERE execution.work_kind='Job' AND execution.work_id=jobs.id
+                        AND execution.harness_adapter <> 'srw/v1')
                   AND assigned_agent_id IS NOT NULL
                   AND assigned_agent_id IN (
                       SELECT id FROM agents WHERE status = 'offline'
@@ -21183,6 +21346,9 @@ class PostgresDB:
                     updated_at = CURRENT_TIMESTAMP
                 WHERE status = 'paused'
                   AND jobs.execution_lane = 'pinned'
+                  AND NOT EXISTS (SELECT 1 FROM srw_execution_specs execution
+                      WHERE execution.work_kind='Job' AND execution.work_id=jobs.id
+                        AND execution.harness_adapter <> 'srw/v1')
                   AND assigned_agent_id IS NOT NULL
                   AND assigned_agent_id IN (
                       SELECT id FROM agents WHERE status = 'offline'
@@ -21212,6 +21378,9 @@ class PostgresDB:
                     updated_at = CURRENT_TIMESTAMP
                 WHERE status = 'paused'
                   AND jobs.execution_lane = 'pinned'
+                  AND NOT EXISTS (SELECT 1 FROM srw_execution_specs execution
+                      WHERE execution.work_kind='Job' AND execution.work_id=jobs.id
+                        AND execution.harness_adapter <> 'srw/v1')
                   AND assigned_agent_id IS NULL
                   AND freeze_data->>'freeze_type' = ANY($1::text[])
                   {completion_exclusion}
@@ -21297,6 +21466,9 @@ class PostgresDB:
                    -- Stateless jobs are recovered only by run_queue's
                    -- lease-token reaper (§5.4.4), never this jobs-row lease.
                    AND jobs.execution_lane = 'pinned'
+                   AND NOT EXISTS (SELECT 1 FROM srw_execution_specs execution
+                       WHERE execution.work_kind='Job' AND execution.work_id=jobs.id
+                         AND execution.harness_adapter <> 'srw/v1')
                    AND lease_expires_at IS NOT NULL
                    AND lease_expires_at < NOW()
                    {completion_exclusion}
@@ -22437,6 +22609,9 @@ class PostgresDB:
                        -- One claim authority per job (§5.4.4). Fail closed for
                        -- unknown lanes instead of handing them to legacy pods.
                        AND execution_lane = 'pinned'
+                       AND NOT EXISTS (SELECT 1 FROM srw_execution_specs execution
+                           WHERE execution.work_kind='Job' AND execution.work_id=jobs.id
+                             AND execution.harness_adapter <> 'srw/v1')
                        AND assigned_agent_id IS NULL
                        AND freeze_data IS NULL
                        AND COALESCE(
@@ -25041,6 +25216,7 @@ class PostgresDB:
         config_updates: Optional[Dict[str, Any]] = None,
         communication_policy_patch: Optional[Dict[str, Any]] = None,
         expected_vacant_updated_at: Any = None,
+        project_manifest_write: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """Atomically update durable post config and its runtime projection.
 
@@ -25096,119 +25272,137 @@ class PostgresDB:
                 }
             return merged
 
-        async with self.acquire() as conn:
-            async with conn.transaction():
-                post = await conn.fetchrow(
-                    "SELECT * FROM project_officers WHERE project_id = $1 FOR UPDATE",
-                    project_uuid,
-                )
-                if post is None:
-                    return None
-
-                if expected_vacant_updated_at is not None and (
-                    post["thread_id"] is not None
-                    or post["updated_at"] != expected_vacant_updated_at
-                ):
-                    raise OfficerPostLifecycleConflict(
-                        "commission_generation_changed",
-                        "Officer Post vacancy/configuration changed; retry commission.",
+        async with self.transaction_scope():
+            await self._lock_expert_catalog()
+            async with self.acquire() as conn:
+                async with conn.transaction():
+                    post = await conn.fetchrow(
+                        "SELECT * FROM project_officers WHERE project_id = $1 FOR UPDATE",
+                        project_uuid,
                     )
+                    if post is None:
+                        return None
 
-                thread = None
-                if post["thread_id"] is not None:
-                    thread = await conn.fetchrow(
-                        "SELECT id, project_id, status, metadata "
-                        "FROM threads WHERE id = $1 FOR UPDATE",
-                        post["thread_id"],
-                    )
-
-                current_config = post["config_override"]
-                if isinstance(current_config, str):
-                    try:
-                        current_config = json.loads(current_config)
-                    except (TypeError, ValueError):
-                        current_config = {}
-                if not isinstance(current_config, dict):
-                    current_config = {}
-                merged_config = _merge_post_config(current_config, config_updates or {})
-
-                officer_config = merged_config.get("officer") or {}
-                if isinstance(officer_config, dict):
-                    try:
-                        sleep_min = int(officer_config.get("sleep_min_minutes") or 5)
-                        sleep_max = int(officer_config.get("sleep_max_minutes") or 60)
-                    except (TypeError, ValueError) as exc:
+                    if expected_vacant_updated_at is not None and (
+                        post["thread_id"] is not None
+                        or post["updated_at"] != expected_vacant_updated_at
+                    ):
                         raise OfficerPostLifecycleConflict(
-                            "invalid_config", "Officer sleep bounds must be integers."
-                        ) from exc
-                    if sleep_min > sleep_max:
-                        raise OfficerPostLifecycleConflict(
-                            "invalid_config",
-                            f"sleep_min_minutes ({sleep_min}) must not exceed "
-                            f"sleep_max_minutes ({sleep_max})",
+                            "commission_generation_changed",
+                            "Officer Post vacancy/configuration changed; retry commission.",
                         )
 
-                policy = post["communication_policy"]
-                if isinstance(policy, str):
-                    try:
-                        policy = json.loads(policy)
-                    except (TypeError, ValueError):
-                        policy = {}
-                if not isinstance(policy, dict):
-                    policy = {}
-                merged_policy = {
-                    **policy,
-                    **(communication_policy_patch or {}),
-                }
+                    thread = None
+                    if post["thread_id"] is not None:
+                        thread = await conn.fetchrow(
+                            "SELECT id, project_id, status, metadata "
+                            "FROM threads WHERE id = $1 FOR UPDATE",
+                            post["thread_id"],
+                        )
 
-                updated_post = await conn.fetchrow(
-                    """
-                    UPDATE project_officers
-                       SET config_override = $2::jsonb
-                               #- '{officer,hold}'
-                               #- '{officer,last_respawn_at}',
-                           communication_policy = $3::jsonb,
-                           updated_at = now()
-                     WHERE project_id = $1
-                    RETURNING *
-                    """,
-                    project_uuid,
-                    json.dumps(merged_config),
-                    json.dumps(merged_policy),
+                    current_config = post["config_override"]
+                    if isinstance(current_config, str):
+                        try:
+                            current_config = json.loads(current_config)
+                        except (TypeError, ValueError):
+                            current_config = {}
+                    if not isinstance(current_config, dict):
+                        current_config = {}
+                    merged_config = _merge_post_config(
+                        current_config, config_updates or {}
+                    )
+
+                    officer_config = merged_config.get("officer") or {}
+                    if isinstance(officer_config, dict):
+                        try:
+                            sleep_min = int(
+                                officer_config.get("sleep_min_minutes") or 5
+                            )
+                            sleep_max = int(
+                                officer_config.get("sleep_max_minutes") or 60
+                            )
+                        except (TypeError, ValueError) as exc:
+                            raise OfficerPostLifecycleConflict(
+                                "invalid_config",
+                                "Officer sleep bounds must be integers.",
+                            ) from exc
+                        if sleep_min > sleep_max:
+                            raise OfficerPostLifecycleConflict(
+                                "invalid_config",
+                                f"sleep_min_minutes ({sleep_min}) must not exceed "
+                                f"sleep_max_minutes ({sleep_max})",
+                            )
+
+                    policy = post["communication_policy"]
+                    if isinstance(policy, str):
+                        try:
+                            policy = json.loads(policy)
+                        except (TypeError, ValueError):
+                            policy = {}
+                    if not isinstance(policy, dict):
+                        policy = {}
+                    merged_policy = {
+                        **policy,
+                        **(communication_policy_patch or {}),
+                    }
+
+                    updated_post = await conn.fetchrow(
+                        """
+                        UPDATE project_officers
+                           SET config_override = $2::jsonb
+                                   #- '{officer,hold}'
+                                   #- '{officer,last_respawn_at}',
+                               communication_policy = $3::jsonb,
+                               updated_at = now()
+                         WHERE project_id = $1
+                        RETURNING *
+                        """,
+                        project_uuid,
+                        json.dumps(merged_config),
+                        json.dumps(merged_policy),
+                    )
+
+                    applied_to_thread = False
+                    updated_thread = None
+                    if (
+                        thread is not None
+                        and thread["project_id"] == project_uuid
+                        and thread["status"] != "ended"
+                        and config_updates
+                    ):
+                        metadata = thread["metadata"]
+                        if isinstance(metadata, str):
+                            try:
+                                metadata = json.loads(metadata)
+                            except (TypeError, ValueError):
+                                metadata = {}
+                        if not isinstance(metadata, dict):
+                            metadata = {}
+                        runtime_config = metadata.get("config_override") or {}
+                        runtime_config = _merge_post_config(
+                            runtime_config, config_updates
+                        )
+                        updated_thread = await conn.fetchrow(
+                            """
+                            UPDATE threads
+                               SET metadata = jsonb_set(
+                                       COALESCE(metadata, '{}'::jsonb),
+                                       '{config_override}', $2::jsonb),
+                                   last_activity = now()
+                             WHERE id = $1
+                            RETURNING id, project_id, status, metadata, user_id
+                            """,
+                            thread["id"],
+                            json.dumps(runtime_config),
+                        )
+                        applied_to_thread = updated_thread is not None
+
+            if not project_manifest_write:
+                from orchestrator.services.manifest_projects import (
+                    persist_officer_controller,
                 )
 
-                applied_to_thread = False
-                updated_thread = None
-                if (
-                    thread is not None
-                    and thread["project_id"] == project_uuid
-                    and thread["status"] != "ended"
-                    and config_updates
-                ):
-                    metadata = thread["metadata"]
-                    if isinstance(metadata, str):
-                        try:
-                            metadata = json.loads(metadata)
-                        except (TypeError, ValueError):
-                            metadata = {}
-                    if not isinstance(metadata, dict):
-                        metadata = {}
-                    runtime_config = metadata.get("config_override") or {}
-                    runtime_config = _merge_post_config(runtime_config, config_updates)
-                    updated_thread = await conn.fetchrow(
-                        """
-                        UPDATE threads
-                           SET metadata = jsonb_set(
-                                   COALESCE(metadata, '{}'::jsonb),
-                                   '{config_override}', $2::jsonb),
-                               last_activity = now()
-                         WHERE id = $1
-                        RETURNING id, project_id, status, metadata, user_id
-                        """,
-                        thread["id"],
-                        json.dumps(runtime_config),
-                    )
-                    applied_to_thread = updated_thread is not None
+                await persist_officer_controller(self, project_id, dict(updated_post))
 
         result_thread = (
             dict(updated_thread)
@@ -26037,37 +26231,44 @@ class PostgresDB:
                     merged[key] = value
             return merged
 
-        async with self.acquire() as conn:
-            async with conn.transaction():
-                row = await conn.fetchrow(
-                    "SELECT config_override FROM project_officers "
-                    "WHERE project_id = $1 FOR UPDATE",
-                    project_uuid,
-                )
-                if row is None:
-                    return None
-                current = row["config_override"]
-                if isinstance(current, str):
-                    try:
-                        current = json.loads(current)
-                    except (TypeError, ValueError):
+        async with self.transaction_scope():
+            await self._lock_expert_catalog()
+            async with self.acquire() as conn:
+                async with conn.transaction():
+                    row = await conn.fetchrow(
+                        "SELECT config_override FROM project_officers "
+                        "WHERE project_id = $1 FOR UPDATE",
+                        project_uuid,
+                    )
+                    if row is None:
+                        return None
+                    current = row["config_override"]
+                    if isinstance(current, str):
+                        try:
+                            current = json.loads(current)
+                        except (TypeError, ValueError):
+                            current = {}
+                    if not isinstance(current, dict):
                         current = {}
-                if not isinstance(current, dict):
-                    current = {}
-                merged = _deep_merge(current, config_updates)
-                updated = await conn.fetchrow(
-                    """
-                    UPDATE project_officers
-                       SET config_override = $2::jsonb
-                               #- '{officer,hold}'
-                               #- '{officer,last_respawn_at}',
-                           updated_at = now()
-                     WHERE project_id = $1
-                    RETURNING *
-                    """,
-                    project_uuid,
-                    json.dumps(merged),
-                )
+                    merged = _deep_merge(current, config_updates)
+                    updated = await conn.fetchrow(
+                        """
+                        UPDATE project_officers
+                           SET config_override = $2::jsonb
+                                   #- '{officer,hold}'
+                                   #- '{officer,last_respawn_at}',
+                               updated_at = now()
+                         WHERE project_id = $1
+                        RETURNING *
+                        """,
+                        project_uuid,
+                        json.dumps(merged),
+                    )
+            from orchestrator.services.manifest_projects import (
+                persist_officer_controller,
+            )
+
+            await persist_officer_controller(self, project_id, dict(updated))
         return self._project_officer_row_to_dict(updated)
 
     async def merge_project_officer_state(
@@ -28029,6 +28230,9 @@ class PostgresDB:
                    freeze_data = NULL,
                    updated_at = CURRENT_TIMESTAMP
              WHERE id = $1{lane_guard}{lifecycle_guard}{status_guard}{route_guard}{completion_guard}{control_guard}{trip_guard}
+               AND NOT EXISTS (SELECT 1 FROM srw_execution_specs execution
+                   WHERE execution.work_kind='Job' AND execution.work_id=jobs.id
+                     AND execution.harness_adapter <> 'srw/v1')
             RETURNING id, priority, user_id
             """,
             *args,
@@ -28115,6 +28319,9 @@ class PostgresDB:
                        ),
                        updated_at = CURRENT_TIMESTAMP
                  WHERE id = $1::uuid
+                   AND NOT EXISTS (SELECT 1 FROM srw_execution_specs execution
+                       WHERE execution.work_kind='Job' AND execution.work_id=jobs.id
+                         AND execution.harness_adapter <> 'srw/v1')
                 RETURNING id
                 """,
                 UUID(job_id) if isinstance(job_id, str) else job_id,
@@ -28822,6 +29029,7 @@ class PostgresDB:
                 -- (0046). Statuses MUST stay literal (see docstring); the
                 -- ORDER BY priority DESC, created_at ASC is the index key.
                 WHERE j.status IN ('created', 'paused')
+                  AND NOT EXISTS (SELECT 1 FROM srw_execution_specs execution WHERE execution.work_kind='Job' AND execution.work_id=j.id AND execution.harness_adapter='generic')
                   -- Coexistence partition (§5.4.4): stateless rows are
                   -- admitted through worker_batch enqueue, not this dispatcher.
                   AND j.execution_lane = 'pinned'
@@ -28908,6 +29116,7 @@ class PostgresDB:
                        j.delegation_context
                 FROM jobs j
                 WHERE j.status IN ('created', 'paused')
+                  AND NOT EXISTS (SELECT 1 FROM srw_execution_specs execution WHERE execution.work_kind='Job' AND execution.work_id=j.id AND execution.harness_adapter='generic')
                   AND j.execution_lane = 'stateless'
                   AND j.assigned_agent_id IS NULL
                   AND j.freeze_data IS NULL
@@ -28997,6 +29206,9 @@ class PostgresDB:
                           FROM jobs
                          WHERE id = $1
                            AND execution_lane = 'stateless'
+                           AND NOT EXISTS (SELECT 1 FROM srw_execution_specs execution
+                               WHERE execution.work_kind='Job' AND execution.work_id=jobs.id
+                                 AND execution.harness_adapter <> 'srw/v1')
                            AND status IN ('created', 'paused')
                            AND assigned_agent_id IS NULL
                            AND freeze_data IS NULL
@@ -29262,6 +29474,7 @@ class PostgresDB:
         execution_lane: str = "pinned",
         initial_metadata: Dict[str, Any] | None = None,
         initial_event: str | None = None,
+        execution_manifest: Mapping[str, Any] | None = None,
     ) -> str:
         """Create a thread with its complete connector selection in one row.
 
@@ -29402,12 +29615,7 @@ class PostgresDB:
                 raise ValueError("initial thread event is too long")
 
         async with self.acquire() as conn:
-            async with _transaction_if(
-                conn,
-                bool(selected_uuids)
-                or authority_user_id is not None
-                or initial_event is not None,
-            ):
+            async with conn.transaction():
                 await _lock_and_compare_policy_snapshot(
                     conn, selected_uuids, policy_snapshot
                 )
@@ -29448,7 +29656,102 @@ class PostgresDB:
                         row["id"],
                         initial_event,
                     )
+                from orchestrator.services.manifest_execution_snapshot import (
+                    capture_execution,
+                )
+
+                snapshot_override = dict(metadata.get("config_override") or {})
+                snapshot_override["interactive"] = {
+                    **(snapshot_override.get("interactive") or {}),
+                    "permission_mode": permission_mode,
+                    "narration_mode": narration_mode,
+                }
+                await capture_execution(
+                    self,
+                    conn,
+                    work_kind="Session",
+                    work_id=str(row["id"]),
+                    owner_id=user_id,
+                    project_ids=[str(value) for value in authority_project_uuids]
+                    or ([project_id] if project_id else []),
+                    execution_manifest=dict(execution_manifest)
+                    if execution_manifest is not None
+                    else None,
+                    config_name=config_name,
+                    expert_id=metadata.get("expert_id"),
+                    config_override=snapshot_override,
+                    description=title,
+                    datasource_ids=selected_ids,
+                    policy_revisions={
+                        str(key): value for key, value in policy_snapshot.items()
+                    },
+                )
         return str(row["id"])
+
+    async def refresh_session_execution(
+        self, thread_id: str, *, conn: Any, config_override: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Patch the frozen current generation on the settings transaction.
+
+        Historical sessions without a snapshot keep their compatibility delta
+        until the next attach captures its newly resolved configuration.
+        """
+        from orchestrator.services.manifest_execution_snapshot import (
+            capture_execution,
+            prepare_srw_session_patch,
+            read_execution,
+        )
+
+        async with self.using_connection(conn):
+            row = await conn.fetchrow(
+                "SELECT * FROM threads WHERE id=$1 FOR UPDATE", UUID(str(thread_id))
+            )
+            if row is None or row.get("kind", "session") != "session":
+                raise ValueError("A session execution requires a session thread")
+            current = await read_execution(conn, "Session", thread_id)
+            if current is None:
+                return {
+                    "delivery_override": config_override,
+                    "configuration_state": "Historical",
+                }
+            metadata = _strict_json_object(row["metadata"], label="session metadata")
+            from orchestrator.services.thread_mount_rows import project_ids_from_mounts
+
+            project_rows = await self.list_thread_mounts(thread_id)
+            project_ids = project_ids_from_mounts(project_rows)
+            if row.get("project_id") and str(row["project_id"]) not in project_ids:
+                project_ids.insert(0, str(row["project_id"]))
+            owner_id = str(row["user_id"]) if row.get("user_id") else None
+            await _lock_and_validate_work_owner(
+                conn,
+                authority_user_id=owner_id,
+                materialized_user_uuid=UUID(owner_id) if owner_id else None,
+                target_project_uuids=[UUID(value) for value in project_ids],
+            )
+            prepared, delivery_override = await prepare_srw_session_patch(
+                self, current, dict(row), metadata, project_ids, config_override
+            )
+            saved = await capture_execution(
+                self,
+                conn,
+                work_kind="Session",
+                work_id=thread_id,
+                owner_id=owner_id,
+                project_ids=project_ids,
+                replace_session=True,
+                execution_manifest=prepared,
+            )
+            from shared.runtime.core.session_config_patch import RESOLVED_PATCH_MARKER
+
+            saved["delivery_override"] = {
+                **delivery_override,
+                RESOLVED_PATCH_MARKER: {
+                    "id": str(saved["id"]),
+                    "generation": saved["generation"],
+                    "revision": saved["revision"],
+                },
+            }
+            return saved
 
     def _dedicated_advisory_slots(self, domain: str) -> asyncio.Semaphore:
         # A few focused tests instantiate PostgresDB via ``__new__``. Lazily
@@ -29590,6 +29893,14 @@ class PostgresDB:
         """Serialize connector writes with delivery without occupying the pool."""
 
         key = _thread_datasource_lock_key(thread_id)
+        task = asyncio.current_task()
+        held = _TASK_DATASOURCE_LOCKS.get()
+        if any(
+            item.database is self and item.key == key and item.owner_task is task
+            for item in held
+        ):
+            yield
+            return
         async with self._dedicated_session_advisory_lock(
             key,
             domain="datasource",
@@ -29598,7 +29909,15 @@ class PostgresDB:
         ) as acquired:
             if not acquired:  # defensive; wait=True raises on timeout
                 raise TimeoutError("datasource lock wait timed out")
-            yield
+            if task is None:
+                raise RuntimeError("datasource locking requires an asyncio task")
+            token = _TASK_DATASOURCE_LOCKS.set(
+                (*held, _TaskDatasourceLock(self, key, task))
+            )
+            try:
+                yield
+            finally:
+                _TASK_DATASOURCE_LOCKS.reset(token)
 
     async def get_thread(self, thread_id: str) -> Dict[str, Any] | None:
         """Get thread by ID.
@@ -29614,7 +29933,11 @@ class PostgresDB:
             return None
         async with self.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT * FROM threads WHERE id = $1",
+                """SELECT threads.*,
+                    (SELECT execution.harness_adapter FROM srw_execution_specs execution
+                     WHERE execution.work_kind='Session' AND execution.work_id=threads.id)
+                    AS execution_harness_adapter
+                    FROM threads WHERE id = $1""",
                 thread_id,
             )
         return dict(row) if row else None
@@ -40461,6 +40784,9 @@ class PostgresDB:
                 JOIN agents a ON j.assigned_agent_id = a.id
                 WHERE j.status = 'processing'
                   AND j.assigned_agent_id IS NOT NULL
+                  AND NOT EXISTS (SELECT 1 FROM srw_execution_specs execution
+                      WHERE execution.work_kind='Job' AND execution.work_id=j.id
+                        AND execution.harness_adapter <> 'srw/v1')
                 ORDER BY j.priority ASC, j.created_at DESC
                 """,
             )
@@ -44346,6 +44672,26 @@ class PostgresDB:
 
     # ── Experts (User-Defined Experts, Slice 1) ───────────────────────────
 
+    async def _project_expert_row(self, row):
+        from orchestrator.services.manifest_experts import hydrate_expert_row
+
+        return await hydrate_expert_row(self, row)
+
+    async def _project_expert_rows(self, rows):
+        from orchestrator.services.manifest_experts import hydrate_expert_rows
+
+        return await hydrate_expert_rows(self, rows)
+
+    async def _persist_expert_resource(self, row):
+        from orchestrator.services.manifest_experts import persist_expert_resource
+
+        return await persist_expert_resource(self, dict(row))
+
+    async def _lock_expert_catalog(self):
+        from orchestrator.services.manifest_store import ManifestStore
+
+        await ManifestStore(self).lock_catalog()
+
     async def create_expert(
         self,
         *,
@@ -44360,36 +44706,58 @@ class PostgresDB:
         config: Dict[str, Any] | None = None,
         prompts: Dict[str, Any] | None = None,
         is_global: bool = False,
+        srw_layers: List[Dict[str, Any]] | None = None,
+        srw_config_name: str | None = None,
+        srw_asset_name: str | None = None,
     ) -> Dict[str, Any]:
         """Insert an owned expert. (name, owner_id) is unique — a personal fork
         named 'scholar' shadows the bundled one for that user only (decision 5)."""
-        row = await self.fetchrow(
-            """
-            INSERT INTO experts
-                (name, display_name, description, icon, color, tags, expert_type,
-                 config, prompts, owner_id, is_global)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10, $11)
-            RETURNING *
-            """,
-            name,
-            display_name,
-            description,
-            icon,
-            color,
-            tags or [],
-            expert_type,
-            json.dumps(config or {}),
-            json.dumps(prompts or {}),
-            UUID(str(owner_id)),
-            is_global,
-        )
-        return dict(row)
+        async with self.transaction_scope():
+            await self._lock_expert_catalog()
+            row = await self.fetchrow(
+                """
+                INSERT INTO experts
+                    (name, display_name, description, icon, color, tags, expert_type,
+                     config, prompts, owner_id, is_global)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10, $11)
+                RETURNING *
+                """,
+                name,
+                display_name,
+                description,
+                icon,
+                color,
+                tags or [],
+                expert_type,
+                json.dumps(config or {}),
+                json.dumps(prompts or {}),
+                UUID(str(owner_id)),
+                is_global,
+            )
+            return await self._persist_expert_resource(
+                {
+                    **dict(row),
+                    **(
+                        {"harness_config_layers": srw_layers}
+                        if srw_layers is not None
+                        else {}
+                    ),
+                    **{
+                        key: value
+                        for key, value in (
+                            ("harness_config_name", srw_config_name),
+                            ("harness_asset_name", srw_asset_name),
+                        )
+                        if value
+                    },
+                }
+            )
 
     async def get_expert_by_id(self, expert_id: str) -> Dict[str, Any] | None:
         row = await self.fetchrow(
             "SELECT * FROM experts WHERE id = $1", UUID(str(expert_id))
         )
-        return dict(row) if row else None
+        return await self._project_expert_row(row)
 
     async def get_expert_by_managed_key(
         self, managed_key: str
@@ -44397,7 +44765,7 @@ class PostgresDB:
         row = await self.fetchrow(
             "SELECT * FROM experts WHERE managed_key = $1", managed_key
         )
-        return dict(row) if row else None
+        return await self._project_expert_row(row)
 
     async def upsert_managed_expert(
         self,
@@ -44421,34 +44789,36 @@ class PostgresDB:
         an operator's DB copy remains authoritative until an explicit reset
         workflow is requested.
         """
-        row = await self.fetchrow(
-            """
-            INSERT INTO experts
-                (name, display_name, description, icon, color, tags, expert_type,
-                 config, prompts, owner_id, is_global, managed_key, seed_version)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb,
-                    NULL, TRUE, $10, $11)
-            ON CONFLICT (managed_key) WHERE managed_key IS NOT NULL DO NOTHING
-            RETURNING *
-            """,
-            name,
-            display_name,
-            description,
-            icon,
-            color,
-            tags or [],
-            expert_type,
-            json.dumps(config or {}),
-            json.dumps(prompts or {}),
-            managed_key,
-            seed_version,
-        )
-        if row:
-            return dict(row), True
-        existing = await self.get_expert_by_managed_key(managed_key)
-        if not existing:  # defensive: conflict target should make this impossible
-            raise RuntimeError(f"managed expert seed disappeared: {managed_key}")
-        return existing, False
+        async with self.transaction_scope():
+            await self._lock_expert_catalog()
+            row = await self.fetchrow(
+                """
+                INSERT INTO experts
+                    (name, display_name, description, icon, color, tags, expert_type,
+                     config, prompts, owner_id, is_global, managed_key, seed_version)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb,
+                        NULL, TRUE, $10, $11)
+                ON CONFLICT (managed_key) WHERE managed_key IS NOT NULL DO NOTHING
+                RETURNING *
+                """,
+                name,
+                display_name,
+                description,
+                icon,
+                color,
+                tags or [],
+                expert_type,
+                json.dumps(config or {}),
+                json.dumps(prompts or {}),
+                managed_key,
+                seed_version,
+            )
+            if row:
+                return await self._persist_expert_resource(row), True
+            existing = await self.get_expert_by_managed_key(managed_key)
+            if not existing:  # defensive: conflict target should make this impossible
+                raise RuntimeError(f"managed expert seed disappeared: {managed_key}")
+            return existing, False
 
     async def upgrade_managed_expert_seed(
         self,
@@ -44471,46 +44841,42 @@ class PostgresDB:
         waiting for a concurrent update; operator edits therefore win.
         """
         repair = (expected_seed_version, expected_subagents, replacement_subagents)
-        if any(value is not None for value in repair):
-            if any(value is None for value in repair):
-                raise ValueError(
-                    "Managed seed repair requires version and both rosters"
-                )
-            row = await self.fetchrow(
-                """
-                UPDATE experts
-                SET config = jsonb_set($2::jsonb || config, '{subagents}', $6::jsonb),
-                    seed_version = $3,
-                    version = version + 1,
-                    updated_at = NOW()
-                WHERE managed_key = $1
-                  AND seed_version = $4 AND seed_version < $3
-                  AND config->'subagents' = $5::jsonb
-                RETURNING *
-                """,
+        if any(value is not None for value in repair) and any(
+            value is None for value in repair
+        ):
+            raise ValueError("Managed seed repair requires version and both rosters")
+        async with self.transaction_scope():
+            await self._lock_expert_catalog()
+            raw = await self.fetchrow(
+                "SELECT * FROM experts WHERE managed_key=$1 FOR UPDATE",
                 managed_key,
-                json.dumps(config_additions or {}),
-                seed_version,
-                expected_seed_version,
-                json.dumps(expected_subagents),
-                json.dumps(replacement_subagents),
             )
-            return dict(row) if row else None
-        row = await self.fetchrow(
-            """
-            UPDATE experts
-            SET config = $2::jsonb || config,
-                seed_version = $3,
-                version = version + 1,
-                updated_at = NOW()
-            WHERE managed_key = $1 AND seed_version < $3
-            RETURNING *
-            """,
-            managed_key,
-            json.dumps(config_additions or {}),
-            seed_version,
-        )
-        return dict(row) if row else None
+            current = await self._project_expert_row(raw)
+            if not current or int(current.get("seed_version") or 0) >= seed_version:
+                return None
+            config = current.get("config") or {}
+            if isinstance(config, str):
+                config = json.loads(config)
+            if expected_seed_version is not None and (
+                current.get("seed_version") != expected_seed_version
+                or config.get("subagents") != expected_subagents
+            ):
+                return None
+            config = {**(config_additions or {}), **config}
+            if replacement_subagents is not None:
+                config["subagents"] = replacement_subagents
+            row = await self.fetchrow(
+                "UPDATE experts SET seed_version=$2,version=version+1,updated_at=now() WHERE id=$1 RETURNING *",
+                current["id"],
+                seed_version,
+            )
+            return await self._persist_expert_resource(
+                {
+                    **dict(row),
+                    "config": config,
+                    "prompts": current.get("prompts") or {},
+                }
+            )
 
     async def get_expert_visible_by_id(
         self,
@@ -44542,7 +44908,7 @@ class PostgresDB:
             proj,
             is_admin,
         )
-        return dict(row) if row else None
+        return await self._project_expert_row(row)
 
     async def list_experts_visible(
         self,
@@ -44574,7 +44940,7 @@ class PostgresDB:
             proj,
             expert_type,
         )
-        return [dict(r) for r in rows]
+        return await self._project_expert_rows(rows)
 
     # ── Default expert pointers ──────────────────────────────────────────
 
@@ -44621,7 +44987,7 @@ class PostgresDB:
             """,
             expert_type,
         )
-        return dict(row) if row else None
+        return await self._project_expert_row(row)
 
     async def list_application_expert_defaults(self) -> List[Dict[str, Any]]:
         rows = await self.fetch(
@@ -44633,7 +44999,7 @@ class PostgresDB:
             ORDER BY d.expert_type
             """
         )
-        return [dict(r) for r in rows]
+        return await self._project_expert_rows(rows)
 
     async def set_application_expert_default(
         self, *, expert_type: str, expert_id: str, actor_user_id: str
@@ -44702,7 +45068,7 @@ class PostgresDB:
             UUID(str(user_id)),
             expert_type,
         )
-        return dict(row) if row else None
+        return await self._project_expert_row(row)
 
     async def list_user_expert_defaults(self, user_id: str) -> List[Dict[str, Any]]:
         rows = await self.fetch(
@@ -44718,7 +45084,7 @@ class PostgresDB:
             """,
             UUID(str(user_id)),
         )
-        return [dict(r) for r in rows]
+        return await self._project_expert_rows(rows)
 
     async def set_user_expert_default(
         self, *, user_id: str, expert_type: str, expert_id: str
@@ -44805,87 +45171,103 @@ class PostgresDB:
         source: Dict[str, Any],
     ) -> Dict[str, Any]:
         """Atomically fork a source expert and make the fork the personal default."""
-        uid = UUID(str(user_id))
-        base_name = str(source["name"])
-        config = source.get("config") or {}
-        prompts = source.get("prompts") or {}
-        if isinstance(config, str):
-            config = json.loads(config)
-        if isinstance(prompts, str):
-            prompts = json.loads(prompts)
-        async with self.acquire() as conn:
-            async with conn.transaction():
-                # Serialize fork naming for one principal; avoids a name race
-                # without letting a unique violation poison the transaction.
-                await conn.execute(
-                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-                    str(uid),
-                )
-                name = ""
-                for index in range(1, 100):
-                    suffix = "default" if index == 1 else f"default-{index}"
-                    candidate = f"{base_name}-{suffix}"[:100]
-                    exists = await conn.fetchval(
-                        "SELECT 1 FROM experts WHERE owner_id = $1 AND name = $2",
-                        uid,
-                        candidate,
+        async with self.transaction_scope():
+            await self._lock_expert_catalog()
+            uid = UUID(str(user_id))
+            base_name = str(source["name"])
+            config = source.get("config") or {}
+            prompts = source.get("prompts") or {}
+            if isinstance(config, str):
+                config = json.loads(config)
+            if isinstance(prompts, str):
+                prompts = json.loads(prompts)
+            async with self.acquire() as conn:
+                async with conn.transaction():
+                    # Serialize fork naming for one principal; avoids a name race
+                    # without letting a unique violation poison the transaction.
+                    await conn.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                        str(uid),
                     )
-                    if not exists:
-                        name = candidate
-                        break
-                if not name:
-                    raise ValueError("No free name for the personal default copy")
-                expert = await conn.fetchrow(
-                    """
-                    INSERT INTO experts
-                        (name, display_name, description, icon, color, tags,
-                         expert_type, config, prompts, owner_id, is_global)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb,
-                            $10, FALSE)
-                    RETURNING *
-                    """,
-                    name,
-                    f"{source['display_name']} (My Default)"[:200],
-                    source.get("description"),
-                    source.get("icon", "smart_toy"),
-                    source.get("color", "#6B7280"),
-                    source.get("tags") or [],
-                    expert_type,
-                    json.dumps(config),
-                    json.dumps(prompts),
-                    uid,
-                )
-                previous = await conn.fetchval(
-                    "SELECT expert_id FROM user_expert_defaults "
-                    "WHERE user_id = $1 AND expert_type = $2 FOR UPDATE",
-                    uid,
-                    expert_type,
-                )
-                await conn.execute(
-                    """
-                    INSERT INTO user_expert_defaults
-                        (user_id, expert_type, expert_id)
-                    VALUES ($1, $2, $3)
-                    ON CONFLICT (user_id, expert_type) DO UPDATE
-                    SET expert_id = EXCLUDED.expert_id, updated_at = NOW()
-                    """,
-                    uid,
-                    expert_type,
-                    expert["id"],
-                )
-                await conn.execute(
-                    """
-                    INSERT INTO expert_default_audit
-                        (actor_user_id, target_user_id, expert_type, scope_kind,
-                         old_expert_id, new_expert_id, action)
-                    VALUES ($1, $1, $2, 'user', $3, $4, 'set')
-                    """,
-                    uid,
-                    expert_type,
-                    previous,
-                    expert["id"],
-                )
-        return dict(expert)
+                    name = ""
+                    for index in range(1, 100):
+                        suffix = "default" if index == 1 else f"default-{index}"
+                        candidate = f"{base_name}-{suffix}"[:100]
+                        exists = await conn.fetchval(
+                            "SELECT 1 FROM experts WHERE owner_id = $1 AND name = $2",
+                            uid,
+                            candidate,
+                        )
+                        if not exists:
+                            name = candidate
+                            break
+                    if not name:
+                        raise ValueError("No free name for the personal default copy")
+                    expert = await conn.fetchrow(
+                        """
+                        INSERT INTO experts
+                            (name, display_name, description, icon, color, tags,
+                             expert_type, config, prompts, owner_id, is_global)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb,
+                                $10, FALSE)
+                        RETURNING *
+                        """,
+                        name,
+                        f"{source['display_name']} (My Default)"[:200],
+                        source.get("description"),
+                        source.get("icon", "smart_toy"),
+                        source.get("color", "#6B7280"),
+                        source.get("tags") or [],
+                        expert_type,
+                        json.dumps(config),
+                        json.dumps(prompts),
+                        uid,
+                    )
+                    previous = await conn.fetchval(
+                        "SELECT expert_id FROM user_expert_defaults "
+                        "WHERE user_id = $1 AND expert_type = $2 FOR UPDATE",
+                        uid,
+                        expert_type,
+                    )
+                    await conn.execute(
+                        """
+                        INSERT INTO user_expert_defaults
+                            (user_id, expert_type, expert_id)
+                        VALUES ($1, $2, $3)
+                        ON CONFLICT (user_id, expert_type) DO UPDATE
+                        SET expert_id = EXCLUDED.expert_id, updated_at = NOW()
+                        """,
+                        uid,
+                        expert_type,
+                        expert["id"],
+                    )
+                    await conn.execute(
+                        """
+                        INSERT INTO expert_default_audit
+                            (actor_user_id, target_user_id, expert_type, scope_kind,
+                             old_expert_id, new_expert_id, action)
+                        VALUES ($1, $1, $2, 'user', $3, $4, 'set')
+                        """,
+                        uid,
+                        expert_type,
+                        previous,
+                        expert["id"],
+                    )
+            return await self._persist_expert_resource(
+                {
+                    **dict(expert),
+                    **(
+                        {"harness_config_layers": source["harness_config_layers"]}
+                        if source.get("harness_config_layers")
+                        else {}
+                    ),
+                    **{
+                        key: source[key]
+                        for key in ("harness_config_name", "harness_asset_name")
+                        if source.get(key)
+                    },
+                }
+            )
 
     async def get_project_default_expert(
         self, *, project_id: str, expert_type: str
@@ -44901,7 +45283,27 @@ class PostgresDB:
             UUID(str(project_id)),
             expert_type,
         )
-        return dict(row) if row else None
+        projected = await self._project_expert_row(row)
+        if projected is None:
+            return None
+        from orchestrator.services.manifest_projects import (
+            project_expert_for_execution,
+            project_link_projection,
+        )
+
+        frozen = await project_expert_for_execution(
+            self, project_id, row["id"], expert_type
+        )
+        return await project_link_projection(
+            self,
+            project_id,
+            {
+                **(frozen or projected),
+                "default_for": row["default_for"],
+                "project_id": row["project_id"],
+                "config_override": row["config_override"],
+            },
+        )
 
     async def get_project_expert_link(
         self, *, project_id: str, expert_id: str
@@ -44911,7 +45313,9 @@ class PostgresDB:
             UUID(str(project_id)),
             UUID(str(expert_id)),
         )
-        return dict(row) if row else None
+        from orchestrator.services.manifest_projects import project_link_projection
+
+        return await project_link_projection(self, project_id, row)
 
     async def list_project_linked_experts(
         self, project_id: str
@@ -44927,7 +45331,14 @@ class PostgresDB:
             """,
             UUID(str(project_id)),
         )
-        return [dict(row) for row in rows]
+        from orchestrator.services.manifest_projects import project_link_projection
+
+        return [
+            await project_link_projection(
+                self, project_id, row, key="project_config_override"
+            )
+            for row in await self._project_expert_rows(rows)
+        ]
 
     async def get_project_linked_expert(
         self, project_id: str, expert_ref: str
@@ -44945,7 +45356,14 @@ class PostgresDB:
             UUID(str(project_id)),
             expert_ref,
         )
-        return dict(row) if row else None
+        from orchestrator.services.manifest_projects import project_link_projection
+
+        return await project_link_projection(
+            self,
+            project_id,
+            await self._project_expert_row(row),
+            key="project_config_override",
+        )
 
     async def set_project_default_expert(
         self,
@@ -44958,93 +45376,104 @@ class PostgresDB:
     ) -> Dict[str, Any]:
         pid, eid = UUID(str(project_id)), UUID(str(expert_id))
         actor = UUID(str(actor_user_id))
-        async with self.acquire() as conn:
-            async with conn.transaction():
-                target = await conn.fetchrow(
-                    "SELECT expert_type FROM experts WHERE id = $1 FOR SHARE", eid
-                )
-                if not target:
-                    raise ValueError("Expert not found")
-                if target["expert_type"] != expert_type:
-                    raise ValueError("Expert type does not match default slot")
-                previous = await conn.fetchval(
-                    "SELECT expert_id FROM project_experts "
-                    "WHERE project_id = $1 AND default_for = $2 FOR UPDATE",
-                    pid,
-                    expert_type,
-                )
-                await conn.execute(
-                    """
-                    UPDATE project_experts SET default_for = NULL
-                    WHERE project_id = $1 AND default_for = $2 AND expert_id <> $3
-                    """,
-                    pid,
-                    expert_type,
-                    eid,
-                )
-                row = await conn.fetchrow(
-                    """
-                    INSERT INTO project_experts
-                        (project_id, expert_id, default_for, config_override)
-                    VALUES ($1, $2, $3, $4::jsonb)
-                    ON CONFLICT (project_id, expert_id) DO UPDATE
-                    SET default_for = EXCLUDED.default_for,
-                        config_override = COALESCE(
-                            EXCLUDED.config_override, project_experts.config_override
-                        )
-                    RETURNING *
-                    """,
-                    pid,
-                    eid,
-                    expert_type,
-                    json.dumps(config_override)
-                    if config_override is not None
-                    else None,
-                )
-                await conn.execute(
-                    """
-                    INSERT INTO expert_default_audit
-                        (actor_user_id, target_project_id, expert_type, scope_kind,
-                         old_expert_id, new_expert_id, action)
-                    VALUES ($1, $2, $3, 'project', $4, $5, 'set')
-                    """,
-                    actor,
-                    pid,
-                    expert_type,
-                    previous,
-                    eid,
-                )
+        async with self.transaction_scope():
+            await self._lock_expert_catalog()
+            async with self.acquire() as conn:
+                async with conn.transaction():
+                    target = await conn.fetchrow(
+                        "SELECT expert_type FROM experts WHERE id = $1 FOR SHARE", eid
+                    )
+                    if not target:
+                        raise ValueError("Expert not found")
+                    if target["expert_type"] != expert_type:
+                        raise ValueError("Expert type does not match default slot")
+                    previous = await conn.fetchval(
+                        "SELECT expert_id FROM project_experts "
+                        "WHERE project_id = $1 AND default_for = $2 FOR UPDATE",
+                        pid,
+                        expert_type,
+                    )
+                    await conn.execute(
+                        """
+                        UPDATE project_experts SET default_for = NULL
+                        WHERE project_id = $1 AND default_for = $2 AND expert_id <> $3
+                        """,
+                        pid,
+                        expert_type,
+                        eid,
+                    )
+                    row = await conn.fetchrow(
+                        """
+                        INSERT INTO project_experts
+                            (project_id, expert_id, default_for, config_override)
+                        VALUES ($1, $2, $3, $4::jsonb)
+                        ON CONFLICT (project_id, expert_id) DO UPDATE
+                        SET default_for = EXCLUDED.default_for,
+                            config_override = COALESCE(
+                                EXCLUDED.config_override, project_experts.config_override
+                            )
+                        RETURNING *
+                        """,
+                        pid,
+                        eid,
+                        expert_type,
+                        json.dumps(config_override)
+                        if config_override is not None
+                        else None,
+                    )
+                    await conn.execute(
+                        """
+                        INSERT INTO expert_default_audit
+                            (actor_user_id, target_project_id, expert_type, scope_kind,
+                             old_expert_id, new_expert_id, action)
+                        VALUES ($1, $2, $3, 'project', $4, $5, 'set')
+                        """,
+                        actor,
+                        pid,
+                        expert_type,
+                        previous,
+                        eid,
+                    )
+            await self._persist_project_resource(
+                project_id,
+                link_changes={str(eid): config_override}
+                if config_override is not None
+                else {},
+            )
         return dict(row)
 
     async def clear_project_default_expert(
         self, *, project_id: str, expert_type: str, actor_user_id: str
     ) -> bool:
         pid, actor = UUID(str(project_id)), UUID(str(actor_user_id))
-        async with self.acquire() as conn:
-            async with conn.transaction():
-                previous = await conn.fetchval(
-                    """
-                    UPDATE project_experts SET default_for = NULL
-                    WHERE project_id = $1 AND default_for = $2
-                    RETURNING expert_id
-                    """,
-                    pid,
-                    expert_type,
-                )
-                if previous is None:
-                    return False
-                await conn.execute(
-                    """
-                    INSERT INTO expert_default_audit
-                        (actor_user_id, target_project_id, expert_type, scope_kind,
-                         old_expert_id, action)
-                    VALUES ($1, $2, $3, 'project', $4, 'clear')
-                    """,
-                    actor,
-                    pid,
-                    expert_type,
-                    previous,
-                )
+        async with self.transaction_scope():
+            await self._lock_expert_catalog()
+            async with self.acquire() as conn:
+                async with conn.transaction():
+                    previous = await conn.fetchval(
+                        """
+                        UPDATE project_experts SET default_for = NULL
+                        WHERE project_id = $1 AND default_for = $2
+                        RETURNING expert_id
+                        """,
+                        pid,
+                        expert_type,
+                    )
+                    if previous is None:
+                        return False
+                    await conn.execute(
+                        """
+                        INSERT INTO expert_default_audit
+                            (actor_user_id, target_project_id, expert_type, scope_kind,
+                             old_expert_id, action)
+                        VALUES ($1, $2, $3, 'project', $4, 'clear')
+                        """,
+                        actor,
+                        pid,
+                        expert_type,
+                        previous,
+                    )
+            await self._persist_project_resource(project_id, link_changes={})
         return True
 
     async def record_managed_expert_update(
@@ -45078,28 +45507,40 @@ class PostgresDB:
             "prompts",
             "is_global",
         }
-        sets, vals = [], []
-        for k, v in fields.items():
-            if k not in allowed:
-                continue
-            vals.append(json.dumps(v) if k in ("config", "prompts") else v)
-            cast = "::jsonb" if k in ("config", "prompts") else ""
-            sets.append(f"{k} = ${len(vals)}{cast}")
-        if not sets:
-            return await self.get_expert_by_id(expert_id)
-        vals.append(UUID(str(updated_by)))
-        vals.append(UUID(str(expert_id)))
-        row = await self.fetchrow(
-            f"""
-            UPDATE experts
-            SET {", ".join(sets)}, version = version + 1,
-                updated_by = ${len(vals) - 1}, updated_at = NOW()
-            WHERE id = ${len(vals)}
-            RETURNING *
-            """,
-            *vals,
-        )
-        return dict(row) if row else None
+        fields = {key: value for key, value in fields.items() if key in allowed}
+        async with self.transaction_scope():
+            await self._lock_expert_catalog()
+            raw = await self.fetchrow(
+                "SELECT * FROM experts WHERE id=$1 FOR UPDATE", UUID(str(expert_id))
+            )
+            current = await self._project_expert_row(raw)
+            if current is None or not fields:
+                return current
+            sets, values = [], []
+            for key, value in fields.items():
+                if key in ("config", "prompts"):
+                    continue
+                values.append(value)
+                sets.append(f"{key}=${len(values)}")
+            values.extend([UUID(str(updated_by)), UUID(str(expert_id))])
+            sets.extend(
+                [
+                    "version=version+1",
+                    "updated_at=now()",
+                    f"updated_by=${len(values) - 1}",
+                ]
+            )
+            updated = await self.fetchrow(
+                f"UPDATE experts SET {', '.join(sets)} WHERE id=${len(values)} RETURNING *",
+                *values,
+            )
+            return await self._persist_expert_resource(
+                {
+                    **dict(updated),
+                    "config": fields.get("config", current.get("config")),
+                    "prompts": fields.get("prompts", current.get("prompts")),
+                }
+            )
 
     async def expert_delete_blockers(self, expert_id: str) -> List[Dict[str, Any]]:
         """Live references that block deletion (decision 15).
@@ -45185,10 +45626,21 @@ class PostgresDB:
         return blockers
 
     async def delete_expert(self, expert_id: str) -> bool:
-        result = await self.execute(
-            "DELETE FROM experts WHERE id = $1", UUID(str(expert_id))
-        )
-        return result == "DELETE 1"
+        from orchestrator.services.manifest_store import ManifestStore
+
+        async with self.transaction_scope():
+            await self._lock_expert_catalog()
+            store = ManifestStore(self)
+            resource = await store.by_link("Expert", expert_id)
+            if resource:
+                await store.delete(
+                    resource, expected_version=resource["resource_version"]
+                )
+            result = await self.execute(
+                "DELETE FROM experts WHERE id=$1",
+                UUID(str(expert_id)),
+            )
+            return result == "DELETE 1"
 
     # ── Skills (Agent Skills, Slice 1: authoring foundation) ──────────────
     async def create_skill(
@@ -46448,108 +46900,115 @@ class PostgresDB:
         Returns:
             Full user dict
         """
-        async with self.acquire() as conn:
-            # Try to link to existing user by email (handles pre-seeded admin)
-            if email:
-                existing = await conn.fetchrow(
-                    """
-                    SELECT id, display_name, avatar_color, email, default_project_id,
-                           is_admin, can_use_vm, keycloak_sub, created_at
-                    FROM users
-                    WHERE LOWER(email) = LOWER($1) AND keycloak_sub IS NULL
-                    """,
-                    email,
-                )
-                if existing:
-                    updated = await conn.fetchrow(
-                        """
-                        UPDATE users
-                        SET keycloak_sub = $1,
-                            is_admin = $2,
-                            is_approved = (is_approved OR $3),
-                            preferred_username = COALESCE($4, preferred_username)
-                        WHERE id = $5
-                        RETURNING is_approved, preferred_username
-                        """,
-                        sub,
-                        is_admin,
-                        is_approved,
-                        preferred_username,
-                        existing["id"],
-                    )
-                    result = dict(existing)
-                    result["keycloak_sub"] = sub
-                    result["is_admin"] = is_admin
-                    result["is_approved"] = updated["is_approved"]
-                    result["preferred_username"] = updated["preferred_username"]
-                    return result
-
-            # Check if keycloak_sub already linked (concurrent request)
-            existing_sub = await conn.fetchrow(
-                """
-                SELECT id, display_name, avatar_color, email, default_project_id,
-                       is_admin, can_use_vm, is_approved, preferred_username,
-                       keycloak_sub, created_at
-                FROM users WHERE keycloak_sub = $1
-                """,
-                sub,
-            )
-            if existing_sub:
-                return dict(existing_sub)
-
-            # Create new user + project atomically (constraint requires default_project_id)
-            try:
-                row = await conn.fetchrow(
-                    """
-                    WITH new_project AS (
-                        INSERT INTO projects (name, description, is_default)
-                        VALUES ($1 || '''s Project', 'Default project', true)
-                        RETURNING id
-                    ),
-                    new_user AS (
-                        INSERT INTO users (display_name, avatar_color, email, is_admin,
-                                          is_approved, approved_at, preferred_username,
-                                          keycloak_sub, default_project_id)
-                        VALUES ($1, '#89b4fa', $2, $3, $4,
-                                CASE WHEN $4 THEN NOW() ELSE NULL END, $5, $6,
-                                (SELECT id FROM new_project))
-                        RETURNING id, display_name, avatar_color, email, default_project_id,
-                                  is_admin, can_use_vm, is_approved, preferred_username,
-                                  keycloak_sub, created_at
-                    ),
-                    membership AS (
-                        INSERT INTO project_members (project_id, user_id, role)
-                        SELECT (SELECT id FROM new_project), id, 'owner'
-                        FROM new_user
-                    )
-                    SELECT * FROM new_user
-                    """,
-                    display_name,
-                    email,
-                    is_admin,
-                    is_approved,
-                    preferred_username,
-                    sub,
-                )
-                return dict(row)
-            except Exception as e:
-                if "unique" in str(e).lower() or "duplicate" in str(e).lower():
-                    # Race condition: concurrent request already created this user.
-                    # Retry lookup by keycloak_sub or email.
-                    retry = await conn.fetchrow(
+        async with self.transaction_scope():
+            await self._lock_expert_catalog()
+            async with self.acquire() as conn:
+                # Try to link to existing user by email (handles pre-seeded admin)
+                if email:
+                    existing = await conn.fetchrow(
                         """
                         SELECT id, display_name, avatar_color, email, default_project_id,
-                               is_admin, can_use_vm, is_approved, preferred_username,
-                               keycloak_sub, created_at
-                        FROM users WHERE keycloak_sub = $1 OR LOWER(email) = LOWER($2)
-                        LIMIT 1
+                               is_admin, can_use_vm, keycloak_sub, created_at
+                        FROM users
+                        WHERE LOWER(email) = LOWER($1) AND keycloak_sub IS NULL
                         """,
-                        sub,
                         email,
                     )
-                    if retry:
-                        return dict(retry)
-                raise
+                    if existing:
+                        updated = await conn.fetchrow(
+                            """
+                            UPDATE users
+                            SET keycloak_sub = $1,
+                                is_admin = $2,
+                                is_approved = (is_approved OR $3),
+                                preferred_username = COALESCE($4, preferred_username)
+                            WHERE id = $5
+                            RETURNING is_approved, preferred_username
+                            """,
+                            sub,
+                            is_admin,
+                            is_approved,
+                            preferred_username,
+                            existing["id"],
+                        )
+                        result = dict(existing)
+                        result["keycloak_sub"] = sub
+                        result["is_admin"] = is_admin
+                        result["is_approved"] = updated["is_approved"]
+                        result["preferred_username"] = updated["preferred_username"]
+                        return result
+
+                # Check if keycloak_sub already linked (concurrent request)
+                existing_sub = await conn.fetchrow(
+                    """
+                    SELECT id, display_name, avatar_color, email, default_project_id,
+                           is_admin, can_use_vm, is_approved, preferred_username,
+                           keycloak_sub, created_at
+                    FROM users WHERE keycloak_sub = $1
+                    """,
+                    sub,
+                )
+                if existing_sub:
+                    return dict(existing_sub)
+
+                # Create new user + project atomically (constraint requires default_project_id)
+                try:
+                    async with conn.transaction():
+                        row = await conn.fetchrow(
+                            """
+                            WITH new_project AS (
+                                INSERT INTO projects (name, description, is_default)
+                                VALUES ($1 || '''s Project', 'Default project', true)
+                                RETURNING id
+                            ),
+                            new_user AS (
+                                INSERT INTO users (display_name, avatar_color, email, is_admin,
+                                                  is_approved, approved_at, preferred_username,
+                                                  keycloak_sub, default_project_id)
+                                VALUES ($1, '#89b4fa', $2, $3, $4,
+                                        CASE WHEN $4 THEN NOW() ELSE NULL END, $5, $6,
+                                        (SELECT id FROM new_project))
+                                RETURNING id, display_name, avatar_color, email, default_project_id,
+                                          is_admin, can_use_vm, is_approved, preferred_username,
+                                          keycloak_sub, created_at
+                            ),
+                            membership AS (
+                                INSERT INTO project_members (project_id, user_id, role)
+                                SELECT (SELECT id FROM new_project), id, 'owner'
+                                FROM new_user
+                            )
+                            SELECT * FROM new_user
+                            """,
+                            display_name,
+                            email,
+                            is_admin,
+                            is_approved,
+                            preferred_username,
+                            sub,
+                        )
+                        async with self.using_connection(conn):
+                            await self._persist_project_resource(
+                                row["default_project_id"], owner_id=row["id"]
+                            )
+                        return dict(row)
+                except Exception as e:
+                    if "unique" in str(e).lower() or "duplicate" in str(e).lower():
+                        # Race condition: concurrent request already created this user.
+                        # Retry lookup by keycloak_sub or email.
+                        retry = await conn.fetchrow(
+                            """
+                            SELECT id, display_name, avatar_color, email, default_project_id,
+                                   is_admin, can_use_vm, is_approved, preferred_username,
+                                   keycloak_sub, created_at
+                            FROM users WHERE keycloak_sub = $1 OR LOWER(email) = LOWER($2)
+                            LIMIT 1
+                            """,
+                            sub,
+                            email,
+                        )
+                        if retry:
+                            return dict(retry)
+                    raise
 
     async def get_user_by_email(self, email: str) -> Dict[str, Any] | None:
         """Get a user by email (case-insensitive).
@@ -46664,6 +47123,10 @@ class PostgresDB:
                     project_row["id"],
                     user_row["id"],
                 )
+                async with self.using_connection(conn):
+                    await self._persist_project_resource(
+                        project_row["id"], owner_id=user_row["id"]
+                    )
 
         return dict(user_row), dict(project_row)
 
@@ -46940,6 +47403,12 @@ class PostgresDB:
 
         async with self.acquire() as conn:
             async with conn.transaction():
+                from orchestrator.services.manifest_user_retirement import (
+                    retire_user_manifests,
+                )
+
+                if not await retire_user_manifests(conn, uuid_val):
+                    return False
                 # No FK cascade fires on capability_grants.scope_id (polymorphic);
                 # delete the user's grant rows in-band so removal stays atomic.
                 await self.delete_grants_for_scope(
@@ -46970,6 +47439,11 @@ class PostgresDB:
     # PROJECT OPERATIONS
     # =========================================================================
 
+    async def _persist_project_resource(self, project_id, **kwargs):
+        from orchestrator.services.manifest_projects import persist_project_resource
+
+        return await persist_project_resource(self, project_id, **kwargs)
+
     async def create_project(
         self,
         name: str,
@@ -46978,6 +47452,8 @@ class PostgresDB:
         is_default: bool = False,
         default_config_name: str | None = None,
         default_config_override: Dict[str, Any] | None = None,
+        *,
+        manifest_project_id: UUID | None = None,
     ) -> Dict[str, Any]:
         """Create a new project.
 
@@ -46998,8 +47474,8 @@ class PostgresDB:
                     """
                     INSERT INTO projects (name, description, goal, is_default,
                                           default_config_name,
-                                          default_config_override)
-                    VALUES ($1, $2, $3, $4, $5, $6)
+                                          default_config_override, id)
+                    VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7::uuid, gen_random_uuid()))
                     RETURNING id, name, description, goal, status, is_default,
                               default_config_name, default_config_override,
                               nextcloud_folder_id, cloud_storage_read_only,
@@ -47016,6 +47492,7 @@ class PostgresDB:
                     json.dumps(default_config_override)
                     if default_config_override
                     else None,
+                    manifest_project_id,
                 )
                 # Every century has a post, whether or not an officer holds
                 # it (officer_post.md §2): the vacant project_officers row is
@@ -47046,7 +47523,7 @@ class PostgresDB:
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT id, name, description, goal, status, is_default,
+                SELECT id, name, description, goal, status, is_default, manifest_resource_id,
                        default_config_name, default_config_override,
                        nextcloud_folder_id, cloud_storage_read_only,
                        main_cloud_backend, main_cloud_backend_instance_id,
@@ -47060,7 +47537,9 @@ class PostgresDB:
                 uuid_val,
             )
 
-        return dict(row) if row else None
+        from orchestrator.services.manifest_projects import hydrate_project_row
+
+        return await hydrate_project_row(self, row)
 
     async def get_workspace_network_tier(
         self, work_id: str, kind: str
@@ -47144,7 +47623,7 @@ class PostgresDB:
             rows = await conn.fetch(
                 f"""
                 SELECT p.id, p.name, p.description, p.goal, p.status,
-                       p.is_default, p.default_config_name,
+                       p.is_default, p.default_config_name, p.manifest_resource_id,
                        p.nextcloud_folder_id, p.cloud_storage_read_only,
                        p.main_cloud_backend, p.main_cloud_backend_instance_id,
                        p.main_cloud_folder_handle,
@@ -47162,7 +47641,9 @@ class PostgresDB:
                 *params,
             )
 
-        return [dict(row) for row in rows]
+        from orchestrator.services.manifest_projects import hydrate_project_row
+
+        return [await hydrate_project_row(self, row) for row in rows]
 
     async def park_project_jobs_for_archive(self, project_id: str) -> int:
         """Park every not-yet-started job in ``project_id``. Returns the count.
@@ -47273,9 +47754,21 @@ class PostgresDB:
 
         query = f"UPDATE projects SET {', '.join(updates)} WHERE id = ${param_count}"
 
-        async with self.acquire() as conn:
-            result = await conn.execute(query, *values)
-
+        async with self.transaction_scope():
+            await self._lock_expert_catalog()
+            result = await self.execute(query, *values)
+            if result == "UPDATE 1" and set(kwargs) & {
+                "name",
+                "description",
+                "default_config_name",
+                "default_config_override",
+            }:
+                await self._persist_project_resource(
+                    project_id,
+                    project_changes={
+                        key: value for key, value in kwargs.items() if value is not None
+                    },
+                )
         return result == "UPDATE 1"
 
     async def delete_project(self, project_id: str) -> bool:
@@ -47294,6 +47787,11 @@ class PostgresDB:
 
         async with self.acquire() as conn:
             async with conn.transaction():
+                from orchestrator.services.manifest_retirement import (
+                    retire_project_resources,
+                )
+
+                await retire_project_resources(conn, uuid_val)
                 # No FK cascade fires on capability_grants.scope_id (polymorphic);
                 # delete the project's grant rows in-band so removal stays atomic.
                 await self.delete_grants_for_scope(
@@ -47346,6 +47844,8 @@ class PostgresDB:
         project_id: str,
         user_id: str,
         role: str = "editor",
+        *,
+        defer_manifest: bool = False,
     ) -> Dict[str, Any]:
         """Add a member to a project.
 
@@ -47360,23 +47860,31 @@ class PostgresDB:
         project_uuid = UUID(project_id)
         user_uuid = UUID(user_id)
 
-        async with self.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                INSERT INTO project_members (project_id, user_id, role)
-                VALUES ($1, $2, $3)
-                RETURNING project_id, user_id, role, added_at AS joined_at
-                """,
-                project_uuid,
-                user_uuid,
-                role,
-            )
+        async with self.transaction_scope():
+            await self._lock_expert_catalog()
+            async with self.acquire() as conn:
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO project_members (project_id, user_id, role)
+                    VALUES ($1, $2, $3)
+                    RETURNING project_id, user_id, role, added_at AS joined_at
+                    """,
+                    project_uuid,
+                    user_uuid,
+                    role,
+                )
 
-            # Fetch user info for display
-            user_row = await conn.fetchrow(
-                "SELECT display_name, avatar_color FROM users WHERE id = $1",
-                user_uuid,
-            )
+                # Fetch user info for display
+                user_row = await conn.fetchrow(
+                    "SELECT display_name, avatar_color FROM users WHERE id = $1",
+                    user_uuid,
+                )
+
+            if role == "owner" and not defer_manifest:
+                from orchestrator.services.manifest_store import ManifestStore
+
+                if await ManifestStore(self).by_link("Project", project_uuid) is None:
+                    await self._persist_project_resource(project_id, owner_id=user_id)
 
         result = dict(row)
         if user_row:
@@ -50788,42 +51296,46 @@ class PostgresDB:
         """
         user_uuid = UUID(user_id)
 
-        async with self.acquire() as conn:
-            # Create the project
-            project_row = await conn.fetchrow(
-                """
-                INSERT INTO projects (name, description, is_default)
-                VALUES ($1, $2, TRUE)
-                RETURNING id, name, description, goal, status, is_default,
-                          default_config_name, default_config_override,
-                          nextcloud_folder_id, cloud_storage_read_only,
-                          main_cloud_backend,
-                          main_cloud_backend_instance_id,
-                          main_cloud_folder_handle,
-                          created_at, updated_at
-                """,
-                f"{display_name}'s Workspace",
-                f"Default workspace for {display_name}",
-            )
+        async with self.transaction_scope():
+            await self._lock_expert_catalog()
+            async with self.acquire() as conn:
+                # Create the project
+                project_row = await conn.fetchrow(
+                    """
+                    INSERT INTO projects (name, description, is_default)
+                    VALUES ($1, $2, TRUE)
+                    RETURNING id, name, description, goal, status, is_default,
+                              default_config_name, default_config_override,
+                              nextcloud_folder_id, cloud_storage_read_only,
+                              main_cloud_backend,
+                              main_cloud_backend_instance_id,
+                              main_cloud_folder_handle,
+                              created_at, updated_at
+                    """,
+                    f"{display_name}'s Workspace",
+                    f"Default workspace for {display_name}",
+                )
 
-            project_id = project_row["id"]
+                project_id = project_row["id"]
 
-            # Add user as owner
-            await conn.execute(
-                """
-                INSERT INTO project_members (project_id, user_id, role)
-                VALUES ($1, $2, 'owner')
-                """,
-                project_id,
-                user_uuid,
-            )
+                # Add user as owner
+                await conn.execute(
+                    """
+                    INSERT INTO project_members (project_id, user_id, role)
+                    VALUES ($1, $2, 'owner')
+                    """,
+                    project_id,
+                    user_uuid,
+                )
 
-            # Update user's default_project_id
-            await conn.execute(
-                "UPDATE users SET default_project_id = $1 WHERE id = $2",
-                project_id,
-                user_uuid,
-            )
+                # Update user's default_project_id
+                await conn.execute(
+                    "UPDATE users SET default_project_id = $1 WHERE id = $2",
+                    project_id,
+                    user_uuid,
+                )
+
+            await self._persist_project_resource(project_id, owner_id=user_id)
 
         return dict(project_row)
 
@@ -50846,7 +51358,7 @@ class PostgresDB:
                 """
                 SELECT p.id, p.name, p.description, p.goal, p.status,
                        p.is_default, p.default_config_name,
-                       p.default_config_override, p.created_at, p.updated_at
+                       p.default_config_override, p.manifest_resource_id, p.created_at, p.updated_at
                 FROM projects p
                 JOIN users u ON u.default_project_id = p.id
                 WHERE u.id = $1
@@ -50854,7 +51366,9 @@ class PostgresDB:
                 uuid_val,
             )
 
-        return dict(row) if row else None
+        from orchestrator.services.manifest_projects import hydrate_project_row
+
+        return await hydrate_project_row(self, row)
 
     # =========================================================================
     # SCHEMA MANAGEMENT

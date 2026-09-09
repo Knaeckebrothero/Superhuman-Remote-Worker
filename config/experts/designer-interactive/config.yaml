@@ -1,90 +1,125 @@
-# yaml-language-server: $schema=../../schema.json
-# Design Studio - Interactive persistent design sessions
-$extends: session_base
+apiVersion: srw/v1alpha1
+kind: Expert
+metadata:
+  name: designer-interactive
+  scope:
+    kind: Catalog
+    name: shared
+  annotations:
+    srw.io/display-name: Design Studio
+    srw.io/description: 'Interactive design collaborator for persistent sessions.
+      Works with the user
 
-agent_id: designer-interactive
-display_name: Design Studio
-description: |
-  Interactive design collaborator for persistent sessions. Works with the user
-  to create HTML/CSS mockups, iterate on designs, and produce structured design
-  specifications. Uses the project's Catppuccin Mocha design system for all
-  visual output. Outputs self-contained HTML prototypes that developers implement.
-icon: palette
-color: "#f5c2e7"
-tags:
+      to create HTML/CSS mockups, iterate on designs, and produce structured design
+
+      specifications. Uses the project''s Catppuccin Mocha design system for all
+
+      visual output. Outputs self-contained HTML prototypes that developers implement.'
+    srw.io/icon: palette
+    srw.io/color: '#f5c2e7'
+    srw.io/expert-type: session
+    srw.io/bundled-selector: designer-interactive
+  tags:
   - design
   - ui
   - prototyping
   - interactive
   - persistent
+  - session
+spec:
+  runtime:
+    image: srw-agent:latest
+    adapter: srw/v1
+    config:
+      config_name: session_base
+      asset_name: designer-interactive
+      config:
+        # Design Studio - Interactive persistent design sessions
+        $extends: session_base
 
-llm:
-  reasoning_level: high
+        agent_id: designer-interactive
+        display_name: Design Studio
+        description: |
+          Interactive design collaborator for persistent sessions. Works with the user
+          to create HTML/CSS mockups, iterate on designs, and produce structured design
+          specifications. Uses the project's Catppuccin Mocha design system for all
+          visual output. Outputs self-contained HTML prototypes that developers implement.
+        icon: palette
+        color: "#f5c2e7"
+        tags:
+          - design
+          - ui
+          - prototyping
+          - interactive
+          - persistent
 
-workspace:
-  # Pinned: this expert's role needs a shell, and a session's account layer
-  # overrides expert_base's `sandbox` with the owner's default (platform
-  # default `virtual`, which strips shell/browser/git). Declaring it HERE
-  # sits above that layer; the New Session form shows it and the user may
-  # still change it. Jobs ignore this key (the workspace contract stamps
-  # the job tier from config_override). See tests/test_expert_defaults.py
-  # ::TestShellBoundBundledExpertsPinTheirTier.
-  backend: sandbox
-  structure:
-    - mockups/
-    - design_spec/
-    - reference/
-    - documents/
-    - notes/
-  git_versioning: true
+        llm:
+          reasoning_level: high
 
-instruction_files:
-  - file: design_guide.md
-    # Persistent sessions have no phase loop. Require the guide at the first
-    # artifact write instead of relying on an unimplemented setup injection.
-    trigger: before_tool:write_file
-    enforce: true
+        workspace:
+          # Pinned: this expert's role needs a shell, and a session's account layer
+          # overrides expert_base's `sandbox` with the owner's default (platform
+          # default `virtual`, which strips shell/browser/git). Declaring it HERE
+          # sits above that layer; the New Session form shows it and the user may
+          # still change it. Jobs ignore this key (the workspace contract stamps
+          # the job tier from config_override). See tests/test_expert_defaults.py
+          # ::TestShellBoundBundledExpertsPinTheirTier.
+          backend: sandbox
+          structure:
+            - mockups/
+            - design_spec/
+            - reference/
+            - documents/
+            - notes/
+          git_versioning: true
 
-tools:
-  workspace:
-    - read_file
-    - write_file
-    - edit_file
-    - list_files
-    - delete_file
-    - search_files
-    - file_exists
-    - move_file
-    - copy_file
-    - get_document_info
-    - create_directory
-  research:
-    - web_search
-    - extract_webpage
-  shell:
-    - run_command
-    - cancel_command
-    - shell_read
-  # git: intentionally absent. This agent has shell tools, and
-  # ToolsConfig.__post_init__ (src/shared/runtime/core/loader.py) suppresses the git_* group
-  # whenever shell is present — a shell can run git against ANY repository in
-  # the workspace, including repos/<name>/, which git_* cannot. Declaring them
-  # here would advertise tools the pod never binds.
-  # Knowledge tools inherited from session_base
-  # Unused categories
-  orchestrator: []
-  core: []
-  citation: []
-  graph: []
-  sql: []
-  mongodb: []
-  evaluation: []
-  delegation: []
-  communication: []
+        instruction_files:
+          - file: design_guide.md
+            # Persistent sessions have no phase loop. Require the guide at the first
+            # artifact write instead of relying on an unimplemented setup injection.
+            trigger: before_tool:write_file
+            enforce: true
 
-interactive:
-  permission_mode: supervised
-  idle_timeout_minutes: 30
+        tools:
+          workspace:
+            - read_file
+            - write_file
+            - edit_file
+            - list_files
+            - delete_file
+            - search_files
+            - file_exists
+            - move_file
+            - copy_file
+            - get_document_info
+            - create_directory
+          research:
+            - web_search
+            - extract_webpage
+          shell:
+            - run_command
+            - cancel_command
+            - shell_read
+          # git: intentionally absent. This agent has shell tools, and
+          # ToolsConfig.__post_init__ (src/shared/runtime/core/loader.py) suppresses the git_* group
+          # whenever shell is present — a shell can run git against ANY repository in
+          # the workspace, including repos/<name>/, which git_* cannot. Declaring them
+          # here would advertise tools the pod never binds.
+          # Knowledge tools inherited from session_base
+          # Unused categories
+          orchestrator: []
+          core: []
+          citation: []
+          graph: []
+          sql: []
+          mongodb: []
+          evaluation: []
+          delegation: []
+          communication: []
 
-memory:
-  enabled: true
+        interactive:
+          permission_mode: supervised
+          idle_timeout_minutes: 30
+
+        memory:
+          enabled: true

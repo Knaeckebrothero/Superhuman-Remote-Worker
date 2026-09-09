@@ -2,7 +2,8 @@
 {{- $vmRemoteProtocol := .Values.orchestrator.vmRemoteOperationProtocol.enabled | default false -}}
 {{- $workspaceCleanupProtocol := .Values.orchestrator.workspaceCleanupReconciliationEnabled | default false -}}
 {{- $workspaceLifecycleCutover := .Values.orchestrator.workspaceLifecycleProtocolCutoverEnabled | default false -}}
-{{- $orchestratorRecreate := or $runtimeAuthorityCutover (or $vmRemoteProtocol (or $workspaceLifecycleCutover $workspaceCleanupProtocol)) -}}
+{{- $manifestCutover := .Values.orchestrator.manifestContractCutoverEnabled | default false -}}
+{{- $orchestratorRecreate := or $manifestCutover (or $runtimeAuthorityCutover (or $vmRemoteProtocol (or $workspaceLifecycleCutover $workspaceCleanupProtocol))) -}}
 {{- if and $runtimeAuthorityCutover (ne (lower (toString (.Values.agent.requirePinnedStatusIdentity | default "true"))) "true") -}}
 {{- fail "orchestrator.runtimeAuthorityMigrationMaintenanceAck requires agent.requirePinnedStatusIdentity=true" -}}
 {{- end }}
@@ -38,6 +39,9 @@ spec:
         # controlled enable/disable therefore deterministically converges every
         # replica before operators rely on the new policy.
         checksum/officer-auto-pull-release: {{ dict "officerAutoPullReleaseEnabled" (.Values.orchestrator.officerAutoPullReleaseEnabled | default false) | toJson | sha256sum | quote }}
+        # Native admission reads these values at startup. Operator changes must
+        # replace the process even when the optional Reloader is disabled.
+        checksum/manifest-hosting: {{ toJson .Values.manifestHosting | sha256sum | quote }}
         checksum/workspace-cleanup-reconciliation: {{ dict "enabled" $workspaceCleanupProtocol | toJson | sha256sum | quote }}
         checksum/workspace-lifecycle-protocol-cutover: {{ dict "enabled" $workspaceLifecycleCutover | toJson | sha256sum | quote }}
         checksum/workspace-lifecycle-service-account: {{ .Values.orchestrator.workspaceLifecycleServiceAccountGeneration | default "0197" | toString | sha256sum | quote }}

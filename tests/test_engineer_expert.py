@@ -9,6 +9,10 @@ carves strict TDD out to the developer).
 
 from __future__ import annotations
 
+from shared.runtime.core.srw_manifest_config import (
+    srw_config_fragment as _srw_config_fragment,
+)
+
 from pathlib import Path
 
 import yaml
@@ -106,7 +110,7 @@ def test_engineer_delegates_to_the_library_roster():
 
 
 def test_engineer_description_routes_code_work_and_carves_out_tdd():
-    raw = yaml.safe_load(_read("config.yaml"))
+    raw = _srw_config_fragment(yaml.safe_load(_read("config.yaml")))
     desc = raw["description"].lower()
     for word in ("frontend", "backend", "script", "install", "shell"):
         assert word in desc, word

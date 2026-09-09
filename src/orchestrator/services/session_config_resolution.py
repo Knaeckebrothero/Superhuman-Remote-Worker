@@ -84,6 +84,11 @@ from orchestrator.services.session_tool_policy import (
 from orchestrator.services.session_workspace_policy import (
     default_session_workspace_backend,
 )
+from orchestrator.services.manifest_execution_snapshot import (
+    apply_srw_delivery_bindings,
+    read_execution,
+    srw_snapshot_config,
+)
 from orchestrator.services.workspace_tier_policy import thread_workspace_backend
 from shared.runtime.core.loader import canonical_config_name
 
@@ -168,7 +173,7 @@ async def prefetch_roster_refs(
     project_ids: list[str] | None = None,
     dependencies: "SessionConfigDependencies",
 ) -> dict[str, dict[str, Any]]:
-    """``{expert_uuid: row}`` for every DB expert a config's ``subagents.roster``
+    """``{expert_selector: row}`` for each stored Expert a config's ``subagents.roster``
     names by ``$ref`` — the rows ``resolve_config(db_refs=...)`` materialises
     (``src/core/subagent_roster.py``; the resolver itself never touches the DB,
     and matches the keys case-insensitively).
@@ -183,11 +188,17 @@ async def prefetch_roster_refs(
     resolver drops that entry, logs, and records ``agent._roster_warnings``;
     dispatch never fails a job over its roster (U1 B.3).
 
-    No database call at all when no layer names a DB ref — the common case.
+    Installed name selectors use the canonical shared Catalog revision. Missing
+    names are recorded as empty entries, so resolution drops them without reading
+    an obsolete file. No database call occurs when no layer names any ref.
     """
-    from shared.runtime.core.subagent_roster import collect_roster_db_refs
+    from shared.runtime.core.subagent_roster import (
+        collect_roster_db_refs,
+        collect_roster_named_refs,
+    )
 
     expert_refs: set[str] = set()
+    named_refs: set[str] = set()
     if expert_row:
         fragment = expert_row.get("config") or {}
         if isinstance(fragment, str):
@@ -196,10 +207,12 @@ async def prefetch_roster_refs(
             except ValueError:
                 fragment = {}
         expert_refs = collect_roster_db_refs(fragment)
+        named_refs |= collect_roster_named_refs(fragment)
     override_refs: set[str] = set()
     for layer in overrides:
         override_refs |= collect_roster_db_refs(layer)
-    if not expert_refs and not override_refs:
+        named_refs |= collect_roster_named_refs(layer)
+    if not expert_refs and not override_refs and not named_refs:
         return {}
 
     db_refs: dict[str, dict[str, Any]] = {}
@@ -236,6 +249,19 @@ async def prefetch_roster_refs(
                     ref,
                     user_id,
                 )
+    if named_refs:
+        from orchestrator.services.manifest_experts import bundled_expert_for_execution
+
+        for ref in sorted(named_refs):
+            try:
+                row = await bundled_expert_for_execution(dependencies.store, ref)
+            except HTTPException as exc:
+                if exc.status_code != 409:
+                    raise
+                row = None
+            # Presence is intentional: the shared loader must not restore a
+            # retired canonical definition from the installed image's file.
+            db_refs[ref] = row or {}
     return db_refs
 
 
@@ -345,24 +371,94 @@ async def resolve_session_config(
     resolve_base_when_experts_disabled: bool = False,
     dependencies: "SessionConfigDependencies",
 ) -> dict[str, Any] | None:
-    """Resolve a persistent thread's full config to a delivery blob (credential-
-    injected), or ``None`` when experts are off / resolution fails (→ the agent's
-    ``config_name`` + ``config_override`` fallback).  The session-memory outbox
-    alone may opt into bundled-base resolution while experts are off; normal
-    attach semantics remain unchanged and dormant expert rows stay excluded.
+    """Deliver the current admitted session generation with live authorization.
 
-    The session sibling of the job-dispatch resolve. Sessions **re-resolve on
-    every (re)attach** — there is no freeze (mutable run; spec delivery table).
-    Layers: session_base + account/system fallback + DB expert
-    (``metadata.expert_id``) + thread ``config_override`` (request) → creds.
-    ``config_override`` overrides ``metadata.config_override`` for the warm-pool
-    path (it carries the attach-time lite-workspace backend).
+    New sessions read their canonical rendered configuration. A settings update
+    publishes another generation; an attached turn retains its delivered copy.
+    Historical rows without a canonical record retain their old resolver until
+    imported. ``config_override`` carries authorized transient workspace and
+    connector-tool bindings, not a replacement for frozen model/prompt settings.
     """
+    execution = await read_execution(dependencies.store, "Session", str(thread["id"]))
+    if execution is not None:
+        try:
+            resolved, policy = srw_snapshot_config(execution)
+            user_id = str(thread["user_id"]) if thread.get("user_id") else None
+            project_id = str(thread["project_id"]) if thread.get("project_id") else None
+            # Ordered controls have their own durable inbox and materialized
+            # columns. Check exactly the values the final attach will deliver,
+            # including an acknowledged control newer than this config revision.
+            interactive = {
+                "permission_mode": str(thread.get("permission_mode") or "supervised")
+            }
+            if thread.get("narration_mode") is not None:
+                interactive["narration_mode"] = str(thread["narration_mode"])
+            for fragment in (resolved["agent"], policy):
+                fragment["interactive"] = {
+                    **(fragment.get("interactive") or {}),
+                    **interactive,
+                }
+            strip = await acknowledged_grant_strip(
+                metadata,
+                user_id=user_id,
+                project_id=project_id,
+                dependencies=dependencies,
+            )
+            resolved, policy = apply_srw_delivery_bindings(
+                resolved,
+                policy,
+                config_override,
+                grant_strip=strip,
+            )
+            resolved["agent"].update(session_tool_group_disabled_markers(policy))
+            await dependencies.enforce_dispatch_grants(
+                policy,
+                runner_user_id=user_id,
+                project_ids=[project_id] if project_id else [],
+            )
+            knowledge_project_ids = (
+                [project_id]
+                if project_id
+                else await dependencies.thread_project_ids(str(thread["id"]))
+            )
+            include_kb_profile = await dependencies.thread_has_knowledge_scope(
+                project_ids=knowledge_project_ids,
+                datasource_ids=metadata.get("datasource_ids"),
+            )
+            delivered = await inject_blob_credentials(
+                resolved,
+                lambda co: dependencies.inject_thread_dispatch_credentials(
+                    co,
+                    user_id=user_id,
+                    project_id=project_id,
+                    include_kb_profile=include_kb_profile,
+                ),
+            )
+            # Included in the stateless attach fingerprint, so a queued turn
+            # sees a new generation while an in-flight turn keeps its copy.
+            delivered["execution_snapshot"] = {
+                "id": str(execution["id"]),
+                "generation": execution["generation"],
+                "revision": execution["revision"],
+            }
+            if status is not None:
+                status["state"] = "ok"
+            return delivered
+        except GrantDenied as denied:
+            if status is not None:
+                status.update(state="denied", grant_violations=list(denied.violations))
+            raise
+        except Exception:
+            if status is not None:
+                status["state"] = "error"
+            raise
     experts_enabled = (
         dependencies.is_experts_db_enabled()
         and await dependencies.user_experts_enabled()
     )
-    if not experts_enabled and not resolve_base_when_experts_disabled:
+    if not experts_enabled and not (
+        resolve_base_when_experts_disabled or (status or {}).get("_capture_manifest")
+    ):
         if status is not None:
             status["state"] = "disabled"
         return None
@@ -423,6 +519,13 @@ async def resolve_session_config(
         _grant_strip = await acknowledged_grant_strip(
             metadata, user_id=user_id, project_id=project_id, dependencies=dependencies
         )
+        roster_refs = await prefetch_roster_refs(
+            expert_row=expert_row,
+            overrides=(project_overrides, request_override),
+            user_id=user_id,
+            project_ids=[project_id] if project_id else [],
+            dependencies=dependencies,
+        )
         resolved = resolve_config(
             base_config_name=base,
             base_defaults=base_defaults,
@@ -433,13 +536,7 @@ async def resolve_session_config(
             capture=_cap,
             skills=_skills_payload,
             grant_strip=_grant_strip,
-            db_refs=await prefetch_roster_refs(
-                expert_row=expert_row,
-                overrides=(project_overrides, request_override),
-                user_id=user_id,
-                project_ids=[project_id] if project_id else [],
-                dependencies=dependencies,
-            ),
+            db_refs=roster_refs,
         )
         # Bound skills are delivered deterministically (instructions channel);
         # strip them from the model-invoked catalog so they aren't double-offered.
@@ -462,6 +559,21 @@ async def resolve_session_config(
         # _cap["merged_fragment"] already reflects the grant_strip hook above
         # (same `data` the delivered blob was built from); this re-check stays
         # authoritative — it re-runs evaluate() on whatever that hook returned.
+        # Historical attachments also overlay materialized controls. Validate
+        # those exact values before capturing the first canonical generation.
+        materialized = {}
+        if "permission_mode" in thread:
+            materialized["permission_mode"] = str(
+                thread.get("permission_mode") or "supervised"
+            )
+        if thread.get("narration_mode") is not None:
+            materialized["narration_mode"] = str(thread["narration_mode"])
+        if materialized:
+            for fragment in (resolved["agent"], _cap["merged_fragment"]):
+                fragment["interactive"] = {
+                    **fragment.get("interactive", {}),
+                    **materialized,
+                }
         await dependencies.enforce_dispatch_grants(
             _cap["merged_fragment"],
             runner_user_id=user_id,
@@ -476,6 +588,23 @@ async def resolve_session_config(
             project_ids=knowledge_project_ids,
             datasource_ids=metadata.get("datasource_ids"),
         )
+        if status is not None and status.get("_capture_manifest"):
+            from orchestrator.services.manifest_experts import installed_srw_image
+            from orchestrator.services.manifest_session_delivery import (
+                prepare_delivery_snapshot,
+            )
+
+            status["_manifest_snapshot"] = prepare_delivery_snapshot(
+                thread,
+                metadata,
+                resolved,
+                _cap["merged_fragment"],
+                image=getattr(dependencies.store, "manifest_runtime_image", None)
+                or installed_srw_image(),
+                config_name=base,
+                expert=expert_row,
+                refs=roster_refs,
+            )
         delivered = await inject_blob_credentials(
             resolved,
             lambda co: dependencies.inject_thread_dispatch_credentials(

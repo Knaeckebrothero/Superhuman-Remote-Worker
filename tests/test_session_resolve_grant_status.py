@@ -46,7 +46,7 @@ async def test_grant_denied_records_violations_in_status():
             "orchestrator.main._enforce_dispatch_grants",
             AsyncMock(side_effect=GrantDenied(violations)),
         ),
-        patch("orchestrator.main.postgres_db"),
+        patch("orchestrator.main.postgres_db", fetchrow=AsyncMock(return_value=None)),
     ):
         with pytest.raises(GrantDenied):
             await _resolve_session_config(THREAD, {}, status=status)

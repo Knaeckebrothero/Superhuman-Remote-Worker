@@ -298,6 +298,9 @@ async def test_resolved_session_uses_canonical_mount_projects_for_kb_gate(monkey
         "shared.runtime.core.skill_resolution.filter_bound_skills", MagicMock()
     )
 
+    monkeypatch.setattr(
+        orchestrator.main.postgres_db, "fetchrow", AsyncMock(return_value=None)
+    )
     result = await orchestrator.main._resolve_session_config(
         {"id": thread_id, "project_id": None, "config_name": "persistent_defaults"},
         {},

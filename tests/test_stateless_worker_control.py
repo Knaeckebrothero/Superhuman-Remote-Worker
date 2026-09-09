@@ -292,8 +292,13 @@ def test_explicit_lanes_are_unchanged_when_default_is_on(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_create_job_sql_inherits_omitted_parent_lane():
+async def test_create_job_sql_inherits_omitted_parent_lane(monkeypatch):
     conn = AsyncMock()
+    conn.transaction = MagicMock(return_value=_AsyncCM())
+    monkeypatch.setattr(
+        "orchestrator.services.manifest_execution_snapshot.capture_execution",
+        AsyncMock(),
+    )
     conn.fetchrow.return_value = {"id": UUID(JOB_ID), "execution_lane": "stateless"}
     db = _db_with_conn(conn)
 
@@ -310,8 +315,13 @@ async def test_create_job_sql_inherits_omitted_parent_lane():
 
 
 @pytest.mark.asyncio
-async def test_create_job_explicit_lane_is_bound_and_invalid_lane_rejected():
+async def test_create_job_explicit_lane_is_bound_and_invalid_lane_rejected(monkeypatch):
     conn = AsyncMock()
+    conn.transaction = MagicMock(return_value=_AsyncCM())
+    monkeypatch.setattr(
+        "orchestrator.services.manifest_execution_snapshot.capture_execution",
+        AsyncMock(),
+    )
     conn.fetchrow.return_value = {"id": UUID(JOB_ID), "execution_lane": "stateless"}
     db = _db_with_conn(conn)
 
@@ -581,7 +591,7 @@ async def test_final_prepared_delete_removes_queue_and_job_atomically():
         if normalized.startswith("SELECT execution_lane"):
             lock_order.append("job")
             return {"execution_lane": "stateless", "delete_pending": True}
-        if normalized.startswith("SELECT status, completion_outcome_kind FROM jobs"):
+        if normalized.startswith("SELECT status, completion_outcome_kind,"):
             return {"status": "created", "completion_outcome_kind": None}
         raise AssertionError(normalized)
 

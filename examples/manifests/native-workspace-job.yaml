@@ -1,0 +1,35 @@
+apiVersion: srw/v1alpha1
+kind: Job
+metadata:
+  name: native-workspace-example
+  scope:
+    kind: Account
+    name: personal
+spec:
+  task:
+    text: Work over SSH in an independently initialized, retained workspace.
+  execution:
+    expert:
+      inline:
+        runtime:
+          image: alpine/git:latest
+          command: ["/bin/sh", "-c"]
+          args:
+            - /run/srw-workspace/ssh 'cd /home/agent-host/workspace && test -f initialized && printf "Completed a job\n" >> history.txt'
+    workspace:
+      template:
+        inline:
+          backend: sandbox
+          retention: Retain
+          resources:
+            cpu: 1
+            memory: 1Gi
+            storage: 1Gi
+          initialize:
+            - command: ["/bin/sh", "-c", "mkdir -p .cache && touch initialized"]
+    connectors: {}
+  completion:
+    mode: ProcessExit
+  timeoutSeconds: 300
+  retry:
+    maxAttempts: 2

@@ -1,58 +1,96 @@
-# yaml-language-server: $schema=../../schema.json
-# Assistant - General-purpose interactive assistant; the default for new sessions
-$extends: session_base
+apiVersion: srw/v1alpha1
+kind: Expert
+metadata:
+  name: assistant
+  scope:
+    kind: Catalog
+    name: shared
+  annotations:
+    srw.io/display-name: Assistant
+    srw.io/description: 'General-purpose interactive assistant and the default for
+      new sessions.
 
-agent_id: assistant
-display_name: Assistant
-description: |
-  General-purpose interactive assistant and the default for new sessions.
-  Collaborates with the user turn by turn on research, writing, analysis,
-  planning, and light coding — rather than running an autonomous batch job.
-  Inherits the safe persistent toolset (files, research, browser, citations,
-  git, knowledge) from session_base; its only specialization is
-  a conversational, generalist persona (persona.txt).
-icon: smart_toy
-color: "#89b4fa"
-tags:
+      Collaborates with the user turn by turn on research, writing, analysis,
+
+      planning, and light coding — rather than running an autonomous batch job.
+
+      Inherits the safe persistent toolset (files, research, browser, citations,
+
+      git, knowledge) from session_base; its only specialization is
+
+      a conversational, generalist persona (persona.txt).'
+    srw.io/icon: smart_toy
+    srw.io/color: '#89b4fa'
+    srw.io/expert-type: session
+    srw.io/bundled-selector: assistant
+  tags:
   - general
   - assistant
   - interactive
   - persistent
+  - session
+spec:
+  runtime:
+    image: srw-agent:latest
+    adapter: srw/v1
+    config:
+      config_name: session_base
+      asset_name: assistant
+      config:
+        # Assistant - General-purpose interactive assistant; the default for new sessions
+        $extends: session_base
 
-# Intentionally thin. Everything operational — tools, memory, auxiliary,
-# interactive settings, limits, context management, workspace, model floor — is
-# inherited from session_base via $extends (deep-merge), so nothing is
-# duplicated. The persona lives here (not in session_base) so the base
-# stays role-neutral for the other session experts that extend it.
+        agent_id: assistant
+        display_name: Assistant
+        description: |
+          General-purpose interactive assistant and the default for new sessions.
+          Collaborates with the user turn by turn on research, writing, analysis,
+          planning, and light coding — rather than running an autonomous batch job.
+          Inherits the safe persistent toolset (files, research, browser, citations,
+          git, knowledge) from session_base; its only specialization is
+          a conversational, generalist persona (persona.txt).
+        icon: smart_toy
+        color: "#89b4fa"
+        tags:
+          - general
+          - assistant
+          - interactive
+          - persistent
 
-# Bind the citation skill to the citation tools inherited from session_base,
-# so the assistant references sources inline as [N] instead of citing-and-forgetting.
-# session_base omits instruction_files by convention, so persistent experts
-# opt in here; before_tool + enforce is the only binding that fires in a session
-# (no phase loop). See knowledge-history/done/citation_engine_integration.md Phase 4.
-instruction_files:
-  - skill: cite-as-you-write
-    trigger: before_tool:cite_web
-    enforce: true
-  - skill: cite-as-you-write
-    trigger: before_tool:cite_document
-    enforce: true
+        # Intentionally thin. Everything operational — tools, memory, auxiliary,
+        # interactive settings, limits, context management, workspace, model floor — is
+        # inherited from session_base via $extends (deep-merge), so nothing is
+        # duplicated. The persona lives here (not in session_base) so the base
+        # stays role-neutral for the other session experts that extend it.
 
-# Roster for delegate_agent (config/subagents/README.md). The generalist gets
-# the three library children a research/writing/light-coding session hands
-# off to; probe/tester/reviewer are worker-shaped and stay on their experts.
-# Delegation itself stays OFF until a session ticks it (tools.delegation +
-# delegation.enabled) — the roster only decides what that tick can reach. A
-# child's tools are capped by the parent's; declared child tools must also
-# pass capability admission before delegation is enabled. The safe default's
-# implementer uses file tools without shell verification. An explicitly
-# shell-enabled roster requires the shell_tools grant like any other expert.
-# The Delegation row shows the roster either way.
-subagents:
-  default: explorer
-  roster:
-    explorer: {$ref: subagents/explorer}
-    reader: {$ref: subagents/reader}
-    implementer:
-      $ref: subagents/implementer
-      tools: {shell: []}
+        # Bind the citation skill to the citation tools inherited from session_base,
+        # so the assistant references sources inline as [N] instead of citing-and-forgetting.
+        # session_base omits instruction_files by convention, so persistent experts
+        # opt in here; before_tool + enforce is the only binding that fires in a session
+        # (no phase loop). See knowledge-history/done/citation_engine_integration.md Phase 4.
+        instruction_files:
+          - skill: cite-as-you-write
+            trigger: before_tool:cite_web
+            enforce: true
+          - skill: cite-as-you-write
+            trigger: before_tool:cite_document
+            enforce: true
+
+        # Roster for delegate_agent (config/subagents/README.md). The generalist gets
+        # the three library children a research/writing/light-coding session hands
+        # off to; probe/tester/reviewer are worker-shaped and stay on their experts.
+        # Delegation itself stays OFF until a session ticks it (tools.delegation +
+        # delegation.enabled) — the roster only decides what that tick can reach. A
+        # child's tools are capped by the parent's; declared child tools must also
+        # pass capability admission before delegation is enabled. The safe default's
+        # implementer uses file tools without shell verification. An explicitly
+        # shell-enabled roster requires the shell_tools grant like any other expert.
+        # The Delegation row shows the roster either way.
+        subagents:
+          default: explorer
+          roster:
+            explorer: {$ref: subagents/explorer}
+            reader: {$ref: subagents/reader}
+            implementer:
+              $ref: subagents/implementer
+              tools: {shell: []}

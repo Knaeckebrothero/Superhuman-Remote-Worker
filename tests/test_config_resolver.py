@@ -108,6 +108,38 @@ def test_account_fallback_sits_below_bundled_expert_leaf():
     assert cap["merged_fragment"]["llm"]["reasoning_level"] == "high"
 
 
+def test_canonical_expert_leaf_removal_cannot_restore_a_setting_from_its_assets():
+    from pathlib import Path
+    from shared.manifests import parse_documents
+    from shared.runtime.core.srw_manifest_config import srw_private_config
+
+    path = Path(__file__).resolve().parents[1] / "config/experts/developer/config.yaml"
+    private = srw_private_config(parse_documents(path.read_text())[0])
+    assert private["config_name"] == "worker_base"
+    assert private["asset_name"] == "developer"
+    assert private["config"]["llm"].pop("reasoning_level") == "high"
+    row = {
+        "expert_type": "worker",
+        "harness_adapter": "srw/v1",
+        "harness_config_name": private["config_name"],
+        "harness_asset_name": private["asset_name"],
+        "config": private["config"],
+        "prompts": {},
+    }
+    capture = {}
+    resolved = resolve_config(
+        base_config_name="worker_base",
+        expert_row=row,
+        base_defaults={"llm": {"reasoning_level": "low"}},
+        expert_type="worker",
+        capture=capture,
+    )
+    assert capture["merged_fragment"]["llm"]["reasoning_level"] == "low"
+    original = resolve_config(base_config_name="developer", expert_type="worker")
+    assert resolved["prompts"] == original["prompts"]
+    assert resolved["instructions"] == original["instructions"]
+
+
 def test_expert_model_applies_when_no_request_override():
     blob = resolve_config(
         base_config_name="persistent_defaults",
