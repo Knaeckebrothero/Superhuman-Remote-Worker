@@ -82,7 +82,7 @@ import {CitationsPanelComponent} from './citations-panel/citations-panel.compone
 import {CloudReviewDialogComponent} from '../job-diff-review/cloud-review-dialog.component';
 import {CloudReviewBannerComponent} from './cloud-review-banner/cloud-review-banner.component';
 import {SshConnectPanelComponent} from './ssh-connect-panel/ssh-connect-panel.component';
-import {DraftEmptyStateComponent, type DisplayedSuggestion} from './draft-empty-state/draft-empty-state.component';
+import {ChatEmptyStateComponent, type DisplayedSuggestion} from './chat-empty-state/chat-empty-state.component';
 import {CapabilitiesService} from '../../core/services/capabilities.service';
 import {AppSelectComponent} from '../../ui/select';
 import {AppIconComponent} from '../../ui/icon';
@@ -912,7 +912,7 @@ export function clearDraft(threadId: string | null): void {
         CloudReviewDialogComponent,
         CloudReviewBannerComponent,
         SshConnectPanelComponent,
-        DraftEmptyStateComponent,
+        ChatEmptyStateComponent,
     ],
     template: `
     <div class="chat-container"
@@ -1753,24 +1753,14 @@ export function clearDraft(threadId: string | null): void {
           @if (!chat.isStreaming()) {
             <div class="empty-state">
               @if (chat.sessionReady()) {
-                <div class="empty-inner">
-                  <img class="empty-mark" src="assets/icons/icon-mark.svg" alt="" />
-                  <h2 class="empty-title">{{ 'chat.empty.title' | transloco }}</h2>
-                  <p class="empty-subtitle">{{ 'chat.empty.subtitle' | transloco }}</p>
-                  @if (displayedSuggestions().length > 0) {
-                    <div class="suggestion-grid">
-                      @for (s of displayedSuggestions(); track $index) {
-                        <button type="button" class="suggestion-chip"
-                                (click)="pickSuggestion(s)">
-                          <app-icon size="lg" class="suggestion-icon">{{ s.icon }}</app-icon>
-                          <span class="suggestion-text">{{ s.text }}</span>
-                        </button>
-                      }
-                    </div>
-                  }
-                </div>
+                <app-chat-empty-state
+                  variant="ready"
+                  [suggestions]="displayedSuggestions()"
+                  (suggestionPicked)="pickSuggestion($event)"
+                />
               } @else if (chat.isDraftSession()) {
-                <app-draft-empty-state
+                <app-chat-empty-state
+                  variant="draft"
                   [suggestions]="displayedSuggestions()"
                   [connectorsLoading]="chat.draftDefaultsLoading()"
                   [connectorsError]="chat.draftDefaultsError()"

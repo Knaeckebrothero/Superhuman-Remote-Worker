@@ -1,0 +1,104 @@
+import {ChangeDetectionStrategy, Component, computed, input, output} from '@angular/core';
+import {RouterLink} from '@angular/router';
+import {TranslocoPipe} from '@jsverse/transloco';
+import {AppIconComponent} from '../../../ui/icon';
+
+/** One suggestion chip, already resolved to the active language. */
+export interface DisplayedSuggestion {
+  icon: string;
+  text: string;
+}
+
+/**
+ * Shared landing content for the chat message list when there is nothing to
+ * show yet. Serves two call sites that differ only in copy and in two
+ * optional elements:
+ *
+ * - `draft`: the pre-session composer landing ("What shall we conquer
+ *   today?" before a thread exists) — shows the default-connectors control
+ *   and the "Advanced options" link, neither of which mean anything until a
+ *   session exists.
+ * - `ready`: a connected session with no turns yet — same mark/suggestions,
+ *   its own copy, no connectors control and no advanced link.
+ */
+@Component({
+  selector: 'app-chat-empty-state',
+  standalone: true,
+  changeDetection: ChangeDetectionStrategy.OnPush,
+  imports: [RouterLink, TranslocoPipe, AppIconComponent],
+  styleUrl: './chat-empty-state.component.scss',
+  template: `
+    <div class="empty-inner">
+      <img class="empty-mark" src="assets/icons/icon-mark.svg" alt="" />
+      <h2 class="empty-title">{{ titleKey() | transloco }}</h2>
+      <p class="empty-subtitle">{{ subtitleKey() | transloco }}</p>
+
+      @if (variant() === 'draft') {
+        <div class="draft-connectors" role="group"
+             [attr.aria-label]="'chat.draft.connectorsLabel' | transloco">
+          @if (connectorsLoading()) {
+            <span class="draft-connectors-state">{{ 'chat.draft.connectorsLoading' | transloco }}</span>
+          } @else if (connectorsError()) {
+            <span class="draft-connectors-state draft-connectors-error">
+              {{ 'chat.draft.connectorsFailed' | transloco }}
+              <button type="button" (click)="retryRequested.emit()">
+                {{ 'chat.draft.connectorsRetry' | transloco }}
+              </button>
+            </span>
+          } @else {
+            <label class="draft-connectors-toggle">
+              <input type="checkbox" [checked]="connectorsEnabled()"
+                     (change)="onConnectorsToggle($event)">
+              <span>{{ 'chat.draft.connectorsCount' | transloco: {count: datasourceCount()} }}</span>
+            </label>
+          }
+        </div>
+      }
+
+      @if (suggestions().length > 0) {
+        <div class="suggestion-grid">
+          @for (s of suggestions(); track $index) {
+            <button type="button" class="suggestion-chip" (click)="pick(s)">
+              <app-icon size="lg" class="suggestion-icon">{{ s.icon }}</app-icon>
+              <span class="suggestion-text">{{ s.text }}</span>
+            </button>
+          }
+        </div>
+      }
+
+      @if (variant() === 'draft') {
+        <a class="draft-advanced" routerLink="/sessions/new">{{ 'chat.draft.advanced' | transloco }}</a>
+      }
+    </div>
+  `,
+})
+export class ChatEmptyStateComponent {
+  variant = input.required<'draft' | 'ready'>();
+  suggestions = input.required<DisplayedSuggestion[]>();
+
+  // Meaningless for `ready` (no connectors control renders), so optional
+  // with defaults rather than required — that call site passes none of them.
+  connectorsLoading = input<boolean>(false);
+  connectorsError = input<boolean>(false);
+  connectorsEnabled = input<boolean>(false);
+  datasourceCount = input<number>(0);
+
+  suggestionPicked = output<DisplayedSuggestion>();
+  connectorsToggled = output<boolean>();
+  retryRequested = output<void>();
+
+  protected readonly titleKey = computed(() =>
+    this.variant() === 'draft' ? 'chat.draft.title' : 'chat.empty.title',
+  );
+  protected readonly subtitleKey = computed(() =>
+    this.variant() === 'draft' ? 'chat.draft.subtitle' : 'chat.empty.subtitle',
+  );
+
+  pick(s: DisplayedSuggestion): void {
+    this.suggestionPicked.emit(s);
+  }
+
+  onConnectorsToggle(event: Event): void {
+    this.connectorsToggled.emit((event.target as HTMLInputElement).checked);
+  }
+}

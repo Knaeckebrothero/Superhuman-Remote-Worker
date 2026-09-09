@@ -2,14 +2,17 @@
   display: contents;
 }
 
-/* .empty-inner through .suggestion-text are duplicated from
-   persistent-chat.component.scss rather than moved: they are also used,
-   unchanged, by the non-draft empty state that stays inline in
-   persistent-chat.component.ts (chat.sessionReady(), same class names).
-   Emulated view encapsulation scopes each stylesheet to its own component,
-   so removing them from the parent would leave that other branch unstyled.
-   Only the draft-exclusive rules below (.draft-advanced, .draft-connectors*)
-   were actually cut from the parent. */
+/* .empty-inner through .suggestion-text (below, through the max-width:600px
+   media query) are shared by both variants this component renders — `ready`
+   (chat.sessionReady(), no connectors/advanced link) and `draft` (adds
+   both). They used to be duplicated here and left unchanged in
+   persistent-chat.component.scss, because an earlier version of this
+   component rendered only the draft branch while sessionReady's markup
+   stayed inline in the parent under the same class names — emulated view
+   encapsulation would have left that branch unstyled if they'd been cut
+   from the parent instead of copied. Now that this component renders both
+   variants, that parent copy is gone: these rules are fully and only owned
+   here. */
 
 .empty-inner {
   text-align: center;
@@ -92,7 +95,8 @@
   }
 }
 
-/* Draft-exclusive from here down — cut from the parent, not duplicated. */
+/* `draft`-variant only from here down: the connectors control and the
+   advanced-options link, gated on variant() === 'draft' in the template. */
 
 .draft-advanced {
   margin-top: 26px;
