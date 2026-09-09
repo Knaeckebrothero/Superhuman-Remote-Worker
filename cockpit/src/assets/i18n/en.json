@@ -389,7 +389,10 @@
     "workbench": "Workbench",
     "settings": "Settings",
     "logout": "Logout",
-    "admin": "admin",
+    "admin": "Admin",
+    "more": "More",
+    "apiKeys": "API keys",
+    "sshKeys": "SSH keys",
     "collapseSidebar": "Collapse sidebar",
     "openSidebar": "Open sidebar",
     "recency": {

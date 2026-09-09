@@ -2,7 +2,6 @@ import {Component, computed, inject, signal} from '@angular/core';
 import {NavigationEnd, Router, RouterLink, RouterLinkActive} from '@angular/router';
 import {takeUntilDestroyed, toSignal} from '@angular/core/rxjs-interop';
 import {filter, map} from 'rxjs';
-import {UserService} from '../../core/services/user.service';
 import {SidebarService} from '../../core/services/sidebar.service';
 import {ViewportService} from '../../core/services/viewport.service';
 import {SessionListService} from '../../core/services/session-list.service';
@@ -15,6 +14,8 @@ import {TranslocoPipe} from '@jsverse/transloco';
 import {AppIconComponent} from '../../ui/icon';
 import {LegionMarkComponent} from '../../ui/legion-mark';
 import {AppTabNavComponent, AppTabNavItemComponent} from '../../ui/tab-nav';
+import {RailMoreMenuComponent} from '../rail-more-menu/rail-more-menu.component';
+import {RailAccountMenuComponent} from '../rail-account-menu/rail-account-menu.component';
 
 export type RailMode = 'chat' | 'jobs' | 'projects';
 
@@ -27,7 +28,7 @@ const MODE_ROUTES: Record<RailMode, string> = {
 @Component({
   selector: 'app-sidebar',
   standalone: true,
-  imports: [RouterLink, RouterLinkActive, LayoutPickerComponent, NotificationBellComponent, TranslocoPipe, AppIconComponent, LegionMarkComponent, AppTabNavComponent, AppTabNavItemComponent],
+  imports: [RouterLink, RouterLinkActive, LayoutPickerComponent, NotificationBellComponent, TranslocoPipe, AppIconComponent, LegionMarkComponent, AppTabNavComponent, AppTabNavItemComponent, RailMoreMenuComponent, RailAccountMenuComponent],
   template: `
     <nav class="sidebar" (click)="onSidebarClick($event)">
       <div class="sidebar-header">
@@ -114,22 +115,10 @@ const MODE_ROUTES: Record<RailMode, string> = {
       </div>
 
       <div class="sidebar-footer">
-        @if (userService.currentUser(); as user) {
-          <div class="user-profile">
-            <span
-              class="user-avatar"
-              [style.background]="user.avatar_color"
-            >{{ getInitials(user.display_name) }}</span>
-            <span class="user-name">{{ user.display_name }}</span>
-          </div>
-          <div class="footer-actions">
-            <app-notification-bell />
-            <a class="footer-link" routerLink="/settings" routerLinkActive="active" [title]="'nav.settings' | transloco">
-              <app-icon size="md" class="nav-icon">settings</app-icon>
-            </a>
-            <button class="logout-button" (click)="logout()">{{ 'nav.logout' | transloco }}</button>
-          </div>
-        }
+        <app-notification-bell />
+        <app-rail-more-menu />
+        <div class="rail-divider"></div>
+        <app-rail-account-menu />
       </div>
     </nav>
   `,
@@ -308,24 +297,30 @@ const MODE_ROUTES: Record<RailMode, string> = {
           font-size: 12px;
         }
 
-        .user-avatar {
-          width: 32px;
-          height: 32px;
-          font-size: 12px;
+        /* Tap-target restoration (Task 8 step 5): Task 6 deleted the old flat
+           nav's .nav-link rule — min-height: 44px; padding: 10px 14px;
+           gap: 12px — along with the links it sized. Every control the rail
+           has grown since (Tasks 6, 7 and this one) needs that minimum back.
+           .rail-new and .rail-item are rendered directly in this template,
+           so one rule reaches both. The More and avatar triggers (.rail-nav,
+           .rail-account) are owned by their own components now and restore
+           this same rule in their own stylesheets — Emulated encapsulation
+           means a rule here can't reach into their templates. The mode
+           switcher's tabs are app-tab-nav-item, a shared ui/ component with
+           the same encapsulation boundary; ::ng-deep reaches its host
+           element, scoped under .mode-switcher so the other app-tab-nav
+           consumers (admin-models, agent-settings) are unaffected. */
+        .rail-new,
+        .rail-item {
+          min-height: 44px;
+          padding: 10px 14px;
+          gap: 12px;
         }
 
-        .user-name {
-          font-size: 14px;
-        }
-
-        .footer-link {
-          width: 40px;
-          height: 40px;
-        }
-
-        .logout-button {
-          min-height: 40px;
-          font-size: 14px;
+        .mode-switcher ::ng-deep app-tab-nav-item {
+          min-height: 44px;
+          padding: 10px 14px;
+          gap: 12px;
         }
       }
 
@@ -389,85 +384,22 @@ const MODE_ROUTES: Record<RailMode, string> = {
         flex-shrink: 0;
       }
 
-      .user-profile {
-        display: flex;
-        align-items: center;
-        gap: 8px;
+      /* Everything else in this column stretches full-width by default (flex
+         column + the default align-items: stretch). The bell keeps its own
+         icon-sized footprint instead, so its unread badge — positioned via
+         the bell's own :host box — stays pinned to the icon rather than
+         drifting toward the far edge of the rail. */
+      .sidebar-footer app-notification-bell {
+        align-self: flex-start;
       }
 
-      .user-avatar {
-        width: 28px;
-        height: 28px;
-        border-radius: 50%;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        font-size: 11px;
-        font-weight: 600;
-        color: var(--timeline-bg);
-        flex-shrink: 0;
-      }
-
-      .user-name {
-        font-size: 12px;
-        color: var(--text-primary);
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-
-      .footer-actions {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-      }
-
-      .footer-link {
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        width: 30px;
-        height: 30px;
-        border-radius: var(--radius-control);
-        color: var(--text-muted);
-        text-decoration: none;
-        transition: color 0.15s ease, background 0.15s ease;
-      }
-
-      .footer-link:hover,
-      .footer-link.active {
-        color: var(--accent-color);
-        background: var(--surface-0);
-      }
-
-      .footer-link .nav-icon {
-        font-size: 18px;
-      }
-
-      .logout-button {
-        flex: 1;
-        padding: 6px 12px;
-        background: transparent;
-        border: 1px solid var(--border-color);
-        border-radius: var(--radius-control);
-        color: var(--text-muted);
-        font-size: 12px;
-        font-family: inherit;
-        cursor: pointer;
-        transition:
-          color 0.15s ease,
-          border-color 0.15s ease;
-      }
-
-      .logout-button:hover {
-        color: var(--accent-color);
-        border-color: var(--accent-color);
+      .rail-divider {
+        border-top: 1px solid var(--border-color);
       }
     `,
   ],
 })
 export class SidebarComponent {
-  readonly userService = inject(UserService);
   readonly sidebar = inject(SidebarService);
   readonly layoutService = inject(LayoutService);
   private readonly router = inject(Router);
@@ -565,19 +497,6 @@ export class SidebarComponent {
   readonly isLayoutPickerOpen = signal(false);
   readonly pickerTop = signal(0);
   readonly pickerLeft = signal(0);
-
-  getInitials(name: string): string {
-    return name
-      .split(' ')
-      .map((w) => w[0])
-      .join('')
-      .toUpperCase()
-      .slice(0, 2);
-  }
-
-  logout(): void {
-    this.userService.logout();
-  }
 
   toggleLayoutPicker(buttonEl: HTMLButtonElement): void {
     if (!this.isLayoutPickerOpen()) {

@@ -390,6 +390,9 @@
     "settings": "Einstellungen",
     "logout": "Abmelden",
     "admin": "Admin",
+    "more": "Mehr",
+    "apiKeys": "API-Schlüssel",
+    "sshKeys": "SSH-Schlüssel",
     "collapseSidebar": "Seitenleiste einklappen",
     "openSidebar": "Seitenleiste öffnen",
     "recency": {
