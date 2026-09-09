@@ -2,8 +2,8 @@
   display: contents;
 }
 
-/* .empty-inner through .suggestion-text (below, through the max-width:600px
-   media query) are shared by both variants this component renders — `ready`
+/* .empty-inner through .suggestion-text (below) are shared by both variants
+   this component renders — `ready`
    (chat.sessionReady(), no connectors/advanced link) and `draft` (adds
    both). They used to be duplicated here and left unchanged in
    persistent-chat.component.scss, because an earlier version of this
@@ -18,18 +18,21 @@
   text-align: center;
   max-width: 850px;
 
-  /* was: 72px 48px — fixed 144px of vertical padding on a 709px phone scrollport */
-  padding: clamp(20px, 5vh, 72px) clamp(16px, 5vw, 48px);
+  /* was: 72px 48px — fixed 144px of vertical padding on a 709px phone scrollport.
+     Vertical coefficient tightened from 5vh to close the phone/short-laptop
+     overflow that remained after removing the 1-column grid rule below. */
+  padding: clamp(16px, 3.5vh, 72px) clamp(16px, 5vw, 48px);
   display: flex;
   flex-direction: column;
   align-items: center;
 }
 
 .empty-mark {
-  /* was: 144px square + 30px margin, unchanged on any screen */
-  width: clamp(72px, 14vh, 144px);
-  height: clamp(72px, 14vh, 144px);
-  margin-bottom: clamp(12px, 3vh, 30px);
+  /* was: 144px square + 30px margin, unchanged on any screen. Coefficients
+     tightened alongside .empty-inner's padding — see that comment. */
+  width: clamp(64px, 12.5vh, 144px);
+  height: clamp(64px, 12.5vh, 144px);
+  margin-bottom: clamp(10px, 2.5vh, 30px);
   opacity: 0.95;
 }
 
@@ -71,8 +74,9 @@
   align-items: center;
   gap: 10px;
 
-  /* was: 16px 22px */
-  padding: clamp(10px, 1.6vh, 16px) 22px;
+  /* was: 16px 22px. Coefficient tightened alongside .empty-inner's padding
+     — see that comment. */
+  padding: clamp(8px, 1.2vh, 16px) 22px;
   background: var(--surface-0);
   border: 1px solid var(--border-color, var(--surface-0));
   color: var(--text-secondary);
@@ -98,24 +102,6 @@
 
 .suggestion-text {
   flex: 1;
-}
-
-@media (max-width: 600px) {
-  .suggestion-grid {
-    grid-template-columns: 1fr;
-  }
-}
-
-/* The clamps above close most of the phone/short-laptop overflow, but not
-   all of it: two full rows of chips is still more vertical budget than a
-   709px (phone) or 494px scrollport has room for. 950px covers both
-   (915px phone, 700px short-laptop) without touching the 1000px desktop
-   viewport, which already fits all 4. Cut to 2 chips instead of shrinking
-   type further. */
-@media (max-height: 950px) {
-  .suggestion-chip:nth-child(n + 3) {
-    display: none;
-  }
 }
 
 /* `draft`-variant only from here down: the connectors control and the
