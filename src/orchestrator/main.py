@@ -155,6 +155,7 @@ from orchestrator.services import job_projection, job_queries, job_reads  # noqa
 from orchestrator.routers import provider_catalog as provider_catalog_routes  # noqa: E402
 from orchestrator.routers import model_catalog as model_catalog_routes  # noqa: E402
 from orchestrator.routers import config_catalog as config_catalog_routes  # noqa: E402
+from orchestrator.routers import manifests as manifest_routes  # noqa: E402
 from orchestrator.services.provider_catalog import (  # noqa: E402
     ProviderCatalogService,
 )
@@ -11585,6 +11586,7 @@ app.state.provider_catalog_dependencies_factory = (
 )
 app.state.model_catalog_dependencies_factory = lambda: _model_catalog_dependencies()
 app.state.config_catalog_dependencies_factory = lambda: _config_catalog_dependencies()
+app.state.manifest_dependencies_factory = lambda: _manifest_dependencies()
 app.state.job_inspection_dependencies_factory = lambda: _job_inspection_dependencies()
 app.state.job_audit_dependencies_factory = lambda: _job_audit_dependencies()
 app.state.job_artifacts_dependencies_factory = lambda: _job_artifacts_dependencies()
@@ -11886,6 +11888,7 @@ app.include_router(job_reads_routes.router)
 app.include_router(provider_catalog_routes.router)
 app.include_router(model_catalog_routes.router)
 app.include_router(config_catalog_routes.router)
+app.include_router(manifest_routes.router)
 app.include_router(job_inspection_routes.router)
 app.include_router(job_audit_routes.router)
 app.include_router(job_artifacts_routes.router)
@@ -43101,6 +43104,17 @@ def _config_catalog_dependencies() -> config_catalog_routes.ConfigCatalogDepende
             instruction_resolver=loader.InstructionMatrixResolver,
         ),
         require_admin=_require_admin,
+    )
+
+
+def _manifest_dependencies() -> manifest_routes.ManifestDependencies:
+    from orchestrator.services.manifests import ManifestService
+
+    async def approved_user(request: Request) -> dict[str, Any]:
+        return await require_approved_user(request, postgres_db)
+
+    return manifest_routes.ManifestDependencies(
+        service=ManifestService(), require_approved_user=approved_user
     )
 
 

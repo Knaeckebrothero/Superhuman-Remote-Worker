@@ -1,0 +1,56 @@
+# Draft examples. Registry images, resource scopes and credentials are illustrative.
+apiVersion: srw/v1alpha1
+kind: Expert
+metadata:
+  name: cpp-developer
+  scope: {kind: Catalog, name: shared}
+  labels: {role: developer}
+  tags: [coding, cpp]
+spec:
+  runtime:
+    image: registry.example.com/srw/worker:1.0.0
+    pullPolicy: IfNotPresent
+    config:
+      llm: {model: project-default}
+      instructions: Develop and test the assigned change.
+      tools:
+        workspace: [read_file, write_file]
+        shell: [run_command]
+    resources:
+      requests: {cpu: 1, memory: 2Gi}
+      limits: {cpu: 2, memory: 4Gi}
+---
+apiVersion: srw/v1alpha1
+kind: WorkspaceTemplate
+metadata:
+  name: cpp-terraform-react
+  scope: {kind: Catalog, name: shared}
+spec:
+  backend: sandbox
+  resources: {cpu: 4, memory: 8Gi, storage: 40Gi}
+  environment:
+    image: registry.example.com/workspaces/build-base:1.0.0
+    pullPolicy: IfNotPresent
+    prepare:
+      - command: [/opt/setup/install-project-toolchain]
+    cache: Reuse
+  initialize:
+    - command: [/opt/setup/initialize-project]
+  retention: Retain
+---
+apiVersion: srw/v1alpha1
+kind: Connector
+metadata:
+  name: application-source
+  scope: {kind: Account, name: personal}
+spec:
+  driver: repository
+  config:
+    url: https://git.example.com/team/application.git
+    branch: main
+  credentials:
+    token:
+      secretRef:
+        name: application-git
+        key: token
+  access: ReadWrite

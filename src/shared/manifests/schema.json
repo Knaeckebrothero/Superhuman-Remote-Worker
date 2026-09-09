@@ -1,0 +1,974 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:srw:manifest:draft:v1alpha1",
+  "title": "SRW resource manifest v1alpha1",
+  "$comment": "Authoring contract. Validation does not insert defaults or perform authorization, provisioning, or execution. Private configuration follows JSON semantics.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "apiVersion",
+    "kind",
+    "metadata",
+    "spec"
+  ],
+  "properties": {
+    "apiVersion": {
+      "const": "srw/v1alpha1"
+    },
+    "kind": {
+      "enum": [
+        "Expert",
+        "WorkspaceTemplate",
+        "Connector",
+        "Project",
+        "Job"
+      ]
+    },
+    "metadata": {
+      "$ref": "#/$defs/Metadata"
+    },
+    "spec": {
+      "type": "object"
+    }
+  },
+  "oneOf": [
+    {
+      "properties": {
+        "kind": {
+          "const": "Expert"
+        },
+        "spec": {
+          "$ref": "#/$defs/ExpertSpec"
+        }
+      }
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "WorkspaceTemplate"
+        },
+        "spec": {
+          "$ref": "#/$defs/WorkspaceSpec"
+        }
+      }
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "Connector"
+        },
+        "spec": {
+          "$ref": "#/$defs/ConnectorSpec"
+        }
+      }
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "Project"
+        },
+        "metadata": {
+          "properties": {
+            "scope": {
+              "properties": {
+                "kind": {
+                  "const": "Account"
+                }
+              }
+            }
+          }
+        },
+        "spec": {
+          "$ref": "#/$defs/ProjectSpec"
+        }
+      }
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "Job"
+        },
+        "spec": {
+          "$ref": "#/$defs/JobSpec"
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "Name": {
+      "type": "string",
+      "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+      "maxLength": 63
+    },
+    "NonemptyString": {
+      "type": "string",
+      "minLength": 1
+    },
+    "Quantity": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*(Mi|Gi|Ti)$"
+    },
+    "StringMap": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "Command": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1
+    },
+    "Scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "name"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "Account",
+            "Project",
+            "Catalog"
+          ]
+        },
+        "name": {
+          "$ref": "#/$defs/Name"
+        }
+      }
+    },
+    "Metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/Name"
+        },
+        "scope": {
+          "$ref": "#/$defs/Scope"
+        },
+        "labels": {
+          "$ref": "#/$defs/StringMap"
+        },
+        "annotations": {
+          "$ref": "#/$defs/StringMap"
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "Ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/Name"
+        },
+        "scope": {
+          "$ref": "#/$defs/Scope"
+        },
+        "revision": {
+          "$ref": "#/$defs/NonemptyString"
+        }
+      }
+    },
+    "SecretRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "key"
+      ],
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/Name"
+        },
+        "key": {
+          "$ref": "#/$defs/NonemptyString"
+        },
+        "scope": {
+          "$ref": "#/$defs/Scope"
+        }
+      }
+    },
+    "SecretValue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "secretRef"
+      ],
+      "properties": {
+        "secretRef": {
+          "$ref": "#/$defs/SecretRef"
+        }
+      }
+    },
+    "PullPolicy": {
+      "enum": [
+        "Always",
+        "IfNotPresent",
+        "Never"
+      ]
+    },
+    "Compute": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cpu": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "memory": {
+          "$ref": "#/$defs/Quantity"
+        }
+      }
+    },
+    "RuntimeResources": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "requests": {
+          "$ref": "#/$defs/Compute"
+        },
+        "limits": {
+          "$ref": "#/$defs/Compute"
+        }
+      }
+    },
+    "Probe": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "httpGet": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "port"
+          ],
+          "properties": {
+            "path": {
+              "type": "string",
+              "pattern": "^/"
+            },
+            "port": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65535
+            }
+          }
+        },
+        "exec": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "command"
+          ],
+          "properties": {
+            "command": {
+              "$ref": "#/$defs/Command"
+            }
+          }
+        },
+        "initialDelaySeconds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "periodSeconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "timeoutSeconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "failureThreshold": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "oneOf": [
+        {
+          "required": [
+            "httpGet"
+          ]
+        },
+        {
+          "required": [
+            "exec"
+          ]
+        }
+      ]
+    },
+    "Runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "image"
+      ],
+      "properties": {
+        "image": {
+          "$ref": "#/$defs/NonemptyString"
+        },
+        "pullPolicy": {
+          "$ref": "#/$defs/PullPolicy"
+        },
+        "command": {
+          "$ref": "#/$defs/Command"
+        },
+        "args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "env": {
+          "type": "object",
+          "propertyNames": {
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+            "not": {
+              "enum": [
+                "SRW_CONFIG_FILE",
+                "SRW_TASK_FILE"
+              ]
+            }
+          },
+          "additionalProperties": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "$ref": "#/$defs/SecretValue"
+              }
+            ]
+          }
+        },
+        "config": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "resources": {
+          "$ref": "#/$defs/RuntimeResources"
+        },
+        "probes": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "readiness": {
+              "$ref": "#/$defs/Probe"
+            },
+            "liveness": {
+              "$ref": "#/$defs/Probe"
+            }
+          }
+        }
+      }
+    },
+    "ExpertSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "runtime"
+      ],
+      "properties": {
+        "runtime": {
+          "$ref": "#/$defs/Runtime"
+        }
+      }
+    },
+    "ExpertSelection": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "ref"
+          ],
+          "properties": {
+            "ref": {
+              "$ref": "#/$defs/Ref"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "inline"
+          ],
+          "properties": {
+            "inline": {
+              "$ref": "#/$defs/ExpertSpec"
+            }
+          }
+        }
+      ]
+    },
+    "Step": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "command"
+      ],
+      "properties": {
+        "command": {
+          "$ref": "#/$defs/Command"
+        }
+      }
+    },
+    "WorkspaceSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "backend"
+      ],
+      "properties": {
+        "backend": {
+          "enum": [
+            "sandbox",
+            "vm",
+            "virtual"
+          ]
+        },
+        "resources": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "cpu": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            "memory": {
+              "$ref": "#/$defs/Quantity"
+            },
+            "storage": {
+              "$ref": "#/$defs/Quantity"
+            }
+          }
+        },
+        "environment": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "image"
+          ],
+          "properties": {
+            "image": {
+              "$ref": "#/$defs/NonemptyString"
+            },
+            "pullPolicy": {
+              "$ref": "#/$defs/PullPolicy"
+            },
+            "prepare": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Step"
+              }
+            },
+            "cache": {
+              "enum": [
+                "Reuse",
+                "Rebuild"
+              ]
+            }
+          }
+        },
+        "initialize": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Step"
+          }
+        },
+        "retention": {
+          "enum": [
+            "Delete",
+            "Retain"
+          ]
+        },
+        "network": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "profileRef"
+          ],
+          "properties": {
+            "profileRef": {
+              "$ref": "#/$defs/Ref"
+            }
+          }
+        }
+      }
+    },
+    "WorkspaceSelection": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "ref"
+          ],
+          "properties": {
+            "ref": {
+              "$ref": "#/$defs/Ref"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "inline"
+          ],
+          "properties": {
+            "inline": {
+              "$ref": "#/$defs/WorkspaceSpec"
+            }
+          }
+        }
+      ]
+    },
+    "WorkspaceBinding": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "template"
+          ],
+          "properties": {
+            "template": {
+              "$ref": "#/$defs/WorkspaceSelection"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "instanceRef"
+          ],
+          "properties": {
+            "instanceRef": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "uid"
+              ],
+              "properties": {
+                "uid": {
+                  "$ref": "#/$defs/NonemptyString"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "ConnectorSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "driver"
+      ],
+      "properties": {
+        "driver": {
+          "$ref": "#/$defs/NonemptyString"
+        },
+        "config": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "credentials": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/SecretValue"
+          }
+        },
+        "access": {
+          "enum": [
+            "ReadOnly",
+            "ReadWrite"
+          ]
+        }
+      }
+    },
+    "ConnectorSelection": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "ref"
+          ],
+          "properties": {
+            "ref": {
+              "$ref": "#/$defs/Ref"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "inline"
+          ],
+          "properties": {
+            "inline": {
+              "$ref": "#/$defs/ConnectorSpec"
+            }
+          }
+        }
+      ]
+    },
+    "ConnectorMap": {
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/$defs/Name"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/ConnectorSelection"
+      }
+    },
+    "ExecutionSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "expert": {
+          "$ref": "#/$defs/ExpertSelection"
+        },
+        "workspace": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/WorkspaceBinding"
+            }
+          ]
+        },
+        "connectors": {
+          "$ref": "#/$defs/ConnectorMap"
+        }
+      }
+    },
+    "CompletionPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode"
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "ProcessExit",
+            "Reported",
+            "Manual"
+          ]
+        }
+      }
+    },
+    "RetryPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "maxAttempts"
+      ],
+      "properties": {
+        "maxAttempts": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "ReportedDeadline": {
+      "if": {
+        "required": [
+          "completion"
+        ],
+        "properties": {
+          "completion": {
+            "required": [
+              "mode"
+            ],
+            "properties": {
+              "mode": {
+                "const": "Reported"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "timeoutSeconds"
+        ]
+      }
+    },
+    "JobPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "completion"
+      ],
+      "allOf": [
+        {
+          "$ref": "#/$defs/ReportedDeadline"
+        }
+      ],
+      "properties": {
+        "completion": {
+          "$ref": "#/$defs/CompletionPolicy"
+        },
+        "retry": {
+          "$ref": "#/$defs/RetryPolicy"
+        },
+        "timeoutSeconds": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "JobSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "execution"
+      ],
+      "allOf": [
+        {
+          "$ref": "#/$defs/ReportedDeadline"
+        }
+      ],
+      "properties": {
+        "task": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "data": true
+          }
+        },
+        "execution": {
+          "$ref": "#/$defs/ExecutionSpec"
+        },
+        "completion": {
+          "$ref": "#/$defs/CompletionPolicy"
+        },
+        "retry": {
+          "$ref": "#/$defs/RetryPolicy"
+        },
+        "timeoutSeconds": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "AliasList": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Name"
+      },
+      "uniqueItems": true
+    },
+    "NullableAlias": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/Name"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "ProjectDefaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "expert": {
+          "$ref": "#/$defs/Name"
+        },
+        "workspace": {
+          "$ref": "#/$defs/NullableAlias"
+        },
+        "connectors": {
+          "$ref": "#/$defs/AliasList"
+        }
+      }
+    },
+    "Officer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "expert"
+      ],
+      "properties": {
+        "expert": {
+          "$ref": "#/$defs/Name"
+        },
+        "workspace": {
+          "$ref": "#/$defs/NullableAlias"
+        },
+        "connectors": {
+          "$ref": "#/$defs/AliasList"
+        }
+      }
+    },
+    "Slot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "count",
+        "expert"
+      ],
+      "properties": {
+        "count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "expert": {
+          "$ref": "#/$defs/Name"
+        },
+        "workspace": {
+          "$ref": "#/$defs/NullableAlias"
+        },
+        "connectors": {
+          "$ref": "#/$defs/AliasList"
+        },
+        "category": {
+          "$ref": "#/$defs/NonemptyString"
+        }
+      }
+    },
+    "ProjectSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "resources"
+      ],
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "resources": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "experts": {
+              "type": "object",
+              "propertyNames": {
+                "$ref": "#/$defs/Name"
+              },
+              "additionalProperties": {
+                "$ref": "#/$defs/ExpertSelection"
+              }
+            },
+            "workspaces": {
+              "type": "object",
+              "propertyNames": {
+                "$ref": "#/$defs/Name"
+              },
+              "additionalProperties": {
+                "$ref": "#/$defs/WorkspaceSelection"
+              }
+            },
+            "connectors": {
+              "$ref": "#/$defs/ConnectorMap"
+            }
+          }
+        },
+        "defaults": {
+          "$ref": "#/$defs/ProjectDefaults"
+        },
+        "team": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "state"
+          ],
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "state": {
+                    "const": "Active"
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "jobPolicy"
+                ]
+              }
+            }
+          ],
+          "properties": {
+            "state": {
+              "enum": [
+                "Active",
+                "Held"
+              ]
+            },
+            "officer": {
+              "$ref": "#/$defs/Officer"
+            },
+            "jobPolicy": {
+              "$ref": "#/$defs/JobPolicy"
+            },
+            "slots": {
+              "type": "object",
+              "propertyNames": {
+                "$ref": "#/$defs/Name"
+              },
+              "additionalProperties": {
+                "$ref": "#/$defs/Slot"
+              }
+            },
+            "backlog": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "enabled",
+                "autoPull"
+              ],
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "autoPull": {
+                  "type": "boolean"
+                }
+              }
+            }
+          }
+        },
+        "limits": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "maxConcurrentJobs": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        }
+      }
+    }
+  }
+}

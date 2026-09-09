@@ -1,0 +1,19 @@
+# Illustrates an existing workspace handle; the UID is a placeholder.
+apiVersion: srw/v1alpha1
+kind: Job
+metadata:
+  name: continue-cpp-feature
+  scope: {kind: Project, name: cpp-product}
+spec:
+  task:
+    text: Continue work in the retained environment.
+  execution:
+    expert:
+      ref:
+        name: cpp-developer
+        scope: {kind: Catalog, name: shared}
+    workspace:
+      instanceRef: {uid: workspace-instance-123}
+    connectors: {}
+  completion: {mode: Reported}
+  timeoutSeconds: 3600

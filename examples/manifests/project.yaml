@@ -1,0 +1,68 @@
+# Concrete installation example. Package parameters/rendering are a later draft.
+apiVersion: srw/v1alpha1
+kind: Project
+metadata:
+  name: cpp-product
+  scope: {kind: Account, name: personal}
+  labels: {team: product-engineering}
+spec:
+  description: A team sharing a prepared C++/Terraform/React environment recipe.
+  resources:
+    experts:
+      lead:
+        inline:
+          runtime:
+            image: registry.example.com/srw/officer:1.0.0
+            config:
+              instructions: Coordinate the backlog and review progress.
+      developer:
+        ref:
+          name: cpp-developer
+          scope: {kind: Catalog, name: shared}
+      reviewer:
+        inline:
+          runtime:
+            image: registry.example.com/team/custom-reviewer:1.0.0
+            config:
+              tools: [custom_read_file, review_diff]
+              memory: false
+    workspaces:
+      development:
+        ref:
+          name: cpp-terraform-react
+          scope: {kind: Catalog, name: shared}
+    connectors:
+      source:
+        ref:
+          name: application-source
+          scope: {kind: Account, name: personal}
+  defaults:
+    expert: developer
+    workspace: development
+    connectors: [source]
+  team:
+    state: Held
+    jobPolicy:
+      completion: {mode: Reported}
+      retry: {maxAttempts: 1}
+      timeoutSeconds: 3600
+    officer:
+      expert: lead
+      workspace: development
+      connectors: [source]
+    slots:
+      implementation:
+        count: 2
+        expert: developer
+        workspace: development
+        connectors: [source]
+        category: executor
+      verification:
+        count: 1
+        expert: reviewer
+        workspace: development
+        connectors: [source]
+        category: tester
+    backlog: {enabled: true, autoPull: true}
+  limits:
+    maxConcurrentJobs: 3

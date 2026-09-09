@@ -59,6 +59,7 @@ def boundary_tree(tmp_path):
         "orchestrator/services/officer_metadata.py": "from shared.value import VALUE\n",
         "orchestrator/services/preference_defaults.py": "from shared.value import VALUE\n",
         "orchestrator/services/session_workspace_policy.py": "from shared.value import VALUE\n",
+        "orchestrator/services/manifest_legacy.py": "from shared.runtime.provider import VALUE\n",
         "mcp_server/app.py": "from shared.contracts.item import VALUE\n",
         "vm_controller/app.py": "from shared.value import VALUE\n",
     }.items():
@@ -98,8 +99,8 @@ def lint_boundaries(root):
 def test_allowed_runtime_and_lightweight_dependencies_pass(boundary_tree):
     result = lint_boundaries(boundary_tree)
     assert result.returncode == 0, result.stdout + result.stderr
-    # R1.B05 added the seventeenth contract, over its own 21 modules.
-    assert "Contracts: 17 kept, 0 broken" in result.stdout
+    # The generic manifest path also excludes the legacy harness adapter.
+    assert "Contracts: 18 kept, 0 broken" in result.stdout
 
 
 @pytest.mark.parametrize(
@@ -113,6 +114,9 @@ def test_allowed_runtime_and_lightweight_dependencies_pass(boundary_tree):
         ("shared/runtime/provider.py", "orchestrator.app"),
         ("shared/value.py", "shared.runtime.provider"),
         ("shared/contracts/item.py", "shared.runtime.provider"),
+        ("orchestrator/routers/manifests.py", "orchestrator.main"),
+        ("orchestrator/services/manifests.py", "shared.runtime.provider"),
+        ("orchestrator/services/manifests.py", "orchestrator.services.manifest_legacy"),
         ("shared/__init__.py", "shared.runtime.provider"),
         ("mcp_server/app.py", "shared.runtime.provider"),
         ("vm_controller/app.py", "shared.runtime.provider"),

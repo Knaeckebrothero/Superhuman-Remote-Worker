@@ -10,6 +10,9 @@ requires-python = ">=3.11"
 # Images install their existing, separate requirements before --no-deps -e .
 dependencies = []
 
+[project.optional-dependencies]
+manifests = ["PyYAML>=6.0", "jsonschema>=4.18,<5"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 include = [
@@ -31,7 +34,7 @@ orchestrator = [
   "config/prompts/*.md",
 ]
 mcp_server = ["templates/*.html"]
-shared = ["**/*.sql"]
+shared = ["**/*.sql", "manifests/schema.json"]
 
 [tool.ruff]
 # Preserve the formatter/linter target used before packaging metadata existed.
@@ -70,6 +73,12 @@ type = "forbidden"
 # Every other current or future shared child remains covered as a package.
 source_modules = ["shared.*"]
 forbidden_modules = ["shared.runtime"]
+
+[[tool.importlinter.contracts]]
+name = "Generic manifest operations do not load application startup or the legacy harness"
+type = "forbidden"
+source_modules = ["orchestrator.routers.manifests", "orchestrator.schemas.manifests", "orchestrator.services.manifests"]
+forbidden_modules = ["orchestrator.main", "shared.runtime", "orchestrator.services.manifest_legacy"]
 
 [[tool.importlinter.contracts]]
 name = "Contacts router does not import application startup"

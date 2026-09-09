@@ -1,0 +1,26 @@
+# The process uses an ordinary env var, ignores SRW task/config files, and has no hooks.
+apiVersion: srw/v1alpha1
+kind: Job
+metadata:
+  name: zero-integration-example
+  scope: {kind: Account, name: personal}
+spec:
+  task:
+    text: Demonstrate a container with zero SRW integration.
+  execution:
+    expert:
+      inline:
+        runtime:
+          image: busybox:1.36.1
+          command: [/bin/sh]
+          args: ['-c', 'printf "%s\n" "$MESSAGE"']
+          env:
+            MESSAGE: hello from a container with no SRW callbacks
+          config:
+            tools: [a_tool_this_image_does_not_have]
+            arbitraryOption: {keepLiteralNull: null}
+    workspace: null
+    connectors: {}
+  completion: {mode: ProcessExit}
+  retry: {maxAttempts: 1}
+  timeoutSeconds: 30

@@ -84,6 +84,8 @@ RUN python -c "import orchestrator.services.infrastructure_metering.compute_acti
 RUN python -c "import orchestrator.services.session_memory_executor"
 # Cloud-push admission must also work with orchestrator-only dependencies.
 RUN python -c "from orchestrator.services.cloud_push_recovery import build_cloud_push_bundle"
+# Keep the manifest schema available with the same lean dependencies as production.
+RUN --network=none python -I -c "from shared.manifests import load_schema; assert load_schema()['properties']['apiVersion']['const'] == 'srw/v1alpha1'"
 
 EXPOSE 8085
 

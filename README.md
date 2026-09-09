@@ -220,6 +220,7 @@ vulnerabilities privately according to [SECURITY.md](SECURITY.md).
 | Understand isolation and trust boundaries | [Security model](docs/security-model.md) |
 | Develop and test the repository | [Development guide](docs/development.md) |
 | Configure experts | [Expert configuration](config/README.md) |
+| Try the v1alpha1 resource configuration contract | [Manifest examples and preview](examples/manifests/README.md) |
 | Connect to a session workspace over SSH | [SSH access](ssh-access.md) |
 | Browse all public documentation | [Documentation index](docs/README.md) |
 

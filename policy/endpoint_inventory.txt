@@ -301,6 +301,10 @@ GET    /api/jobs/{job_id}/usage                                                 
 GET    /api/jobs/{job_id}/version                                                       gated:require_job_access
 GET    /api/jobs/{job_id}/workspace-status                                              internal:require_internal
 POST   /api/jobs/{target_job_id}/verification/rounds                                    internal:require_internal
+POST   /api/manifests/export                                                            gated:require_approved_user
+POST   /api/manifests/preview                                                           gated:require_approved_user
+GET    /api/manifests/schema                                                            gated:require_approved_user
+POST   /api/manifests/validate                                                          gated:require_approved_user
 GET    /api/mcp-tokens                                                                  gated:require_approved_user
 POST   /api/mcp-tokens                                                                  gated:require_approved_user
 DELETE /api/mcp-tokens/{token_id}                                                       gated:require_approved_user
