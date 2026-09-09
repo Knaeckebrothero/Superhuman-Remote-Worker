@@ -216,11 +216,24 @@ const MODE_ROUTES: Record<RailMode, string> = {
         color: var(--accent-color);
       }
 
+      /* Task 10 fix round 1 gave flex: none to the row's two icon controls
+         (.collapse-btn, the notification bell) but not to this block,
+         leaving it the row's only shrinkable item. --font-display has a
+         4-deep webfont fallback chain (see the .sidebar-header comment
+         above), so under a wide fallback face the mark squeezed before the
+         text gave up any width — flex: none on the mark's host and
+         min-width: 0 on the stack flip that: the mark never shrinks, and
+         the text is the thing that gives. */
+      .sidebar-brand srw-legion-mark {
+        flex: none;
+      }
+
       .sidebar-brand-stack {
         display: flex;
         flex-direction: column;
         line-height: 1;
         gap: 3px;
+        min-width: 0;
       }
 
       .sidebar-logo {
