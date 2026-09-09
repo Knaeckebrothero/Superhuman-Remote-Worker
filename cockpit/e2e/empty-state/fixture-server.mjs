@@ -26,7 +26,7 @@ const SHELL_CSS = `
   .messages-inner{flex:1;width:100%;max-width:var(--chat-content-width,700px);
     margin-inline:auto;min-width:0;display:flex;flex-direction:column;gap:16px}
   .empty-state{flex:1;display:flex;align-items:center;justify-content:center}
-  @media (max-width:600px){.messages{padding:10px}}
+  @media (max-width:768px){.messages{padding:10px}}
 `;
 
 // Read the real copy, never a hardcoded copy of it: Task 4 rewrites these
