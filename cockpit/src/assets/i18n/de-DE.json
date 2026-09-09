@@ -372,6 +372,9 @@
   "nav": {
     "cockpit": "Cockpit",
     "builder": "Builder",
+    "modeChat": "Chat",
+    "modeJobs": "Jobs",
+    "modeProjects": "Projekte",
     "sessions": "Sitzungen",
     "jobs": "Aufträge",
     "review": "Auftragsprüfung",

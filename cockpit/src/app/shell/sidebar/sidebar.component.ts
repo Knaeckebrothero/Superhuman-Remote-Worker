@@ -13,10 +13,20 @@ import {environment} from '../../core/environment';
 import {TranslocoPipe} from '@jsverse/transloco';
 import {AppIconComponent} from '../../ui/icon';
 import {LegionMarkComponent} from '../../ui/legion-mark';
+import {AppTabNavComponent, AppTabNavItemComponent} from '../../ui/tab-nav';
+
+export type RailMode = 'chat' | 'jobs' | 'projects';
+
+const MODE_ROUTES: Record<RailMode, string> = {
+  chat: '/',
+  jobs: '/jobs',
+  projects: '/projects',
+};
+
 @Component({
   selector: 'app-sidebar',
   standalone: true,
-  imports: [RouterLink, RouterLinkActive, LayoutPickerComponent, NotificationBellComponent, TranslocoPipe, AppIconComponent, LegionMarkComponent],
+  imports: [RouterLink, RouterLinkActive, LayoutPickerComponent, NotificationBellComponent, TranslocoPipe, AppIconComponent, LegionMarkComponent, AppTabNavComponent, AppTabNavItemComponent],
   template: `
     <nav class="sidebar" (click)="onSidebarClick($event)">
       <div class="sidebar-header">
@@ -33,132 +43,11 @@ import {LegionMarkComponent} from '../../ui/legion-mark';
       </div>
 
       <div class="sidebar-body">
-        <div class="sidebar-nav">
-          <a
-            class="nav-link"
-            [routerLink]="sessionsLink()"
-            routerLinkActive="active"
-          >
-            <app-icon size="md" class="nav-icon">chat</app-icon>
-            {{ 'nav.sessions' | transloco }}
-          </a>
-          <a
-            class="nav-link"
-            routerLink="/jobs"
-            routerLinkActive="active"
-          >
-            <app-icon size="md" class="nav-icon">work</app-icon>
-            {{ 'nav.jobs' | transloco }}
-          </a>
-          <a
-            class="nav-link"
-            routerLink="/projects"
-            routerLinkActive="active"
-          >
-            <app-icon size="md" class="nav-icon">folder_shared</app-icon>
-            {{ 'nav.projects' | transloco }}
-          </a>
-          <a
-            class="nav-link"
-            routerLink="/datasources"
-            routerLinkActive="active"
-          >
-            <app-icon size="md" class="nav-icon">database</app-icon>
-            {{ 'nav.datasources' | transloco }}
-          </a>
-          <a
-            class="nav-link"
-            routerLink="/contacts"
-            routerLinkActive="active"
-          >
-            <app-icon size="md" class="nav-icon">group</app-icon>
-            {{ 'nav.contacts' | transloco }}
-          </a>
-          <a
-            class="nav-link"
-            routerLink="/experts"
-            routerLinkActive="active"
-          >
-            <app-icon size="md" class="nav-icon">psychology</app-icon>
-            {{ 'nav.experts' | transloco }}
-          </a>
-          <a
-            class="nav-link"
-            routerLink="/skills"
-            routerLinkActive="active"
-          >
-            <app-icon size="md" class="nav-icon">extension</app-icon>
-            {{ 'nav.skills' | transloco }}
-          </a>
-          <a
-            class="nav-link"
-            routerLink="/automations"
-            routerLinkActive="active"
-          >
-            <app-icon size="md" class="nav-icon">schedule</app-icon>
-            {{ 'nav.automations' | transloco }}
-          </a>
-          @if (!viewport.isMobile()) {
-            <a
-              class="nav-link"
-              routerLink="/workbench"
-              routerLinkActive="active"
-            >
-              <app-icon size="md" class="nav-icon">view_quilt</app-icon>
-              {{ 'nav.workbench' | transloco }}
-            </a>
-          }
-          @if (userService.currentUser()?.is_admin) {
-            <a
-              class="nav-link"
-              routerLink="/admin/models"
-              routerLinkActive="active"
-            >
-              <app-icon size="md" class="nav-icon">smart_toy</app-icon>
-              Admin · Models
-            </a>
-            <a
-              class="nav-link"
-              routerLink="/admin/users"
-              routerLinkActive="active"
-            >
-              <app-icon size="md" class="nav-icon">group</app-icon>
-              Admin · Users
-            </a>
-            <a
-              class="nav-link"
-              routerLink="/admin/config"
-              routerLinkActive="active"
-            >
-              <app-icon size="md" class="nav-icon">edit_note</app-icon>
-              Admin · Config
-            </a>
-            <a
-              class="nav-link"
-              routerLink="/admin/grants"
-              routerLinkActive="active"
-            >
-              <app-icon size="md" class="nav-icon">verified_user</app-icon>
-              Admin · Grants
-            </a>
-            <a
-              class="nav-link"
-              routerLink="/admin/usage"
-              routerLinkActive="active"
-            >
-              <app-icon size="md" class="nav-icon">monitoring</app-icon>
-              Admin · Usage
-            </a>
-            <a
-              class="nav-link"
-              routerLink="/admin/capacity"
-              routerLinkActive="active"
-            >
-              <app-icon size="md" class="nav-icon">hub</app-icon>
-              Admin · Capacity
-            </a>
-          }
-        </div>
+        <app-tab-nav class="mode-switcher" [value]="mode()" (valueChange)="selectMode($event)">
+          <app-tab-nav-item value="chat">{{ 'nav.modeChat' | transloco }}</app-tab-nav-item>
+          <app-tab-nav-item value="jobs">{{ 'nav.modeJobs' | transloco }}</app-tab-nav-item>
+          <app-tab-nav-item value="projects">{{ 'nav.modeProjects' | transloco }}</app-tab-nav-item>
+        </app-tab-nav>
 
         @if (isWorkbenchRoute()) {
           <div class="section">
@@ -323,35 +212,8 @@ import {LegionMarkComponent} from '../../ui/legion-mark';
         scrollbar-color: var(--border-color) transparent;
       }
 
-      .sidebar-nav {
-        display: flex;
-        flex-direction: column;
-        gap: 2px;
-        padding: 12px 8px;
-      }
-
-      .nav-link {
-        display: flex;
-        align-items: center;
-        gap: 10px;
-        padding: 8px 12px;
-        border-radius: var(--radius-control);
-        color: var(--text-secondary);
-        text-decoration: none;
-        font-size: 13px;
-        transition:
-          background 0.15s ease,
-          color 0.15s ease;
-      }
-
-      .nav-link:hover {
-        background: var(--surface-0);
-        color: var(--text-primary);
-      }
-
-      .nav-link.active {
-        background: var(--surface-0);
-        color: var(--accent-color);
+      .mode-switcher {
+        margin: 8px;
       }
 
       /* Mobile drawer sizing: the 200px/13px desktop rail reads cramped as an
@@ -362,22 +224,6 @@ import {LegionMarkComponent} from '../../ui/legion-mark';
         :host,
         .sidebar {
           width: min(300px, 84vw);
-        }
-
-        .sidebar-nav {
-          padding: 14px 10px;
-          gap: 4px;
-        }
-
-        .nav-link {
-          min-height: 44px;
-          padding: 10px 14px;
-          gap: 12px;
-          font-size: 15px;
-        }
-
-        .nav-icon {
-          font-size: 22px;
         }
 
         .sidebar-logo {
@@ -554,8 +400,19 @@ export class SidebarComponent {
   private readonly chatService = inject(PersistentChatService);
   readonly viewport = inject(ViewportService);
 
-  /** Sessions link — always goes to the session list. */
-  readonly sessionsLink = computed(() => '/sessions');
+  readonly mode = computed<RailMode>(() => {
+    const url = this.currentUrl();
+    if (url.startsWith('/jobs')) return 'jobs';
+    if (url.startsWith('/projects')) return 'projects';
+    return 'chat';
+  });
+
+  selectMode(mode: RailMode | null): void {
+    // Always the mode's own route. Never a thread id — see the April 2026
+    // hijack regression recorded in coding_agent_ui_assessment.md §3.
+    if (mode === null) return;
+    this.router.navigate([MODE_ROUTES[mode]]);
+  }
 
   constructor() {
     // Auto-collapse sidebar on mobile after navigation
