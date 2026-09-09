@@ -130,8 +130,10 @@ describe('SidebarComponent session list', () => {
   });
 
   // The rail must have sessions ready the instant the user is looking at
-  // Chat, even when the app boots somewhere else — so the initial refresh is
-  // unconditional, not gated on the starting route.
+  // Chat, even when the app boots somewhere else — so this doesn't gate on
+  // the starting *route*. (It does gate on Router.navigated — see the
+  // cold-boot pair of tests below; this test relies on create()'s default
+  // of navigated: true.)
   it('refreshes the session list once on construction, regardless of the starting route', () => {
     const {sessions} = create({url: '/jobs'});
     expect(sessions.refresh).toHaveBeenCalledTimes(1);
