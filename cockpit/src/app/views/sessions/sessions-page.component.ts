@@ -624,6 +624,10 @@ export class SessionsPageComponent implements OnInit {
 
     async loadThreads(): Promise<void> {
         this.loading.set(true);
+        // No try/catch: SessionListService.refresh() never rejects — both its
+        // success and failure paths resolve, updating its own signals either
+        // way (a failed fetch leaves sessionList.threads() as whatever it
+        // already had, so re-reading it below is safe on either outcome).
         await this.sessionList.refresh();
         this.threads.set(
             this.sessionList.threads()

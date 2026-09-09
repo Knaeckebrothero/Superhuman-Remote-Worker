@@ -44,7 +44,10 @@ export class SessionListService {
         this._loading.set(false);
       },
       () => {
-        this._threads.set([]);
+        // Leave _threads untouched: a transient failure should not blank
+        // whatever was already on screen (or, for a first-ever load, it's
+        // already the empty initial value — either way there's nothing to
+        // clear here).
         this._loading.set(false);
       },
     );
