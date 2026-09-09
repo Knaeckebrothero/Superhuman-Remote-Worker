@@ -67,4 +67,25 @@ describe('SidebarComponent mode switcher', () => {
     expect(create({url: '/sessions/abc'}).component.mode()).toBe('chat');
     expect(create({url: '/'}).component.mode()).toBe('chat');
   });
+
+  // Allowlist, not a fallback: fix round 1. mode() used to default to 'chat'
+  // for anything unmatched, which lit the Chat tab on /experts, /admin/*,
+  // /settings, etc. — routes that have no mode of their own and are reached
+  // via the More/avatar menus (Task 8). Those routes must light no tab.
+  it('lights no tab for routes outside the three modes', () => {
+    expect(create({url: '/experts'}).component.mode()).toBeNull();
+    expect(create({url: '/admin/models'}).component.mode()).toBeNull();
+    expect(create({url: '/settings'}).component.mode()).toBeNull();
+  });
+
+  it('treats the landing page as chat even with a query string', () => {
+    // router.url carries the query string and fragment; a naive `=== '/'`
+    // check breaks on '/?foo=bar' and would wrongly null out the tab on the
+    // landing page itself.
+    expect(create({url: '/?foo=bar'}).component.mode()).toBe('chat');
+  });
+
+  it('treats a session thread url as chat, using the id from the hijack test', () => {
+    expect(create({url: '/sessions/abc-123'}).component.mode()).toBe('chat');
+  });
 });

@@ -400,11 +400,19 @@ export class SidebarComponent {
   private readonly chatService = inject(PersistentChatService);
   readonly viewport = inject(ViewportService);
 
-  readonly mode = computed<RailMode>(() => {
-    const url = this.currentUrl();
-    if (url.startsWith('/jobs')) return 'jobs';
-    if (url.startsWith('/projects')) return 'projects';
-    return 'chat';
+  readonly mode = computed<RailMode | null>(() => {
+    // Allowlist, deliberately not a fallback: a route that is none of the three
+    // modes must light no tab, rather than defaulting to Chat and telling the
+    // user they are somewhere they are not. Routes outside these three
+    // (/experts, /settings, /admin/*, ...) are reached from the More and avatar
+    // menus and have no mode of their own.
+    // router.url carries the query string and fragment (e.g. '/?foo=bar') —
+    // strip both before matching, or the landing page itself falls through.
+    const path = this.currentUrl().split(/[?#]/)[0];
+    if (path === '/' || path.startsWith('/sessions')) return 'chat';
+    if (path.startsWith('/jobs')) return 'jobs';
+    if (path.startsWith('/projects')) return 'projects';
+    return null;
   });
 
   selectMode(mode: RailMode | null): void {
