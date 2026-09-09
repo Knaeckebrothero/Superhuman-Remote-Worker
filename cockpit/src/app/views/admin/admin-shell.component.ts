@@ -93,6 +93,39 @@ import {AppIconComponent} from '../../ui/icon';
       height: 100%;
       overflow: hidden;
     }
+
+    /* Regression, not a pre-existing gap: before this rail redesign, admin
+       pages got the full content width with the sub-nav as an overlay
+       drawer. .admin-sub's fixed 200px never got a mobile treatment of its
+       own, so a 412px viewport left ~212px for Users/Usage/Grants/Capacity —
+       all data tables. Stack instead: the sub-nav becomes a horizontally
+       scrollable strip above the body, which gets the full viewport width. */
+    @media (max-width: 768px) {
+      .admin-shell {
+        flex-direction: column;
+      }
+
+      .admin-sub {
+        width: auto;
+        flex-direction: row;
+        flex-shrink: 0;
+        padding: 8px;
+        overflow-x: auto;
+        overflow-y: visible;
+        border-right: none;
+        border-bottom: 1px solid var(--border-color);
+      }
+
+      .admin-sub-title {
+        flex-shrink: 0;
+        white-space: nowrap;
+        margin: 0 4px 0 0;
+      }
+
+      .admin-sub a {
+        flex-shrink: 0;
+      }
+    }
   `],
 })
 export class AdminShellComponent {
