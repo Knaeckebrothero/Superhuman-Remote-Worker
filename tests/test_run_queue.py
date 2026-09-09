@@ -131,6 +131,8 @@ MIGRATION_FILES = [
     _MIGRATIONS_DIR / "0128_thread_interrupt_receipt_idx.notx.sql",
     _MIGRATIONS_DIR / "0129_thread_interrupt_validate_constraints.sql",
     _MIGRATIONS_DIR / "0231_run_queue_park_lifecycle.sql",
+    _MIGRATIONS_DIR / "0232_thread_cloud_sync_push_ownership.sql",
+    _MIGRATIONS_DIR / "0233_run_queue_bg_tasks.sql",
 ]
 
 SESSION = UNIT_KIND_SESSION_TURN
@@ -219,7 +221,11 @@ async def _apply_schema() -> None:
             "delivery_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(), "
             "thread_id UUID, message_id UUID, "
             "execution_lane TEXT NOT NULL DEFAULT 'pinned', "
-            "state TEXT NOT NULL DEFAULT 'persisted'"
+            "state TEXT NOT NULL DEFAULT 'persisted', "
+            # 0191 adds this; the suite replays only the queue-shaping
+            # migrations, so the stub has to carry it. _COMPLETE_SQL
+            # reads delivery.owner_run_queue_lease_token.
+            "owner_run_queue_lease_token BIGINT"
             ")"
         )
         for migration in MIGRATION_FILES:
