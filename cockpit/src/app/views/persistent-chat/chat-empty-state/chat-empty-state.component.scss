@@ -17,27 +17,32 @@
 .empty-inner {
   text-align: center;
   max-width: 850px;
-  padding: 72px 48px;
+
+  /* was: 72px 48px — fixed 144px of vertical padding on a 709px phone scrollport */
+  padding: clamp(20px, 5vh, 72px) clamp(16px, 5vw, 48px);
   display: flex;
   flex-direction: column;
   align-items: center;
 }
 
 .empty-mark {
-  width: 144px;
-  height: 144px;
-  margin-bottom: 30px;
+  /* was: 144px square + 30px margin, unchanged on any screen */
+  width: clamp(72px, 14vh, 144px);
+  height: clamp(72px, 14vh, 144px);
+  margin-bottom: clamp(12px, 3vh, 30px);
   opacity: 0.95;
 }
 
 .empty-title {
   font-family: var(--font-display, inherit);
-  font-size: 32px;
+
+  /* was: 32px — wraps to four lines at phone width */
+  font-size: clamp(22px, 4.5vw, 32px);
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.06em;
   color: var(--text-primary);
-  margin: 0 0 16px;
+  margin: 0 0 clamp(8px, 2vh, 16px);
   line-height: 1.15;
 }
 
@@ -45,7 +50,9 @@
   font-size: 17px;
   line-height: 1.55;
   color: var(--text-muted);
-  margin: 0 0 38px;
+
+  /* was: 38px */
+  margin: 0 0 clamp(16px, 3vh, 38px);
   max-width: 620px;
 }
 
@@ -54,14 +61,18 @@
   grid-template-columns: 1fr 1fr;
   gap: 10px;
   width: 100%;
-  max-width: 760px;
+
+  /* was: 760px — never reached; the 700px reading column caps it first */
+  max-width: 100%;
 }
 
 .suggestion-chip {
   display: inline-flex;
   align-items: center;
   gap: 10px;
-  padding: 16px 22px;
+
+  /* was: 16px 22px */
+  padding: clamp(10px, 1.6vh, 16px) 22px;
   background: var(--surface-0);
   border: 1px solid var(--border-color, var(--surface-0));
   color: var(--text-secondary);
@@ -95,11 +106,24 @@
   }
 }
 
+/* The clamps above close most of the phone/short-laptop overflow, but not
+   all of it: two full rows of chips is still more vertical budget than a
+   709px (phone) or 494px scrollport has room for. 950px covers both
+   (915px phone, 700px short-laptop) without touching the 1000px desktop
+   viewport, which already fits all 4. Cut to 2 chips instead of shrinking
+   type further. */
+@media (max-height: 950px) {
+  .suggestion-chip:nth-child(n + 3) {
+    display: none;
+  }
+}
+
 /* `draft`-variant only from here down: the connectors control and the
    advanced-options link, gated on variant() === 'draft' in the template. */
 
 .draft-advanced {
-  margin-top: 26px;
+  /* was: 26px */
+  margin-top: clamp(12px, 2.5vh, 26px);
   font-size: 14px;
   color: var(--text-muted);
   text-decoration: underline;
