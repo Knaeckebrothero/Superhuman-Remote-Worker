@@ -4,6 +4,7 @@ import {HttpClient, HttpErrorResponse} from '@angular/common/http';
 import {Router} from '@angular/router';
 import {of, throwError} from 'rxjs';
 import {SessionsPageComponent} from './sessions-page.component';
+import {SessionListService} from '../../core/services/session-list.service';
 import {TranslocoService} from '@jsverse/transloco';
 import {PersistentChatService} from '../../core/services/persistent-chat.service';
 import {ModelService} from '../../core/services/model.service';
@@ -80,6 +81,11 @@ function createComponent() {
             {provide: SettingsService, useValue: mockSettings},
             {provide: ModelService, useValue: mockModelService},
             {provide: TranslocoService, useValue: {translate: (key: string) => key, getActiveLang: () => 'en'}},
+            // Real service, not a hand-rolled mock: it has no logic of its own
+            // worth stubbing, and wiring it for real here means it resolves
+            // against the same mockHttp above — every existing assertion on
+            // mockHttp.get keeps working unchanged.
+            SessionListService,
         ],
     });
 
