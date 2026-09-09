@@ -1680,6 +1680,7 @@
       "citationsButton": "Citations",
       "citationsTooltip": "Show this session's citations",
       "moreActions": "More actions",
+      "copySessionId": "Copy session ID {{id}}",
       "disconnect": "Disconnect",
       "disconnecting": "Disconnecting…",
       "projectFilesButton": "Project files",

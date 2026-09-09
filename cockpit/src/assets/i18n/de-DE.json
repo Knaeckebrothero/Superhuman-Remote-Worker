@@ -1680,6 +1680,7 @@
       "citationsButton": "Quellen",
       "citationsTooltip": "Quellen dieser Sitzung anzeigen",
       "moreActions": "Weitere Aktionen",
+      "copySessionId": "Sitzungs-ID {{id}} kopieren",
       "disconnect": "Trennen",
       "disconnecting": "Wird getrennt…",
       "projectFilesButton": "Projektdateien",

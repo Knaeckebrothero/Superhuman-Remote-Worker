@@ -92,6 +92,7 @@ import {JobBatchCardComponent} from '../../ui/tool-card/job-batch-card.component
 import {AppReadAloudComponent} from '../../ui/read-aloud';
 import {AppInlineEditableTextComponent} from '../../ui/inline-editable-text';
 import {AppToastService} from '../../ui/toast';
+import {copyText} from '../../ui/copy-field';
 import {queueParkReasonKey} from '../../core/models/queue-park-reason';
 import {ErrorMessageService} from '../../core/services/error-message.service';
 import {ExternalImageDirective} from '../../ui/external-image';
@@ -988,6 +989,9 @@ export function clearDraft(threadId: string | null): void {
               <app-icon size="sm">more_vert</app-icon>
             </app-icon-button>
             <app-menu #headerMenu>
+              @if (chat.threadId(); as tid) {
+                <app-menu-item (activated)="copyThreadId()">{{ 'chat.header.copySessionId' | transloco:{ id: tid.slice(0, 8) } }}</app-menu-item>
+              }
               <app-menu-item (activated)="settingsRequested.emit(undefined)">{{ 'chat.header.settingsTooltip' | transloco }}</app-menu-item>
               <app-menu-item (activated)="showViewMenu.update(v => !v)">{{ 'chat.header.viewMenuTooltip' | transloco }}</app-menu-item>
               @if (chat.citationsByCid().size > 0) {
@@ -3975,6 +3979,18 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
             await this.chat.renameThread(threadId, title);
         } catch (e) {
             this.toast.danger(this.errors.translate(e, 'errors.sessions.renameFailed'));
+        }
+    }
+
+    /** ⋮ menu "Copy session ID …" row. Spec §6: the id is a debugging
+     *  affordance, not wayfinding, so it lives behind the overflow menu
+     *  instead of costing a permanent header chip — but it copies the full
+     *  id, not the truncated one the menu label shows. */
+    async copyThreadId(): Promise<void> {
+        const threadId = this.chat.threadId();
+        if (!threadId) return;
+        if (await copyText(threadId)) {
+            this.toast.success(this.transloco.translate('common.copied'));
         }
     }
 
