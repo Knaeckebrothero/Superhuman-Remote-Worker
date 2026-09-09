@@ -948,6 +948,17 @@ export function clearDraft(threadId: string | null): void {
           <span class="status-announce">{{ connectionLabel() }}</span>
 
           @if (chat.isConnected()) {
+            <!-- Danger first, deliberately: app-badge is flex-shrink:0 +
+                 white-space:nowrap and .header-left has no overflow
+                 fallback, so under width pressure the title ellipsizes to
+                 nothing and then the LAST badges clip silently. A degraded
+                 cloud sync (the user's files may not be saving) must never
+                 be the one that clips. -->
+            @if (chat.cloudSyncDegraded()) {
+              <app-badge tone="danger" size="sm" [title]="'chat.status.cloudSyncOffTooltip' | transloco">
+                {{ 'chat.status.cloudSyncOff' | transloco }}
+              </app-badge>
+            }
             @if (chat.modelName()) {
               <app-badge tone="accent" size="sm" role="button" tabindex="0"
                          [title]="'chat.header.settingsTooltip' | transloco"
@@ -966,11 +977,6 @@ export function clearDraft(threadId: string | null): void {
             }
             @if (chat.compaction(); as comp) {
               <app-badge tone="warning" size="sm">{{ 'chat.compactionLive.footer' | transloco:{ current: comp.currentPass > 0 ? comp.currentPass : 1, total: comp.nPasses, elapsed: compactionElapsed() } }}</app-badge>
-            }
-            @if (chat.cloudSyncDegraded()) {
-              <app-badge tone="danger" size="sm" [title]="'chat.status.cloudSyncOffTooltip' | transloco">
-                {{ 'chat.status.cloudSyncOff' | transloco }}
-              </app-badge>
             }
           }
         </div>
