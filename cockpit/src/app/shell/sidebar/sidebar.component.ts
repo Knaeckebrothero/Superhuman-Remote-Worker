@@ -42,6 +42,7 @@ const MODE_ROUTES: Record<RailMode, string> = {
         <button class="collapse-btn" (click)="sidebar.collapse()" [title]="'nav.collapseSidebar' | transloco">
           <app-icon size="md" class="collapse-icon">chevron_left</app-icon>
         </button>
+        <app-notification-bell />
       </div>
 
       <div class="sidebar-body">
@@ -115,7 +116,6 @@ const MODE_ROUTES: Record<RailMode, string> = {
       </div>
 
       <div class="sidebar-footer">
-        <app-notification-bell />
         <app-rail-more-menu />
         <div class="rail-divider"></div>
         <app-rail-account-menu />
@@ -382,15 +382,6 @@ const MODE_ROUTES: Record<RailMode, string> = {
         flex-direction: column;
         gap: 8px;
         flex-shrink: 0;
-      }
-
-      /* Everything else in this column stretches full-width by default (flex
-         column + the default align-items: stretch). The bell keeps its own
-         icon-sized footprint instead, so its unread badge — positioned via
-         the bell's own :host box — stays pinned to the icon rather than
-         drifting toward the far edge of the rail. */
-      .sidebar-footer app-notification-bell {
-        align-self: flex-start;
       }
 
       .rail-divider {
