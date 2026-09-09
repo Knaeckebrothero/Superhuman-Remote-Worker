@@ -56,13 +56,16 @@ const MODE_ROUTES: Record<RailMode, string> = {
           <app-icon size="md">edit_square</app-icon> {{ 'nav.newChat' | transloco }}
         </a>
 
-        <label class="rail-search">
-          <app-icon size="md">search</app-icon>
-          <input #filterInput type="search" [value]="filterText()"
-                 (input)="filterText.set($any($event.target).value)"
-                 [placeholder]="'nav.searchSessions' | transloco">
-          <kbd>⌘K</kbd>
-        </label>
+        @if (showFilter()) {
+          <label class="rail-search">
+            <app-icon size="md">search</app-icon>
+            <input #filterInput type="search" [value]="filterText()"
+                   (input)="filterText.set($any($event.target).value)"
+                   [placeholder]="'nav.searchSessions' | transloco"
+                   [attr.aria-label]="'nav.searchSessions' | transloco">
+            <kbd aria-hidden="true">⌘K</kbd>
+          </label>
+        }
 
         @for (group of sessionGroups(); track group.label) {
           <div class="rail-group">{{ ('nav.recency.' + group.label) | transloco }}</div>
@@ -499,6 +502,17 @@ export class SidebarComponent {
 
   readonly filterText = signal('');
 
+  // Fix round 1: the filter box is a control over the session list, not a
+  // create action like "New chat" — a control over a list that isn't on
+  // screen is noise, so it renders in chat mode only. Deliberately
+  // `=== 'chat'`, not `!== 'jobs'`, for the same allowlist reason as
+  // sessionGroups() below: mode() returns null outside the three modes
+  // (/admin/*, /experts, /settings, ...), and a negated rewrite would show
+  // the box there too. Kept separate from sessionGroups() rather than
+  // derived from `sessionGroups().length > 0` — a search with zero matches
+  // must still show the (now empty) box so the user can see and clear it.
+  readonly showFilter = computed(() => this.mode() === 'chat');
+
   // Null, same as 'jobs'/'projects': outside chat mode the rail shows no
   // session groups at all (see the mode() allowlist above). Deliberately
   // `=== 'chat'`, not `!== 'jobs'` — mode() is an allowlist that returns
@@ -513,10 +527,18 @@ export class SidebarComponent {
       .filter((g) => g.threads.length > 0);
   });
 
-  // Static: this repo's vitest JIT pipeline never resolves signal-based
-  // viewChild() queries (see multi-select.component.ts), while decorator
-  // queries resolve under both JIT and AOT.
-  @ViewChild('filterInput', {static: true}) private readonly filterInput?: ElementRef<HTMLInputElement>;
+  // Not `{static: true}`: the filter now only exists in the DOM in chat mode
+  // (the @if in the template using showFilter() above), so this must be a
+  // dynamic query that re-resolves as mode() changes — a static query
+  // resolves once, before the first change detection, and would stay
+  // undefined forever if the component happened to construct outside chat
+  // mode. A decorator query is still used rather than the signal-based
+  // viewChild() function: this repo's vitest JIT pipeline never resolves
+  // those (see multi-select.component.ts), while decorator queries resolve
+  // under both JIT and AOT — moot for this component's own spec (it never
+  // renders the template at all) but kept for consistency with the rest of
+  // the codebase.
+  @ViewChild('filterInput') private readonly filterInput?: ElementRef<HTMLInputElement>;
 
   // ⌘K/Ctrl+K focuses the rail filter. Temporary key ownership: the command
   // palette (knowledge-base/knowledge/features/command_palette.md) will
@@ -524,10 +546,13 @@ export class SidebarComponent {
   // and the <kbd> hint — the filter itself stays.
   @HostListener('window:keydown', ['$event'])
   onKeydown(event: KeyboardEvent): void {
-    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
-      event.preventDefault();
-      this.filterInput?.nativeElement.focus();
-    }
+    if (!(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== 'k') return;
+    // Outside chat mode filterInput is undefined (see the dynamic-query note
+    // above) — leave the browser's own Ctrl+K alone rather than pre-empting
+    // it for a control that isn't on screen to focus.
+    if (!this.filterInput) return;
+    event.preventDefault();
+    this.filterInput.nativeElement.focus();
   }
 
   selectMode(mode: RailMode | null): void {

@@ -212,4 +212,16 @@ describe('SidebarComponent session filter', () => {
     component.filterText.set('nothing matches this');
     expect(component.sessionGroups()).toEqual([]);
   });
+
+  // Fix round 1: the filter box itself must not render outside chat mode —
+  // it offers to search a list that isn't on screen there. Same allowlist
+  // trap as sessionGroups() and the NavigationEnd refresh gate: a `!==
+  // 'jobs'` rewrite would also show the box on /admin/users.
+  it('shows the rail filter only in chat mode', () => {
+    expect(create({url: '/'}).component.showFilter()).toBe(true);
+    expect(create({url: '/sessions/abc'}).component.showFilter()).toBe(true);
+    expect(create({url: '/jobs'}).component.showFilter()).toBe(false);
+    expect(create({url: '/projects'}).component.showFilter()).toBe(false);
+    expect(create({url: '/admin/users'}).component.showFilter()).toBe(false);
+  });
 });
