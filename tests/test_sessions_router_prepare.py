@@ -1549,6 +1549,13 @@ def test_connection_reports_stateless_ready_without_a_socket(monkeypatch):
             "mode.set": "rest",
             "narration.set": "rest",
         },
+        # The run-queue lifecycle block rides the connection payload so a
+        # reload can re-derive a queued or parked turn.  This fake serves no
+        # connection, so the read degrades to None -- which is exactly the
+        # contract: a queue read that fails never withholds readiness.  The
+        # block's own shape and both degrade paths are covered by
+        # test_thread_queue_endpoints.py::test_connection_queue_block_reads_and_degrades.
+        "queue": None,
     }
     fake_db.get_pinned_session_binding.assert_not_awaited()
 
