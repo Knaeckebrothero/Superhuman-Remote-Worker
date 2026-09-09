@@ -166,6 +166,7 @@ async def _apply_schema() -> None:
         await conn.execute("DROP TABLE IF EXISTS thread_events CASCADE")
         await conn.execute("DROP TABLE IF EXISTS thread_control_requests CASCADE")
         await conn.execute("DROP TABLE IF EXISTS thread_interrupt_requests CASCADE")
+        await conn.execute("DROP TABLE IF EXISTS run_queue_bg_tasks CASCADE")
         await conn.execute("DROP TABLE IF EXISTS run_queue CASCADE")
         await conn.execute("DROP TABLE IF EXISTS canvases CASCADE")
         await conn.execute("DROP TABLE IF EXISTS thread_input_deliveries CASCADE")
@@ -193,7 +194,17 @@ async def _apply_schema() -> None:
             "total_turns INTEGER NOT NULL DEFAULT 0, "
             "awaiting_user_since TIMESTAMPTZ, "
             "extend_count INTEGER NOT NULL DEFAULT 0, "
-            "last_activity TIMESTAMPTZ NOT NULL DEFAULT now()"
+            "last_activity TIMESTAMPTZ NOT NULL DEFAULT now(), "
+            # 0185 gave a pinned thread its runtime authority triple and
+            # the control-inbox fences read all three: adoption and
+            # finalization both require the request's generation to match
+            # the thread's, with no retirement token, on top of the
+            # reciprocal agents.thread_id binding. The queue-shaping
+            # migrations this suite replays do not include 0185, so the
+            # stub carries them the same way it carries 0191's column.
+            "runtime_generation UUID, "
+            "runtime_attach_token UUID, "
+            "runtime_retirement_token UUID"
             ")"
         )
         await conn.execute(
@@ -235,6 +246,12 @@ async def _apply_schema() -> None:
         await conn.execute(
             "ALTER TABLE run_queue "
             "ADD COLUMN IF NOT EXISTS input_delivery_capable_lease_token BIGINT"
+        )
+        # Same reason: 0185 adds this to thread_control_requests and
+        # finalize/adopt both compare it against threads.runtime_generation.
+        await conn.execute(
+            "ALTER TABLE thread_control_requests "
+            "ADD COLUMN IF NOT EXISTS runtime_generation UUID"
         )
     finally:
         await conn.close()
@@ -1575,6 +1592,11 @@ class TestControlFinalization:
         new_agent = uuid4()
         request_id = uuid4()
         client_request_id = uuid4()
+        # One runtime incarnation, shared by the thread and the request. The
+        # fence compares the two, so a request minted under a different
+        # generation is not adoptable by the current owner at all -- which is
+        # the property being exercised here, not an incidental fixture value.
+        generation = uuid4()
         await conn.execute(
             "INSERT INTO agents (id, thread_id) VALUES ($1, $2), ($3, $2)",
             old_agent,
@@ -1582,22 +1604,24 @@ class TestControlFinalization:
             new_agent,
         )
         await conn.execute(
-            "INSERT INTO threads (id, user_id, agent_id, execution_lane) "
-            "VALUES ($1, $2, $3, 'pinned')",
+            "INSERT INTO threads (id, user_id, agent_id, execution_lane, "
+            "runtime_generation) VALUES ($1, $2, $3, 'pinned', $4)",
             thread_id,
             owner_id,
             new_agent,
+            generation,
         )
         await conn.execute(
             "INSERT INTO thread_control_requests ("
             "id, thread_id, request_seq, client_request_id, verb, payload, "
-            "requested_by, accepted_agent_id"
-            ") VALUES ($1, $2, 1, $3, 'narration.set', $4::jsonb, 'owner', $5)",
+            "requested_by, accepted_agent_id, runtime_generation"
+            ") VALUES ($1, $2, 1, $3, 'narration.set', $4::jsonb, 'owner', $5, $6)",
             request_id,
             thread_id,
             client_request_id,
             '{"mode":"silent"}',
             old_agent,
+            generation,
         )
         await conn.execute(
             "INSERT INTO thread_events ("
@@ -1621,6 +1645,7 @@ class TestControlFinalization:
                 conn,
                 request_id=request_id,
                 agent_id=old_agent,
+                runtime_generation=generation,
             )
         assert result == "lost_owner"
         assert (
@@ -1639,6 +1664,7 @@ class TestControlFinalization:
                 conn,
                 request_id=request_id,
                 agent_id=new_agent,
+                runtime_generation=generation,
             )
         assert result == "applied"
         terminal = await conn.fetchrow(
@@ -1667,22 +1693,24 @@ class TestControlFinalization:
             thread_id,
             new_agent,
         )
+        generation = uuid4()
         await conn.execute(
-            "INSERT INTO threads (id, user_id, agent_id, execution_lane) "
-            "VALUES ($1, $2, $3, 'pinned')",
+            "INSERT INTO threads (id, user_id, agent_id, execution_lane, "
+            "runtime_generation) VALUES ($1, $2, $3, 'pinned', $4)",
             thread_id,
             owner_id,
             new_agent,
+            generation,
         )
         first_id = uuid4()
         second_id = uuid4()
         await conn.execute(
             "INSERT INTO thread_control_requests ("
             "id, thread_id, request_seq, client_request_id, verb, payload, "
-            "requested_by, accepted_agent_id"
+            "requested_by, accepted_agent_id, runtime_generation"
             ") VALUES "
-            "($1, $3, 1, $4, 'mode.set', $5::jsonb, 'owner', $6), "
-            "($2, $3, 2, $7, 'narration.set', $8::jsonb, 'owner', $9)",
+            "($1, $3, 1, $4, 'mode.set', $5::jsonb, 'owner', $6, $10), "
+            "($2, $3, 2, $7, 'narration.set', $8::jsonb, 'owner', $9, $10)",
             first_id,
             second_id,
             thread_id,
@@ -1692,22 +1720,32 @@ class TestControlFinalization:
             uuid4(),
             '{"mode":"silent"}',
             new_agent,
+            generation,
         )
 
         # Global order wins over per-agent filtering: seq2 is not visible
         # while the older handoff request still belongs to the dead owner.
         assert (
             await fetch_next_control_request(
-                conn, thread_id=thread_id, agent_id=new_agent
+                conn,
+                thread_id=thread_id,
+                agent_id=new_agent,
+                runtime_generation=generation,
             )
             is None
         )
         async with conn.transaction():
             assert await adopt_next_pinned_control_request(
-                conn, thread_id=thread_id, agent_id=new_agent
+                conn,
+                thread_id=thread_id,
+                agent_id=new_agent,
+                runtime_generation=generation,
             )
         first = await fetch_next_control_request(
-            conn, thread_id=thread_id, agent_id=new_agent
+            conn,
+            thread_id=thread_id,
+            agent_id=new_agent,
+            runtime_generation=generation,
         )
         assert first is not None
         assert first.id == first_id
