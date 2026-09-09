@@ -24,6 +24,11 @@ import { AppIconComponent } from '../../ui/icon';
     :host {
       position: relative;
       display: inline-flex;
+      /* Fixed-size icon control: never let the rail header's flexbox shrink
+         this to make room for a sibling (that's what happened before Task
+         10's fix round 1 — the collapse button absorbed the whole deficit
+         because nothing in the row opted out of default flex-shrink: 1). */
+      flex: none;
     }
 
     .bell-btn {

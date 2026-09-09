@@ -148,8 +148,23 @@ const MODE_ROUTES: Record<RailMode, string> = {
       .sidebar-header {
         display: flex;
         align-items: center;
-        gap: 8px;
-        padding: 16px;
+        /* 6px, not 8px: the row now holds three items instead of two (Task
+           10 fix round 1), and the two fixed-size icon controls
+           (.collapse-btn, the notification bell) are flex: none — they no
+           longer absorb a tight fit by shrinking, so the space this row was
+           short on desktop has to come from chrome instead. Combined with
+           the padding trim below, this leaves ~6px of real slack rather
+           than an exact, zero-margin fit — measured in a real browser
+           against the compiled CSS (see task-10-report.md fix round 1).
+           A hairline fit was reachable with padding alone, but --font-display
+           has a 4-deep fallback chain (Cinzel → Cormorant Garamond → Times
+           New Roman → serif) and font-display: swap, so the brand text's
+           actual width can shift slightly if the primary webfont hasn't
+           loaded yet — a razor's-edge fit isn't worth it for ~2px. */
+        gap: 6px;
+        /* 16px 12px, not a flat 16px: horizontal only, so row height
+           (vertical rhythm) is unchanged. */
+        padding: 16px 12px;
         border-bottom: 1px solid var(--border-color);
         flex-shrink: 0;
       }
@@ -186,6 +201,11 @@ const MODE_ROUTES: Record<RailMode, string> = {
 
       .collapse-btn {
         margin-left: auto;
+        /* Fixed-size icon control: never let the header's flexbox shrink
+           this to make room for a sibling. Task 10 fix round 1 — before
+           this, default flex-shrink: 1 (no flex shorthand here) let the
+           row squeeze this to ~22x28 once the bell became a third sibling. */
+        flex: none;
         display: flex;
         align-items: center;
         justify-content: center;
