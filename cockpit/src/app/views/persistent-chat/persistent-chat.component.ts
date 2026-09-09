@@ -3757,6 +3757,10 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
 
     pickSuggestion(s: DisplayedSuggestion): void {
         this.inputText = s.text;
+        // inputText is a plain ngModel field, so this assignment fires no
+        // ngModelChange and onInputChange never runs — the draft must be saved by
+        // hand or a reload eats it. Same hazard denyOffer() documents below.
+        saveDraft(this.chat.threadId(), this.inputText);
         setTimeout(() => {
             this.inputEl?.nativeElement?.focus();
             this.autoResizeInput();
