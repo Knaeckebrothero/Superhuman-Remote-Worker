@@ -86,17 +86,7 @@
         overflow: hidden;
       }
 
-      .back-link {
-        display: flex;
-        align-items: center;
-        color: var(--text-muted);
-        text-decoration: none;
-        margin-right: 4px;
-      }
-
-      .back-link:hover { color: var(--text-primary); }
-
-      .header-icon, .error-icon {
+      .error-icon {
         color: var(--accent-color);
       }
 
@@ -108,12 +98,6 @@
         overflow: hidden;
         text-overflow: ellipsis;
         min-width: 0;
-      }
-
-      .header-session-id {
-        font-family: var(--font-mono, monospace);
-        font-size: 11px;
-        color: var(--text-muted);
       }
 
       .status-dot {
@@ -131,27 +115,6 @@
       @keyframes pulse {
         0%, 100% { opacity: 1; }
         50% { opacity: 0.4; }
-      }
-
-      .status-label {
-        font-size: 11px;
-        color: var(--text-muted);
-      }
-
-      /* Status bar */
-
-      .status-bar {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        padding: 4px 16px;
-        border-bottom: 1px solid var(--border-color, var(--surface-0));
-        background: var(--panel-bg);
-        flex-shrink: 0;
-      }
-
-      .status-bar > app-badge {
-        flex-shrink: 0;
       }
 
       /* Task bar */
@@ -216,22 +179,6 @@
         align-items: center;
         gap: 8px;
         flex: 0 0 auto;
-      }
-
-      .settings-btn {
-        display: flex;
-        align-items: center;
-        padding: 4px 8px;
-        border-radius: var(--radius-control);
-        border: 1px solid var(--border-color, var(--surface-0));
-        background: transparent;
-        color: var(--text-muted);
-        cursor: pointer;
-        transition: all 0.15s ease;
-      }
-      .settings-btn:hover, .settings-btn.active {
-        color: var(--accent-color);
-        border-color: var(--accent-color);
       }
 
       .settings-panel {
@@ -2355,8 +2302,8 @@
           padding: 6px 8px;
         }
 
-        /* Let the title take the available width on one line (it was wrapping
-           to ~3 lines). The 8-char session id is redundant on a phone. */
+        /* Let the title take the available width on one line (it was
+           wrapping to ~3 lines). */
         .header-left {
           flex: 1;
           min-width: 0;
@@ -2367,31 +2314,8 @@
           min-width: 0;
         }
 
-        .header-session-id {
-          display: none;
-        }
-
-        /* The dot alone carries connection state; the text label is what
-           pushed the header buttons into each other on a phone. */
-        .status-label {
-          display: none;
-        }
-
-        /* Decorative — the title needs those pixels more. */
-        .header-icon {
-          display: none;
-        }
-
         .header-right {
           flex-shrink: 0;
-        }
-
-        /* Badges (model · turn · mode …) keep their width; scroll instead of
-           spilling out of the viewport. */
-        .status-bar {
-          overflow-x: auto;
-          scrollbar-width: none;
-          &::-webkit-scrollbar { display: none; }
         }
 
         .messages {

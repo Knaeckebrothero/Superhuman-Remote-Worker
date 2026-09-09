@@ -21,7 +21,7 @@ import {
 import {DatePipe, NgTemplateOutlet, TitleCasePipe} from '@angular/common';
 import {HttpClient} from '@angular/common/http';
 import {FormsModule} from '@angular/forms';
-import {Router, RouterLink} from '@angular/router';
+import {Router} from '@angular/router';
 import {firstValueFrom, Subscription} from 'rxjs';
 import {MarkdownComponent} from 'ngx-markdown';
 import {CitationRefDirective} from '../../core/markdown/citation-ref.directive';
@@ -887,7 +887,6 @@ export function clearDraft(threadId: string | null): void {
         NgTemplateOutlet,
         TitleCasePipe,
         DatePipe,
-        RouterLink,
         MarkdownComponent,
         ExternalImageDirective,
         CitationRefDirective,
@@ -932,10 +931,6 @@ export function clearDraft(threadId: string | null): void {
       <div class="chat-header" #chatHeaderEl>
         <div class="header-left">
           <app-sidebar-toggle />
-          <a class="back-link" routerLink="/sessions">
-            <app-icon size="md" class="back-icon">arrow_back</app-icon>
-          </a>
-          <app-icon size="md" class="header-icon">smart_toy</app-icon>
           <span class="header-title">
             @if (chat.threadId(); as tid) {
               <app-inline-editable-text
@@ -948,119 +943,76 @@ export function clearDraft(threadId: string | null): void {
               {{ chat.sessionTitle() || ('chat.defaultTitle' | transloco) }}
             }
           </span>
-          @if (chat.threadId(); as tid) {
-            <span class="header-session-id" title="Session ID">{{ tid.slice(0, 8) }}</span>
-          }
-          <span class="status-dot" [class]="connectionClass()"
-                [title]="headerCompact() ? connectionLabel() : null"></span>
-          @if (!headerCompact()) {
-            <span class="status-label">{{ connectionLabel() }}</span>
+          <span class="status-dot" [class]="connectionClass()" [title]="connectionLabel()"></span>
+
+          @if (chat.isConnected()) {
+            @if (chat.modelName()) {
+              <app-badge tone="accent" size="sm" role="button" tabindex="0"
+                         [title]="'chat.header.settingsTooltip' | transloco"
+                         (click)="settingsRequested.emit('model')"
+                         (keydown.enter)="settingsRequested.emit('model')">{{ chat.modelName() }}</app-badge>
+            }
+            <app-badge tone="accent" size="sm" role="button" tabindex="0"
+                       [title]="'chat.header.settingsTooltip' | transloco"
+                       (click)="settingsRequested.emit(undefined)"
+                       (keydown.enter)="settingsRequested.emit(undefined)">{{ chat.permissionMode() | titlecase }}</app-badge>
+
+            <!-- Transient conditions: conditional and usually absent, so they cost
+                 nothing when nothing is wrong. -->
+            @if (chat.agentSilenceSeconds() >= 30 && !chat.compaction()) {
+              <app-badge tone="warning" size="sm">{{ 'chat.status.agentQuiet' | transloco:{ seconds: chat.agentSilenceSeconds() } }}</app-badge>
+            }
+            @if (chat.compaction(); as comp) {
+              <app-badge tone="warning" size="sm">{{ 'chat.compactionLive.footer' | transloco:{ current: comp.currentPass > 0 ? comp.currentPass : 1, total: comp.nPasses, elapsed: compactionElapsed() } }}</app-badge>
+            }
+            @if (chat.cloudSyncDegraded()) {
+              <app-badge tone="danger" size="sm" [title]="'chat.status.cloudSyncOffTooltip' | transloco">
+                {{ 'chat.status.cloudSyncOff' | transloco }}
+              </app-badge>
+            }
           }
         </div>
         <div class="header-right" #headerActionsEl>
           <ng-content select="[chatHeaderAction]" />
           @if (chat.isConnected()) {
-            @if (headerCompact()) {
-              <!-- Narrow header (mobile, or the canvas/settings pane eating the
-                   chat pane): fold the secondary controls into one overflow menu
-                   so the header stays a single row; Disconnect stays reachable. -->
-              <app-icon-button
-                size="sm"
-                [ariaLabel]="'chat.header.moreActions' | transloco"
-                [appMenuTrigger]="headerMenu"
-                menuPlacement="bottom-end"
-              >
-                <app-icon size="sm">more_vert</app-icon>
-              </app-icon-button>
-              <app-menu #headerMenu>
-                <app-menu-item (activated)="settingsRequested.emit(undefined)">{{ 'chat.header.settingsTooltip' | transloco }}</app-menu-item>
-                <app-menu-item (activated)="showViewMenu.update(v => !v)">{{ 'chat.header.viewMenuTooltip' | transloco }}</app-menu-item>
-                @if (chat.citationsByCid().size > 0) {
-                  <app-menu-item (activated)="showCitations.update(v => !v)">{{ 'chat.header.citationsButton' | transloco }}</app-menu-item>
-                }
-                @if (chat.verifiedProjectFolder()) {
-                  <app-menu-item (activated)="openProjectFiles()">{{ 'chat.header.projectFilesButton' | transloco }}</app-menu-item>
-                }
-                @if (chat.cloudSessionUrl() || chat.ncSessionFolder()) {
-                  <app-menu-item (activated)="openSessionFiles()">{{ sessionFilesLabelKey() | transloco }}</app-menu-item>
-                }
-                @if (ideStatus(); as ide) {
-                  @if (ide.gitea_url) {
-                    <app-menu-item (activated)="openIde(ide.gitea_url!)">{{ 'chat.header.gitButton' | transloco }}</app-menu-item>
-                  }
-                  @if (ide.status === 'active' && ide.code_server_url) {
-                    <app-menu-item (activated)="openCodeServer()">{{ 'chat.header.ideButton' | transloco }}</app-menu-item>
-                  } @else if (ide.status === 'restoring') {
-                    <app-menu-item [disabled]="true">{{ 'chat.header.ideLoadingTooltip' | transloco }}</app-menu-item>
-                  }
-                }
-                @if (sshButtonVisible()) {
-                  <app-menu-item (activated)="showSshPanel.update(v => !v)">{{ 'chat.header.sshButton' | transloco }}</app-menu-item>
-                }
-              </app-menu>
-            } @else {
-              <button class="settings-btn" (click)="settingsRequested.emit(undefined)"
-                      [title]="'chat.header.settingsTooltip' | transloco">
-                <app-icon size="sm" class="settings-icon">tune</app-icon>
-              </button>
-
-              <button class="settings-btn" (click)="showViewMenu.update(v => !v)"
-                      [class.active]="showViewMenu()" [title]="'chat.header.viewMenuTooltip' | transloco">
-                <app-icon size="sm" class="settings-icon">visibility</app-icon>
-              </button>
-
+            <!-- Secondary controls always fold into one overflow menu now
+                 (used to be conditional on headerCompact(), which survives
+                 for the ended-session buttons below). Disconnect stays its
+                 own visible button, not folded in. -->
+            <app-icon-button
+              size="sm"
+              [ariaLabel]="'chat.header.moreActions' | transloco"
+              [appMenuTrigger]="headerMenu"
+              menuPlacement="bottom-end"
+            >
+              <app-icon size="sm">more_vert</app-icon>
+            </app-icon-button>
+            <app-menu #headerMenu>
+              <app-menu-item (activated)="settingsRequested.emit(undefined)">{{ 'chat.header.settingsTooltip' | transloco }}</app-menu-item>
+              <app-menu-item (activated)="showViewMenu.update(v => !v)">{{ 'chat.header.viewMenuTooltip' | transloco }}</app-menu-item>
               @if (chat.citationsByCid().size > 0) {
-                <button class="settings-btn" (click)="showCitations.update(v => !v)"
-                        [class.active]="showCitations()" [title]="'chat.header.citationsTooltip' | transloco">
-                  <app-icon size="sm" class="settings-icon">format_quote</app-icon>
-                </button>
+                <app-menu-item (activated)="showCitations.update(v => !v)">{{ 'chat.header.citationsButton' | transloco }}</app-menu-item>
               }
-
-              <!-- PC-19. Two unambiguous actions, never one guess: the
-                   project folder the protected diff actually applies to, and
-                   the session scratch folder. The project action only exists
-                   once the mount has been cross-checked against the diff
-                   summary (chat.verifiedProjectFolder). -->
-              @if (chat.verifiedProjectFolder(); as folder) {
-                <button class="ide-btn" (click)="openProjectFiles()"
-                        [title]="'chat.header.projectFilesTooltip' | transloco:{ name: folder.name }">
-                  <app-icon size="sm" class="ide-icon">folder_shared</app-icon>
-                  {{ 'chat.header.projectFilesButton' | transloco }}
-                </button>
+              @if (chat.verifiedProjectFolder()) {
+                <app-menu-item (activated)="openProjectFiles()">{{ 'chat.header.projectFilesButton' | transloco }}</app-menu-item>
               }
               @if (chat.cloudSessionUrl() || chat.ncSessionFolder()) {
-                <button class="ide-btn" (click)="openSessionFiles()" [title]="'chat.header.filesTooltip' | transloco">
-                  <app-icon size="sm" class="ide-icon">cloud</app-icon>
-                  {{ sessionFilesLabelKey() | transloco }}
-                </button>
+                <app-menu-item (activated)="openSessionFiles()">{{ sessionFilesLabelKey() | transloco }}</app-menu-item>
               }
               @if (ideStatus(); as ide) {
                 @if (ide.gitea_url) {
-                  <button class="ide-btn gitea-btn" (click)="openIde(ide.gitea_url!)" [title]="'chat.header.gitTooltip' | transloco">
-                    <app-icon size="sm" class="ide-icon">history</app-icon>
-                    {{ 'chat.header.gitButton' | transloco }}
-                  </button>
+                  <app-menu-item (activated)="openIde(ide.gitea_url!)">{{ 'chat.header.gitButton' | transloco }}</app-menu-item>
                 }
                 @if (ide.status === 'active' && ide.code_server_url) {
-                  <button class="ide-btn" (click)="openCodeServer()" [title]="'chat.header.ideActiveTooltip' | transloco">
-                    <app-icon size="sm" class="ide-icon">code</app-icon>
-                    {{ 'chat.header.ideButton' | transloco }}
-                  </button>
+                  <app-menu-item (activated)="openCodeServer()">{{ 'chat.header.ideButton' | transloco }}</app-menu-item>
                 } @else if (ide.status === 'restoring') {
-                  <button class="ide-btn ide-loading" disabled [title]="'chat.header.ideLoadingTooltip' | transloco">
-                    <span class="ide-spinner"></span>
-                    {{ 'chat.header.ideButton' | transloco }}
-                  </button>
+                  <app-menu-item [disabled]="true">{{ 'chat.header.ideLoadingTooltip' | transloco }}</app-menu-item>
                 }
               }
               @if (sshButtonVisible()) {
-                <button class="ide-btn" (click)="showSshPanel.update(v => !v)"
-                        [title]="'chat.header.sshTooltip' | transloco">
-                  <app-icon size="sm" class="ide-icon">terminal</app-icon>
-                  {{ 'chat.header.sshButton' | transloco }}
-                </button>
+                <app-menu-item (activated)="showSshPanel.update(v => !v)">{{ 'chat.header.sshButton' | transloco }}</app-menu-item>
               }
-            }
+            </app-menu>
             <app-button variant="ghost" size="sm"
                         [loading]="isDisconnecting()"
                         [ariaLabel]="(isDisconnecting() ? 'chat.header.disconnecting' : 'chat.header.disconnect') | transloco"
@@ -1118,53 +1070,12 @@ export function clearDraft(threadId: string | null): void {
         </div>
       </div>
 
-      <!-- Status bar -->
-      @if (chat.isConnected()) {
-        <div class="status-bar">
-          @if (chat.modelName()) {
-            <app-badge tone="accent" size="sm" role="button" tabindex="0"
-                       [title]="'chat.header.settingsTooltip' | transloco"
-                       (click)="settingsRequested.emit('model')"
-                       (keydown.enter)="settingsRequested.emit('model')">{{ chat.modelName() }}</app-badge>
-          }
-          @if (chat.temperature()) {
-            <app-badge tone="neutral" size="sm" role="button" tabindex="0"
-                       [title]="'chat.header.settingsTooltip' | transloco"
-                       (click)="settingsRequested.emit('model')"
-                       (keydown.enter)="settingsRequested.emit('model')">{{ 'chat.status.temp' | transloco:{ value: chat.temperature() } }}</app-badge>
-          }
-          <app-badge tone="neutral" size="sm">{{ 'chat.status.turn' | transloco:{ count: chat.turnCount() } }}</app-badge>
-          @if (chat.agentSilenceSeconds() >= 30 && !chat.compaction()) {
-            <app-badge tone="warning" size="sm">{{ 'chat.status.agentQuiet' | transloco:{ seconds: chat.agentSilenceSeconds() } }}</app-badge>
-          }
-          @if (chat.compaction(); as comp) {
-            <app-badge tone="warning" size="sm">{{ 'chat.compactionLive.footer' | transloco:{ current: comp.currentPass > 0 ? comp.currentPass : 1, total: comp.nPasses, elapsed: compactionElapsed() } }}</app-badge>
-          }
-          @if (chat.cloudSyncDegraded()) {
-            <app-badge tone="danger" size="sm"
-                       [title]="'chat.status.cloudSyncOffTooltip' | transloco">
-              {{ 'chat.status.cloudSyncOff' | transloco }}
-            </app-badge>
-          }
-          <!-- The staged-cloud-changes entry point used to live here. It was
-               a passive-looking badge, keyboard-unreachable (role="button"
-               with no tabindex), and — fatally — inside this
-               isConnected()-gated bar, so an ended session could never reach
-               a genuine pending review (PC-23, PC-25). It is now
-               the cloud-review banner below, outside the gate. -->
-          <app-badge tone="accent" size="sm" role="button" tabindex="0"
-                     [title]="'chat.header.settingsTooltip' | transloco"
-                     (click)="settingsRequested.emit(undefined)"
-                     (keydown.enter)="settingsRequested.emit(undefined)">{{ chat.permissionMode() | titlecase }}</app-badge>
-        </div>
-      }
-
       <!-- Pending protected-cloud review. Deliberately OUTSIDE the
            isConnected() gate above: the review API serves ended threads on
            purpose, and gating the only entry point on the live agent turned a
            recoverable duplicate stage into a trap whose only exit was Resume
            (PC-25). Its own component so no rules land in
-           persistent-chat.component.scss, which is already 41kB of a 48kB
+           persistent-chat.component.scss, which is already 39.38kB of a 48kB
            anyComponentStyle error budget. -->
       <app-cloud-review-banner
         [protectedCloud]="chat.protectedCloud()"
