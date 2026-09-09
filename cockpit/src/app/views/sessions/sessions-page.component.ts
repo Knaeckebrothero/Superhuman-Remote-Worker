@@ -62,11 +62,6 @@ interface Project {
     <div class="sessions-page">
       <div class="page-header">
         <h2>{{ 'sessions.title' | transloco }}</h2>
-        <div class="header-actions">
-          <app-button variant="primary" size="sm" (clicked)="goToCreate()">
-            <app-icon size="sm">add</app-icon> {{ 'sessions.newSession' | transloco }}
-          </app-button>
-        </div>
       </div>
 
       <!-- Active session banner (hidden when filtering to ended sessions) -->
@@ -310,11 +305,6 @@ interface Project {
       font-weight: 600;
       color: var(--text-primary, var(--text-primary));
       margin: 0;
-    }
-
-    .header-actions {
-      display: flex;
-      gap: 8px;
     }
 
     /* Active session banner */
@@ -861,10 +851,6 @@ export class SessionsPageComponent implements OnInit {
         } catch (e2: any) {
             this.toast.danger(this.errors.translate(e2, 'errors.sessions.deleteFailed'));
         }
-    }
-
-    goToCreate(): void {
-        this.router.navigate(['/sessions/new']);
     }
 
     goToDraft(): void {

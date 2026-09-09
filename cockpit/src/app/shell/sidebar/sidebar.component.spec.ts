@@ -185,3 +185,31 @@ describe('SidebarComponent session list', () => {
     expect(sessions.refresh).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('SidebarComponent session filter', () => {
+  it('filters the session list case-insensitively', () => {
+    const {component} = create({url: '/', threads: [
+      {id: 'a', title: 'Comparing take-home pay', last_activity: new Date().toISOString()},
+      {id: 'b', title: 'Kubernetes manifest review', last_activity: new Date().toISOString()},
+    ]});
+    component.filterText.set('TAKE-HOME');
+    expect(component.sessionGroups()[0].threads.map((t) => t.id)).toEqual(['a']);
+  });
+
+  it('an empty filter shows every session', () => {
+    const {component} = create({url: '/', threads: [
+      {id: 'a', title: 'Comparing take-home pay', last_activity: new Date().toISOString()},
+      {id: 'b', title: 'Kubernetes manifest review', last_activity: new Date().toISOString()},
+    ]});
+    component.filterText.set('');
+    expect(component.sessionGroups()[0].threads).toHaveLength(2);
+  });
+
+  it('drops a group whose every thread was filtered out', () => {
+    const {component} = create({url: '/', threads: [
+      {id: 'a', title: 'Comparing take-home pay', last_activity: new Date().toISOString()},
+    ]});
+    component.filterText.set('nothing matches this');
+    expect(component.sessionGroups()).toEqual([]);
+  });
+});

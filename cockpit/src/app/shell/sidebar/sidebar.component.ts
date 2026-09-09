@@ -1,4 +1,4 @@
-import {Component, computed, inject, signal} from '@angular/core';
+import {Component, computed, ElementRef, HostListener, inject, signal, ViewChild} from '@angular/core';
 import {NavigationEnd, Router, RouterLink, RouterLinkActive} from '@angular/router';
 import {takeUntilDestroyed, toSignal} from '@angular/core/rxjs-interop';
 import {filter, map} from 'rxjs';
@@ -55,6 +55,14 @@ const MODE_ROUTES: Record<RailMode, string> = {
         <a class="rail-new" routerLink="/">
           <app-icon size="md">edit_square</app-icon> {{ 'nav.newChat' | transloco }}
         </a>
+
+        <label class="rail-search">
+          <app-icon size="md">search</app-icon>
+          <input #filterInput type="search" [value]="filterText()"
+                 (input)="filterText.set($any($event.target).value)"
+                 [placeholder]="'nav.searchSessions' | transloco">
+          <kbd>⌘K</kbd>
+        </label>
 
         @for (group of sessionGroups(); track group.label) {
           <div class="rail-group">{{ ('nav.recency.' + group.label) | transloco }}</div>
@@ -263,6 +271,58 @@ const MODE_ROUTES: Record<RailMode, string> = {
         color: var(--text-primary);
       }
 
+      .rail-search {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin: 4px 8px 8px;
+        padding: 7px 10px;
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-control);
+        color: var(--text-muted);
+        transition: border-color 0.15s ease;
+      }
+
+      .rail-search:focus-within {
+        border-color: var(--accent-color);
+      }
+
+      .rail-search input {
+        flex: 1;
+        min-width: 0;
+        border: none;
+        outline: none;
+        background: transparent;
+        font: inherit;
+        font-size: 13px;
+        color: var(--text-primary);
+      }
+
+      .rail-search input::placeholder {
+        color: var(--text-muted);
+      }
+
+      /* The custom icon + <kbd> hint own this affordance — suppress the
+         native search-field magnifier/clear-button decorations so they
+         don't double up. */
+      .rail-search input[type='search']::-webkit-search-decoration,
+      .rail-search input[type='search']::-webkit-search-cancel-button,
+      .rail-search input[type='search']::-webkit-search-results-button,
+      .rail-search input[type='search']::-webkit-search-results-decoration {
+        -webkit-appearance: none;
+      }
+
+      .rail-search kbd {
+        flex-shrink: 0;
+        padding: 1px 5px;
+        border: 1px solid var(--border-color);
+        border-radius: 4px;
+        font-family: inherit;
+        font-size: 10px;
+        line-height: 1.4;
+        color: var(--text-muted);
+      }
+
       .rail-group {
         margin: 0 8px;
         padding: 12px 4px 4px;
@@ -320,18 +380,22 @@ const MODE_ROUTES: Record<RailMode, string> = {
         /* Tap-target restoration (Task 8 step 5): Task 6 deleted the old flat
            nav's .nav-link rule — min-height: 44px; padding: 10px 14px;
            gap: 12px — along with the links it sized. Every control the rail
-           has grown since (Tasks 6, 7 and this one) needs that minimum back.
-           .rail-new and .rail-item are rendered directly in this template,
-           so one rule reaches both. The More and avatar triggers (.rail-nav,
-           .rail-account) are owned by their own components now and restore
-           this same rule in their own stylesheets — Emulated encapsulation
-           means a rule here can't reach into their templates. The mode
-           switcher's tabs are app-tab-nav-item, a shared ui/ component with
-           the same encapsulation boundary; ::ng-deep reaches its host
-           element, scoped under .mode-switcher so the other app-tab-nav
-           consumers (admin-models, agent-settings) are unaffected. */
+           has grown since (Tasks 6, 7, this one, and 12) needs that minimum
+           back. .rail-new, .rail-item and .rail-search (Task 12's filter
+           label — the whole label focuses the input on tap, an implicit
+           label/input association, so sizing the label covers the target)
+           are rendered directly in this template, so one rule reaches all
+           three. The More and avatar triggers (.rail-nav, .rail-account)
+           are owned by their own components now and restore this same rule
+           in their own stylesheets — Emulated encapsulation means a rule
+           here can't reach into their templates. The mode switcher's tabs
+           are app-tab-nav-item, a shared ui/ component with the same
+           encapsulation boundary; ::ng-deep reaches its host element,
+           scoped under .mode-switcher so the other app-tab-nav consumers
+           (admin-models, agent-settings) are unaffected. */
         .rail-new,
-        .rail-item {
+        .rail-item,
+        .rail-search {
           min-height: 44px;
           padding: 10px 14px;
           gap: 12px;
@@ -433,11 +497,38 @@ export class SidebarComponent {
     return null;
   });
 
+  readonly filterText = signal('');
+
   // Null, same as 'jobs'/'projects': outside chat mode the rail shows no
-  // session groups at all (see the mode() allowlist above).
-  readonly sessionGroups = computed(() =>
-    this.mode() === 'chat' ? this.sessions.grouped() : [],
-  );
+  // session groups at all (see the mode() allowlist above). Deliberately
+  // `=== 'chat'`, not `!== 'jobs'` — mode() is an allowlist that returns
+  // null for routes outside the three modes (/admin/*, /experts,
+  // /settings, ...), and a negated rewrite would show sessions there too.
+  readonly sessionGroups = computed(() => {
+    if (this.mode() !== 'chat') return [];
+    const q = this.filterText().trim().toLowerCase();
+    if (!q) return this.sessions.grouped();
+    return this.sessions.grouped()
+      .map((g) => ({...g, threads: g.threads.filter((t) => t.title.toLowerCase().includes(q))}))
+      .filter((g) => g.threads.length > 0);
+  });
+
+  // Static: this repo's vitest JIT pipeline never resolves signal-based
+  // viewChild() queries (see multi-select.component.ts), while decorator
+  // queries resolve under both JIT and AOT.
+  @ViewChild('filterInput', {static: true}) private readonly filterInput?: ElementRef<HTMLInputElement>;
+
+  // ⌘K/Ctrl+K focuses the rail filter. Temporary key ownership: the command
+  // palette (knowledge-base/knowledge/features/command_palette.md) will
+  // claim ⌘K app-wide when it lands, and this filter will drop the binding
+  // and the <kbd> hint — the filter itself stays.
+  @HostListener('window:keydown', ['$event'])
+  onKeydown(event: KeyboardEvent): void {
+    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
+      event.preventDefault();
+      this.filterInput?.nativeElement.focus();
+    }
+  }
 
   selectMode(mode: RailMode | null): void {
     // Always the mode's own route. Never a thread id — see the April 2026
