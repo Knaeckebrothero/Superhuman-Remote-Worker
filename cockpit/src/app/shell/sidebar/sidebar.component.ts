@@ -63,17 +63,46 @@ const MODE_ROUTES: Record<RailMode, string> = {
                    (input)="filterText.set($any($event.target).value)"
                    [placeholder]="'nav.searchSessions' | transloco"
                    [attr.aria-label]="'nav.searchSessions' | transloco">
-            <kbd aria-hidden="true">⌘K</kbd>
+            <!-- The native ::-webkit-search-cancel-button is suppressed
+                 below (it doesn't double up with this), so an empty vs.
+                 filled filter needs its own way to clear — otherwise
+                 clearing means select-all plus backspace. -->
+            @if (filterText()) {
+              <button type="button" class="rail-search-clear" (click)="clearFilter()"
+                      [attr.aria-label]="'nav.clearFilter' | transloco">
+                <app-icon size="sm">close</app-icon>
+              </button>
+            } @else {
+              <kbd aria-hidden="true">⌘K</kbd>
+            }
           </label>
         }
 
-        @for (group of sessionGroups(); track group.label) {
-          <div class="rail-group">{{ ('nav.recency.' + group.label) | transloco }}</div>
-          @for (t of group.threads; track t.id) {
-            <a class="rail-item" [routerLink]="['/sessions', t.id]" routerLinkActive="active">
-              {{ t.title }}
-            </a>
+        <!-- Gated on mode(), not on sessionGroups().length — same allowlist
+             reason as showFilter()/sessionGroups() above. A fresh account
+             with zero sessions is exactly the user "See all sessions" must
+             stay reachable for, and the empty-state copy below only makes
+             sense while the session list is the thing on screen. -->
+        @if (mode() === 'chat') {
+          @for (group of sessionGroups(); track group.label) {
+            <div class="rail-group">{{ ('nav.recency.' + group.label) | transloco }}</div>
+            @for (t of group.threads; track t.id) {
+              <a class="rail-item" [routerLink]="['/sessions', t.id]" routerLinkActive="active">
+                {{ t.title }}
+              </a>
+            }
           }
+
+          <!-- sessionGroups() is [] both when the account has no sessions
+               and when the filter matched none — tell those apart, or a
+               forgotten filter reads as "my sessions disappeared". -->
+          @if (sessionGroups().length === 0) {
+            <div class="rail-empty">{{ (hasSessions() ? 'nav.noMatches' : 'nav.noSessionsYet') | transloco }}</div>
+          }
+
+          <a class="rail-see-all" routerLink="/sessions">
+            <app-icon size="sm">arrow_forward</app-icon> {{ 'nav.seeAllSessions' | transloco }}
+          </a>
         }
 
         @if (isWorkbenchRoute()) {
@@ -326,6 +355,32 @@ const MODE_ROUTES: Record<RailMode, string> = {
         color: var(--text-muted);
       }
 
+      /* Replaces the suppressed native ::-webkit-search-cancel-button —
+         occupies the same slot the <kbd> hint does when there's nothing to
+         clear. */
+      .rail-search-clear {
+        flex-shrink: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 20px;
+        height: 20px;
+        padding: 0;
+        border: none;
+        border-radius: var(--radius-control);
+        background: transparent;
+        color: var(--text-muted);
+        cursor: pointer;
+        transition:
+          color 0.15s ease,
+          background 0.15s ease;
+      }
+
+      .rail-search-clear:hover {
+        color: var(--text-primary);
+        background: var(--surface-0);
+      }
+
       .rail-group {
         margin: 0 8px;
         padding: 12px 4px 4px;
@@ -362,6 +417,38 @@ const MODE_ROUTES: Record<RailMode, string> = {
         color: var(--accent-color);
       }
 
+      /* sessionGroups() is [] both for "no sessions yet" and "no matches" —
+         this is the copy that tells them apart. */
+      .rail-empty {
+        margin: 4px 8px;
+        padding: 8px 12px;
+        font-size: 12px;
+        color: var(--text-muted);
+      }
+
+      /* Bulk-management escape hatch: routes to /sessions, the only
+         discoverable path there (see the finding this fixes). Styled as an
+         action row like .rail-new, not a session row like .rail-item. */
+      .rail-see-all {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin: 4px 8px 0;
+        padding: 8px 12px;
+        border-radius: var(--radius-control);
+        color: var(--text-secondary);
+        text-decoration: none;
+        font-size: 13px;
+        transition:
+          background 0.15s ease,
+          color 0.15s ease;
+      }
+
+      .rail-see-all:hover {
+        background: var(--surface-0);
+        color: var(--text-primary);
+      }
+
       /* Mobile drawer sizing: the 200px/13px desktop rail reads cramped as an
          overlay drawer. Widen it (capped below the viewport so the backdrop
          stays tappable) and scale the type/targets for thumbs. The width:0
@@ -383,22 +470,24 @@ const MODE_ROUTES: Record<RailMode, string> = {
         /* Tap-target restoration (Task 8 step 5): Task 6 deleted the old flat
            nav's .nav-link rule — min-height: 44px; padding: 10px 14px;
            gap: 12px — along with the links it sized. Every control the rail
-           has grown since (Tasks 6, 7, this one, and 12) needs that minimum
-           back. .rail-new, .rail-item and .rail-search (Task 12's filter
-           label — the whole label focuses the input on tap, an implicit
-           label/input association, so sizing the label covers the target)
-           are rendered directly in this template, so one rule reaches all
-           three. The More and avatar triggers (.rail-nav, .rail-account)
-           are owned by their own components now and restore this same rule
-           in their own stylesheets — Emulated encapsulation means a rule
-           here can't reach into their templates. The mode switcher's tabs
-           are app-tab-nav-item, a shared ui/ component with the same
+           has grown since (Tasks 6, 7, this one, 12, and the "See all
+           sessions" row) needs that minimum back. .rail-new, .rail-item,
+           .rail-search (Task 12's filter label — the whole label focuses the
+           input on tap, an implicit label/input association, so sizing the
+           label covers the target) and .rail-see-all are rendered directly
+           in this template, so one rule reaches all four. The More and
+           avatar triggers (.rail-nav, .rail-account) are owned by their own
+           components now and restore this same rule in their own
+           stylesheets — Emulated encapsulation means a rule here can't reach
+           into their templates. The mode switcher's tabs are
+           app-tab-nav-item, a shared ui/ component with the same
            encapsulation boundary; ::ng-deep reaches its host element,
            scoped under .mode-switcher so the other app-tab-nav consumers
            (admin-models, agent-settings) are unaffected. */
         .rail-new,
         .rail-item,
-        .rail-search {
+        .rail-search,
+        .rail-see-all {
           min-height: 44px;
           padding: 10px 14px;
           gap: 12px;
@@ -527,6 +616,12 @@ export class SidebarComponent {
       .filter((g) => g.threads.length > 0);
   });
 
+  // Reads the UNFILTERED list on purpose (sessions.grouped(), not
+  // sessionGroups()) — this is how the empty state tells "no sessions yet"
+  // (nothing to filter) apart from "no matches" (the filter hid everything)
+  // when sessionGroups() is empty for either reason.
+  readonly hasSessions = computed(() => this.sessions.grouped().length > 0);
+
   // Not `{static: true}`: the filter now only exists in the DOM in chat mode
   // (the @if in the template using showFilter() above), so this must be a
   // dynamic query that re-resolves as mode() changes — a static query
@@ -559,6 +654,14 @@ export class SidebarComponent {
     // the browser's own Ctrl+K/⌘K — expand first so the target is visible.
     if (this.sidebar.collapsed()) this.sidebar.expand();
     this.filterInput.nativeElement.focus();
+  }
+
+  /** The filter's clear affordance (replaces the suppressed native
+   *  ::-webkit-search-cancel-button). Returns focus to the input so clearing
+   *  doesn't strand the next keystroke on the button. */
+  clearFilter(): void {
+    this.filterText.set('');
+    this.filterInput?.nativeElement.focus();
   }
 
   selectMode(mode: RailMode | null): void {

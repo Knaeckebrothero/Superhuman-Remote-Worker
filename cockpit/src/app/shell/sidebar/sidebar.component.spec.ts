@@ -297,3 +297,49 @@ describe('SidebarComponent ⌘K shortcut', () => {
     expect(sidebarService.expand).not.toHaveBeenCalled();
   });
 });
+
+// F4/F5: the "See all sessions" row and the empty-state copy are template-
+// only additions (a static routerLink and two @if branches on mode()/
+// sessionGroups().length, both already covered by the mode() and
+// sessionGroups() tests above) — this component's spec never renders the
+// template (see the dynamic-query note on filterInput), so there is no
+// rendered-DOM assertion to add for those beyond what mode()'s existing
+// allowlist tests already prove about the gate they share. hasSessions()
+// and clearFilter() are new component-level logic, so those get real cases.
+describe('SidebarComponent rail empty state', () => {
+  it('hasSessions reflects the UNFILTERED list, not the filtered one — this is what tells "no sessions yet" apart from "no matches"', () => {
+    const {component} = create({url: '/', threads: [
+      {id: 'a', title: 'Comparing take-home pay', last_activity: new Date().toISOString()},
+    ]});
+    component.filterText.set('nothing matches this');
+
+    expect(component.sessionGroups()).toEqual([]);
+    expect(component.hasSessions()).toBe(true);
+  });
+
+  it('hasSessions is false for a genuinely empty account', () => {
+    const {component} = create({url: '/', threads: []});
+    expect(component.hasSessions()).toBe(false);
+  });
+});
+
+describe('SidebarComponent clearFilter', () => {
+  it('resets filterText and returns focus to the input', () => {
+    const {component} = create({url: '/'});
+    component.filterText.set('something');
+    const focus = vi.fn();
+    (component as any).filterInput = {nativeElement: {focus}};
+
+    component.clearFilter();
+
+    expect(component.filterText()).toBe('');
+    expect(focus).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not throw when the filter input is not resolved', () => {
+    const {component} = create({url: '/'});
+    component.filterText.set('something');
+    expect(() => component.clearFilter()).not.toThrow();
+    expect(component.filterText()).toBe('');
+  });
+});
