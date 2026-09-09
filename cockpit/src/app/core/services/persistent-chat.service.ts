@@ -737,12 +737,25 @@ export class PersistentChatService {
 
     // While a send awaits a claim, poll the durable queue block so a unit
     // that gets parked (or a reload that lost the accept) is rendered from
-    // the server's truth rather than process-local state. Runs only while
-    // awaiting; a parked verdict ends the awaiting stretch and so the poll.
+    // the server's truth rather than process-local state. A parked verdict
+    // ends the awaiting stretch and so the poll.
+    //
+    // The same poll also runs while the "Starting session" card is up on a
+    // thread that exists. That card yields on `sessionReady`, which no
+    // durable read flips on its own: if `/connection` is still polling behind
+    // a not-yet-ready protected-cloud runtime, nothing else would ever tell
+    // this tab that the queued first turn already ran to completion, and the
+    // card would outlive the answer (see
+    // _reconcileReadinessFromDurableState). The poll costs one 5 s REST read
+    // per startup and stops the moment readiness lands, from this path or
+    // any other.
     effect(() => {
       const awaiting = this.isAwaitingTurn();
+      // `isStartingSession` also covers the pre-thread create, where
+      // _pollQueueState no-ops for want of a thread id.
+      const startingSession = this.isStartingSession();
       untracked(() => {
-        if (!awaiting) {
+        if (!awaiting && !startingSession) {
           this._stopQueuePoll();
           return;
         }
@@ -1167,6 +1180,30 @@ export class PersistentChatService {
   private _applyQueueState(threadId: string, queue: SessionQueueState | null | undefined): void {
     if (!queue || typeof queue !== 'object' || typeof queue.state !== 'string') return;
     this._queueState.set({ threadId, queue });
+    this._reconcileReadinessFromDurableState();
+  }
+
+  /**
+   * How many durable transcript rows this tab has for the open thread,
+   * thread-stamped like `usage` / `_queueState` so another thread's count
+   * reads as 0. Counts rows the server (or the append-only cache) actually
+   * has — never the optimistic bubble a send paints before it is accepted.
+   * Feeds `_reconcileReadinessFromDurableState`.
+   */
+  private readonly _durableMessages = signal<{ threadId: string; count: number } | null>(null);
+  private readonly durableMessageCount = computed(() => {
+    const seen = this._durableMessages();
+    if (!seen) return 0;
+    return seen.threadId === this.threadId() ? seen.count : 0;
+  });
+
+  private _recordDurableMessages(threadId: string, count: number): void {
+    const seen = this._durableMessages();
+    // Never let a narrower read (an `?after=` refresh that returned nothing)
+    // shrink what a wider one already established for the same thread.
+    if (seen?.threadId === threadId && seen.count >= count) return;
+    this._durableMessages.set({ threadId, count });
+    this._reconcileReadinessFromDurableState();
   }
 
   private _stopQueuePoll(): void {
@@ -2380,6 +2417,7 @@ export class PersistentChatService {
         this.dispatch({ type: 'load_history', threadId, turns: historyToTurns(cached) });
         this.resetWindow();
         this.historyLoaded.set(true);
+        this._recordDurableMessages(threadId, cached.length);
       }
 
       // 2. Refresh from the server. With a cache, fetch only what's newer
@@ -2409,6 +2447,7 @@ export class PersistentChatService {
         const merged = mergeMessagesById(cached, fetched);
         this.dispatch({ type: 'load_history', threadId, turns: historyToTurns(merged) });
         this.resetWindow();
+        this._recordDurableMessages(threadId, merged.length);
       }
       this.historyLoaded.set(true);
     } catch {
@@ -6965,6 +7004,41 @@ export class PersistentChatService {
       return msg.slice(0, 240) + '…';
     }
     return msg;
+  }
+
+  /**
+   * Readiness observed from durable state instead of the lifecycle stream.
+   *
+   * `sessionReady` is otherwise only ever flipped by a *live* signal: the
+   * agent's `session.state` welcome frame, an SSE `ready` frame the snapshot
+   * cursor did not already cover, or `/connection` resolving — and on a
+   * socketless (queue-served) session that last path additionally requires
+   * the durable `/state` read of the *same* connect to have succeeded
+   * (`sessionSnapshotLoaded`). Any interleaving where those don't line up —
+   * a `/state` that failed, a `/connection` still polling behind a
+   * not-yet-ready protected-cloud runtime, a replayed `ready` suppressed as
+   * covered-by-snapshot — leaves the start panel up over a session that has
+   * already answered. See
+   * knowledge-base/knowledge/issues/session_start_panel_never_yields_to_a_completed_first_turn.md
+   *
+   * Durable evidence settles it: a thread that has transcript rows AND whose
+   * run-queue unit reached `done` has demonstrably run a turn to completion,
+   * so the session is admissible whatever the client saw. Both facts already
+   * ride payloads this service fetches (`GET …/messages`, and the `queue`
+   * block on `/connection`, `POST …/input` and `GET …/queue`) — nothing new
+   * is asked of the server. The pinned lane has no unit (`queue` is null
+   * there), so this is a queue-served-lane repair by construction, and
+   * `markSessionReady` still owns every retirement/ownership guard.
+   */
+  private _reconcileReadinessFromDurableState(): void {
+    if (this.sessionReady()) return;
+    // Only `done` proves a completed turn. `queued`/`leased` are in flight,
+    // `parked` is stalled, `none` never enqueued — none of them is evidence.
+    if (this.queueState()?.state !== 'done') return;
+    // Yield the panel only once the transcript the queue is talking about is
+    // actually on screen; otherwise the user trades a spinner for a blank.
+    if (this.durableMessageCount() <= 0) return;
+    this.markSessionReady();
   }
 
   /** Mark the session as ready and flush any pending message. */

@@ -747,12 +747,24 @@ export class ChatPageComponent implements OnInit, OnDestroy {
                     // Canvas state reconciles independently from chat history
                     // and may remain available while transport is offline.
                     this.canvas.selectThread(threadId);
-                    // Already connected or mid-start on this thread? Don't
-                    // reconnect. The latter is the draft flow landing here
-                    // right after createAndConnect.
+                    // Already connected, ready, or mid-start on this thread?
+                    // Don't reconnect. The mid-start case is the draft flow
+                    // landing here right after createAndConnect.
+                    //
+                    // `sessionReady` is in the test because the other two miss
+                    // a real window: `/connection` can resolve ready before the
+                    // EventSource has opened, so `isStartingSession` is already
+                    // false (it is gated on `sessionReady`) while
+                    // `connectionState` is still 'connecting'. Reconnecting
+                    // there tears down a live session, wipes the transcript,
+                    // and drops readiness back to false — the startup card
+                    // returns over a session that has already answered. See
+                    // knowledge-base/knowledge/issues/session_start_panel_never_yields_to_a_completed_first_turn.md
                     if (
                         this.chat.threadId() === threadId &&
-                        (this.chat.isConnected() || this.chat.isStartingSession())
+                        (this.chat.isConnected() ||
+                            this.chat.sessionReady() ||
+                            this.chat.isStartingSession())
                     ) return;
 
                     void this.chat.connect(threadId);

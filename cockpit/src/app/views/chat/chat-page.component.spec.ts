@@ -33,6 +33,7 @@ function createFixture(options: {
     threadId: ReturnType<typeof signal<string | null>>;
     isConnected: ReturnType<typeof signal<boolean>>;
     isStartingSession: ReturnType<typeof signal<boolean>>;
+    sessionReady: ReturnType<typeof signal<boolean>>;
     pendingDrift: ReturnType<typeof signal<ConfigDriftItem[] | null>>;
     connect: ReturnType<typeof vi.fn>;
     enterDraftSession: ReturnType<typeof vi.fn>;
@@ -66,6 +67,7 @@ function createFixture(options: {
     threadId: signal<string | null>(null),
     isConnected: signal(false),
     isStartingSession: signal(false),
+    sessionReady: signal(false),
     pendingDrift: signal<ConfigDriftItem[] | null>(null),
     connect: vi.fn().mockResolvedValue(undefined),
     enterDraftSession: vi.fn(),
@@ -242,6 +244,26 @@ describe('ChatPageComponent Canvas route selection', () => {
 
     params.next(convertToParamMap({threadId: 'ignored-on-draft-route'}));
     expect(canvas.selectThread).toHaveBeenCalledOnce();
+  });
+
+  it('does not reconnect a ready session whose EventSource has not opened yet', () => {
+    // The draft flow lands here right after createAndConnect. `/connection`
+    // can resolve ready before the SSE handshake completes, so `isConnected`
+    // (connectionState === 'connected') and `isStartingSession` (gated on
+    // sessionReady) are BOTH false for that window. Reconnecting there tears
+    // down a live session and puts the startup card back over a session that
+    // has already answered.
+    // knowledge-base/knowledge/issues/session_start_panel_never_yields_to_a_completed_first_turn.md
+    const {component, chat} = createFixture({threadId: 'thread-1'});
+    chat.threadId.set('thread-1');
+    chat.sessionReady.set(true);
+    chat.isConnected.set(false);
+    chat.isStartingSession.set(false);
+
+    component.ngOnInit();
+    TestBed.tick();
+
+    expect(chat.connect).not.toHaveBeenCalled();
   });
 
   it('loads a subagent transcript without connecting or selecting live Canvas state', () => {

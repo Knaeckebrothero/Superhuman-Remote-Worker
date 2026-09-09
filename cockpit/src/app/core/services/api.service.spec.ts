@@ -1390,3 +1390,61 @@ describe('ApiService — protected cloud diff outcomes', () => {
     await expect(pending).resolves.toMatchObject({kind: 'ok'});
   });
 });
+
+describe('ApiService.getThreadQueue — the durable queue block', () => {
+  let api: ApiService;
+  let httpMock: HttpTestingController;
+
+  beforeEach(() => {
+    TestBed.resetTestingModule();
+    TestBed.configureTestingModule({
+      providers: [
+        ApiService,
+        provideHttpClient(),
+        provideHttpClientTesting(),
+        {provide: AppToastService, useValue: {danger: vi.fn(), info: vi.fn(), success: vi.fn()}},
+        {provide: TranslocoService, useValue: {translate: (k: string) => k}},
+        {provide: ErrorMessageService, useValue: {translate: (_e: unknown, k: string) => k}},
+      ],
+    });
+    api = TestBed.inject(ApiService);
+    httpMock = TestBed.inject(HttpTestingController);
+  });
+
+  afterEach(() => httpMock.verify());
+
+  const block = {
+    state: 'done',
+    park_reason: null,
+    parked_at: null,
+    retryable: false,
+    attempts: 1,
+    pending_input: false,
+  };
+
+  // GET …/queue wraps the block, unlike /input and /connection which carry it
+  // inline. Without the unwrap every poll resolved to an envelope whose
+  // `state` is undefined and the caller dropped it — the poll never applied
+  // anything it read.
+  it('unwraps the {thread_id, queue} envelope the endpoint actually returns', async () => {
+    const pending = firstValueFrom(api.getThreadQueue('t1'));
+    const request = httpMock.expectOne((item) => item.url.endsWith('/persistent/threads/t1/queue'));
+    expect(request.request.method).toBe('GET');
+    request.flush({thread_id: 't1', queue: block});
+    await expect(pending).resolves.toEqual(block);
+  });
+
+  it('still accepts a bare block, for a peer that answers the inline shape', async () => {
+    const pending = firstValueFrom(api.getThreadQueue('t1'));
+    httpMock.expectOne((item) => item.url.endsWith('/persistent/threads/t1/queue')).flush(block);
+    await expect(pending).resolves.toEqual(block);
+  });
+
+  it('reports an unreadable block as null rather than a shapeless object', async () => {
+    const pending = firstValueFrom(api.getThreadQueue('t1'));
+    httpMock
+      .expectOne((item) => item.url.endsWith('/persistent/threads/t1/queue'))
+      .flush({thread_id: 't1'});
+    await expect(pending).resolves.toBeNull();
+  });
+});

@@ -3205,11 +3205,32 @@ export class ApiService {
       );
   }
 
-  /** The thread's durable queue block — polled while a send awaits a claim. */
+  /** The thread's durable queue block — polled while a send awaits a claim,
+   *  and while a start panel is still up on a thread that may already have
+   *  finished its turn.
+   *
+   *  `GET …/queue` answers with the block wrapped in a `{thread_id, queue}`
+   *  envelope, unlike `/input` and `/connection`, which carry the same block
+   *  inline. Unwrapping here was missing, so every poll resolved to an
+   *  envelope whose `state` is undefined and the caller's type guard dropped
+   *  it — the poll ran and never applied anything. A bare block is still
+   *  accepted so a rolling deploy of either shape lands. */
   getThreadQueue(threadId: string): Observable<SessionQueueState | null> {
     return this.http
-      .get<SessionQueueState>(`${this.baseUrl}/persistent/threads/${threadId}/queue`)
-      .pipe(catchError(() => of(null)));
+      .get<SessionQueueState | { queue?: SessionQueueState | null }>(
+        `${this.baseUrl}/persistent/threads/${threadId}/queue`,
+      )
+      .pipe(
+        map((body): SessionQueueState | null => {
+          if (!body || typeof body !== 'object') return null;
+          const enveloped = (body as { queue?: SessionQueueState | null }).queue;
+          if (enveloped && typeof enveloped === 'object') return enveloped;
+          return typeof (body as SessionQueueState).state === 'string'
+            ? (body as SessionQueueState)
+            : null;
+        }),
+        catchError(() => of(null)),
+      );
   }
 
   /**
