@@ -1,7 +1,7 @@
 import {describe, expect, it, vi} from 'vitest';
 import {Injector, runInInjectionContext} from '@angular/core';
 import {HttpClient} from '@angular/common/http';
-import {of} from 'rxjs';
+import {of, throwError} from 'rxjs';
 import {SessionListService} from './session-list.service';
 import type {Thread} from '../models/api.model';
 
@@ -20,13 +20,13 @@ function create(threads: Thread[]) {
 }
 
 describe('SessionListService', () => {
-  it('exposes threads after refresh', () => {
+  it('exposes threads after refresh', async () => {
     const {service} = create([thread('a', new Date().toISOString())]);
-    service.refresh();
+    await service.refresh();
     expect(service.threads().map((t) => t.id)).toEqual(['a']);
   });
 
-  it('groups by recency into today, yesterday and earlier', () => {
+  it('groups by recency into today, yesterday and earlier', async () => {
     const now = new Date();
     const yesterday = new Date(now.getTime() - 26 * 3600_000);
     const lastWeek = new Date(now.getTime() - 8 * 24 * 3600_000);
@@ -35,14 +35,25 @@ describe('SessionListService', () => {
       thread('y', yesterday.toISOString()),
       thread('e', lastWeek.toISOString()),
     ]);
-    service.refresh();
+    await service.refresh();
     expect(service.grouped().map((g) => g.label)).toEqual(['today', 'yesterday', 'earlier']);
     expect(service.grouped()[0].threads.map((t) => t.id)).toEqual(['t']);
   });
 
-  it('omits a group with no threads', () => {
+  it('omits a group with no threads', async () => {
     const {service} = create([thread('t', new Date().toISOString())]);
-    service.refresh();
+    await service.refresh();
     expect(service.grouped().map((g) => g.label)).toEqual(['today']);
+  });
+
+  it('resolves rather than rejects when the HTTP call errors, so fire-and-forget callers never see an unhandled rejection', async () => {
+    const http = {get: vi.fn(() => throwError(() => new Error('boom')))};
+    const injector = Injector.create({providers: [{provide: HttpClient, useValue: http}]});
+    const service = runInInjectionContext(injector, () => new SessionListService());
+
+    await expect(service.refresh()).resolves.toBeUndefined();
+
+    expect(service.threads()).toEqual([]);
+    expect(service.loading()).toBe(false);
   });
 });

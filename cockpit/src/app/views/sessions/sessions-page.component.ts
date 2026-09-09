@@ -624,16 +624,7 @@ export class SessionsPageComponent implements OnInit {
 
     async loadThreads(): Promise<void> {
         this.loading.set(true);
-        this.sessionList.refresh();
-        // SessionListService.refresh() is fire-and-forget: its signals settle
-        // whenever the underlying request does (synchronously for a mocked or
-        // cached response, on the network's own schedule for a real one). This
-        // page still needs an awaitable completion — ngOnInit, the delete
-        // flows, and its own tests all call/await loadThreads() expecting the
-        // fetch to be done when it resolves — so wait for the shared loading
-        // flag to drop before reading the result back out. Both the service's
-        // success and error paths clear `loading`, so this always settles.
-        await this.awaitSessionListIdle();
+        await this.sessionList.refresh();
         this.threads.set(
             this.sessionList.threads()
                 // The server filters children, but keep the mutation-heavy
@@ -646,23 +637,6 @@ export class SessionsPageComponent implements OnInit {
                 ),
         );
         this.loading.set(false);
-    }
-
-    /** Resolves once SessionListService's in-flight refresh() settles. Polls
-     *  via setTimeout (a macrotask), not a microtask/Promise chain, so a real
-     *  pending HTTP request still gets a turn to complete — a microtask-only
-     *  retry loop would never yield the event loop to it. */
-    private awaitSessionListIdle(): Promise<void> {
-        return new Promise((resolve) => {
-            const check = () => {
-                if (!this.sessionList.loading()) {
-                    resolve();
-                } else {
-                    setTimeout(check, 0);
-                }
-            };
-            check();
-        });
     }
 
     async loadProjects(): Promise<void> {

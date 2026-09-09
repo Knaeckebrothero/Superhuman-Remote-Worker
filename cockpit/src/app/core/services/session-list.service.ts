@@ -1,5 +1,6 @@
 import {Injectable, computed, inject, signal} from '@angular/core';
 import {HttpClient} from '@angular/common/http';
+import {firstValueFrom} from 'rxjs';
 import {environment} from '../environment';
 import type {Thread} from '../models/api.model';
 
@@ -33,18 +34,20 @@ export class SessionListService {
       .filter((g) => g.threads.length > 0);
   });
 
-  refresh(): void {
+  refresh(): Promise<void> {
     this._loading.set(true);
-    this.http.get<{threads: Thread[]}>(`${environment.apiUrl}/persistent/threads`).subscribe({
-      next: (r) => {
+    return firstValueFrom(
+      this.http.get<{threads: Thread[]}>(`${environment.apiUrl}/persistent/threads`),
+    ).then(
+      (r) => {
         this._threads.set(r?.threads ?? []);
         this._loading.set(false);
       },
-      error: () => {
+      () => {
         this._threads.set([]);
         this._loading.set(false);
       },
-    });
+    );
   }
 }
 
