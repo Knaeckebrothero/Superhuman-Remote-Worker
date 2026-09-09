@@ -20,7 +20,10 @@ either side has to keep them in step.
 
 from __future__ import annotations
 
+import ast
 import inspect
+import textwrap
+from typing import Any
 
 import pytest
 
@@ -219,24 +222,84 @@ def test_a_bridge_awaits_what_its_target_awaits(bridge_name: str) -> None:
     )
 
 
+def _forwarding_call(bridge_name: str) -> ast.Call:
+    """The single forwarding call in a ``*args, **kwargs`` bridge's body.
+
+    Every such bridge in ``main`` is exactly one statement — ``return [await]
+    <target>(*args, **kwargs, dependencies=...)`` — so this is a parse, not a
+    heuristic. A bridge that grew a second statement is no longer a bridge and
+    should fail here rather than be waved through.
+    """
+    body = ast.parse(textwrap.dedent(inspect.getsource(getattr(main, bridge_name))))
+    function = body.body[0]
+    assert isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
+    assert len(function.body) == 1, (
+        f"main.{bridge_name} is not a single forwarding statement; it has "
+        f"{len(function.body)} and is no longer a thin bridge"
+    )
+    statement = function.body[0]
+    assert isinstance(statement, ast.Return) and statement.value is not None
+    value = statement.value
+    if isinstance(value, ast.Await):
+        value = value.value
+    assert isinstance(value, ast.Call), f"main.{bridge_name} does not forward to a call"
+    return value
+
+
 @pytest.mark.parametrize("bridge_name", sorted(BRIDGES))
 def test_a_bridge_accepts_what_its_target_accepts(bridge_name: str) -> None:
     """A bridge that spells its parameters out must spell out the same ones.
 
-    ``dependencies`` is the one addition the extraction is allowed to make, and
-    a ``*args, **kwargs`` bridge forwards everything by construction.
+    ``dependencies`` is the one addition the extraction is allowed to make.
+
+    A ``*args, **kwargs`` bridge forwards every argument by construction, so
+    there are no parameter names to compare — but that is not the same as
+    nothing to check, and this test used to *skip* those. It skipped 59 of the
+    73 bridges, which left B05's headline property ("both halves pinned for
+    every bridge") true only of the ``async`` half. What a varargs bridge can
+    still get wrong is the half this file exists for: it can forward to the
+    wrong function. ``_validate_mcp_datasource`` lost a positional parameter
+    and every caller raised ``TypeError``; a varargs wrapper in front of the
+    same mistake would have forwarded the bad call silently.
+
+    So the varargs branch asserts the two things that remain falsifiable: the
+    call target resolves — through ``main``'s own namespace, by object
+    identity — to the operation ``BRIDGES`` claims, and both stars are present
+    so no argument is dropped on the way.
     """
     bridge = getattr(main, bridge_name)
     signature = inspect.signature(bridge)
     kinds = {p.kind for p in signature.parameters.values()}
+    target = BRIDGES[bridge_name]
+
     if {
         inspect.Parameter.VAR_POSITIONAL,
         inspect.Parameter.VAR_KEYWORD,
     } <= kinds:
-        pytest.skip("forwards every argument by construction")
-    target = inspect.signature(BRIDGES[bridge_name])
-    expected = [n for n in target.parameters if n != "dependencies"]
+        call = _forwarding_call(bridge_name)
+        dotted = ast.unparse(call.func)
+        resolved: Any = main
+        for part in dotted.split("."):
+            resolved = getattr(resolved, part, None)
+            assert resolved is not None, (
+                f"main.{bridge_name} forwards to {dotted!r}, which does not "
+                f"resolve in main's namespace"
+            )
+        assert resolved is target, (
+            f"main.{bridge_name} forwards to {dotted!r} but BRIDGES maps it to "
+            f"{target.__module__}.{target.__name__}"
+        )
+        assert any(isinstance(a, ast.Starred) for a in call.args), (
+            f"main.{bridge_name} does not forward *args"
+        )
+        assert any(k.arg is None for k in call.keywords), (
+            f"main.{bridge_name} does not forward **kwargs"
+        )
+        return
+
+    target_signature = inspect.signature(target)
+    expected = [n for n in target_signature.parameters if n != "dependencies"]
     assert list(signature.parameters) == expected, (
         f"main.{bridge_name}{signature} does not accept what "
-        f"{BRIDGES[bridge_name].__name__}{target} accepts"
+        f"{target.__name__}{target_signature} accepts"
     )
