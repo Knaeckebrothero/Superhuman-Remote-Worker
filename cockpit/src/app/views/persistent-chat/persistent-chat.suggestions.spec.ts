@@ -74,11 +74,25 @@ describe('suggestions.json', () => {
     }
   });
 
-  it('no entry is a meta-request the agent cannot act on', () => {
-    // "Continue from a project I've shared" asked the agent to do something it
-    // has no way to resolve. Chips must name work, not describe categories.
-    const texts = suggestions.map((s) => s.en.toLowerCase());
-    expect(texts.some((t) => t.includes("project i've shared"))).toBe(false);
-    expect(texts.some((t) => t.startsWith('surprise me'))).toBe(false);
+  it('keeps chip text within the length the layout lane can fit, in both languages', () => {
+    // German runs 20-55% longer than English here and is what the layout lane
+    // measures (Ruling T34-1). 45 is an empirical tripwire, not a proof: the real
+    // check is `npm run test:e2e:empty-state`, which asserts zero overflow at
+    // 412x915. This exists so a too-long string fails in seconds with a clear
+    // message instead of reddening the slow lane.
+    const MAX_CHIP_CHARS = 45;
+    for (const s of suggestions) {
+      expect(s.en.length, `en too long: "${s.en}"`).toBeLessThanOrEqual(MAX_CHIP_CHARS);
+      expect(s.de.length, `de too long: "${s.de}"`).toBeLessThanOrEqual(MAX_CHIP_CHARS);
+    }
+  });
+
+  it('never lets a retired phrase back in, in either language', () => {
+    const RETIRED = ["project i've shared", 'surprise me', 'geteilten projekt', 'überrasche mich'];
+    for (const s of suggestions) {
+      for (const phrase of RETIRED) {
+        expect(`${s.en} ${s.de}`.toLowerCase(), `retired phrase "${phrase}" is back`).not.toContain(phrase);
+      }
+    }
   });
 });

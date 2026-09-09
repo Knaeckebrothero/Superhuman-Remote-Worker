@@ -2732,7 +2732,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     readonly slashSelectedIndex = signal(0);
     readonly filteredCommands = signal<SlashCommand[]>([]);
 
-    // Empty-state suggestions (loaded once, picked once per mount)
+    // Empty-state suggestions (loaded once per mount; the whole set renders, nothing is picked)
     private readonly pickedSuggestions = signal<Suggestion[]>([]);
     readonly displayedSuggestions = computed<DisplayedSuggestion[]>(() => {
         const lang = this.i18n.activeLang();
