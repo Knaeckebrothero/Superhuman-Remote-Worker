@@ -82,6 +82,7 @@ import {CitationsPanelComponent} from './citations-panel/citations-panel.compone
 import {CloudReviewDialogComponent} from '../job-diff-review/cloud-review-dialog.component';
 import {CloudReviewBannerComponent} from './cloud-review-banner/cloud-review-banner.component';
 import {SshConnectPanelComponent} from './ssh-connect-panel/ssh-connect-panel.component';
+import {DraftEmptyStateComponent, type DisplayedSuggestion} from './draft-empty-state/draft-empty-state.component';
 import {CapabilitiesService} from '../../core/services/capabilities.service';
 import {AppSelectComponent} from '../../ui/select';
 import {AppIconComponent} from '../../ui/icon';
@@ -104,11 +105,6 @@ interface Suggestion {
     icon: string;
     en: string;
     de: string;
-}
-
-interface DisplayedSuggestion {
-    icon: string;
-    text: string;
 }
 
 const SLASH_COMMANDS: SlashCommand[] = [
@@ -916,6 +912,7 @@ export function clearDraft(threadId: string | null): void {
         CloudReviewDialogComponent,
         CloudReviewBannerComponent,
         SshConnectPanelComponent,
+        DraftEmptyStateComponent,
     ],
     template: `
     <div class="chat-container"
@@ -1773,47 +1770,16 @@ export function clearDraft(threadId: string | null): void {
                   }
                 </div>
               } @else if (chat.isDraftSession()) {
-                <div class="empty-inner">
-                  <img class="empty-mark" src="assets/icons/icon-mark.svg" alt="" />
-                  <h2 class="empty-title">{{ 'chat.draft.title' | transloco }}</h2>
-                  <p class="empty-subtitle">{{ 'chat.draft.subtitle' | transloco }}</p>
-                  <div class="draft-connectors" role="group" [attr.aria-label]="'chat.draft.connectorsLabel' | transloco">
-                    @if (chat.draftDefaultsLoading()) {
-                      <span class="draft-connectors-state">{{ 'chat.draft.connectorsLoading' | transloco }}</span>
-                    } @else if (chat.draftDefaultsError()) {
-                      <span class="draft-connectors-state draft-connectors-error">
-                        {{ 'chat.draft.connectorsFailed' | transloco }}
-                        <button type="button" (click)="chat.retryDraftDefaults()">
-                          {{ 'chat.draft.connectorsRetry' | transloco }}
-                        </button>
-                      </span>
-                    } @else {
-                      <label class="draft-connectors-toggle">
-                        <input
-                          type="checkbox"
-                          [checked]="chat.draftConnectorsEnabled()"
-                          (change)="chat.setDraftConnectorsEnabled($any($event.target).checked)"
-                        >
-                        <span>
-                          {{ 'chat.draft.connectorsCount'
-                            | transloco: {count: chat.draftDatasourceIds()?.length ?? 0} }}
-                        </span>
-                      </label>
-                    }
-                  </div>
-                  @if (displayedSuggestions().length > 0) {
-                    <div class="suggestion-grid">
-                      @for (s of displayedSuggestions(); track $index) {
-                        <button type="button" class="suggestion-chip"
-                                (click)="pickSuggestion(s)">
-                          <app-icon size="lg" class="suggestion-icon">{{ s.icon }}</app-icon>
-                          <span class="suggestion-text">{{ s.text }}</span>
-                        </button>
-                      }
-                    </div>
-                  }
-                  <a class="draft-advanced" routerLink="/sessions/new">{{ 'chat.draft.advanced' | transloco }}</a>
-                </div>
+                <app-draft-empty-state
+                  [suggestions]="displayedSuggestions()"
+                  [connectorsLoading]="chat.draftDefaultsLoading()"
+                  [connectorsError]="chat.draftDefaultsError()"
+                  [connectorsEnabled]="chat.draftConnectorsEnabled()"
+                  [datasourceCount]="chat.draftDatasourceIds()?.length ?? 0"
+                  (suggestionPicked)="pickSuggestion($event)"
+                  (connectorsToggled)="chat.setDraftConnectorsEnabled($event)"
+                  (retryRequested)="chat.retryDraftDefaults()"
+                />
               } @else if (chat.isStartingSession()) {
                 <div class="startup-wrapper">
                   <ng-container *ngTemplateOutlet="startupCardTpl"></ng-container>

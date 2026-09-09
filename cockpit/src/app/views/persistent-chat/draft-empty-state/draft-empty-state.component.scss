@@ -1,0 +1,141 @@
+:host {
+  display: contents;
+}
+
+/* .empty-inner through .suggestion-text are duplicated from
+   persistent-chat.component.scss rather than moved: they are also used,
+   unchanged, by the non-draft empty state that stays inline in
+   persistent-chat.component.ts (chat.sessionReady(), same class names).
+   Emulated view encapsulation scopes each stylesheet to its own component,
+   so removing them from the parent would leave that other branch unstyled.
+   Only the draft-exclusive rules below (.draft-advanced, .draft-connectors*)
+   were actually cut from the parent. */
+
+.empty-inner {
+  text-align: center;
+  max-width: 850px;
+  padding: 72px 48px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.empty-mark {
+  width: 144px;
+  height: 144px;
+  margin-bottom: 30px;
+  opacity: 0.95;
+}
+
+.empty-title {
+  font-family: var(--font-display, inherit);
+  font-size: 32px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-primary);
+  margin: 0 0 16px;
+  line-height: 1.15;
+}
+
+.empty-subtitle {
+  font-size: 17px;
+  line-height: 1.55;
+  color: var(--text-muted);
+  margin: 0 0 38px;
+  max-width: 620px;
+}
+
+.suggestion-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  width: 100%;
+  max-width: 760px;
+}
+
+.suggestion-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 16px 22px;
+  background: var(--surface-0);
+  border: 1px solid var(--border-color, var(--surface-0));
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: 16px;
+  font-weight: 500;
+  text-align: left;
+  cursor: pointer;
+  border-radius: 0;
+  transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
+}
+
+.suggestion-chip:hover {
+  border-color: var(--accent-color);
+  color: var(--text-primary);
+  background: var(--hover, rgba(255, 255, 255, 0.04));
+}
+
+.suggestion-icon {
+  color: var(--accent-color);
+  flex-shrink: 0;
+}
+
+.suggestion-text {
+  flex: 1;
+}
+
+@media (max-width: 600px) {
+  .suggestion-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Draft-exclusive from here down — cut from the parent, not duplicated. */
+
+.draft-advanced {
+  margin-top: 26px;
+  font-size: 14px;
+  color: var(--text-muted);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.draft-advanced:hover {
+  color: var(--text-primary);
+}
+
+.draft-connectors {
+  display: flex;
+  justify-content: center;
+  margin-top: 12px;
+  min-height: 28px;
+}
+
+.draft-connectors-toggle,
+.draft-connectors-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+  border: 1px solid var(--border-color, var(--surface-1));
+  border-radius: var(--radius-pill, 999px);
+  background: var(--surface-0);
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.draft-connectors-toggle { cursor: pointer; }
+.draft-connectors-toggle input { accent-color: var(--accent-color); }
+.draft-connectors-error { color: var(--danger); }
+.draft-connectors-error button {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  text-decoration: underline;
+}
