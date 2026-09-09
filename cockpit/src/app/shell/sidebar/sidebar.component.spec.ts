@@ -23,6 +23,9 @@ function create(opts: {
    *  true (steady state) — tests exercising the cold-boot distinction set it
    *  explicitly. */
   navigated?: boolean;
+  /** SidebarService.collapsed's initial value. Defaults to false (expanded) —
+   *  the ⌘K collapse-then-focus test sets it explicitly. */
+  collapsed?: boolean;
 }) {
   const threads = signal((opts.threads ?? []) as Thread[]);
   const router = {
@@ -39,6 +42,11 @@ function create(opts: {
       threads().length ? [{label: 'today' as const, threads: threads()}] : [],
     ),
   };
+  const sidebarService = {
+    collapse: vi.fn(),
+    expand: vi.fn(),
+    collapsed: signal(opts.collapsed ?? false),
+  };
   const injector = Injector.create({
     providers: [
       {provide: Router, useValue: router},
@@ -47,14 +55,14 @@ function create(opts: {
         currentUser: signal({is_admin: opts.isAdmin ?? false}),
         logout: vi.fn(),
       }},
-      {provide: SidebarService, useValue: {collapse: vi.fn(), collapsed: signal(false)}},
+      {provide: SidebarService, useValue: sidebarService},
       {provide: ViewportService, useValue: {isMobile: signal(false)}},
       {provide: LayoutService, useValue: {}},
       {provide: PersistentChatService, useValue: {threadId: signal(null)}},
     ],
   });
   const component = runInInjectionContext(injector, () => new SidebarComponent());
-  return {component, router, sessions};
+  return {component, router, sessions, sidebarService};
 }
 
 describe('SidebarComponent mode switcher', () => {
@@ -223,5 +231,69 @@ describe('SidebarComponent session filter', () => {
     expect(create({url: '/jobs'}).component.showFilter()).toBe(false);
     expect(create({url: '/projects'}).component.showFilter()).toBe(false);
     expect(create({url: '/admin/users'}).component.showFilter()).toBe(false);
+  });
+});
+
+describe('SidebarComponent ⌘K shortcut', () => {
+  // filterInput is a @ViewChild, only ever resolved by rendering the real
+  // template — this spec never does (see the dynamic-query note on the
+  // field). Stand in for it directly; onKeydown only ever reads
+  // `.nativeElement.focus()` off it.
+  function stubFilterInput(component: ReturnType<typeof create>['component']) {
+    const focus = vi.fn();
+    (component as any).filterInput = {nativeElement: {focus}};
+    return focus;
+  }
+
+  function cmdK(): KeyboardEvent {
+    return new KeyboardEvent('keydown', {key: 'k', metaKey: true});
+  }
+
+  // Regression guard for F1: the rail can be collapsed (width: 0, overflow:
+  // hidden) while the filter stays mounted — mobile's default state after
+  // every navigation (SidebarService.collapsed defaults true at <=768px, and
+  // the rail auto-collapses post-navigation on mobile). Focusing straight
+  // into that would strand focus on an invisible control while having
+  // already swallowed the browser's own Ctrl+K/⌘K. Asserting call ORDER
+  // (not just that both were called) is deliberate: the fix expands before
+  // it focuses, and a version that focused first would still pass a looser
+  // "both were called" assertion.
+  it('expands a collapsed rail before focusing the filter, and swallows the browser shortcut', () => {
+    const {component, sidebarService} = create({url: '/', collapsed: true});
+    const focus = stubFilterInput(component);
+    const event = cmdK();
+    const preventDefault = vi.spyOn(event, 'preventDefault');
+
+    component.onKeydown(event);
+
+    expect(preventDefault).toHaveBeenCalled();
+    expect(sidebarService.expand).toHaveBeenCalledTimes(1);
+    expect(focus).toHaveBeenCalledTimes(1);
+    const expandOrder = sidebarService.expand.mock.invocationCallOrder[0];
+    const focusOrder = focus.mock.invocationCallOrder[0];
+    expect(expandOrder).toBeLessThan(focusOrder);
+  });
+
+  it('does not expand an already-expanded rail, but still focuses the filter', () => {
+    const {component, sidebarService} = create({url: '/', collapsed: false});
+    const focus = stubFilterInput(component);
+
+    component.onKeydown(cmdK());
+
+    expect(sidebarService.expand).not.toHaveBeenCalled();
+    expect(focus).toHaveBeenCalledTimes(1);
+  });
+
+  // Unchanged pre-existing behavior: outside chat mode filterInput is never
+  // set (the @if in the template), so the browser's own Ctrl+K must survive.
+  it('leaves the browser shortcut alone when the filter is not on screen', () => {
+    const {component, sidebarService} = create({url: '/jobs', collapsed: true});
+    const event = cmdK();
+    const preventDefault = vi.spyOn(event, 'preventDefault');
+
+    component.onKeydown(event);
+
+    expect(preventDefault).not.toHaveBeenCalled();
+    expect(sidebarService.expand).not.toHaveBeenCalled();
   });
 });

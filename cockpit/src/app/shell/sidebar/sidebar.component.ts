@@ -552,6 +552,12 @@ export class SidebarComponent {
     // it for a control that isn't on screen to focus.
     if (!this.filterInput) return;
     event.preventDefault();
+    // The rail can be collapsed (:host(.collapsed){width:0} + overflow:
+    // hidden) while the filter stays mounted in the DOM — the default state
+    // on mobile after every navigation. Focusing a zero-width, hidden input
+    // would strand focus somewhere invisible after we've already swallowed
+    // the browser's own Ctrl+K/⌘K — expand first so the target is visible.
+    if (this.sidebar.collapsed()) this.sidebar.expand();
     this.filterInput.nativeElement.focus();
   }
 
