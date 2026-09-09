@@ -3249,8 +3249,15 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         if (!this.chat.isConnected()) return this.transloco.translate('chat.input.connect');
         if (this.chat.isInterrupting()) return this.transloco.translate('chat.input.stopping');
         if (this.chat.isStreaming()) return this.transloco.translate('chat.input.working');
-        // A parked unit needs a retry — say so, not "waiting".
-        if (this.chat.isParked()) return this.transloco.translate('chat.input.parked');
+        // A parked unit needs a retry — say so, not "waiting". A park an owner
+        // may NOT revive (claim-loss hold, stop markers, a non-retryable
+        // reason) renders no Retry button, so it must not name a retry either:
+        // only an operator's admin unpark clears it.
+        if (this.chat.isParked()) {
+            return this.transloco.translate(
+                this.chat.queueState()?.retryable ? 'chat.input.parked' : 'chat.input.parkedBlocked',
+            );
+        }
         // isAwaitingTurn: the send is accepted but no agent has picked it up
         // yet — say "waiting", not "working"; the queued bubble carries the
         // escalation copy.

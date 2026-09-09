@@ -1748,7 +1748,7 @@
         "attachFailed": "Der Agent konnte diese Sitzung nicht wieder aufnehmen.",
         "shutdownCancelled": "Die Antwort wurde durch Wartungsarbeiten unterbrochen.",
         "stopped": "Die Sitzung wurde beendet, bevor diese Nachricht verarbeitet wurde.",
-        "generic": "Die Sitzung ist auf ein Problem gestoßen. Versuchen Sie es erneut."
+        "generic": "Die Sitzung ist auf ein Problem gestoßen, das sie nicht selbst beheben kann — ein Administrator muss sie freigeben, bevor diese Nachricht ausgeführt werden kann."
       }
     },
     "queued": {
@@ -1962,6 +1962,7 @@
       "working": "Agent arbeitet...",
       "queued": "Warten auf einen verfügbaren Agenten…",
       "parked": "Diese Nachricht muss erneut gesendet werden",
+      "parkedBlocked": "Blockiert, bis ein Administrator sie freigibt",
       "reconnecting": "Getrennt — verbinde erneut…",
       "uploading": "Anhänge werden hochgeladen…",
       "default": "Nachricht eingeben... (Eingabe zum Senden, Umschalt+Eingabe für neue Zeile)",
