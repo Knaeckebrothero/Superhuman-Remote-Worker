@@ -177,7 +177,9 @@ test('first message creates a durable session and renders the reply', async ({ a
   await expect(hydratedAssistant.getByText(expectedReply, { exact: true })).toHaveCount(1);
   await expect(page.getByTestId('chat-error')).toHaveCount(0);
 
-  const sessionsLink = page.getByRole('link', { name: /^(Sessions|Sitzungen)$/ });
+  const sessionsLink = page.getByRole('link', {
+    name: /^(See all sessions|Alle Sitzungen anzeigen)$/,
+  });
   await expect(sessionsLink).toHaveCount(1);
   app.setPhase('list-navigation');
   await sessionsLink.click();
