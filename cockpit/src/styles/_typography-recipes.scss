@@ -3,10 +3,9 @@
 // Each mixin owns a typographic decision: which font family + casing + spacing
 // to apply for a given role. Tokens own values; recipes own decisions.
 //
-// Roman themes set the optional --letter-spacing-display and
-// --text-transform-display tokens; the recipes fall back to no-op for
-// non-Roman themes, so the same primitive renders sentence-case Inter or
-// uppercase Cinzel depending only on the active theme.
+// No active theme sets --letter-spacing-display / --text-transform-display
+// any more (retired 2026-09-10). The recipes keep the fallbacks so the
+// contract stays: a theme MAY rebind them, and every consumer follows.
 //
 // Usage in a primitive:
 //

@@ -47,3 +47,23 @@ describe('root scale', () => {
     expect(styles).toMatch(/\nbody\s*\{[^}]*font-size:\s*v\.\$font-size-sm;/);
   });
 });
+
+describe('typography — Cinzel only on the brand mark and hero', () => {
+  const overrides = code(read('./themes/_shape-overrides.scss'));
+
+  it('themes no longer rebind the primary font or its display casing', () => {
+    expect(overrides).not.toMatch(/--font-primary\s*:/);
+    expect(overrides).not.toMatch(/--letter-spacing-display\s*:/);
+    expect(overrides).not.toMatch(/--text-transform-display\s*:/);
+  });
+
+  it('legacy component selectors are gone from the theme layer', () => {
+    for (const sel of ['.btn', '.filter-chip', '.tab-button', '.session-message', '.chat-message', 'h1.panel-title', '.session-title', '.nav-section-label', '.section-title']) {
+      expect(overrides, sel).not.toContain(sel);
+    }
+  });
+
+  it('the approval-card left rule survives', () => {
+    expect(overrides).toMatch(/\.approval-card,\s*\n\s*\.tool-approval\s*\{[^}]*border-left:\s*3px solid var\(--accent-color\)/);
+  });
+});
