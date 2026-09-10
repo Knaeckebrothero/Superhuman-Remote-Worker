@@ -176,6 +176,7 @@ export interface EffectiveModels {
 }
 
 export interface ExpertDetail extends Expert {
+  workspace_preference?: {backend: "none" | "virtual" | "sandbox" | "vm"} | null;
   config: Record<string, unknown>;
   instructions: string | null;
   /**
@@ -2255,6 +2256,7 @@ export interface Job {
  * Keep view state and internal delegation/identity commands outside this type.
  */
 export interface JobCreateRequest {
+  workspace?: Record<string, unknown> | null;
   description: string;
   upload_id?: string;
   config_upload_id?: string;

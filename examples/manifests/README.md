@@ -47,6 +47,37 @@ The [2026-09-10 k3d verification](verification/k3d-installed-harness-2026-09-10.
 records migration of all 20 installed Experts, preserved execution history, and
 a successful real Job/Session run with this binding.
 
+## Execution-owned workspace selection
+
+[srw-workspace-selection.yaml](srw-workspace-selection.yaml) uses the same
+installed SRW Expert with two referenced WorkspaceTemplates and with an explicit
+`workspace: null`. An Expert's `workspacePreference` is advisory: the creation UI
+can follow it, but the runtime never replaces a Job/Session selection with it.
+Project defaults take precedence over this recommendation. The UI previews tool
+availability for the chosen tier; the reference harness keeps its existing
+backend filtering and authorized upgrade requests.
+
+The existing `POST /api/jobs` and `POST /api/persistent/threads` requests accept
+the same binding as a top-level `workspace` field:
+
+```json
+{"workspace": {"template": {"ref": {"name": "build-env"}}}}
+```
+
+Omission inherits the active Project default, then account/role defaults. Explicit
+null selects no workspace. `config_override.workspace.backend` remains an
+explicit compatibility input; supplying both forms is rejected. Referenced
+workspace revisions are frozen in execution snapshots, including across Session
+configuration edits and End/Resume. Unattended Project loops, automations and
+Officer dispatch also resolve the Project workspace before connector selection.
+
+The current SRW provisioner accepts backend-only templates with `Delete`
+retention. It rejects template resources, custom workspace images, initialization,
+preparation, retained instances and `instanceRef` instead of discarding them.
+These fields are part of the manifest schema and are supported only where the
+selected provisioner implements them. This change does not add a general
+auto-upgrade policy or preparation cache.
+
 ## Local use
 
 Install with `pip install -e '.[manifests]'` or use the configured orchestrator

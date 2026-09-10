@@ -115,6 +115,7 @@ class JobAdmissionCreationInputs:
     delivery_contract: dict[str, Any] | None
     officer_preparation: OfficerAdmissionPreparation | None
     ticket_ready_at: datetime | None
+    workspace_selection: dict[str, Any] | None = None
 
 
 async def create_admitted_job(
@@ -170,6 +171,8 @@ async def create_admitted_job(
         ),
         "delivery_contract": inputs.delivery_contract,
     }
+    if inputs.workspace_selection is not None:
+        create_kwargs["workspace_selection"] = inputs.workspace_selection
     if inputs.officer_preparation is not None:
         try:
             result = await dependencies.admit_officer(

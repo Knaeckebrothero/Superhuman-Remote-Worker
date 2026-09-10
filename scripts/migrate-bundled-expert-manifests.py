@@ -18,6 +18,40 @@ from shared.runtime.core.srw_manifest_config import (
 )
 
 
+def migrate_workspace_text(text: str) -> str:
+    """Move a leaf's backend pin without reformatting its behavioral settings."""
+    raw = yaml.safe_load(text)
+    private = srw_private_config(raw)
+    workspace = private.get("config", {}).get("workspace")
+    if not isinstance(workspace, dict) or "backend" not in workspace:
+        return text
+    from shared.runtime.core.workspace_selection import (
+        migrate_expert_workspace_preference,
+    )
+
+    migrated = migrate_expert_workspace_preference(raw)
+    node = yaml.compose(text)
+    for key in ("spec", "runtime", "config", "config", "workspace"):
+        node = next(value for name, value in node.value if name.value == key)
+    key, value = next(
+        (key, value) for key, value in node.value if key.value == "backend"
+    )
+    lines = text.splitlines(keepends=True)
+    start = key.start_mark.line
+    while start > 0 and lines[start - 1].lstrip().startswith("#"):
+        start -= 1
+    if len(workspace) == 1:
+        start -= 1  # the now-empty workspace mapping header
+    del lines[start : value.end_mark.line + 1]
+    result = "".join(lines)
+    if "workspacePreference" not in raw["spec"]:
+        backend = migrated["spec"]["workspacePreference"]["backend"]
+        result = result.replace(
+            "spec:\n", f"spec:\n  workspacePreference: {{backend: {backend}}}\n", 1
+        )
+    return result
+
+
 def converted(path: Path, *, image: str | None) -> str | None:
     text = path.read_text(encoding="utf-8")
     raw = yaml.safe_load(text)
@@ -36,6 +70,7 @@ def converted(path: Path, *, image: str | None) -> str | None:
                 f"      config_name: {base}\n      asset_name: {selector}\n",
                 1,
             )
+        updated = migrate_workspace_text(updated)
         return updated if updated != text else None
     library = path.parent.parent.name == "subagents"
     name = path.parent.name
@@ -82,7 +117,7 @@ def converted(path: Path, *, image: str | None) -> str | None:
         for line in text.splitlines()
         if not line.startswith("# yaml-language-server:")
     )
-    return (
+    return migrate_workspace_text(
         header
         + "      config:\n"
         + "\n".join("        " + line if line else "" for line in body.splitlines())

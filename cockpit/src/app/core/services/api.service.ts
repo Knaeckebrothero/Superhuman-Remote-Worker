@@ -238,6 +238,7 @@ export interface SessionSubagentRoster {
 }
 
 export interface SessionToolGroupsResponse {
+  workspace?: import("../models/workspace.model").WorkspacePreview;
   thread_id: string;
   /** Which agent path the PREDICTION models. Says nothing about `origin`. */
   source: 'resolved' | 'legacy' | 'error';
@@ -2008,6 +2009,8 @@ export class ApiService {
      * Same deadline and same silent-null contract as the thread read.
      */
     previewToolGroups(body: {
+        workspace?: Record<string, unknown> | null;
+        workspace_preference?: 'none' | 'virtual' | 'sandbox' | 'vm' | null;
         config_name?: string | null;
         expert_id?: string | null;
         project_id?: string | null;

@@ -444,6 +444,7 @@ def _db(
     """
     db = AsyncMock()
     db.get_officer_capacity_lineage.return_value = [OFFICER_THREAD_ID]
+    db.get_project.return_value = None
     db.ticket_claim_states.return_value = claims or {}
     db.list_officer_slot_claims.return_value = slot_claims or []
     db.list_officer_distinct_terminal_outcomes.return_value = []

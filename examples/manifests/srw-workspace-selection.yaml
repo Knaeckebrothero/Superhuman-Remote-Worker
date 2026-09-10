@@ -1,0 +1,69 @@
+# Omitted scope is supplied by the authenticated API or the local preview CLI.
+apiVersion: srw/v1alpha1
+kind: Expert
+metadata:
+  name: workspace-independent-helper
+spec:
+  workspacePreference: {backend: sandbox}
+  runtime:
+    adapter: srw/v1
+    config:
+      config_name: worker_base
+      prompts:
+        persona: Complete the assignment using the resources selected for this job.
+---
+apiVersion: srw/v1alpha1
+kind: WorkspaceTemplate
+metadata:
+  name: build-env
+spec:
+  backend: sandbox
+---
+apiVersion: srw/v1alpha1
+kind: WorkspaceTemplate
+metadata:
+  name: lightweight-env
+spec:
+  backend: virtual
+---
+apiVersion: srw/v1alpha1
+kind: Job
+metadata:
+  name: sandbox-assignment
+spec:
+  task: {text: Inspect the workspace and report which resources are available.}
+  execution:
+    expert: {ref: {name: workspace-independent-helper}}
+    workspace: {template: {ref: {name: build-env}}}
+    connectors: {}
+  completion: {mode: Reported}
+  retry: {maxAttempts: 1}
+  timeoutSeconds: 600
+---
+apiVersion: srw/v1alpha1
+kind: Job
+metadata:
+  name: virtual-assignment
+spec:
+  task: {text: Read the workspace files and summarize their contents.}
+  execution:
+    expert: {ref: {name: workspace-independent-helper}}
+    workspace: {template: {ref: {name: lightweight-env}}}
+    connectors: {}
+  completion: {mode: Reported}
+  retry: {maxAttempts: 1}
+  timeoutSeconds: 600
+---
+apiVersion: srw/v1alpha1
+kind: Job
+metadata:
+  name: workspace-free-assignment
+spec:
+  task: {text: Answer the assignment using the prompt and available connectors.}
+  execution:
+    expert: {ref: {name: workspace-independent-helper}}
+    workspace: null
+    connectors: {}
+  completion: {mode: Reported}
+  retry: {maxAttempts: 1}
+  timeoutSeconds: 600

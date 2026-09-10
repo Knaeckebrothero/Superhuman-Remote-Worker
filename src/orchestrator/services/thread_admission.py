@@ -554,6 +554,23 @@ async def resolve_thread_creation_plan(
         request_body, user_id=str(user["id"]), dependencies=dependencies
     )
 
+    from orchestrator.services.manifest_workspace_selection import (
+        select_execution_workspace,
+    )
+    from shared.runtime.core.workspace_selection import bind_execution_workspace
+
+    selected_workspace, workspace_selection = await select_execution_workspace(
+        dependencies.store,
+        user,
+        project_id=primary_project_id,
+        role="session",
+        workspace=request_body.workspace,
+        supplied="workspace" in request_body.model_fields_set,
+        config_override=config_override,
+        account_defaults=account_defaults,
+    )
+    config_override = bind_execution_workspace(config_override, selected_workspace)
+
     # Resolve the complete create-time policy view.  This is also the source
     # for infrastructure-affecting values and grants, preventing the create
     # path from validating only a thin request fragment while attach sees a
@@ -859,6 +876,8 @@ async def resolve_thread_creation_plan(
         authority_project_ids=effective_project_ids,
         execution_lane=execution_lane,
     )
+    if workspace_selection is not None:
+        create_kwargs["workspace_selection"] = workspace_selection
     if trusted_seed is not None:
         create_kwargs["initial_event"] = trusted_seed.opening_event
     # A review branch is attach authority, not decorative metadata. Commit

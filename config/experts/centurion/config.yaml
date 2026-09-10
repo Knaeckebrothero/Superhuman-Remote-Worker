@@ -28,6 +28,7 @@ metadata:
   - persistent
   - session
 spec:
+  workspacePreference: {backend: none}
   runtime:
     adapter: srw/v1
     config:
@@ -66,8 +67,6 @@ spec:
         # delegation is not a persona preference — it is the only path to getting work
         # done. The job reads below are control-plane supervision and bounded
         # evidence, not an officer workspace.
-        workspace:
-          backend: none
 
         # The officer's OWN brain is deliberately NOT pinned here: catalogs differ per
         # deployment (k3d has no codex-proxy), and a model absent from the catalog

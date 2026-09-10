@@ -118,7 +118,11 @@ def expert_manifest(
         private["layers"] = deepcopy(row["harness_config_layers"])
     runtime["config"] = private
     srw_private_config(document)
-    return document
+    from shared.runtime.core.workspace_selection import (
+        migrate_expert_workspace_preference,
+    )
+
+    return migrate_expert_workspace_preference(document)
 
 
 def project_expert_resource(
@@ -136,6 +140,9 @@ def project_expert_resource(
             "manifest_uid": str(resource["id"]),
             "manifest_revision": resource["revision"],
             "manifest_resource_version": resource["resource_version"],
+            "workspace_preference": deepcopy(
+                document["spec"].get("workspacePreference")
+            ),
             "harness_adapter": adapter,
             "harness_config_name": None,
             "harness_asset_name": None,

@@ -61,6 +61,20 @@ class JobCreate(BaseModel):
             "orchestrator resolves it over the worker_base profile."
         ),
     )
+    workspace: dict[str, Any] | None = Field(
+        None,
+        description="Execution workspace: a manifest template binding or null for none. Omit to use Project/default selection.",
+    )
+
+    @field_validator("workspace")
+    @classmethod
+    def _validate_workspace(cls, value):
+        from orchestrator.services.manifest_workspace_selection import (
+            validate_workspace_selection,
+        )
+
+        return validate_workspace_selection(value)
+
     config_override: dict[str, Any] | None = Field(
         None, description="Per-job configuration overrides"
     )

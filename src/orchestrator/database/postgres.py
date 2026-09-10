@@ -3779,6 +3779,7 @@ class PostgresDB:
         workspace_assignment_source: str | None = None,
         delivery_contract: Mapping[str, Any] | None = None,
         execution_manifest: Mapping[str, Any] | None = None,
+        workspace_selection: Mapping[str, Any] | None = None,
         conn: Any = None,
     ) -> Dict[str, Any]:
         """Create a new job.
@@ -4111,6 +4112,9 @@ class PostgresDB:
                 config_name=config_name,
                 expert_id=expert_id,
                 config_override=config_override,
+                workspace_selection=dict(workspace_selection)
+                if workspace_selection is not None
+                else None,
                 description=description,
                 datasource_ids=[str(value) for value in datasource_uuids],
                 policy_revisions={
@@ -29475,6 +29479,7 @@ class PostgresDB:
         initial_metadata: Dict[str, Any] | None = None,
         initial_event: str | None = None,
         execution_manifest: Mapping[str, Any] | None = None,
+        workspace_selection: Mapping[str, Any] | None = None,
     ) -> str:
         """Create a thread with its complete connector selection in one row.
 
@@ -29680,6 +29685,9 @@ class PostgresDB:
                     config_name=config_name,
                     expert_id=metadata.get("expert_id"),
                     config_override=snapshot_override,
+                    workspace_selection=dict(workspace_selection)
+                    if workspace_selection is not None
+                    else None,
                     description=title,
                     datasource_ids=selected_ids,
                     policy_revisions={

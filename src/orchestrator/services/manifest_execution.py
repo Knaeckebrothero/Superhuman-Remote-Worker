@@ -153,16 +153,11 @@ class ManifestExecutionService:
                 runtime, trusted_image=self.srw_image
             )
             config_name = private.get("config_name", "worker_base")
-            config_override = {"workspace": {"backend": backend or "sandbox"}}
-            if workspace and (
-                "instanceRef" in workspace
-                or set(workspace["template"]["inline"]) - {"backend", "retention"}
-                or workspace["template"]["inline"].get("retention") == "Retain"
-            ):
-                raise HTTPException(
-                    422,
-                    "The SRW adapter's existing workspace provisioner does not yet implement this workspace recipe.",
-                )
+            from orchestrator.services.manifest_workspace_selection import (
+                srw_workspace_config,
+            )
+
+            config_override = {"workspace": srw_workspace_config(workspace)}
             if (
                 spec["completion"]["mode"] != "Reported"
                 or spec["retry"]["maxAttempts"] != 1

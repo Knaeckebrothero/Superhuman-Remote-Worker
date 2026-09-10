@@ -202,7 +202,7 @@ class TestAccountDefaultsLayer:
         assert detail["config"]["workspace"]["backend"] == "sandbox"
 
     @pytest.mark.asyncio
-    async def test_expert_fragment_still_beats_the_account_layer(
+    async def test_expert_backend_cannot_override_the_account_workspace(
         self, monkeypatch, account_user
     ):
         expert_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
@@ -231,8 +231,8 @@ class TestAccountDefaultsLayer:
             expert_id, user_id=account_user, include_account_defaults=True
         )
 
-        # base -> account -> expert: the expert is the most specific layer here.
-        assert detail["config"]["workspace"]["backend"] == "sandbox"
+        # Infrastructure has its own selection; private Expert settings cannot replace it.
+        assert detail["config"]["workspace"]["backend"] == "virtual"
 
     @pytest.mark.asyncio
     async def test_anonymous_caller_has_no_account_layer(self):
@@ -325,6 +325,11 @@ class TestPublicBaseIdsAfterTheRootSplit:
         path, _ = resolve_config_path(expert_id)
         expected = load_and_merge_config(path)
         expected.pop("connections", None)
+        # The platform's execution fallback is independent of the harness asset default.
+
+        expected["workspace"]["backend"] = (
+            "virtual" if detail["resolved_role"] == "session" else "sandbox"
+        )
         assert detail["config"] == expected
 
 
@@ -564,28 +569,14 @@ class TestRoleParameter:
         assert set(effective) == {"model", "subagent", "session"}
 
 
-class TestShellBoundBundledExpertsPinTheirTier:
-    """A shell-bound bundled expert must not start a session on the lite tier.
+class TestBundledWorkspacePreferences:
+    """Shell-oriented Experts advertise a preference without allocating resources.
 
-    Session resolution is ``expert_base < account layer < the expert's own
-    file``. The account layer ALWAYS emits ``workspace.backend`` (the owner's
-    saved tier, else the platform default ``virtual``), so ``expert_base.yaml``'s
-    ``backend: sandbox`` is dead for sessions; only a backend declared in the
-    expert's OWN ``config.yaml`` sits above that layer. On ``virtual`` the
-    capability gate strips shell, browser and git, and the agent can only ask a
-    human for an upgrade — a designer that cannot render, or a developer that
-    cannot run anything, is not the expert the picker advertised.
-
-    Ruling 2026-09-02 (vault issue
-    ``expert_workspace_requirements_do_not_select_runtime_tier``): experts are
-    templates — the create form shows the expert's backend the way it shows its
-    model, and the user may still change it before create — so a shell-bound
-    expert declares ``sandbox`` itself. Jobs are unaffected either way: the
-    workspace contract stamps the job tier from ``config_override`` and drops
-    the expert YAML's backend.
+    Creation clients may adopt it and submit the selected workspace explicitly.
+    The account/Project/Job selection remains independent of Expert behavior.
     """
 
-    PINNED_TO_SANDBOX = (
+    RECOMMENDS_SANDBOX = (
         "designer",
         "designer-interactive",
         "developer",
@@ -615,8 +606,8 @@ class TestShellBoundBundledExpertsPinTheirTier:
         return "22222222-2222-4222-8222-222222222222"
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("expert_id", PINNED_TO_SANDBOX)
-    async def test_shell_bound_expert_starts_a_session_on_sandbox(
+    @pytest.mark.parametrize("expert_id", RECOMMENDS_SANDBOX)
+    async def test_shell_bound_expert_recommends_sandbox_without_replacing_account(
         self, expert_id, virtual_default_user
     ):
         detail = await catalogue_service().load_expert_detail(
@@ -626,7 +617,8 @@ class TestShellBoundBundledExpertsPinTheirTier:
             role="session",
         )
 
-        assert detail["config"]["workspace"]["backend"] == "sandbox"
+        assert detail["config"]["workspace"]["backend"] == "virtual"
+        assert detail["workspace_preference"] == {"backend": "sandbox"}
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("expert_id", FOLLOWS_ACCOUNT_DEFAULT)
@@ -645,23 +637,22 @@ class TestShellBoundBundledExpertsPinTheirTier:
     def test_every_bundled_expert_with_shell_tools_takes_a_position_on_its_tier(
         self,
     ):
-        """Tripwire: the next shell-bound expert must decide, not inherit.
+        """Bundled shell-oriented Experts advertise a useful recommendation.
 
-        Reads each bundled file raw (not merged) so an inherited
-        ``expert_base`` value cannot satisfy it. Listing shell tools without
-        declaring ``workspace.backend`` is a silent vote for "starts blind";
-        either pin a tier here or add the expert to the documented exception
-        list above.
+        Inspect authored metadata rather than inherited runtime settings. An
+        Expert may deliberately defer to the independent execution defaults.
         """
         from pathlib import Path
 
         experts_dir = Path(__file__).resolve().parents[1] / "config" / "experts"
         undecided: list[str] = []
         for path in sorted(experts_dir.glob("*/config.yaml")):
-            raw = _srw_config_fragment(yaml.safe_load(path.read_text())) or {}
+            document = yaml.safe_load(path.read_text())
+            raw = _srw_config_fragment(document) or {}
             shell = (raw.get("tools") or {}).get("shell")
             lists_shell = isinstance(shell, list) and len(shell) > 0
-            declared = (raw.get("workspace") or {}).get("backend")
+            assert "backend" not in (raw.get("workspace") or {})
+            declared = document["spec"].get("workspacePreference", {}).get("backend")
             expert = path.parent.name
             if expert in self.FOLLOWS_ACCOUNT_DEFAULT:
                 assert declared is None, (
@@ -673,6 +664,6 @@ class TestShellBoundBundledExpertsPinTheirTier:
                 undecided.append(expert)
 
         assert not undecided, (
-            "Bundled experts list shell tools but declare no workspace.backend "
+            "Bundled experts list shell tools but declare no workspacePreference "
             f"in their own config.yaml: {undecided}"
         )

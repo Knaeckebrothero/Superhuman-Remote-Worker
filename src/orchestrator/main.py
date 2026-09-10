@@ -29759,6 +29759,8 @@ async def commission_project_officer(
         sub = row_cfg.get(passthrough)
         if isinstance(sub, dict) and sub:
             create_override[passthrough] = sub
+    # The commissioning request owns infrastructure, independently of Centurion.
+    create_override.setdefault("workspace", {}).setdefault("backend", "none")
     row_llm = row_cfg.get("llm") or {}
     row_interactive = row_cfg.get("interactive") or {}
     create_request = ThreadCreateRequest(
@@ -29772,9 +29774,8 @@ async def commission_project_officer(
         # Resavio change of command (2026-08-15): the endpoint-commissioned
         # officer had 34 tools and not one could create a job, while the
         # July officer — provisioned by hand with config_name=centurion —
-        # had the full 49. ``centurion`` also carries workspace.backend=none
-        # (klug-und-faul enforced structurally) and the reviewed nine-tool
-        # kb grant; ``officer.enabled`` stays false there and is flipped by
+        # had the full 49. Commissioning selects no workspace above; Centurion
+        # supplies the reviewed knowledge grant and behavioral settings; ``officer.enabled`` stays false there and is flipped by
         # the thread override above, which is the documented split.
         config_name=OFFICER_CONFIG_NAME,
         config_override=create_override,
@@ -31312,6 +31313,8 @@ class ToolGroupPreviewRequest(BaseModel):
     expert_id: Optional[str] = None
     project_id: Optional[str] = None
     config_override: Optional[dict[str, Any]] = None
+    workspace: Optional[dict[str, Any]] = None
+    workspace_preference: Literal["none", "virtual", "sandbox", "vm"] | None = None
     #: Which surface is asking. ``worker`` is the job-create form and defaults
     #: the base to ``worker_base``; ``session`` is the New Session form. Default
     #: stays ``session`` so the shipped cockpit's payloads keep their meaning.
@@ -31366,6 +31369,55 @@ async def preview_tool_groups(
     except Exception:
         logger.warning("Tool-group preview could not load the expert/project layer")
 
+    from orchestrator.services.manifest_workspace_selection import (
+        select_execution_workspace,
+    )
+    from shared.runtime.core.workspace_selection import bind_execution_workspace
+
+    account = (
+        await _resolve_session_account_defaults(str(user["id"]))
+        if not is_worker
+        else {}
+    )
+    workspace_config, workspace_selection = await select_execution_workspace(
+        postgres_db,
+        user,
+        project_id=body.project_id,
+        role=body.expert_type,
+        workspace=body.workspace,
+        supplied="workspace" in body.model_fields_set,
+        config_override=body.config_override,
+        account_defaults=account,
+        request=request,
+    )
+    workspace_source = (
+        "project"
+        if workspace_selection and workspace_selection.get("project_revision")
+        else "request"
+        if "workspace" in body.model_fields_set
+        or "backend" in ((body.config_override or {}).get("workspace") or {})
+        else "default"
+    )
+    # A creation client can ask to preview its proposed recommendation. It must
+    # materialize that choice in the submitted execution; admission never reads it.
+    if workspace_source == "default" and body.workspace_preference is not None:
+        workspace_config["backend"] = body.workspace_preference
+        workspace_source = "recommendation"
+    preview_override = bind_execution_workspace(
+        body.config_override or {}, workspace_config
+    )
+    preview_workspace = {
+        "backend": workspace_config["backend"],
+        "source": workspace_source,
+        "binding": workspace_selection["document"]
+        if workspace_selection
+        else (
+            None
+            if workspace_config["backend"] == "none"
+            else {"template": {"inline": {"backend": workspace_config["backend"]}}}
+        ),
+    }
+
     # The legacy branch models ONE agent's behaviour: persistent_session's
     # re-adding of the closed group lists when no disable marker is present.
     # Worker jobs have no such step, so on the worker surface "experts off" only
@@ -31379,7 +31431,7 @@ async def preview_tool_groups(
     try:
         if use_legacy:
             configured, provenance = await asyncio.to_thread(
-                _legacy_session_tool_policy, base, body.config_override or None
+                _legacy_session_tool_policy, base, preview_override
             )
         else:
             # No grant_strip here: this is a not-yet-created session, so
@@ -31399,7 +31451,7 @@ async def preview_tool_groups(
                 base_config_name=base,
                 expert_row=expert_row,
                 project_overrides=project_overrides,
-                request_override=body.config_override or None,
+                request_override=preview_override,
                 expert_type=body.expert_type,
                 db_refs=db_refs,
                 capture=capture,
@@ -31428,10 +31480,15 @@ async def preview_tool_groups(
         measured=None,
         configured=configured,
         provenance=provenance,
-        backend_caps=None,
+        backend_caps={
+            "supports_shell": workspace_config["backend"] in ("sandbox", "vm"),
+            "supports_file_tools": workspace_config["backend"] != "none",
+            "supports_canvas_presentation": workspace_config["backend"] != "none",
+        },
         grants=grants,
     )
     return {
+        "workspace": preview_workspace,
         "source": "legacy" if use_legacy else "resolved",
         **_origin_fields(
             _unmeasured(

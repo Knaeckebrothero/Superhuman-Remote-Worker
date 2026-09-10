@@ -87,6 +87,14 @@ def source_paths():
         "src/orchestrator/services/stateless_workspace_history_cleanup.py",
         "src/shared/runtime/core/srw_manifest_config.py",
         "src/shared/runtime/core/expert_resolution.py",
+        "src/shared/runtime/core/workspace_selection.py",
+        "src/shared/runtime/core/tool_report.py",
+        "src/orchestrator/services/config_resolver.py",
+        "src/orchestrator/services/job_admission.py",
+        "src/orchestrator/services/job_admission_config.py",
+        "src/orchestrator/services/thread_admission.py",
+        "src/orchestrator/schemas/job_create.py",
+        "src/orchestrator/schemas/thread_admission.py",
     }
     for pattern in (
         "src/shared/manifests/*.py",

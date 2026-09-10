@@ -1222,6 +1222,7 @@
       "permissionAutoAccept": "Auto-accept",
       "permissionAutonomous": "Autonomous",
       "workspaceBackend": "Default Workspace",
+      "workspaceRecommendation": "This Expert recommends {{tier}}. You can choose another workspace.",
       "workspaceBackendHint": "Where new sessions keep their files. Virtual starts in seconds and can be upgraded to a container mid-session; Container has full shell and git from the start but takes longer to provision.",
       "workspaceVirtual": "Virtual — instant, cloud file storage",
       "workspaceSandbox": "Container — full shell & git, slower start",

@@ -33,6 +33,12 @@ from shared.runtime.core.tool_report import (
 _AGENT_ROW = {"id": "agent-1", "pod_ip": "10.0.0.9", "pod_port": 8001}
 
 
+@pytest.fixture(autouse=True)
+def account_workspace_defaults(fake_db):
+    fake_db.get_user_settings.return_value = {}
+    fake_db.resolve_default_for_capability.return_value = None
+
+
 def _approved(user):
     """A stand-in with the REAL ``require_approved_user(request, db)`` arity.
 
@@ -1310,3 +1316,38 @@ class TestPreviewRoster:
         assert with_roster["subagents"]["roster"][0]["ref"] == "subagents/reader"
         assert with_roster["subagents"]["roster"][0]["description"] == description
         assert bare["subagents"] == {"default": None, "roster": []}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["none", "virtual", "sandbox"])
+async def test_explicit_workspace_preview_overrides_expert_recommendation(
+    user_a, fake_db, fake_request, backend
+):
+    from orchestrator.main import ToolGroupPreviewRequest, preview_tool_groups
+
+    selected = (
+        None if backend == "none" else {"template": {"inline": {"backend": backend}}}
+    )
+    with (
+        patch("orchestrator.main.require_approved_user", _approved(user_a)),
+        patch("orchestrator.main.postgres_db", fake_db),
+        patch("orchestrator.main._resolve_runner_grants", AsyncMock(return_value=None)),
+    ):
+        result = await preview_tool_groups(
+            ToolGroupPreviewRequest(
+                config_name="session_base",
+                workspace=selected,
+                workspace_preference="sandbox",
+                config_override={"tools": {"shell": ["run_command"]}},
+            ),
+            fake_request,
+        )
+    assert result["workspace"] == {
+        "backend": backend,
+        "source": "request",
+        "binding": selected,
+    }
+    assert result["origin"] == ORIGIN_PREDICTION
+    if backend != "sandbox":
+        assert result["categories"]["shell"]["state"] == STATE_UNAVAILABLE
+        assert result["categories"]["shell"]["decided_by"] == "backend"

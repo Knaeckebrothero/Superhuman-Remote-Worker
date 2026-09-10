@@ -276,6 +276,26 @@ def resolve_config(
                 explicit_llm_keys |= set(layer["llm"].keys())
             data = deep_merge(data, layer)
 
+    # Infrastructure is selected independently of the Expert's private layers.
+    # Keep the delivery format expected by the SRW harness, but never let an
+    # Expert select a backend or size a VM through its behavioral configuration.
+    if role in ("worker", "session"):
+        from shared.runtime.core.workspace_selection import (
+            bind_execution_workspace,
+            execution_workspace_config,
+        )
+
+        data = bind_execution_workspace(
+            data,
+            execution_workspace_config(
+                base_defaults,
+                project_overrides,
+                user_settings,
+                request_override,
+                role=role,
+            ),
+        )
+
     # Provenance markers are written LAST, after every authored layer has
     # merged, so this DB-loading path is their only writer: no layer above or
     # below can set, clear, or replace them.

@@ -399,6 +399,15 @@
         "runtime"
       ],
       "properties": {
+        "workspacePreference": {
+          "description": "Advisory workspace recommendation for creation clients. Never grants or selects infrastructure.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["backend"],
+          "properties": {
+            "backend": {"enum": ["none", "virtual", "sandbox", "vm"]}
+          }
+        },
         "runtime": {
           "$ref": "#/$defs/Runtime"
         }

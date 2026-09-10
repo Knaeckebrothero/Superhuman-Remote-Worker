@@ -181,6 +181,7 @@ async def prepare_srw_snapshot(
     policy_revisions: dict[str, int],
     runner_kind: str = "user",
     expert_row: dict | None = None,
+    workspace_selection: dict | None = None,
 ) -> dict:
     """Render the complete SRW configuration while the insertion is locked.
 
@@ -208,6 +209,14 @@ async def prepare_srw_snapshot(
     )
     from shared.runtime.core.model_registry import resolve_model
     from shared.runtime.core.skill_resolution import filter_bound_skills
+
+    if workspace_selection is not None:
+        from orchestrator.services.manifest_workspace_selection import (
+            verify_workspace_selection,
+        )
+
+        await ManifestStore(db).lock_catalog()
+        await verify_workspace_selection(db, workspace_selection, owner_id)
 
     if expert_row is not None and expert_id is not None:
         raise ValueError(
@@ -356,7 +365,7 @@ async def prepare_srw_snapshot(
             }
             if dependency not in dependencies:
                 dependencies.append(dependency)
-    return rendered_srw_snapshot(
+    prepared = rendered_srw_snapshot(
         blob,
         policy,
         work_kind=work_kind,
@@ -371,6 +380,23 @@ async def prepare_srw_snapshot(
         dependencies=dependencies,
         asset_name=(expert or {}).get("harness_asset_name"),
     )
+    if workspace_selection is not None:
+        from orchestrator.services.manifest_workspace_selection import (
+            srw_workspace_config,
+        )
+
+        expected = srw_workspace_config(workspace_selection["resolved"])["backend"]
+        if blob["agent"]["workspace"]["backend"] != expected:
+            raise HTTPException(409, "Workspace assignment changed during admission.")
+        for key in ("document", "resolved"):
+            prepared[key]["spec"]["execution"]["workspace"] = deepcopy(
+                workspace_selection[key]
+            )
+        for dependency in workspace_selection["dependencies"]:
+            if dependency not in prepared["dependencies"]:
+                prepared["dependencies"].append(deepcopy(dependency))
+        prepared["revision"] = content_revision(prepared["resolved"]["spec"])
+    return prepared
 
 
 def rendered_srw_snapshot(
@@ -527,6 +553,23 @@ async def prepare_srw_session_patch(
         image=runtime["image"],
         dependencies=deepcopy(current["dependencies"]),
     )
+    old_workspace = current["resolved"]["spec"]["execution"]["workspace"]
+    new_workspace = prepared["resolved"]["spec"]["execution"]["workspace"]
+
+    def backend_of(selection):
+        return (
+            (selection or {})
+            .get("template", {})
+            .get("inline", {})
+            .get("backend", "none")
+        )
+
+    if backend_of(old_workspace) == backend_of(new_workspace):
+        for key in ("document", "resolved"):
+            prepared[key]["spec"]["execution"]["workspace"] = deepcopy(
+                current[key]["spec"]["execution"]["workspace"]
+            )
+        prepared["revision"] = content_revision(prepared["resolved"]["spec"])
     prepared["expected_generation"] = current["generation"]
     return prepared, delivery_override
 

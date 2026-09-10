@@ -100,6 +100,18 @@ async def admit_job(
             config=config,
             dependencies=dependencies.officer(),
         )
+        workspace_selection = config.workspace_selection
+        if workspace_selection and workspace_selection.get("project_revision"):
+            from orchestrator.services.manifest_workspace_selection import (
+                srw_workspace_config,
+            )
+            from shared.workspace_contract import configured_workspace_backend
+
+            if (
+                configured_workspace_backend(officer.config_override)
+                != srw_workspace_config(workspace_selection["resolved"])["backend"]
+            ):
+                workspace_selection = None
         lane = await prepare_job_admission_workspace(
             context=officer.context,
             config_override=officer.config_override,
@@ -138,6 +150,7 @@ async def admit_job(
                 expert_id=config.expert_id,
                 config_override=officer.config_override,
                 requested_workspace_backend=config.requested_workspace_backend,
+                workspace_selection=workspace_selection,
                 root_creation=config.root_creation,
                 effective_user_id=scope.user_id,
                 project_id=config.project_id,

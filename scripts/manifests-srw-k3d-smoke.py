@@ -635,6 +635,9 @@ async def inspect():
             result={'id':str(snapshot['id']),'generation':snapshot['generation'],'revision':snapshot['revision'],
               'adapter':snapshot['harness_adapter'],'image':runtime['image'],'model':agent.get('llm',{}).get('model'),
               'temperature':agent.get('llm',{}).get('temperature'),
+              'workspaceBackend':agent.get('workspace',{}).get('backend'),
+              'workspace':snapshot['document']['spec']['execution'].get('workspace'),
+              'resolvedWorkspace':snapshot['resolved']['spec']['execution'].get('workspace'),
               'sourceDigest':hashlib.sha256(json.dumps(source,sort_keys=True).encode()).hexdigest()}
             if kind=='Session':
                 row=await db.fetchrow("SELECT execution_lane,status,runtime_generation::text AS generation,total_turns FROM threads WHERE id=$1",UUID(work_id))
@@ -722,6 +725,7 @@ def deployed_agents():
         "src/agent/api/persistent_app.py",
         "src/agent/agent.py",
         "src/shared/runtime/core/session_config_patch.py",
+        "src/shared/runtime/core/tool_report.py",
         "src/shared/runtime/core/srw_manifest_config.py",
     ]
     local = {
@@ -1109,7 +1113,6 @@ def authored_expert(prefix, image, model, *, session=False):
             "auxiliary": {"model": model, "enabled": False},
             "memory": {"enabled": False},
             "tools": tools,
-            "workspace": {"backend": "sandbox"},
             "limits": {"max_tool_calls_per_job": 50},
         },
         "prompts": {
@@ -1128,6 +1131,7 @@ def authored_expert(prefix, image, model, *, session=False):
     document = cutover.authored_expert(
         prefix, "session" if session else "worker", image=image, private=private
     )
+    document["spec"]["workspacePreference"] = {"backend": "sandbox"}
     document["spec"]["runtime"]["adapter"] = "srw/v1"
     document["spec"]["runtime"].pop("image")
     if session:
@@ -1256,13 +1260,35 @@ class Smoke:
         )
         return result
 
-    def exercise_job(self):
+    def workspace_binding(self, backend):
+        if backend == "none":
+            return None
+        name = self.prefix + backend
+        self.gate.apply(
+            {
+                "apiVersion": "srw/v1alpha1",
+                "kind": "WorkspaceTemplate",
+                "metadata": {"name": name},
+                "spec": {"backend": backend},
+            }
+        )
+        return {"template": {"ref": {"name": name}}}
+
+    def exercise_job(self, backend="sandbox"):
         run_id = self.prefix + "job"
         self.fixture.arm(run_id, "worker-job", 100)
         document = authored_job(
             self.prefix, authored_expert(self.prefix, self.image, self.model)
         )
-        result = self.gate.apply(document, key=self.prefix + "job-create")
+        document["metadata"]["name"] += "-" + backend
+        worker = authored_expert(self.prefix, self.image, self.model)
+        self.gate.apply(worker)
+        document["spec"]["execution"]["expert"] = {
+            "ref": {"name": worker["metadata"]["name"]}
+        }
+        selected = self.workspace_binding(backend)
+        document["spec"]["execution"]["workspace"] = selected
+        result = self.gate.apply(document, key=self.prefix + "job-create-" + backend)
         require(
             len(result["executions"]) == 1,
             "Job admission did not return one work identity.",
@@ -1283,6 +1309,11 @@ class Smoke:
             finished, "Waiting for the real SRW Job to report completion.", timeout=600
         )
         snapshot = self.snapshot("Job", self.job_id)
+        require(
+            snapshot["workspaceBackend"] == backend
+            and snapshot["workspace"] == selected,
+            "The Job did not bind its referenced workspace independently of the Expert.",
+        )
         repeated = self.gate.apply(document)
         require(
             next(iter(repeated["executions"].values())) == self.job_id
@@ -1297,14 +1328,13 @@ class Smoke:
             and state["pending_calls"] == 0,
             "The Job fixture observed missing or unexpected inference.",
         )
-        self.evidence["job"] = {
-            "workID": self.job_id,
-            "snapshot": snapshot,
-            "provider": state,
-        }
+        result = {"workID": self.job_id, "snapshot": snapshot, "provider": state}
+        self.evidence.setdefault("workspaceJobs", []).append(result)
+        if backend == "sandbox":
+            self.evidence["job"] = result
         self.fixture.reset(run_id)
         self.check(
-            "Native SRW manifest Job completes through the real worker and reapply preserves its execution identity"
+            f"Native SRW manifest Job on {backend} completes through the same Expert and reapply preserves its execution identity"
         )
 
     def reply(self, number):
@@ -1353,6 +1383,7 @@ class Smoke:
         document = authored_expert(self.prefix, self.image, self.model, session=True)
         item = self.gate.apply(document)["resources"][0]
         expert_id = self.gate.catalog_identity(item)
+        selected = self.workspace_binding("sandbox")
         thread = self.gate.request(
             "POST",
             "/api/persistent/threads",
@@ -1364,7 +1395,7 @@ class Smoke:
                 "project_ids": [],
                 "datasource_ids": [],
                 "use_datasource_defaults": False,
-                "config_override": {"workspace": {"backend": "sandbox"}},
+                "workspace": selected,
             },
         )
         self.thread_id = str(UUID(thread["thread_id"]))
@@ -1379,7 +1410,9 @@ class Smoke:
         self.reply(1)
         original = self.snapshot("Session", self.thread_id)
         require(
-            original["thread"]["execution_lane"] == "stateless",
+            original["thread"]["execution_lane"] == "stateless"
+            and original["workspaceBackend"] == "sandbox"
+            and original["workspace"] == selected,
             "The Session execution lane differs.",
         )
 
@@ -1402,6 +1435,9 @@ class Smoke:
                     "revision",
                     "sourceDigest",
                     "temperature",
+                    "workspace",
+                    "resolvedWorkspace",
+                    "workspaceBackend",
                 )
             ),
             "Editing the saved Expert changed a Session's captured configuration.",
@@ -1420,7 +1456,9 @@ class Smoke:
             patched["id"] == original["id"]
             and patched["generation"] == original["generation"] + 1
             and patched["temperature"] == 0.42
-            and patched["sourceDigest"] == original["sourceDigest"],
+            and patched["sourceDigest"] == original["sourceDigest"]
+            and patched["workspace"] == original["workspace"]
+            and patched["resolvedWorkspace"] == original["resolvedWorkspace"],
             "The Session PATCH did not create the expected isolated generation.",
         )
         self.reply(2)
@@ -1442,6 +1480,9 @@ class Smoke:
                     "revision",
                     "sourceDigest",
                     "temperature",
+                    "workspace",
+                    "resolvedWorkspace",
+                    "workspaceBackend",
                 )
             ),
             "End/Resume re-resolved or replaced the edited Session snapshot.",
@@ -1462,6 +1503,98 @@ class Smoke:
         }
         self.check(
             "Stateless Session first attach, frozen source edit, next-turn PATCH and End/Resume preserve the admitted contract"
+        )
+
+    def exercise_workspace_sessions(self):
+        """One immutable Expert, with explicit shell/file tools, on three tiers."""
+        if self.presence:
+            self.presence.close()
+            self.presence = None
+        document = authored_expert(
+            self.prefix + "workspace-", self.image, self.model, session=True
+        )
+        tools = document["spec"]["runtime"]["config"]["config"]["tools"]
+        tools.update(workspace=["read_file"], shell=["run_command"])
+        item = self.gate.apply(document)["resources"][0]
+        expert_id = self.gate.catalog_identity(item)
+        run_id = self.prefix + "session"
+        results = self.evidence["workspaceSessions"] = []
+        for backend in ("sandbox", "virtual", "none"):
+            progress(f"Exercising the unchanged Session Expert on {backend}.")
+            self.fixture.reset(run_id)
+            self.fixture.arm(run_id, "reply", 1)
+            selected = self.workspace_binding(backend)
+            preview = self.gate.request(
+                "POST",
+                "/api/persistent/tool-groups/preview",
+                payload={
+                    "expert_id": expert_id,
+                    "workspace": selected,
+                    "workspace_preference": "sandbox",
+                },
+            )
+            require(
+                preview["workspace"]["backend"] == backend
+                and preview["workspace"]["source"] == "request",
+                "An Expert recommendation replaced the explicit workspace preview.",
+            )
+            if backend != "sandbox":
+                require(
+                    preview["categories"]["shell"]["state"] == "unavailable",
+                    "The preview did not explain unavailable shell tools.",
+                )
+            thread = self.gate.request(
+                "POST",
+                "/api/persistent/threads",
+                payload={
+                    "title": "E2E-" + run_id,
+                    "expert_id": expert_id,
+                    "config_name": "session_base",
+                    "model": self.model,
+                    "project_ids": [],
+                    "datasource_ids": [],
+                    "use_datasource_defaults": False,
+                    "workspace": selected,
+                },
+            )
+            self.thread_id = str(UUID(thread["thread_id"]))
+            self.open_presence()
+            self.reply(1)
+            snapshot = self.snapshot("Session", self.thread_id)
+            require(
+                snapshot["workspaceBackend"] == backend
+                and snapshot["workspace"] == selected,
+                "A Session did not bind the requested workspace.",
+            )
+            report = self.gate.request(
+                "GET", f"/api/persistent/threads/{self.thread_id}/tool-groups"
+            )
+            state = self.fixture.state(run_id)
+            require(
+                state["consumed_required_responses"] == 1
+                and state["unexpected_count"] == 0
+                and state["pending_calls"] == 0,
+                "The workspace Session used unexpected inference.",
+            )
+            results.append(
+                {
+                    "backend": backend,
+                    "workID": self.thread_id,
+                    "snapshot": snapshot,
+                    "toolReportOrigin": report["origin"],
+                    "provider": state,
+                    "shellPreview": preview["categories"]["shell"]["state"],
+                }
+            )
+            self.presence.close()
+            self.presence = None
+        require(
+            self.gate.current(item)["revision"] == item["revision"],
+            "Workspace selection unexpectedly changed the Expert revision.",
+        )
+        self.fixture.reset(run_id)
+        self.check(
+            "The same immutable Session Expert replies on sandbox, virtual and explicit none; previews respect the selected tier"
         )
 
     def cleanup(self):
@@ -1562,7 +1695,7 @@ def main(argv=None):
         "gateIdentity": prefix,
         "startedAt": datetime.now(timezone.utc).isoformat(),
         "status": "failed",
-        "scope": "Real SRW worker Job and stateless Session over HTTP, SSE, sandbox workspace and stored snapshots",
+        "scope": "Real SRW Jobs on sandbox/virtual and stateless Sessions on sandbox/virtual/none over HTTP, SSE and referenced workspace snapshots",
     }
     admin = fixture = smoke = None
     succeeded = False
@@ -1615,7 +1748,9 @@ def main(argv=None):
             fixture.create(fixture_image)
             smoke.register_model()
             smoke.exercise_job()
+            smoke.exercise_job("virtual")
             smoke.exercise_session()
+            smoke.exercise_workspace_sessions()
             succeeded = True
         except GateFailure as exc:
             evidence["failure"] = str(exc)

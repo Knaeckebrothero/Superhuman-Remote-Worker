@@ -33,6 +33,7 @@ metadata:
   - delegation
   - worker
 spec:
+  workspacePreference: {backend: sandbox}
   runtime:
     adapter: srw/v1
     config:
@@ -83,12 +84,6 @@ spec:
             reviewer: {$ref: subagents/reviewer}
 
         workspace:
-          # Pinned: shell-bound. A session's account layer overrides expert_base's
-          # `sandbox` with the owner's default (platform default `virtual`, which
-          # strips shell/browser/git); a backend declared HERE sits above that layer.
-          # Jobs stamp their tier from config_override and ignore this key. See
-          # tests/test_expert_defaults.py::TestShellBoundBundledExpertsPinTheirTier.
-          backend: sandbox
           structure:
             - archive/
             - documents/

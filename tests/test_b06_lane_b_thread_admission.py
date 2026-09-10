@@ -65,6 +65,7 @@ def _unavailable_provisioner() -> SimpleNamespace:
 def _deps(**over: Any) -> ta.ThreadAdmissionDependencies:
     store_over = over.pop("store", {})
     store = SimpleNamespace(
+        fetchrow=AsyncMock(return_value=None),
         get_user_settings=AsyncMock(return_value={}),
         get_thread=AsyncMock(return_value=_created_thread()),
         create_thread=AsyncMock(return_value=THREAD),
@@ -104,7 +105,9 @@ def _deps(**over: Any) -> ta.ThreadAdmissionDependencies:
         authorize_thread_datasource_selection=AsyncMock(
             side_effect=lambda _u, ids, **_kw: (list(ids), {})
         ),
-        resolve_session_account_defaults=AsyncMock(return_value={}),
+        resolve_session_account_defaults=AsyncMock(
+            return_value={"workspace": {"backend": "sandbox"}}
+        ),
         prefetch_roster_refs=AsyncMock(return_value=None),
         resolve_thread_execution_lane=MagicMock(return_value="pinned"),
         build_thread_mount_rows=AsyncMock(return_value=[]),

@@ -279,6 +279,16 @@ async def create_job_from_automation(
 
     owner_id = str(automation["owner_id"])
     target_project_ids = [str(project_id)] if project_id else []
+    from orchestrator.services.manifest_workspace_selection import (
+        select_project_workspace_default,
+    )
+
+    config_override, workspace_selection = await select_project_workspace_default(
+        db,
+        owner_id,
+        project_id,
+        config_override,
+    )
     workspace_backend = _workspace_backend(config_override)
 
     # Automations intentionally store no connector selection in v1. Resolve
@@ -295,6 +305,11 @@ async def create_job_from_automation(
     )
 
     job = await db.create_job(
+        **(
+            {"workspace_selection": workspace_selection}
+            if workspace_selection is not None
+            else {}
+        ),
         origin="automation",
         description=automation["prompt"],
         config_name=config_name,

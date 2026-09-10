@@ -598,6 +598,15 @@ class ExpertCatalogService:
             from shared.runtime.core.expert_resolution import build_expert_config
 
             merged, _ = build_expert_config(deep_merge_dicts(base, account_layer), row)
+            from shared.runtime.core.workspace_selection import (
+                bind_execution_workspace,
+                execution_workspace_config,
+            )
+
+            if role_used in ("session", "worker"):
+                merged = bind_execution_workspace(
+                    merged, execution_workspace_config(account_layer, role=role_used)
+                )
             merged = prune_ignored_keys(merged)
             for key in ("connections", "$ignore_keys"):
                 merged.pop(key, None)
@@ -668,6 +677,9 @@ class ExpertCatalogService:
                 ),
                 "storage_kind": "db",
                 "managed_key": row.get("managed_key"),
+                "workspace_preference": (row.get("manifest") or {})
+                .get("spec", {})
+                .get("workspacePreference"),
                 "manifest": row.get("manifest"),
                 "harness_adapter": row.get("harness_adapter", SRW_HARNESS_ADAPTER),
                 "config": merged,
@@ -680,6 +692,8 @@ class ExpertCatalogService:
             }
         config_dir = self.deps.get_config_dir()
         private = {}
+        saved_manifest = None
+        account_layer = {}
 
         # Load expert config
         if expert_id in {
@@ -730,6 +744,10 @@ class ExpertCatalogService:
             saved_manifest = await self.bundled_manifest(
                 f"subagents/{expert_id}" if library_entry else expert_id
             )
+            if saved_manifest is None:
+                installed_document = yaml.safe_load(config_path.read_text()) or {}
+                if installed_document.get("kind") == "Expert":
+                    saved_manifest = installed_document
             if (
                 saved_manifest
                 and saved_manifest["spec"]["runtime"].get("adapter")
@@ -775,12 +793,12 @@ class ExpertCatalogService:
 
             # Account layer sits above the framework base and below the bundled
             # expert leaf — the same slot `resolve_config` gives `base_defaults`.
-            base_layer = deep_merge_dicts(
-                defaults,
-                await self.deps.account_defaults_layer(user_id, role_used)
+            account_layer = (
+                (await self.deps.account_defaults_layer(user_id, role_used))
                 if include_account_defaults
-                else {},
+                else {}
             )
+            base_layer = deep_merge_dicts(defaults, account_layer)
             from shared.runtime.core.expert_resolution import build_expert_config
 
             merged, _ = build_expert_config(
@@ -804,6 +822,16 @@ class ExpertCatalogService:
             effective_leaf = _private_layers(expert_data, private.get("layers", []))
             expert_llm_leaf = effective_leaf.get("llm") or {}
             expert_subagents = effective_leaf.get("subagents")
+
+        from shared.runtime.core.workspace_selection import (
+            bind_execution_workspace,
+            execution_workspace_config,
+        )
+
+        if saved_manifest and role_used in ("session", "worker"):
+            merged = bind_execution_workspace(
+                merged, execution_workspace_config(account_layer, role=role_used)
+            )
 
         # Load the raw settings_matrix for the client to resolve per-model defaults.
         # Do NOT apply it to merged — the client resolves based on the user's model selection.
@@ -856,6 +884,9 @@ class ExpertCatalogService:
             else None
         )
         return {
+            "workspace_preference": (saved_manifest or {})
+            .get("spec", {})
+            .get("workspacePreference"),
             "config": merged,
             "instructions": instructions_content,
             "enumerate_only": enumerate_only_members(),

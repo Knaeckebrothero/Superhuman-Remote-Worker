@@ -1222,6 +1222,7 @@
       "permissionAutoAccept": "Auto-akzeptieren",
       "permissionAutonomous": "Autonom",
       "workspaceBackend": "Standard-Arbeitsbereich",
+      "workspaceRecommendation": "Dieser Experte empfiehlt {{tier}}. Du kannst einen anderen Workspace wählen.",
       "workspaceBackendHint": "Wo neue Sitzungen ihre Dateien ablegen. Virtuell startet in Sekunden und kann während der Sitzung auf einen Container aufgerüstet werden; Container bietet von Anfang an Shell und Git, braucht aber länger zum Bereitstellen.",
       "workspaceVirtual": "Virtuell — sofort, Dateien im Cloud-Speicher",
       "workspaceSandbox": "Container — volle Shell & Git, langsamerer Start",

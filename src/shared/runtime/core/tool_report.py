@@ -413,7 +413,10 @@ def compose_tool_view(
         conf = [n for n in (configured.get(category) or [])]
         if measured is None:
             bound = None
-            tools = conf
+            # Creation previews know the selected tier. Configured tools which
+            # cannot bind there must not be forecast as available. Measurements
+            # below remain the agent's answer, including a contradictory one.
+            tools = [] if category in blocked_by_backend else conf
         else:
             bound = [n for n in (measured.get(category) or [])]
             tools = bound

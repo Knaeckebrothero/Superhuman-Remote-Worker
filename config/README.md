@@ -196,22 +196,39 @@ session for `session`, a roster entry for `subagent` — the loader
 (`load_and_merge_config(path, role=...)`) replaces the link that ends the chain
 with that role's overlay. So a session expert dispatched as a job gains the
 worker keys underneath it, and a worker expert used in a session sits on the
-session overlay; the expert's own values always win ("expert wins").
+session overlay; the expert's own behavioral values win. The orchestrator binds execution-owned
+infrastructure separately after this private merge.
 
-**Session account layer — `workspace.backend` needs an owner.** For sessions
-the orchestrator inserts an *account* layer between the merged role base and
-the expert's own file: the owner's saved `settings.persistent_agent.
-workspace_backend`, else the platform default `virtual`. That layer always
-emits `workspace.backend`, so `expert_base`'s `backend: sandbox` never reaches
-a session. An expert whose role needs a shell (build, run, browser, git) must
-declare `workspace.backend` in its **own** `config.yaml`; the New Session form
-then shows it like an expert-pinned model and the user may still change it.
-An expert that lists shell tools without declaring a backend starts on the
-lite tier with shell/browser/git stripped — a tripwire in
-`tests/test_expert_defaults.py::TestShellBoundBundledExpertsPinTheirTier`
-fails on that unless the expert is on its documented exception list
-(`scholar`). Jobs ignore the key: the workspace contract stamps a job's tier
-from `config_override` (default `sandbox`).
+**Workspace ownership.** A Job or Session selects its workspace independently
+of its Expert. Infrastructure fields (`workspace.backend` and `workspace.vm`)
+in an SRW Expert's private configuration do not select or size that workspace.
+Behavioral workspace settings, such as Git versioning, remain private settings.
+Selection precedence is explicit execution choice, then the active Project's
+workspace default, then account/role defaults (worker: sandbox, session: virtual).
+An explicit `workspace: null` means no workspace.
+
+Experts can publish `spec.workspacePreference: {backend: sandbox}`. The creation
+forms show this recommendation and materialize it as an explicit execution choice
+when no Project default or manual selection takes precedence. API callers must
+choose to follow recommendations themselves. Listing shell tools never allocates
+a machine: the SRW harness filters tools for the actual backend and retains the
+existing authorized workspace-upgrade flow.
+
+The existing Job and Session endpoints accept a top-level `workspace` using the
+manifest binding shape, for example `{"template":{"ref":{"name":"build-env"}}}`.
+Inline templates work too. Existing `config_override.workspace` requests remain
+compatible, but cannot be combined with a second top-level backend selection.
+Selected template and Project revisions are captured at admission; source edits
+do not change existing execution snapshots. Children keep their existing
+workspace inheritance.
+
+Bundled Experts now declare advisory preferences. For stored SRW Experts, run
+`scripts/migrate-workspace-preferences.py` to preview versioned changes, then
+`--apply --plan-revision <returned-revision>` against the intended database.
+The migration preserves execution history and active Project generations;
+managed Experts require an explicit update of their owning Project. Generic
+harness configuration remains opaque. See the
+[workspace examples](../examples/manifests/srw-workspace-selection.yaml).
 
 **Ignored keys.** A role overlay may declare `$ignore_keys`, a list of dotted
 paths its role never reads. They are pruned from the merged config after every
