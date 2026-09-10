@@ -142,3 +142,13 @@ describe('debt — no px radii anywhere', () => {
     expect(hits, hits.join('\n')).toEqual([]);
   });
 });
+
+describe('debt — uppercase only as eyebrows', () => {
+  it('no tracking wider than the eyebrow contract (0.06em), brand marks excepted', () => {
+    const hits = scanSources(
+      join(here, '../app'),
+      /letter-spacing:\s*(?:0\.(?:0[7-9]|[1-9]\d*)em|\d*\.?\d+px)\s*;(?!\s*\/\* brand)/,
+    ).filter((h) => !/chat-empty-state/.test(h));
+    expect(hits, hits.join('\n')).toEqual([]);
+  });
+});

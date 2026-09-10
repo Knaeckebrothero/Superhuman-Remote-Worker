@@ -2260,7 +2260,6 @@ const EXPIRY_OPTIONS = [
         border-radius: var(--radius-tag);
         font-family: var(--font-mono);
         font-size: 13px;
-        letter-spacing: 0.08em;
       }
 
       .subs-callback-row {

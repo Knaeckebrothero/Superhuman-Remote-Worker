@@ -739,7 +739,6 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
     }
     .discovery-family {
       font-size: 11px;
-      letter-spacing: 0.3px;
     }
     .discovery-caps {
       display: flex;

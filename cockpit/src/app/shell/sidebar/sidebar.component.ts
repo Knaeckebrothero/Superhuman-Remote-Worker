@@ -241,7 +241,7 @@ const MODE_ROUTES: Record<RailMode, string> = {
         font-size: 18px;
         font-weight: 700;
         color: var(--accent-color);
-        letter-spacing: 1px;
+        letter-spacing: 1px; /* brand */
       }
 
       .sidebar-label {
