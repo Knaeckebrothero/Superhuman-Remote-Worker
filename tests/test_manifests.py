@@ -60,9 +60,20 @@ def test_all_public_examples_validate_and_resolve_without_mutating_input():
         for doc in parse_documents(path.read_text())
     ]
     original = deepcopy(documents)
-    result = preview_documents(documents)
+    # srw-workspace-selection.yaml authors no scope on purpose: it documents the
+    # scope the authenticated API or the preview CLI supplies. An explicit
+    # metadata.scope in the other examples still wins over this default.
+    scoped = [
+        doc
+        if "scope" in doc["metadata"]
+        else {**doc, "metadata": {**doc["metadata"], "scope": ACCOUNT}}
+        for doc in original
+    ]
+    result = preview_documents(documents, default_scope=ACCOUNT)
     assert len(result["documents"]) == len(documents) >= 9
-    assert documents == original == result["documents"]
+    assert documents == original
+    # Resolution fills the supplied default scope and changes nothing else.
+    assert result["documents"] == scoped
     assert result["admissionReady"] is False
     assert result["effects"] == []
     assert "resourceAuthorization" in result["pendingChecks"]
@@ -80,7 +91,8 @@ def test_all_public_examples_validate_and_resolve_without_mutating_input():
         ]["scope"]
         == ACCOUNT
     )
-    assert parse_documents(export_documents(documents)) == documents
+    assert parse_documents(export_documents(documents, default_scope=ACCOUNT)) == scoped
+    assert documents == original
 
 
 def test_private_configuration_and_image_defaults_survive_every_operation():

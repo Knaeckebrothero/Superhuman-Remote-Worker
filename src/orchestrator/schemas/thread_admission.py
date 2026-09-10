@@ -104,7 +104,7 @@ class ThreadCreateRequest(BaseModel):
     @field_validator("workspace")
     @classmethod
     def _validate_workspace(cls, value):
-        from orchestrator.services.manifest_workspace_selection import (
+        from orchestrator.services.manifest_workspace_binding import (
             validate_workspace_selection,
         )
 

@@ -69,7 +69,7 @@ class JobCreate(BaseModel):
     @field_validator("workspace")
     @classmethod
     def _validate_workspace(cls, value):
-        from orchestrator.services.manifest_workspace_selection import (
+        from orchestrator.services.manifest_workspace_binding import (
             validate_workspace_selection,
         )
 
@@ -234,6 +234,7 @@ PUBLIC_JOB_CREATE_FIELDS = (
     "user_id",
     "project_id",
     "priority",
+    "workspace",
     "execution_lane",
 )
 

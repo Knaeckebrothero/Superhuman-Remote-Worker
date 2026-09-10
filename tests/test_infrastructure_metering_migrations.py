@@ -377,7 +377,7 @@ APP_INPUT_DELIVERY_CONSTRAINTS_NOT_VALID = (
 )
 APP_CURRENT_MIGRATION_HEAD = (
     ROOT
-    / "src/orchestrator/database/migrations/app/0237_stateless_historical_reclaim_projection_replay.sql"
+    / "src/orchestrator/database/migrations/app/0239_validate_manifest_deferred_constraints.sql"
 )
 AUDIT_EXPANSION = (
     ROOT

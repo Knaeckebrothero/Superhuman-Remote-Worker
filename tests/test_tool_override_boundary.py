@@ -716,6 +716,10 @@ def session_create_env(monkeypatch):
     acquire_cm.__aexit__.return_value = False
 
     db = SimpleNamespace(
+        # Session create now asks the manifest store for a Project workspace
+        # default before it authorizes anything. None means this project
+        # authored none, so selection falls back to the account/role default.
+        fetchrow=AsyncMock(return_value=None),
         get_user_settings=AsyncMock(return_value={}),
         create_thread=AsyncMock(return_value=SESSION_THREAD_ID),
         get_thread=AsyncMock(
@@ -1266,11 +1270,14 @@ class TestSessionCreateBoundary:
                 MagicMock(),
             )
 
+        # Execution now owns workspace selection, and the documented account/role
+        # default is sandbox for a worker but virtual for a session
+        # (config/README.md, "Workspace ownership").
         resolver.assert_awaited_once_with(
             db,
             SESSION_USER_ID,
             [],
-            "sandbox",
+            "virtual",
         )
         kwargs = db.create_thread.await_args.kwargs
         assert kwargs["datasource_ids"] == [SESSION_DATASOURCE_ID]

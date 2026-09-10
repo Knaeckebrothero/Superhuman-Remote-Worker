@@ -4,30 +4,14 @@ from copy import deepcopy
 from typing import Any
 
 from fastapi import HTTPException
-from jsonschema import Draft202012Validator
 
 from orchestrator.services.manifest_authority import ManifestAuthority
+from orchestrator.services.manifest_workspace_binding import (
+    validate_workspace_selection,
+)
 from orchestrator.services.manifest_resolution import LiveManifestResolver
 from orchestrator.services.manifest_store import ManifestStore
-from shared.manifests import load_schema
-from shared.manifests.validation import check_json_value
 from shared.runtime.core.workspace_selection import execution_workspace_config
-
-
-def validate_workspace_selection(value: dict | None) -> dict | None:
-    """Use the manifest binding schema for HTTP compatibility ingress too."""
-    if value is None:
-        return None
-    check_json_value(value)
-    schema = load_schema()
-    validator = Draft202012Validator(
-        {"$ref": "#/$defs/WorkspaceBinding", "$defs": schema["$defs"]}
-    )
-    if next(validator.iter_errors(value), None) is not None:
-        raise ValueError(
-            "workspace must be null or a manifest template/instanceRef binding"
-        )
-    return value
 
 
 def srw_workspace_config(workspace: dict | None) -> dict:
