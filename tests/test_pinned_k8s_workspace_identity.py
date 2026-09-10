@@ -13,6 +13,7 @@ from fastapi import HTTPException
 
 from orchestrator import main
 from orchestrator.services import thread_workspace_delivery
+from orchestrator.services.container_provisioner import WorkspaceRuntimeAttestation
 
 
 JOB_ID = "11111111-1111-4111-8111-111111111111"
@@ -24,8 +25,8 @@ BINDING_GENERATION = "66666666-6666-4666-8666-666666666666"
 FINGERPRINT = "SHA256:" + "A" * 43
 
 
-def _attestation(runtime: str = RUNTIME_A) -> main.WorkspaceRuntimeAttestation:
-    return main.WorkspaceRuntimeAttestation(
+def _attestation(runtime: str = RUNTIME_A) -> WorkspaceRuntimeAttestation:
+    return WorkspaceRuntimeAttestation(
         backing_id=f"k8s-pvc:default:{BACKING}",
         workspace_generation=BACKING,
         runtime_incarnation=runtime,
