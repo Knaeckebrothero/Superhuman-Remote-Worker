@@ -79,6 +79,17 @@ def test_unknown_mutation_is_not_replayed_or_printed(smoke_module):
     assert "private-value" not in str(error.value)
 
 
+def test_remote_workspace_evidence_program_is_executable(smoke_module, monkeypatch):
+    def inspect_program(source):
+        compile(source, "workspace-evidence.py", "exec")
+        return {"inspected": True}
+
+    monkeypatch.setattr(smoke_module.cutover, "remote_json", inspect_program)
+    assert smoke_module.readonly_evidence(kind="Job", work_id=str(uuid4())) == {
+        "inspected": True
+    }
+
+
 @pytest.mark.parametrize("kind", ("Session", "Job"))
 def test_owned_cleanup_retries_explicit_503_after_exact_readback(
     smoke_module, monkeypatch, kind
