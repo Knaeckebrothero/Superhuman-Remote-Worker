@@ -347,5 +347,15 @@
     "Explicit legacy VM sizing remains a compatibility input. No automatic workspace-upgrade policy was added.",
     "Generic hosting remains disabled on this k3d installation; this evidence covers the installed SRW adapter.",
     "Stateless Session reattachment was tested; the gate does not force another pool Pod or cover the pinned Session WebSocket protocol."
-  ]
+  ],
+  "integration": {
+    "commit": "a45b9e2a8",
+    "context": "Concurrent B06 refactor commits were preserved when merging the final smoke checks and documentation.",
+    "python": {
+      "passed": 136,
+      "warnings": 9,
+      "scope": "Manifest runtime ownership, workspace selection, Session tool preview, Job admission configuration, and B06 caller isolation."
+    },
+    "liveEvidenceScope": "The live runs above retain their original deployment hashes; this integration received the additional Python checks."
+  }
 }
