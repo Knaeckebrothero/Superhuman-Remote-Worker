@@ -171,7 +171,7 @@ async def list_available_models(
     - ``groups`` (chat-capability rows, grouped by provider)
     - ``auxiliary_models`` / ``vision_models`` / ``embedding_models`` /
       ``whisper_models`` / ``tts_models`` / ``search_models`` /
-      ``fetch_models`` (one helper list per capability)
+      ``fetch_models`` / ``rerank_models`` (one helper list per capability)
 
     Every row carries ``configured: true`` because the catalog only
     contains rows whose transport (system_api_keys row or system endpoint)

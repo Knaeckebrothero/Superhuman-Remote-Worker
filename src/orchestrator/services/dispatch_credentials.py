@@ -758,6 +758,26 @@ async def inject_thread_dispatch_credentials(
         and "openrouter" in resolved_keys
     ):
         env_keys_block.setdefault("OPENROUTER_API_KEY", resolved_keys["openrouter"])
+    # The memory reranker travels the same way (RERANK_MODEL / _BASE_URL /
+    # _API_KEY): the persisted block first so re-injection on resume is
+    # stable, then the user's pin, then the admin default for the ``rerank``
+    # capability. The agent rides the embedding transport when no RERANK_*
+    # keys arrive (single-router deployments), so this block is additive.
+    rerank_model = env_keys_block.get("RERANK_MODEL") or user_settings.get(
+        "default_rerank_model"
+    )
+    if not rerank_model:
+        rerank_model = await dependencies.store.resolve_default_for_capability("rerank")
+    if rerank_model:
+        await inject_env_key_credentials(
+            env_keys=env_keys_block,
+            prefix="RERANK",
+            model_id=rerank_model,
+            user_id=user_id,
+            resolved_keys=resolved_keys,
+            capability="rerank",
+            dependencies=dependencies,
+        )
     if include_kb_profile:
         await inject_system_kb_embedding_profile(
             env_keys_block, dependencies=dependencies

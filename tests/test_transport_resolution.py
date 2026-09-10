@@ -9,6 +9,7 @@ import pytest
 from shared.runtime.core.transport_resolution import (
     CitationTransportError,
     embedding_role_violation,
+    rerank_role_violation,
     is_openai_default_endpoint,
     llm_role_violation,
     resolve_citation_transport,
@@ -229,3 +230,25 @@ class TestCitationTransport:
         monkeypatch.setenv("OPENAI_API_KEY", "sk-openai")
         t = resolve_citation_transport()
         assert (t.base_url, t.api_key) == (self.CUSTOM, "sk-cit")
+
+
+class TestRerankRoleViolation:
+    """The `rerank` catalog slot mirrors the embedding pre-flight: flag only
+    the unambiguous case (a model delivered with no endpoint anywhere)."""
+
+    def test_no_rerank_model_not_flagged(self):
+        assert rerank_role_violation({"EMBEDDING_MODEL": "e"}) is None
+        assert rerank_role_violation({}) is None
+        assert rerank_role_violation(None) is None
+
+    def test_pinned_endpoint_row_ok(self):
+        env = {"RERANK_MODEL": "r", "RERANK_BASE_URL": "https://rerank/v1"}
+        assert rerank_role_violation(env) is None
+
+    def test_model_alone_rides_the_embedding_endpoint(self):
+        env = {"RERANK_MODEL": "r", "EMBEDDING_BASE_URL": "https://embed/v1"}
+        assert rerank_role_violation(env) is None
+
+    def test_model_with_no_endpoint_anywhere_flagged(self):
+        reason = rerank_role_violation({"RERANK_MODEL": "r", "RERANK_API_KEY": "k"})
+        assert reason and "RERANK_BASE_URL" in reason

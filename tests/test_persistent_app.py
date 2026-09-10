@@ -7728,7 +7728,7 @@ class TestAttachSessionRebinds:
         """M3 scrub-on-claim (§5.6) moved the embedding-override block into
         the pop-first helper ``_apply_session_embedding_env``; the attach path
         must still route through it, and the helper must reset the singleton
-        and own all four memory-embedding keys."""
+        and own every memory transport key (embedding + the rerank slot)."""
         from inspect import getsource
         from agent.api.persistent_app import (
             MEMORY_EMBEDDING_ENV_KEYS,
@@ -7746,6 +7746,9 @@ class TestAttachSessionRebinds:
             "EMBEDDING_MODEL",
             "EMBEDDING_BASE_URL",
             "EMBEDDING_API_KEY",
+            "RERANK_MODEL",
+            "RERANK_BASE_URL",
+            "RERANK_API_KEY",
         }
         # Pop-first: the scrub precedes any re-application of new env values.
         assert helper_src.index("os.environ.pop") < helper_src.index(

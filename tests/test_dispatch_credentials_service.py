@@ -972,6 +972,46 @@ class TestResolutionPrecedence:
         assert from_system["env_keys"]["EMBEDDING_MODEL"] == "sys-embed"
 
     @pytest.mark.asyncio
+    async def test_rerank_precedence_persisted_then_setting_then_system(
+        self, patched_main
+    ):
+        # The `rerank` catalog slot travels like embedding: persisted block,
+        # then the user's pin, then the admin default — and it is additive
+        # (no RERANK_* when nothing resolves; the agent then rides EMBEDDING_*).
+        patched_main.defaults.side_effect = _defaults(rerank="sys-rerank")
+        with patch(
+            "orchestrator.services.capability_credentials.resolve_capability_credentials",
+            AsyncMock(return_value=None),
+        ):
+            persisted = await dc.inject_thread_dispatch_credentials(
+                {"env_keys": {"RERANK_MODEL": "endpoint-chat"}},
+                user_id="u",
+                project_id="p",
+                user_settings={"default_rerank_model": "builtin-chat"},
+                dependencies=_deps(),
+            )
+            from_setting = await dc.inject_thread_dispatch_credentials(
+                {},
+                user_id="u",
+                project_id="p",
+                user_settings={"default_rerank_model": "builtin-chat"},
+                dependencies=_deps(),
+            )
+            from_system = await dc.inject_thread_dispatch_credentials(
+                {}, user_id="u", project_id="p", user_settings={}, dependencies=_deps()
+            )
+            patched_main.defaults.side_effect = _defaults()
+            unpinned = await dc.inject_thread_dispatch_credentials(
+                {}, user_id="u", project_id="p", user_settings={}, dependencies=_deps()
+            )
+        assert persisted["env_keys"]["RERANK_MODEL"] == "endpoint-chat"
+        assert persisted["env_keys"]["RERANK_BASE_URL"] == ENDPOINT_BASE_URL
+        assert persisted["env_keys"]["RERANK_API_KEY"] == ENDPOINT_KEY
+        assert from_setting["env_keys"]["RERANK_MODEL"] == "builtin-chat"
+        assert from_system["env_keys"]["RERANK_MODEL"] == "sys-rerank"
+        assert "RERANK_MODEL" not in (unpinned.get("env_keys") or {})
+
+    @pytest.mark.asyncio
     async def test_nested_roster_slots_are_credentialed_and_inherit_is_skipped(
         self, patched_main
     ):

@@ -1,11 +1,13 @@
 """Reranker scorer (memory overhaul Phase 3, slice 2).
 
 Reorders memory candidates by query relevance via an external rerank
-endpoint (Cohere-shaped ``POST {base_url}/rerank``). ``qwen3-reranker-8b``
-is served by the same router as the *embedding* model
-(``qwen3-embedding-8b``), so the plugin defaults to the **embedding**
-transport (``EMBEDDING_BASE_URL``/``EMBEDDING_API_KEY``) and needs no extra
-credential plumbing. It deliberately does NOT ride the auxiliary model: the
+endpoint (Cohere-shaped ``POST {base_url}/rerank``). The model and transport
+come from the ``rerank`` catalog slot (Admin → Models): the orchestrator
+injects ``RERANK_MODEL``/``RERANK_BASE_URL``/``RERANK_API_KEY`` from the
+pinned row at dispatch. With no ``RERANK_*`` at all the plugin rides the
+**embedding** transport (``EMBEDDING_BASE_URL``/``EMBEDDING_API_KEY`` — the
+single-router layout where ``qwen3-reranker-8b`` sits next to
+``qwen3-embedding-8b``). It deliberately does NOT ride the auxiliary model: the
 auxiliary is a freely-swapped chat model that may be OpenRouter-direct (no
 explicit ``base_url``) or a provider that serves no ``/rerank`` route —
 coupling to it crashed session startup and silently no-op'd reranking. See
@@ -41,7 +43,7 @@ Scope discipline:
 import asyncio
 import logging
 import os
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Mapping, Optional, Tuple
 
 from agent.services.memory.registry import register_memory_plugin
 from agent.services.memory.types import AssembleRequest, Scored, TransientScorerError
@@ -92,7 +94,8 @@ class RerankerScorer:
     ) -> None:
         if not base_url:
             raise ValueError(
-                "reranker needs a base_url: set memory.reranker.base_url or "
+                "reranker needs a base_url: pin a rerank model in Admin → Models "
+                "(RERANK_BASE_URL), set memory.reranker.base_url, or provide "
                 "EMBEDDING_BASE_URL (the reranker rides the embedding endpoint)"
             )
         self.model = model
@@ -201,6 +204,41 @@ class RerankerScorer:
         return [*head, *reordered, *tail, *others]
 
 
+DEFAULT_RERANK_MODEL = "qwen3-reranker-8b"
+
+
+def resolve_reranker_transport(
+    cfg: Any, env: Optional[Mapping[str, str]] = None
+) -> Tuple[str, Optional[str], Optional[str]]:
+    """``(model, base_url, api_key)`` for the scorer, explicit config first.
+
+    Per field: ``memory.reranker.*`` (YAML / job override) beats the
+    ``RERANK_*`` env the orchestrator injects from the ``rerank`` catalog pin,
+    which beats the embedding transport. ``base_url`` and ``api_key`` travel
+    as a pair: a host chosen by ``RERANK_BASE_URL`` is authenticated only by
+    ``RERANK_API_KEY`` (the embedding key never leaves the embedding host),
+    and when no rerank endpoint resolves at all both fall back to
+    ``EMBEDDING_*`` — the single-router deployment the plugin was built for.
+    An explicit ``memory.reranker.base_url`` keeps its pre-catalog contract
+    (any key that resolves), so existing overrides keep working.
+    """
+    if env is None:
+        env = os.environ
+    model = cfg.model or env.get("RERANK_MODEL") or DEFAULT_RERANK_MODEL
+    if cfg.base_url:
+        base_url = cfg.base_url
+        api_key = (
+            cfg.api_key or env.get("RERANK_API_KEY") or env.get("EMBEDDING_API_KEY")
+        )
+    elif env.get("RERANK_BASE_URL"):
+        base_url = env["RERANK_BASE_URL"]
+        api_key = cfg.api_key or env.get("RERANK_API_KEY")
+    else:
+        base_url = env.get("EMBEDDING_BASE_URL")
+        api_key = cfg.api_key or env.get("EMBEDDING_API_KEY")
+    return model, base_url, api_key
+
+
 @register_memory_plugin(
     "scorer",
     "reranker",
@@ -212,14 +250,13 @@ def _build_reranker(runtime: Any) -> RerankerScorer:
     cfg = getattr(runtime.memory_config, "reranker", None)
     if cfg is None:
         raise ValueError("memory.reranker config section missing")
-    # Ride the embedding endpoint, not the auxiliary: qwen3-reranker-8b and
-    # qwen3-embedding-8b are the same family on the same router, the embedding
-    # transport is always injected at dispatch, and it never depends on which
-    # chat model the user picked as their auxiliary. Explicit config wins.
-    base_url = cfg.base_url or os.environ.get("EMBEDDING_BASE_URL")
-    api_key = cfg.api_key or os.environ.get("EMBEDDING_API_KEY")
+    # Transport precedence: explicit memory.reranker.* → the RERANK_* env the
+    # orchestrator injects from the `rerank` catalog pin → the embedding
+    # endpoint (single-router deployments). Never the auxiliary: it may be
+    # OpenRouter-direct or serve no /rerank route at all.
+    model, base_url, api_key = resolve_reranker_transport(cfg)
     return RerankerScorer(
-        model=cfg.model,
+        model=model,
         base_url=base_url,
         api_key=api_key,
         top_k=cfg.top_k,

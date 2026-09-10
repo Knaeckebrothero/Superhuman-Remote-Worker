@@ -58,6 +58,9 @@ Payload shape::
           - id: "qwen3-embedding-8b"
             displayName: "Qwen3 Embedding 8B"
             capability: embedding        # routes to Admin → Defaults → Embedding
+          - id: "qwen3-reranker-8b"
+            displayName: "Qwen3 Reranker 8B"
+            capability: rerank           # memory reranker; Cohere-shaped /rerank
 
     systemModels:
       - provider: "anthropic"
@@ -201,6 +204,7 @@ _CAPABILITY_ENUM = (
     "tts",
     "search",
     "fetch",
+    "rerank",
 )
 
 # Default-model pins the payload's ``defaults`` map may set — one
@@ -223,6 +227,7 @@ DEFAULT_PIN_CAPABILITY_BY_KIND: dict[str, str] = {
     "search": "search",
     "fetch": "fetch",
     "search_fallback": "search",
+    "rerank": "rerank",
 }
 
 

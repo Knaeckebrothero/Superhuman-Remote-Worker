@@ -3950,12 +3950,18 @@ async def _release_failed_attach_receipt_until_confirmed(
 
 
 # Memory-path embedding routing keys. EmbeddingService is a process-wide
-# singleton built from these EMBEDDING_* env vars at first call.
+# singleton built from these EMBEDDING_* env vars at first call. The memory
+# reranker's RERANK_* transport (the `rerank` catalog slot) rides along under
+# the same scrub-on-claim contract: the scorer reads them at bind time, so a
+# following tenant must never inherit the previous tenant's rerank host/key.
 MEMORY_EMBEDDING_ENV_KEYS = (
     "EMBEDDING_PROVIDER",
     "EMBEDDING_MODEL",
     "EMBEDDING_BASE_URL",
     "EMBEDDING_API_KEY",
+    "RERANK_MODEL",
+    "RERANK_BASE_URL",
+    "RERANK_API_KEY",
 )
 
 
@@ -15567,6 +15573,12 @@ async def _handle_config_update(
             "EMBEDDING_MODEL",
             "EMBEDDING_BASE_URL",
             "EMBEDDING_API_KEY",
+            # The rerank slot is credential-bearing too; a change must round-
+            # trip through the orchestrator for base_url/api_key enrichment.
+            # The bound scorer keeps its attach-time transport until re-attach.
+            "RERANK_MODEL",
+            "RERANK_BASE_URL",
+            "RERANK_API_KEY",
         )
         ds_update = datasource_ids is not None
         tools_update = bool(config_override.get("tools"))

@@ -180,3 +180,9 @@ llm:
             displayName: E2E Embedding
             family: e2e
             capabilities: [embedding]
+          # The memory reranker's own catalog slot (required by readiness).
+          # The fixture accepts this id on /rerank alongside e2e-embedding.
+          - id: qwen3-reranker-8b
+            displayName: E2E Reranker
+            family: e2e
+            capabilities: [rerank]

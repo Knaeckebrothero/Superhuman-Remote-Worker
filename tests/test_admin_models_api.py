@@ -78,6 +78,7 @@ class TestCatalogConstants:
             "tts",
             "search",
             "fetch",
+            "rerank",
         )
 
     def test_provider_kinds_locked(self):
@@ -531,6 +532,7 @@ class TestReadinessAccessors:
             "tts": 0,
             "search": 0,
             "fetch": 0,
+            "rerank": 0,
         }
 
     @pytest.mark.asyncio

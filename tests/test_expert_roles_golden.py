@@ -107,8 +107,15 @@ _POST_SPLIT_OVERLAY_REMOVALS: dict[str, tuple[str, ...]] = {
     # with the light reader it was sized for.
     # Manifest workspace ownership: infrastructure now comes from the
     # execution resolver, so the shared Expert root no longer selects it.
-    "worker": ("limits.tool_category_timeouts.delegation", "workspace.backend"),
-    "session": ("workspace.backend",),
+    # rerank catalog capability (migration 0240): the shared root no longer
+    # names the reranker model — the `rerank` pin arrives as RERANK_MODEL at
+    # dispatch and the loader default is None, so the key left both overlays.
+    "worker": (
+        "limits.tool_category_timeouts.delegation",
+        "workspace.backend",
+        "memory.reranker.model",
+    ),
+    "session": ("workspace.backend", "memory.reranker.model"),
 }
 #: Tool names later work packages added to a tool CATEGORY on top of the
 #: frozen baseline (role -> category -> names, with the work that added them).

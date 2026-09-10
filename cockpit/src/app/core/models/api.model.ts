@@ -675,7 +675,7 @@ export interface ApiKeySetRequest {
 
 /**
  * Which slot a model fills. Chat is the default; non-chat rows are routed
- * to the matching Admin → Defaults selector (embedding/vision/whisper/tts)
+ * to the matching Admin → Defaults selector (embedding/rerank/vision/whisper/tts)
  * or used as auxiliary LLMs for memory extraction / curation / title gen.
  */
 export type LlmModelCapability =
@@ -686,7 +686,8 @@ export type LlmModelCapability =
   | 'whisper'
   | 'tts'
   | 'search'
-  | 'fetch';
+  | 'fetch'
+  | 'rerank';
 
 /**
  * A user-registered OpenAI-compatible LLM endpoint. Models attached to this
@@ -811,13 +812,15 @@ export type CatalogCapability =
   | 'whisper'
   | 'tts'
   | 'search'
-  | 'fetch';
+  | 'fetch'
+  | 'rerank';
 
 /** Provider anchor for a catalog row. */
 export type CatalogProviderKind = 'system' | 'endpoint';
 
 export const CATALOG_CAPABILITIES: CatalogCapability[] = [
   'chat', 'auxiliary', 'embedding', 'vision', 'whisper', 'tts', 'search', 'fetch',
+  'rerank',
 ];
 
 /**

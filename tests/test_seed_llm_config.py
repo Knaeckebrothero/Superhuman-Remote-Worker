@@ -551,6 +551,25 @@ class TestCapabilitiesArraySemantics:
         assert db.create_model.await_args.kwargs["capabilities"] == ["embedding"]
 
     @pytest.mark.asyncio
+    async def test_rerank_capability_seeds_as_a_singleton(self):
+        # `capability: rerank` is the memory reranker's own slot (migration
+        # 0240): no chat/auxiliary expansion, never filed under `embedding`.
+        payload = {
+            "systemModels": [
+                {
+                    "provider": "openai",
+                    "id": "qwen3-reranker-8b",
+                    "displayName": "Reranker",
+                    "capability": "rerank",
+                    "family": "qwen",
+                }
+            ],
+        }
+        db = _fake_db(existing_api_keys=[{"provider": "openai"}])
+        await seed(db, payload)
+        assert db.create_model.await_args.kwargs["capabilities"] == ["rerank"]
+
+    @pytest.mark.asyncio
     async def test_duplicate_provider_model_aggregates_capabilities(self):
         """Two helm entries pointing at the same (provider, model_id) collapse
         into a single insert with the union of capabilities[]. Required because

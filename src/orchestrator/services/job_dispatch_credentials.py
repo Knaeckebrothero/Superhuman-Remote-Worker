@@ -298,6 +298,10 @@ async def inject_dispatch_credentials(
             ("vision", "VISION", "default_vision_model", "vision"),
             ("whisper", "WHISPER", "default_whisper_model", "whisper"),
             ("tts", "TTS", "default_tts_model", "tts"),
+            # Memory reranker: RERANK_MODEL/_BASE_URL/_API_KEY from the `rerank`
+            # catalog pin. The agent rides the embedding transport when these
+            # are absent (single-router deployments), so this is additive.
+            ("rerank", "RERANK", "default_rerank_model", "rerank"),
             ("citation", "CITATION_LLM", "default_citation_model", "chat"),
         ):
             _model = user_settings.get(_user_key)

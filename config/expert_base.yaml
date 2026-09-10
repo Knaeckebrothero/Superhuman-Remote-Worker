@@ -283,7 +283,9 @@ memory:
   # the legacy two-tier read + cosine-dedup write stay in place behind these
   # flags, so this is a one-edit revert.
   reranker:
-    model: qwen3-reranker-8b         # rides the embedding endpoint EMBEDDING_BASE_URL (same qwen3 router; no extra credential plumbing)
+    # model / base_url / api_key: deliberately unset — the `rerank` catalog pin
+    # (Admin → Models) arrives as RERANK_MODEL/_BASE_URL/_API_KEY at dispatch;
+    # with no pin the scorer runs qwen3-reranker-8b on the embedding endpoint.
     top_k: 512                       # cover the candidate set; any tail past this fails the gate open, bounded backstops it
     keep_pinned_first: false         # ~95% of project corpora freeze TTL-pinned — let the reranker rank them too
     timeout: 10                      # live-latency cap per attempt (eval used 60 for cold-batch throughput)

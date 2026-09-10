@@ -1217,6 +1217,7 @@ def test_e2e_values_keep_only_required_stack_and_exact_provider_egress() -> None
     assert models[0]["capabilities"] == ["chat", "auxiliary"]
     assert models[0]["contextWindow"] == 128000
     assert models[1]["capabilities"] == ["embedding"]
+    assert models[2]["capabilities"] == ["rerank"]
 
 
 def test_stateless_sandbox_values_enable_session_executor_and_skill_catalogue() -> None:

@@ -46540,6 +46540,7 @@ class PostgresDB:
             "tts",
             "search",
             "fetch",
+            "rerank",
         }
     )
 

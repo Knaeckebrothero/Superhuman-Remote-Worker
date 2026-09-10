@@ -2318,11 +2318,15 @@ class TestScrubOnClaim:
                 "EMBEDDING_MODEL": "tenant-a-model",
                 "EMBEDDING_BASE_URL": "https://a.example",
                 "EMBEDDING_API_KEY": "sk-tenant-a",
+                "RERANK_MODEL": "tenant-a-rerank",
+                "RERANK_BASE_URL": "https://a-rerank.example",
+                "RERANK_API_KEY": "sk-tenant-a-rerank",
                 "KB_EMBEDDING_MODEL": "kb-a",
                 "KB_EMBEDDING_API_KEY": "sk-kb-a",
             }
         )
         assert os.environ.get("EMBEDDING_API_KEY") == "sk-tenant-a"
+        assert os.environ.get("RERANK_API_KEY") == "sk-tenant-a-rerank"
         assert os.environ.get("KB_EMBEDDING_MODEL") == "kb-a"
         emb._embedding_service = object()  # simulate a built singleton
 

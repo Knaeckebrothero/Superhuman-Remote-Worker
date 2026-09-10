@@ -95,6 +95,7 @@ VALID_DEFAULT_MODEL_KINDS = {
     "search",
     "fetch",
     "search_fallback",
+    "rerank",
 }
 
 

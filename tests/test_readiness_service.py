@@ -96,7 +96,12 @@ async def test_empty_state_is_not_ready() -> None:
     result = await readiness.compute_readiness(_FakeDb())
     assert result["ready"] is False
     assert result["missing_providers"] == ["any"]
-    assert set(result["missing_capabilities"]) == {"chat", "embedding", "auxiliary"}
+    assert set(result["missing_capabilities"]) == {
+        "chat",
+        "embedding",
+        "auxiliary",
+        "rerank",
+    }
     # No pins required when there are no rows to pin against — nothing in
     # missing_defaults.
     assert result["missing_defaults"] == []
@@ -109,7 +114,12 @@ async def test_provider_only_still_misses_models() -> None:
     result = await readiness.compute_readiness(db)
     assert result["ready"] is False
     assert result["missing_providers"] == []
-    assert set(result["missing_capabilities"]) == {"chat", "embedding", "auxiliary"}
+    assert set(result["missing_capabilities"]) == {
+        "chat",
+        "embedding",
+        "auxiliary",
+        "rerank",
+    }
 
 
 @pytest.mark.asyncio
@@ -118,13 +128,18 @@ async def test_models_present_but_no_default_pins() -> None:
     → ready=False, missing_defaults lists the required caps."""
     db = _FakeDb(
         api_keys=[{"provider": "openai"}],
-        capability_counts={"chat": 2, "embedding": 1, "auxiliary": 1},
+        capability_counts={"chat": 2, "embedding": 1, "auxiliary": 1, "rerank": 1},
         pinned_capabilities=[],
     )
     result = await readiness.compute_readiness(db)
     assert result["ready"] is False
     assert result["missing_capabilities"] == []
-    assert set(result["missing_defaults"]) == {"chat", "embedding", "auxiliary"}
+    assert set(result["missing_defaults"]) == {
+        "chat",
+        "embedding",
+        "auxiliary",
+        "rerank",
+    }
 
 
 @pytest.mark.asyncio
@@ -132,8 +147,8 @@ async def test_partially_pinned_defaults() -> None:
     """Pinning only some of the required capabilities keeps the gate red."""
     db = _FakeDb(
         api_keys=[{"provider": "openai"}],
-        capability_counts={"chat": 1, "embedding": 1, "auxiliary": 1},
-        pinned_capabilities=["chat", "embedding"],
+        capability_counts={"chat": 1, "embedding": 1, "auxiliary": 1, "rerank": 1},
+        pinned_capabilities=["chat", "embedding", "rerank"],
     )
     result = await readiness.compute_readiness(db)
     assert result["ready"] is False
@@ -142,11 +157,11 @@ async def test_partially_pinned_defaults() -> None:
 
 @pytest.mark.asyncio
 async def test_fully_ready_state() -> None:
-    """All three required caps have rows and pinned defaults → ready."""
+    """All four required caps have rows and pinned defaults → ready."""
     db = _FakeDb(
         api_keys=[{"provider": "openai"}],
-        capability_counts={"chat": 2, "embedding": 1, "auxiliary": 1},
-        pinned_capabilities=["chat", "embedding", "auxiliary"],
+        capability_counts={"chat": 2, "embedding": 1, "auxiliary": 1, "rerank": 1},
+        pinned_capabilities=["chat", "embedding", "auxiliary", "rerank"],
     )
     result = await readiness.compute_readiness(db)
     assert result["ready"] is True
@@ -160,8 +175,8 @@ async def test_fully_ready_state() -> None:
 async def test_missing_application_expert_pointer_blocks_readiness() -> None:
     db = _FakeDb(
         api_keys=[{"provider": "openai"}],
-        capability_counts={"chat": 1, "embedding": 1, "auxiliary": 1},
-        pinned_capabilities=["chat", "embedding", "auxiliary"],
+        capability_counts={"chat": 1, "embedding": 1, "auxiliary": 1, "rerank": 1},
+        pinned_capabilities=["chat", "embedding", "auxiliary", "rerank"],
         expert_defaults=[{"expert_type": "worker"}],
     )
     result = await readiness.compute_readiness(db)
@@ -183,9 +198,9 @@ async def test_chat_row_with_auxiliary_in_array_satisfies_auxiliary_requirement(
         api_keys=[{"provider": "openai"}],
         # Counts are what the fan-out would emit for ONE chat row with
         # capabilities=['chat','auxiliary'] plus one embedding row.
-        capability_counts={"chat": 1, "auxiliary": 1, "embedding": 1},
+        capability_counts={"chat": 1, "auxiliary": 1, "embedding": 1, "rerank": 1},
         # User pinned the same physical chat row for both slots.
-        pinned_capabilities=["chat", "auxiliary", "embedding"],
+        pinned_capabilities=["chat", "auxiliary", "embedding", "rerank"],
     )
     result = await readiness.compute_readiness(db)
     assert result["ready"] is True
@@ -198,8 +213,8 @@ async def test_endpoint_alone_satisfies_provider_check() -> None:
     """A system endpoint with no API key still counts as a configured provider."""
     db = _FakeDb(
         endpoints=[{"id": "ep-1", "label": "vllm"}],
-        capability_counts={"chat": 1, "embedding": 1, "auxiliary": 1},
-        pinned_capabilities=["chat", "embedding", "auxiliary"],
+        capability_counts={"chat": 1, "embedding": 1, "auxiliary": 1, "rerank": 1},
+        pinned_capabilities=["chat", "embedding", "auxiliary", "rerank"],
     )
     result = await readiness.compute_readiness(db)
     assert result["ready"] is True
@@ -212,8 +227,8 @@ async def test_optional_vision_falls_back_to_chat_by_default() -> None:
     audio caps disable (``None``)."""
     db = _FakeDb(
         api_keys=[{"provider": "openai"}],
-        capability_counts={"chat": 1, "embedding": 1, "auxiliary": 1},
-        pinned_capabilities=["chat", "embedding", "auxiliary"],
+        capability_counts={"chat": 1, "embedding": 1, "auxiliary": 1, "rerank": 1},
+        pinned_capabilities=["chat", "embedding", "auxiliary", "rerank"],
     )
     result = await readiness.compute_readiness(db)
     fallbacks = result["optional_capability_fallbacks"]
@@ -229,10 +244,11 @@ async def test_optional_capability_present_no_fallback_needed() -> None:
             "chat": 1,
             "embedding": 1,
             "auxiliary": 1,
+            "rerank": 1,
             "vision": 1,
             "whisper": 1,
         },
-        pinned_capabilities=["chat", "embedding", "auxiliary"],
+        pinned_capabilities=["chat", "embedding", "auxiliary", "rerank"],
     )
     result = await readiness.compute_readiness(db)
     assert result["optional_capability_fallbacks"]["vision"] is None
@@ -245,8 +261,8 @@ async def test_fallback_flag_false_disables_vision_chat_bridge() -> None:
     longer reports use_chat — it just disables."""
     db = _FakeDb(
         api_keys=[{"provider": "openai"}],
-        capability_counts={"chat": 1, "embedding": 1, "auxiliary": 1},
-        pinned_capabilities=["chat", "embedding", "auxiliary"],
+        capability_counts={"chat": 1, "embedding": 1, "auxiliary": 1, "rerank": 1},
+        pinned_capabilities=["chat", "embedding", "auxiliary", "rerank"],
         fallback_setting={"value": {"enabled": False}},
     )
     result = await readiness.compute_readiness(db)

@@ -1043,7 +1043,8 @@
           "tts": "Sprachsynthese",
           "search": "Suche (primär)",
           "fetch": "Web-Abruf",
-          "search_fallback": "Such-Fallback"
+          "search_fallback": "Such-Fallback",
+          "rerank": "Rerank (Sortierung der Memory-Treffer)"
         }
       }
     },

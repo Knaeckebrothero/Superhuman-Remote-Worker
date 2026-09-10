@@ -111,6 +111,34 @@ def embedding_role_violation(
     return None
 
 
+def rerank_role_violation(
+    env_keys: Optional[Mapping],
+) -> Optional[str]:
+    """Reason string if the *configured* rerank transport is unusable, else
+    ``None``.
+
+    Mirrors :func:`embedding_role_violation` for the ``rerank`` catalog slot.
+    The memory reranker binds ``RERANK_BASE_URL`` when dispatch resolved one
+    and otherwise rides the embedding endpoint (``EMBEDDING_BASE_URL``), so
+    the unambiguous failure is: a rerank *model* was delivered but neither
+    endpoint was — the scorer's ``ValueError`` at bind, one pod-spawn later.
+    A delivery with no ``RERANK_MODEL`` is the cluster default and is not
+    second-guessed here.
+    """
+    if not env_keys:
+        return None
+    model = env_keys.get("RERANK_MODEL")
+    if not model:
+        return None
+    if env_keys.get("RERANK_BASE_URL") or env_keys.get("EMBEDDING_BASE_URL"):
+        return None
+    return (
+        f"rerank model '{model}' resolved but no RERANK_BASE_URL (and no "
+        f"EMBEDDING_BASE_URL to fall back to) — the memory reranker cannot "
+        f"reach a /rerank endpoint"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Citation LLM credential isolation
 # ---------------------------------------------------------------------------

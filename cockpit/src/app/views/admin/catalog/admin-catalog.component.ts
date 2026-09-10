@@ -99,6 +99,7 @@ function hintsToCapabilities(
     'tts',
     'search',
     'fetch',
+    'rerank',
   ];
   const isKnown = (v: string): v is CatalogCapability =>
     known.includes(v as CatalogCapability);

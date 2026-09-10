@@ -45,6 +45,10 @@ import {AppFormFieldComponent} from '../../../ui/form-field';
                     @for (m of modelService.embeddingModels(); track m.id) {
                       <option [value]="m.id">{{ m.label }}</option>
                     }
+                  } @else if (kind === 'rerank') {
+                    @for (m of modelService.rerankModels(); track m.id) {
+                      <option [value]="m.id">{{ m.label }}</option>
+                    }
                   } @else if (kind === 'vision') {
                     @for (m of modelService.visionModels(); track m.id) {
                       <option [value]="m.id">{{ m.label }}</option>
@@ -153,7 +157,8 @@ export class AdminDefaultsComponent implements OnInit {
     this.modelService.whisperModels().length === 0 &&
     this.modelService.ttsModels().length === 0 &&
     this.modelService.searchModels().length === 0 &&
-    this.modelService.fetchModels().length === 0,
+    this.modelService.fetchModels().length === 0 &&
+    this.modelService.rerankModels().length === 0,
   );
   readonly searchFallbackMatchesPrimary = computed(() => {
     const primary = this.admin.defaults().search;

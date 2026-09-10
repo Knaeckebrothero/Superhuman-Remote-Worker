@@ -13,12 +13,17 @@ LLM_MODEL_CAPABILITIES = (
     "tts",
     "search",
     "fetch",
+    "rerank",
 )
 
 
 # Locked enum for the admin-curated catalog. Adding a new capability requires
 # touching every consumer (resolver, dispatcher, default-model fallback),
 # so the schema-level CHECK constraint and this Literal are kept in sync.
+# ``rerank`` is the memory reranker's slot (a Cohere-shaped ``/rerank`` route;
+# migration 0240). It is wired like ``embedding`` — required by the readiness
+# gate, one default pin, flat ``RERANK_*`` env at dispatch — until embedding
+# and rerank become optional together.
 VALID_CATALOG_CAPABILITIES = (
     "chat",
     "auxiliary",
@@ -28,6 +33,7 @@ VALID_CATALOG_CAPABILITIES = (
     "tts",
     "search",
     "fetch",
+    "rerank",
 )
 
 
@@ -35,7 +41,15 @@ VALID_CATALOG_PROVIDER_KINDS = ("system", "endpoint")
 
 
 CatalogCapabilityLiteral = Literal[
-    "chat", "auxiliary", "embedding", "vision", "whisper", "tts", "search", "fetch"
+    "chat",
+    "auxiliary",
+    "embedding",
+    "vision",
+    "whisper",
+    "tts",
+    "search",
+    "fetch",
+    "rerank",
 ]
 
 

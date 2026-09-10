@@ -1043,7 +1043,8 @@
           "tts": "Text-to-speech",
           "search": "Search (primary)",
           "fetch": "Web fetch",
-          "search_fallback": "Search fallback"
+          "search_fallback": "Search fallback",
+          "rerank": "Rerank (memory recall ordering)"
         }
       }
     },

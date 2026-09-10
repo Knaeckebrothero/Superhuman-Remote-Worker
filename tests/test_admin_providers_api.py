@@ -100,6 +100,11 @@ class TestDefaultModelKinds:
             VALID_DEFAULT_MODEL_KINDS
         )
 
+    def test_rerank_kind_present(self):
+        # The memory reranker is a catalog slot of its own (migration 0240),
+        # pinned like embedding; dispatch injects RERANK_* env for the agent.
+        assert "rerank" in VALID_DEFAULT_MODEL_KINDS
+
 
 # ---------------------------------------------------------------------------
 # Pydantic bodies

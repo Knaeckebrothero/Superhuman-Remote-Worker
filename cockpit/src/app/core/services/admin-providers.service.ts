@@ -51,13 +51,15 @@ export type DefaultModelKind =
   | 'tts'
   | 'search'
   | 'fetch'
-  | 'search_fallback';
+  | 'search_fallback'
+  | 'rerank';
 
 export const DEFAULT_MODEL_KINDS: DefaultModelKind[] = [
   'chat',
   'browser',
   'citation',
   'embedding',
+  'rerank',
   'vision',
   'auxiliary',
   'whisper',
@@ -79,6 +81,7 @@ const EMPTY_DEFAULTS: Record<DefaultModelKind, string | null> = {
   search: null,
   fetch: null,
   search_fallback: null,
+  rerank: null,
 };
 
 /**

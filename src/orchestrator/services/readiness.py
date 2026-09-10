@@ -9,9 +9,18 @@ catalog row exists. This module computes the readiness signal that:
 - Gates ``POST /api/jobs`` and ``POST /api/persistent/threads`` with a
   503 when one of the three required capabilities is missing.
 
-Required capabilities: ``chat``, ``embedding``, ``auxiliary``. Optional:
-``vision`` (falls back to chat when ``llm.fallback_optional_capabilities_to_chat``
-is true), ``whisper``, ``tts`` (audio features disable when missing).
+Required capabilities: ``chat``, ``embedding``, ``auxiliary``, ``rerank``.
+Optional: ``vision`` (falls back to chat when
+``llm.fallback_optional_capabilities_to_chat`` is true), ``whisper``, ``tts``
+(audio features disable when missing).
+
+Rerank is required for the same reason embedding is: the memory pipeline binds
+the reranker scorer unconditionally (``scorers: [reranker]`` in
+``config/expert_base.yaml``) and a configured scorer is required — a session or
+job whose ``/rerank`` route is unreachable fails every turn, so a fresh install
+must not be able to start one. Embedding and rerank are slated to become
+optional together (grep-based knowledge navigation already works without
+vectors); until then the gate holds both.
 
 Auxiliary is required (not optional + chat-fallback) because the
 auxiliary LLM runs the memory observer and knowledge curator on a
@@ -28,7 +37,7 @@ from typing import Any
 
 # Capabilities that *must* be ready before the cockpit releases. Aligns
 # with knowledge-base/knowledge/features/models_yaml_removal.md §"Role-completeness gate".
-REQUIRED_CAPABILITIES = ("chat", "embedding", "auxiliary")
+REQUIRED_CAPABILITIES = ("chat", "embedding", "auxiliary", "rerank")
 
 # Optional capabilities — surfaced in the readiness payload so the cockpit
 # can show "vision is missing → falls back to chat" hints, but they don't

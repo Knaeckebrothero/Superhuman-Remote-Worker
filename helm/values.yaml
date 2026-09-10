@@ -2992,8 +2992,8 @@ llm:
     # for keyless endpoints like in-cluster vLLM.
     #
     # `capability` on each model is optional and defaults to `chat`. Set it
-    # to `embedding`, `vision`, `auxiliary`, or `whisper` to route the row
-    # to the matching slot in Admin → Providers → Defaults. A single endpoint
+    # to `embedding`, `rerank`, `vision`, `auxiliary`, or `whisper` to route
+    # the row to the matching slot in Admin → Providers → Defaults. A single endpoint
     # can back multiple capabilities (e.g., Groq serving chat + whisper, or
     # OpenRouter serving chat + embedding) by listing the same `apiKeyRef`
     # once and adding one model row per physical model — a single row can
@@ -3021,6 +3021,9 @@ llm:
     #       - id: "kokoro-tts"
     #         displayName: "Kokoro TTS"
     #         capability: tts
+    #       - id: "qwen3-reranker-8b"
+    #         displayName: "Qwen3 Reranker 8B"
+    #         capability: rerank                # memory reranker (Cohere-shaped /rerank)
     systemEndpoints: []
 
     # -- Optional: provider-direct catalog rows (served by a system API key,
@@ -3080,17 +3083,18 @@ llm:
     # Kinds and the capability their model must carry:
     #   chat, browser, citation        -> chat
     #   auxiliary                      -> auxiliary
-    #   embedding / vision / whisper / tts -> the same-named capability
+    #   embedding / rerank / vision / whisper / tts -> the same-named capability
     #   search, search_fallback        -> search
     #   fetch                          -> fetch
-    # The readiness gate needs chat, auxiliary and embedding pinned before
-    # jobs and sessions can start.
+    # The readiness gate needs chat, auxiliary, embedding and rerank pinned
+    # before jobs and sessions can start.
     #
     # defaults:
     #   chat: "claude-opus-4-7"
     #   auxiliary: "gpt-4o"
     #   vision: "claude-opus-4-7"
     #   embedding: "text-embedding-3-large"
+    #   rerank: "qwen3-reranker-8b"
     defaults: {}
 
     # -- Resource requests for the short-lived seed Job pod.

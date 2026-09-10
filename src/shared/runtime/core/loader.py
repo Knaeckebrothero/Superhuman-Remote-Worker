@@ -2392,17 +2392,22 @@ class RerankerConfig:
     """memory.reranker — options for the 'reranker' scorer (overhaul Phase 3).
 
     Only consulted when ``reranker`` appears in ``memory.pipeline.scorers``.
-    ``base_url``/``api_key`` default to the **embedding** endpoint at bind time
-    (``EMBEDDING_BASE_URL``/``EMBEDDING_API_KEY`` — the same router serves the
-    ``qwen3-reranker-8b`` ``/rerank`` route and ``qwen3-embedding-8b``), so
-    production needs no extra credential plumbing. It does NOT ride the
-    auxiliary model (that coupling crashed startup on OpenRouter auxiliaries;
-    see knowledge-base/knowledge/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md).
+    The transport comes from the ``rerank`` catalog slot (Admin → Models):
+    dispatch injects ``RERANK_MODEL``/``RERANK_BASE_URL``/``RERANK_API_KEY``
+    from the pinned row, and explicit values here override them. With no
+    ``RERANK_*`` at all the scorer rides the **embedding** endpoint
+    (``EMBEDDING_BASE_URL``/``EMBEDDING_API_KEY`` — the single-router layout
+    where ``qwen3-reranker-8b`` and ``qwen3-embedding-8b`` share a host). It
+    never rides the auxiliary model (that coupling crashed startup on
+    OpenRouter auxiliaries; see
+    knowledge-base/knowledge/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md).
+    Resolution order per field lives in
+    ``agent.services.memory.plugins.reranker.resolve_reranker_transport``.
     """
 
-    model: str = "qwen3-reranker-8b"
-    base_url: Optional[str] = None  # null = EMBEDDING_BASE_URL
-    api_key: Optional[str] = None  # null = EMBEDDING_API_KEY
+    model: Optional[str] = None  # null = RERANK_MODEL, then qwen3-reranker-8b
+    base_url: Optional[str] = None  # null = RERANK_BASE_URL, then EMBEDDING_BASE_URL
+    api_key: Optional[str] = None  # null = the key paired with the chosen base_url
     top_k: int = 64  # rerank at most this many candidates per assemble
     timeout: float = 10.0  # seconds per rerank call
     # Transient-fault budget (timeouts / connection drops / 5xx): extra
@@ -2973,7 +2978,7 @@ def _parse_memory_config(data: Dict[str, Any]) -> MemoryConfig:
     )
     reranker_data = data.get("reranker", {}) or {}
     reranker = RerankerConfig(
-        model=reranker_data.get("model", "qwen3-reranker-8b"),
+        model=reranker_data.get("model") or None,
         base_url=reranker_data.get("base_url"),
         api_key=reranker_data.get("api_key"),
         top_k=int(reranker_data.get("top_k", 64)),

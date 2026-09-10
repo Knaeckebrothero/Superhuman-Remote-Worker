@@ -21,6 +21,7 @@ const defaults = signal<Record<string, string | null>>({
   search: 'tavily',
   fetch: 'tavily',
   search_fallback: 'searxng',
+  rerank: null,
 });
 const setDefault = vi.fn(() => of({kind: 'search_fallback', model: null}));
 
@@ -43,6 +44,7 @@ const modelService = {
   ttsModels: signal([]),
   searchModels: signal(helperModels),
   fetchModels: signal(helperModels.slice(0, 1)),
+  rerankModels: signal([]),
   load: vi.fn(),
 };
 

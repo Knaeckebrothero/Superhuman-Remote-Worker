@@ -748,9 +748,10 @@ async def session_endpoint_violations(
     transport, or experts off / resolve error → fail-open, same as the attach
     path). Runs the SAME resolve+inject as attach (``resolve_session_config``,
     which credential-injects the delivery blob) and then checks each configured
-    role (primary llm, auxiliary, embedding) against the loader's raise
-    conditions (``src/core/transport_resolution``). The reranker rides the
-    embedding endpoint, so validating embedding covers it.
+    role (primary llm, auxiliary, embedding, rerank) against the loader's raise
+    conditions (``shared.runtime.core.transport_resolution``). The reranker
+    binds RERANK_BASE_URL when the ``rerank`` catalog slot delivered one and
+    otherwise rides the embedding endpoint, so both transports are checked.
 
     Lets ``provision_or_assign`` / ``routers/sessions._do_prepare`` reject a
     never-startable session up front — emitting ``session.lifecycle: failed``
@@ -782,6 +783,7 @@ async def session_endpoint_violations(
     from shared.runtime.core.transport_resolution import (
         embedding_role_violation,
         llm_role_violation,
+        rerank_role_violation,
     )
 
     agent_blob = delivered.get("agent") or {}
@@ -802,6 +804,9 @@ async def session_endpoint_violations(
     emb_reason = embedding_role_violation(env_keys)
     if emb_reason:
         violations.append(emb_reason)
+    rerank_reason = rerank_role_violation(env_keys)
+    if rerank_reason:
+        violations.append(rerank_reason)
     return violations
 
 
