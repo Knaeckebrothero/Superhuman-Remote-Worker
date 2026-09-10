@@ -18,16 +18,30 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def _travertine_block() -> str:
-    """Return ONLY the $travertine-theme map body.
+    """Return the $travertine-theme map body PLUS the default accent's
+    Travertine sub-map.
 
-    Scoping matters: $senate-theme defines the same keys with different values
-    (accent-color is #9c2832 here and #cc4647 there), so a whole-file regex
-    matches both and silently compares against the wrong map.
+    Scoping matters: $senate-theme defines the same keys with different values,
+    so a whole-file regex matches both and silently compares against the wrong
+    map. Since 2026-09-10 the accent tokens (accent-color, on-accent, ...) live
+    in $accents, keyed by accent then mode; email and login wear the default
+    accent ($default-accent), so that sub-map is appended here.
     """
     text = (ROOT / brand.SCSS_TOKEN_SOURCE).read_text()
     start = text.index("$travertine-theme: (")
     end = text.index("\n);", start)
-    return text[start:end]
+    return text[start:end] + "\n" + default_accent_block(text, "travertine")
+
+
+def default_accent_block(text: str, mode: str) -> str:
+    """The `'<mode>': ( ... )` sub-map of the default accent inside $accents."""
+    default = re.search(r"\$default-accent:\s*'([a-z]+)'", text)
+    assert default, "$default-accent missing from the SCSS -- the accent axis moved?"
+    accents = text[text.index("$accents: (") :]
+    accent_start = accents.index(f"'{default.group(1)}': (")
+    mode_start = accents.index(f"'{mode}': (", accent_start)
+    mode_end = accents.index("),", mode_start)
+    return accents[mode_start:mode_end]
 
 
 def _parse_scss_hexes(block: str) -> dict[str, str]:
@@ -70,6 +84,13 @@ def test_normalize_hex_expands_shorthand() -> None:
     # 'on-accent' is #fff in SCSS; comparing raw strings would false-fail.
     assert brand.normalize_hex("#FFF") == "#ffffff"
     assert brand.normalize_hex("#9C2832") == "#9c2832"
+
+
+def test_default_accent_is_not_the_danger_colour() -> None:
+    """The reason the accent axis exists: a primary button must never share a
+    hex with Delete. Porphyry (the old red) is still selectable in the cockpit,
+    but the default the emails and the login page wear must differ."""
+    assert brand.TRAVERTINE["accent-color"] != brand.TRAVERTINE["danger"]
 
 
 def _contrast_ratio(hex_a: str, hex_b: str) -> float:

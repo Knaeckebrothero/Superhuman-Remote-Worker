@@ -200,13 +200,18 @@ def test_dark_tokens_match_the_shared_senate_palette() -> None:
     """
     from orchestrator.services import brand
 
+    from tests.test_brand_palette import default_accent_block
+
     scss = (ROOT / brand.SCSS_TOKEN_SOURCE).read_text()
     start = scss.index("$senate-theme: (")
+    # Accent tokens moved to $accents on 2026-09-10; the login page wears the
+    # default accent, so its Senate sub-map is appended to the base map.
+    senate_scss = scss[start : scss.index("\n);", start)] + "\n" + default_accent_block(scss, "senate")
     senate = {
         k: brand.normalize_hex(v)
         for k, v in re.findall(
             r"'([a-z0-9-]+)':\s*(#[0-9a-fA-F]{3,8})",
-            scss[start : scss.index("\n);", start)],
+            senate_scss,
         )
     }
     assert len(senate) >= 20, (

@@ -38,7 +38,7 @@
   table { border-collapse:collapse; }
   .srw-body p { margin:0 0 16px; font-size:15px; line-height:24px; color:#2a1d12; }
   .srw-body p:last-child { margin-bottom:0; }
-  .srw-body a { color:#9c2832; font-weight:600; text-decoration:underline; }
+  .srw-body a { color:#5f499c; font-weight:600; text-decoration:underline; }
   .srw-body b { color:#2a1d12; }
 </style>
 </head>
@@ -47,7 +47,7 @@
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#f3ece0" style="background-color:#f3ece0;">
 <tr><td align="center" style="padding:32px 12px;">
 <table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" bgcolor="#fbf6ec" style="width:600px;max-width:600px;background-color:#fbf6ec;border:1px solid #dccfb6;">
-<tr><td bgcolor="#9c2832" style="background-color:#9c2832;height:4px;line-height:4px;font-size:0;">&nbsp;</td></tr>
+<tr><td bgcolor="#5f499c" style="background-color:#5f499c;height:4px;line-height:4px;font-size:0;">&nbsp;</td></tr>
 <tr><td style="padding:24px 32px 8px 32px;">
 <#if (properties.logoUrl)?has_content>
   <img src="${properties.logoUrl}" width="200" alt="${_brand}" style="display:block;width:200px;max-width:200px;height:auto;">

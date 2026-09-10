@@ -1259,8 +1259,8 @@ spec:
             items:
               - key: login_theme.properties
                 path: login/theme.properties
-              - key: login_resources_css_srw.20260816.css
-                path: login/resources/css/srw.20260816.css
+              - key: login_resources_css_srw.20260910.css
+                path: login/resources/css/srw.20260910.css
               - key: login_resources_img_srw-logo.svg
                 path: login/resources/img/srw-logo.svg
               - key: email_theme.properties

@@ -15,17 +15,17 @@
  * Bump the datestamp (and theme.properties) whenever this file changes.
  */
 
-/* --- Travertine (light) ------------------------------------------------- */
+/* --- Travertine (light), Tyrian accent ---------------------------------- */
 :root {
-  --pf-v5-global--primary-color--100: #9c2832;
-  --pf-v5-global--primary-color--200: #7d1e26;
+  --pf-v5-global--primary-color--100: #5f499c;
+  --pf-v5-global--primary-color--200: #574093;
   --pf-v5-global--BackgroundColor--100: #fbf6ec;
   --pf-v5-global--BackgroundColor--200: #f3ece0;
   --pf-v5-global--Color--100: #2a1d12;
   --pf-v5-global--Color--200: #5a4632;
   --pf-v5-global--BorderColor--100: #dccfb6;
-  --pf-v5-global--link--Color: #9c2832;
-  --pf-v5-global--link--Color--hover: #7d1e26;
+  --pf-v5-global--link--Color: #5f499c;
+  --pf-v5-global--link--Color--hover: #574093;
 
   /* Roman shape pass: no rounded corners anywhere. */
   --pf-v5-global--BorderRadius--sm: 0;
@@ -36,25 +36,25 @@
   --pf-v5-global--FontFamily--heading: 'Cinzel', Georgia, 'Times New Roman', serif;
 
   /* keycloak.v2 brand hooks. The 4px card stripe ships PatternFly blue. */
-  --keycloak-card-top-color: #9c2832;
+  --keycloak-card-top-color: #5f499c;
   --keycloak-logo-url: url('../img/srw-logo.svg');
   --keycloak-logo-width: 260px;
   --keycloak-logo-height: 56px;
   --keycloak-bg-logo-url: none;
 }
 
-/* --- Senate (dark) ------------------------------------------------------ */
+/* --- Senate (dark), Tyrian accent --------------------------------------- */
 .pf-v5-theme-dark {
-  --pf-v5-global--primary-color--100: #cc4647;
-  --pf-v5-global--primary-color--200: #d65a5b;
+  --pf-v5-global--primary-color--100: #7f65ca;
+  --pf-v5-global--primary-color--200: #8a75cd;
   --pf-v5-global--BackgroundColor--100: #1c1c22;
   --pf-v5-global--BackgroundColor--200: #141418;
   --pf-v5-global--Color--100: #f4f2ee;
   --pf-v5-global--Color--200: #c9c5be;
   --pf-v5-global--BorderColor--100: #33333d;
-  --pf-v5-global--link--Color: #cc4647;
-  --pf-v5-global--link--Color--hover: #d65a5b;
-  --keycloak-card-top-color: #cc4647;
+  --pf-v5-global--link--Color: #7f65ca;
+  --pf-v5-global--link--Color--hover: #8a75cd;
+  --keycloak-card-top-color: #7f65ca;
 }
 
 /* Page ground. keycloak.v2 paints a dark background image here; we drop it. */
