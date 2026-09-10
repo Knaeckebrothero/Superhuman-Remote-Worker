@@ -1,0 +1,351 @@
+{
+  "gate": "execution-owned-workspace-selection",
+  "status": "passed",
+  "date": "2026-09-10",
+  "context": "k3d-srw",
+  "namespace": "srw",
+  "implementationCommit": "e6fadffdc",
+  "smokeHarnessCommit": "297f3d062",
+  "contract": "Expert behavior and advisory workspace preferences are independent of the workspace selected by the execution.",
+  "deployment": {
+    "pod": "srw-orchestrator-6db884d9cf-hwbtx",
+    "imageID": "srw-registry:5000/srw-orchestrator@sha256:e092d46918556b5308f7920e510696916022f1e4838e5daacb5e2a55a2e1a583",
+    "sourceFilesMatched": 74,
+    "sourceDigest": "06041bce049cb2980c2a763ecc896b403c3e79341ce5f724d8a1b9b50e420445",
+    "nativeHostingEnabled": false,
+    "nativeNamespace": "srw-native"
+  },
+  "rollout": {
+    "tiltCi": "passed",
+    "method": "Helm values and templates through Tilt; no manual Deployment patch"
+  },
+  "storedExpertMigration": {
+    "changes": 8,
+    "managedExpertsRequireProjectUpdate": 0,
+    "historyRowsPreserved": 119,
+    "executionAndProjectFingerprintsPreserved": true,
+    "rollbackVerified": true,
+    "repeatIsNoOp": true
+  },
+  "migrationRehearsal": {
+    "workspacePreferences": {
+      "changes": 8,
+      "managedExpertsRequireProjectUpdate": 0,
+      "historyRowsPreserved": 119,
+      "executionAndProjectFingerprintsPreserved": true,
+      "rollbackVerified": true,
+      "repeatIsNoOp": true
+    },
+    "activityMetadata": {
+      "migration": "0238",
+      "previousFunctionsUpdated": true,
+      "repeatIsNoOp": true,
+      "executionAndProjectFingerprintsPreserved": true
+    }
+  },
+  "activityProjectionMigration": {
+    "ledger": {
+      "filename": "0238_workspace_activity_projection.sql",
+      "checksum": "946937e6ba390304ac2175c54a434751ed4bf4b40136b8dcbb86db15660ef9f9",
+      "success": true
+    },
+    "functionsUpdated": {
+      "enforce_managed_repository_process_zero_transition": true,
+      "prevent_workspace_owner_delete_before_cleanup": true
+    }
+  },
+  "schemaSnapshot": "Regenerated app schema by replaying the complete migration chain into a disposable PostgreSQL database.",
+  "liveRuns": [
+    {
+      "identity": "cutover-456fdd2fc85f-",
+      "scope": "Real SRW Jobs on sandbox/virtual and stateless Sessions on sandbox/virtual/none over HTTP, SSE and referenced workspace snapshots",
+      "startedAt": "2026-09-10T09:17:39.253081+00:00",
+      "finishedAt": "2026-09-10T09:23:03.521659+00:00",
+      "deployment": {
+        "pod": "srw-orchestrator-799fb47847-gvqgt",
+        "imageID": "srw-registry:5000/srw-orchestrator@sha256:51fe97bcae0ce3935b20a7ef7fa1abaf18b349c75e987c7426304c81a8f3271f",
+        "sourceFilesMatched": 72,
+        "sourceDigest": "86891df135b26a843bf32121efbb19473909acc26030d22cb6047a159d91c628",
+        "nativeHostingEnabled": false,
+        "nativeNamespace": "srw-native"
+      },
+      "checks": [
+        "Role-authenticated owned provider/model registration preserves configured and effective defaults",
+        "Native SRW manifest Job on sandbox completes through the same Expert and reapply preserves its execution identity",
+        "Native SRW manifest Job on virtual completes through the same Expert and reapply preserves its execution identity",
+        "Stateless Session first attach, frozen source edit, next-turn PATCH and End/Resume preserve the admitted contract",
+        "The same immutable Session Expert replies on sandbox, virtual and explicit none; previews respect the selected tier"
+      ],
+      "cleanupComplete": true,
+      "rawInvocationSha256": "35a3204e7b4ea90f3b7ef20ecc143432c53370bdc71323ebf6348553495c11fe"
+    },
+    {
+      "identity": "cutover-e8732d178d3b-",
+      "scope": "Real existing Job API with a referenced virtual workspace and independently selected Expert",
+      "startedAt": "2026-09-10T10:00:24.777810+00:00",
+      "finishedAt": "2026-09-10T10:02:32.113773+00:00",
+      "deployment": {
+        "pod": "srw-orchestrator-6db884d9cf-hwbtx",
+        "imageID": "srw-registry:5000/srw-orchestrator@sha256:e092d46918556b5308f7920e510696916022f1e4838e5daacb5e2a55a2e1a583",
+        "sourceFilesMatched": 74,
+        "sourceDigest": "06041bce049cb2980c2a763ecc896b403c3e79341ce5f724d8a1b9b50e420445",
+        "nativeHostingEnabled": false,
+        "nativeNamespace": "srw-native"
+      },
+      "checks": [
+        "Role-authenticated owned provider/model registration preserves configured and effective defaults",
+        "Existing Job API selects a referenced virtual workspace independently of its Expert"
+      ],
+      "cleanupComplete": true,
+      "rawInvocationSha256": "cb8c574c4f7ccd0e8a25dba3cfd889299f80477ead954708d06ec734917ec1ee"
+    }
+  ],
+  "jobs": [
+    {
+      "ingress": "manifest-api",
+      "workID": "2856d0e9-edd6-498c-b27c-a4f947dbfe33",
+      "backend": "sandbox",
+      "authoredWorkspace": {
+        "template": {
+          "ref": {
+            "name": "cutover-456fdd2fc85f-sandbox"
+          }
+        }
+      },
+      "resolvedWorkspace": {
+        "template": {
+          "inline": {
+            "backend": "sandbox",
+            "retention": "Delete"
+          }
+        }
+      },
+      "capturedSourceDigest": "23a9b2ccda3764c3d4eda349ef012dcc33318d6bf5295553c0c2853c7ca6f756",
+      "snapshotRevision": "sha256:d1196aeaa47c1603710b62a32fc899b12918879193370df103553139f8f7e04c",
+      "observedJob": null,
+      "deterministicToolSteps": 12,
+      "unexpectedProviderCalls": 0
+    },
+    {
+      "ingress": "manifest-api",
+      "workID": "fd9714fe-ca80-48c6-926b-98f575995859",
+      "backend": "virtual",
+      "authoredWorkspace": {
+        "template": {
+          "ref": {
+            "name": "cutover-456fdd2fc85f-virtual"
+          }
+        }
+      },
+      "resolvedWorkspace": {
+        "template": {
+          "inline": {
+            "backend": "virtual",
+            "retention": "Delete"
+          }
+        }
+      },
+      "capturedSourceDigest": "23a9b2ccda3764c3d4eda349ef012dcc33318d6bf5295553c0c2853c7ca6f756",
+      "snapshotRevision": "sha256:3d5afc1926fd53d9ea4063ddee45d4d5c1552f547730301cb78f15b5a8044e40",
+      "observedJob": null,
+      "deterministicToolSteps": 12,
+      "unexpectedProviderCalls": 0
+    },
+    {
+      "ingress": "job-api",
+      "workID": "1b5807ea-e13c-4e40-b5bf-7d9e3ba5ae47",
+      "backend": "virtual",
+      "authoredWorkspace": {
+        "template": {
+          "ref": {
+            "name": "cutover-e8732d178d3b-virtual",
+            "scope": {
+              "kind": "Account",
+              "name": "996a2e0d-1ead-48d1-a56f-21a0ab1524db"
+            }
+          }
+        }
+      },
+      "resolvedWorkspace": {
+        "template": {
+          "inline": {
+            "backend": "virtual",
+            "retention": "Delete"
+          }
+        }
+      },
+      "capturedSourceDigest": "23a9b2ccda3764c3d4eda349ef012dcc33318d6bf5295553c0c2853c7ca6f756",
+      "snapshotRevision": "sha256:dd0a62bcbf74b27aba9ea978ab5ff32e62ef843dfecf25bd020c101816a5abdc",
+      "observedJob": {
+        "execution_lane": "pinned",
+        "status": "completed",
+        "has_workspace_container": false
+      },
+      "deterministicToolSteps": 12,
+      "unexpectedProviderCalls": 0
+    }
+  ],
+  "sessions": [
+    {
+      "backend": "sandbox",
+      "workID": "8ea64d1f-5d56-4f9c-9049-d8bc07c5e03b",
+      "executionLane": "stateless",
+      "turns": 1,
+      "authoredWorkspace": {
+        "template": {
+          "ref": {
+            "name": "cutover-456fdd2fc85f-sandbox"
+          }
+        }
+      },
+      "capturedSourceDigest": "742f50f0dae87705fc1acd27302b3b5f5f7163a16539455a92fe5ba716010067",
+      "toolReportOrigin": "prediction",
+      "shellPreview": "on"
+    },
+    {
+      "backend": "virtual",
+      "workID": "eca34f89-9b27-4221-9933-04a774f0febb",
+      "executionLane": "stateless",
+      "turns": 1,
+      "authoredWorkspace": {
+        "template": {
+          "ref": {
+            "name": "cutover-456fdd2fc85f-virtual"
+          }
+        }
+      },
+      "capturedSourceDigest": "742f50f0dae87705fc1acd27302b3b5f5f7163a16539455a92fe5ba716010067",
+      "toolReportOrigin": "prediction",
+      "shellPreview": "unavailable"
+    },
+    {
+      "backend": "none",
+      "workID": "023a78df-62fc-4222-a086-7d06e8291353",
+      "executionLane": "stateless",
+      "turns": 1,
+      "authoredWorkspace": null,
+      "capturedSourceDigest": "742f50f0dae87705fc1acd27302b3b5f5f7163a16539455a92fe5ba716010067",
+      "toolReportOrigin": "prediction",
+      "shellPreview": "unavailable"
+    }
+  ],
+  "sessionLifecycle": {
+    "workID": "af1aca55-3f54-42b5-8dbf-49feddab2baf",
+    "replies": 3,
+    "generations": {
+      "original": 1,
+      "patched": 2,
+      "resumed": 2
+    },
+    "workspaceSnapshotPreserved": true,
+    "capturedExpertSourcePreserved": true
+  },
+  "browser": {
+    "surface": "Session creation in deployed Cockpit",
+    "recommendationDisplayedAndSubmitted": true,
+    "explicitNoneSurvivesExpertChange": true,
+    "createdExecutions": 0
+  },
+  "localVerification": {
+    "initialBroadPythonRun": {
+      "passed": 1004,
+      "failuresFound": 14,
+      "resolution": "Updated account-default/normalized-template fixtures and fixed backend filtering in predicted tool reports; affected suites rerun."
+    },
+    "followUpSuites": [
+      {
+        "scope": "Tool prediction and measured-report handling",
+        "passed": 128
+      },
+      {
+        "scope": "Job admission and compatibility precedence",
+        "passed": 72
+      },
+      {
+        "scope": "Workspace ownership and heartbeat regressions",
+        "passed": 121
+      },
+      {
+        "scope": "Existing PostgreSQL workspace authority, retirement and smoke gates",
+        "passed": 95,
+        "fixtureFailure": "One new pending-creation fixture was corrected and rerun with the nine new guard cases."
+      },
+      {
+        "scope": "New historical activity and workspace authority cases",
+        "passed": 9
+      },
+      {
+        "scope": "Smoke gate harness",
+        "passed": 20
+      },
+      {
+        "scope": "Remote smoke evidence program compilation",
+        "passed": 1
+      },
+      {
+        "scope": "Cockpit Job/Session creation and workspace selection",
+        "passed": 60
+      }
+    ],
+    "ruff": "check and format passed for changed Python",
+    "cockpit": "Development build and translation parity passed (3298 keys); one pre-existing NG8102 warning.",
+    "examples": "Six-document workspace example validated and resolved; bundled Expert converter --check passed."
+  },
+  "cleanup": {
+    "acceptedRunsComplete": true,
+    "earlierManifestCleanupOrderFailure": {
+      "recovered": true,
+      "consumersRetiredBeforeDefinitions": true
+    },
+    "historicalHeartbeatFixture": {
+      "recovered": true,
+      "workloadCleanup": [
+        {
+          "kind": "Job",
+          "workID": "589421e9-1f8b-4e16-94bf-f7e9e00ae29e",
+          "statuses": [
+            {
+              "method": "GET",
+              "status": 200
+            },
+            {
+              "method": "DELETE",
+              "status": 200
+            },
+            {
+              "method": "GET",
+              "status": 404
+            }
+          ],
+          "absent": true
+        }
+      ],
+      "manifestCleanup": {
+        "complete": true,
+        "activeOwnedResources": 0,
+        "ownedProjects": 0,
+        "failedOperations": 0,
+        "historicalRevisionsRetained": true
+      },
+      "providerRemoved": true,
+      "fixtureNamespaceRemoved": true
+    },
+    "temporaryExternalProfiles": {
+      "identitiesChecked": 6,
+      "giteaProfilesAbsent": true,
+      "nextcloudAccountsAbsent": true,
+      "method": "Only exact temporary OIDC identities with creation-time proof and zero repositories, organizations and keys were eligible for deletion."
+    },
+    "configuredAndEffectiveModelDefaultsPreserved": true,
+    "historicalExecutionSnapshotsAndResourceRevisionsRetained": true,
+    "cachedFixtureImageLayersRetained": true
+  },
+  "limits": [
+    "VM selection is covered by resolver/admission tests; no VM was provisioned in this live gate.",
+    "Live tool reports captured after Session claim release are predictions. The gate does not prove every shell tool operation on each backend.",
+    "The SRW provisioner currently accepts backend-only templates with Delete retention; resources, custom images, initialization/preparation, retained instances and instanceRef remain explicitly unsupported.",
+    "Explicit legacy VM sizing remains a compatibility input. No automatic workspace-upgrade policy was added.",
+    "Generic hosting remains disabled on this k3d installation; this evidence covers the installed SRW adapter.",
+    "Stateless Session reattachment was tested; the gate does not force another pool Pod or cover the pinned Session WebSocket protocol."
+  ]
+}

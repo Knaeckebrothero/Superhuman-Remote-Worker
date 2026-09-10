@@ -643,8 +643,11 @@ not edited. Bootstrap credentials can be provided through
 `SRW_K3D_BOOTSTRAP_USER` and `SRW_K3D_BOOTSTRAP_PASSWORD`; tokens and fixture keys
 stay in memory and are excluded from evidence.
 
-The smoke admits a native `srw/v1` Job with an independent sandbox workspace and
-checks reported completion and reapply without replay. Its authored private
+The smoke admits native `srw/v1` Jobs with referenced sandbox and virtual
+workspaces using the same Expert, then checks completion and reapply without
+replay. It also exercises a referenced virtual workspace through the existing
+Job API and verifies that working heartbeats do not create a container projection.
+Use `--compatibility-job-only` to run that existing API case alone. Authored private
 settings disable auxiliary work, memory and instruction gates, and select only
 the four in-workspace/core tools needed by the deterministic phase driver. It
 then creates a stateless Session, opens the real owner SSE stream, and checks
@@ -652,7 +655,16 @@ three replies across a source Expert edit, a next-turn temperature PATCH, and
 End/Resume. Read-only PostgreSQL evidence compares snapshot identity, generation,
 model and hashes of captured prompts/instructions/skills. This covers stateless
 reattachment; it does not force another pool pod or exercise the pinned Session
-WebSocket configuration protocol.
+WebSocket configuration protocol. Three additional stateless Sessions use the
+same unchanged Expert with sandbox, virtual and explicit no workspace. Their
+previews follow the selected tier and mark shell tools unavailable on virtual/none;
+after claim release, tool-report evidence identifies itself as a prediction.
+
+The [workspace ownership acceptance](verification/k3d-workspace-ownership-2026-09-10.json)
+records the 2026-09-10 native Job/Session run and final existing Job API rerun.
+It includes the eight-Expert migration, preserved historical snapshots, deployed
+schema 0238 checksum, Cockpit selection check and completed fixture cleanup.
+VM provisioning and workspace preparation/retention are outside that live gate.
 
 Cleanup fences and removes owned work through the normal lifecycle APIs, retires
 its manifests, deletes only its endpoint/model and application administrator,
