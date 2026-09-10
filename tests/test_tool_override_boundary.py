@@ -85,6 +85,7 @@ from shared.runtime.core.tool_policy import (
     validate_tool_override_fragment,
 )
 from agent.tools.registry import TOOL_REGISTRY, get_tools_by_category
+from orchestrator.services import session_config_resolution  # noqa: E402
 
 #: The categories the cockpit's New Session form renders as checkboxes, in
 #: order. Mirror of SESSION_TOOL_CATEGORIES in
@@ -739,7 +740,9 @@ def session_create_env(monkeypatch):
         main, "_authorize_thread_project_ids", AsyncMock(return_value=[])
     )
     monkeypatch.setattr(
-        main, "_resolve_session_account_defaults", AsyncMock(return_value={})
+        session_config_resolution,
+        "resolve_session_account_defaults",
+        AsyncMock(return_value={}),
     )
     monkeypatch.setattr(main, "_is_experts_db_enabled", MagicMock(return_value=False))
     monkeypatch.setattr(main, "_user_experts_enabled", AsyncMock(return_value=False))
@@ -874,8 +877,8 @@ class TestSessionCreateBoundary:
         main, db, _, _ = session_create_env
         monkeypatch.setattr(main, "OFFICER_AUTO_PULL_RELEASE_ENABLED", release_enabled)
         monkeypatch.setattr(
-            main,
-            "_resolve_session_account_defaults",
+            session_config_resolution,
+            "resolve_session_account_defaults",
             AsyncMock(return_value={"officer": {"enabled": True, "auto_pull": True}}),
         )
 
@@ -903,8 +906,8 @@ class TestSessionCreateBoundary:
     ):
         main, db, _, _ = session_create_env
         monkeypatch.setattr(
-            main,
-            "_resolve_session_account_defaults",
+            session_config_resolution,
+            "resolve_session_account_defaults",
             AsyncMock(return_value={"officer": {"enabled": True, **post_owned}}),
         )
 
@@ -1108,8 +1111,8 @@ class TestSessionCreateBoundary:
         )
         if class_source == "account":
             monkeypatch.setattr(
-                main,
-                "_resolve_session_account_defaults",
+                session_config_resolution,
+                "resolve_session_account_defaults",
                 AsyncMock(return_value={"officer": {"enabled": True}}),
             )
         else:

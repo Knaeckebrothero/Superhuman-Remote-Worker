@@ -570,15 +570,20 @@ async def test_exact_attach_abort_strongly_owns_successor_provisioning():
         assert duplicate is task
         await task
 
-    provision.assert_awaited_once_with(
+    # The binder now also receives its constructed port. Assert the subject of
+    # the call — who is provisioned, for which exact successor generation —
+    # rather than the composition root's dependency object.
+    provision.assert_awaited_once()
+    args, kwargs = provision.await_args
+    assert args == (
         "user-a",
         THREAD_ID,
         "session_base",
         {"workspace": {"backend": "sandbox"}},
         ["project-a"],
         ["datasource-a"],
-        runtime_generation=SUCCESSOR_GENERATION,
     )
+    assert kwargs["runtime_generation"] == SUCCESSOR_GENERATION
 
 
 @pytest.mark.asyncio

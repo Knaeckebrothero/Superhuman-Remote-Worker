@@ -124,6 +124,7 @@ def _admission_deps(**over: Any) -> ta.ThreadAdmissionDependencies:
         record_protected_error=AsyncMock(),
         find_idle_persistent_agent=AsyncMock(return_value=None),
         send_session_attach=AsyncMock(return_value=True),
+        provision_or_assign=AsyncMock(),
         redact_thread_metadata=MagicMock(side_effect=lambda t: t),
     )
     fields.update(over)

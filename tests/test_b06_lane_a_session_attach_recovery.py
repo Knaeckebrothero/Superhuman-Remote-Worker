@@ -100,6 +100,7 @@ def _deps(
     project_ids=None,
     reconcile=None,
     tasks=None,
+    provision=None,
 ):
     return SessionAttachRecoveryDependencies(
         store=store or MagicMock(),
@@ -109,6 +110,7 @@ def _deps(
         ensure_session_workspace=ensure or AsyncMock(),
         thread_project_ids=project_ids or AsyncMock(return_value=[]),
         reconcile_attach_abort_successor=reconcile or AsyncMock(return_value=True),
+        provision_or_assign=provision or AsyncMock(),
         successor_tasks=tasks if tasks is not None else {},
     )
 
