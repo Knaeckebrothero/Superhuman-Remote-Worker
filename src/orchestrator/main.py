@@ -31383,7 +31383,9 @@ async def preview_tool_groups(
     from shared.runtime.core.workspace_selection import bind_execution_workspace
 
     account = (
-        await _resolve_session_account_defaults(str(user["id"]))
+        await session_config_resolution.resolve_session_account_defaults(
+            str(user["id"]), dependencies=_session_config_dependencies()
+        )
         if not is_worker
         else {}
     )
