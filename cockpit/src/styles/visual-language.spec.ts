@@ -111,3 +111,20 @@ describe('controls — no stamp, compact sizes', () => {
     expect(code(read('../app/ui/button/button.component.scss'))).toMatch(/data-size='md'\]\s*\{[^}]*height:\s*32px/);
   });
 });
+
+describe('surfaces — data tables', () => {
+  it('every <table> in a view carries the app-table hook', () => {
+    const tables = [
+      ...scanSources(join(here, '../app/views'), /<table\b/),
+      ...scanSources(join(here, '../app/workbench'), /<table\b/),
+    ];
+    const bare = tables.filter((hit) => {
+      const [file, line] = hit.split(':');
+      const dir = hit.includes('workbench/') || file.startsWith('components/') ? '../app/workbench' : '../app/views';
+      const text = read(join(dir, file)).split('\n')[Number(line) - 1];
+      return !/app-table/.test(text);
+    });
+    // Task 11 converts the jobs table; Task 12 tightens this to toEqual([]).
+    expect(bare.length, bare.join('\n')).toBeLessThanOrEqual(12);
+  });
+});

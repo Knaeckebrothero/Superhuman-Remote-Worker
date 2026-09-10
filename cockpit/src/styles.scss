@@ -10,6 +10,7 @@
 @use 'styles/external-image';     // Inert click-to-load cards in untrusted Markdown
 @use 'styles/workspace-file-link'; // Inert workspace-path controls in untrusted Markdown
 @use 'styles/chat-queued';        // Retry/discard affordances on a stalled chat send
+@use 'styles/app-table';          // Shared data-table look (class="app-table" on <table>)
 
 // --- Theme classes (body-class swap) ---
 // Default look = senate (dark). <body class="theme-senate"> applies these tokens.

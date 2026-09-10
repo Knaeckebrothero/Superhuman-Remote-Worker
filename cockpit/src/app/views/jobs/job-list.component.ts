@@ -254,7 +254,7 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
       <div #tableTop tabindex="-1" class="table-anchor"></div>
       @if (displayRows().length > 0) {
         <div class="table-container">
-          <table class="job-table">
+          <table class="job-table app-table">
             <thead>
               <tr>
                 <th class="col-prompt">{{ 'jobs.colJob' | transloco }}</th>
@@ -820,26 +820,8 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
         overflow-x: hidden;
       }
 
-      .job-table {
-        width: 100%;
-        border-collapse: collapse;
-        font-size: 12px;
-      }
-
-      .job-table th {
-        text-align: left;
-        padding: 10px 12px;
-        background: var(--surface-0, var(--surface-0));
-        color: var(--text-muted);
-        font-weight: 500;
-        text-transform: uppercase;
-        font-size: 10px;
-        letter-spacing: 0.5px;
-        border-bottom: 1px solid var(--border-color, var(--surface-1));
-        position: sticky;
-        top: 0;
-        z-index: 1;
-      }
+      /* Table look comes from the global .app-table (src/styles/_app-table.scss);
+         only column widths and row semantics live here. */
 
       .col-prompt { width: 100%; }
       .col-project { width: 180px; white-space: nowrap; }
@@ -847,24 +829,8 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
       .col-created { white-space: nowrap; }
       .col-actions { white-space: nowrap; }
 
-      .job-table td {
-        padding: 10px 12px;
-        border-bottom: 1px solid var(--border-color, var(--surface-0));
-        color: var(--text-primary, var(--text-primary));
-        vertical-align: middle;
-      }
-
       .job-table tbody tr {
         cursor: pointer;
-        transition: background 0.15s ease;
-      }
-
-      .job-table tbody tr:hover {
-        background: var(--surface-0, var(--surface-0));
-      }
-
-      .job-table tbody tr.selected {
-        background: color-mix(in srgb, var(--accent-color) 20%, transparent);
       }
 
       /* Hierarchy */
