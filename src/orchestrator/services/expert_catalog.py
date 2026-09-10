@@ -718,12 +718,12 @@ class ExpertCatalogService:
             defaults = role_base_or_empty(role_used)
             # `defaults` stays the pristine framework base; the account layer is
             # merged on top only for `merged`.
-            merged = deep_merge_dicts(
-                defaults,
+            account_layer = (
                 await self.deps.account_defaults_layer(user_id, role_used)
                 if include_account_defaults
-                else {},
+                else {}
             )
+            merged = deep_merge_dicts(defaults, account_layer)
             expert_config_dir = config_dir
             # The "defaults" virtual expert is model-agnostic — no expert-level model
             # pin, so its effective model is the account/system default.
@@ -828,7 +828,9 @@ class ExpertCatalogService:
             execution_workspace_config,
         )
 
-        if saved_manifest and role_used in ("session", "worker"):
+        # Framework presets preview the same execution defaults as authored
+        # Experts. Their private base no longer carries a workspace backend.
+        if role_used in ("session", "worker"):
             merged = bind_execution_workspace(
                 merged, execution_workspace_config(account_layer, role=role_used)
             )

@@ -90,9 +90,11 @@ def test_engineer_is_a_worker_with_shell_and_the_full_edit_set():
     assert tools["graph"] == []
 
 
-def test_engineer_pins_sandbox_and_git_versioning():
+def test_engineer_recommends_sandbox_and_keeps_git_versioning_private():
+    manifest = yaml.safe_load(_read("config.yaml"))
+    assert manifest["spec"]["workspacePreference"] == {"backend": "sandbox"}
     ws = _merged()["workspace"]
-    assert ws["backend"] == "sandbox"
+    assert "backend" not in ws
     assert ws["git_versioning"] is True
     assert "repo" not in [str(s).strip("/") for s in ws["structure"]]
 

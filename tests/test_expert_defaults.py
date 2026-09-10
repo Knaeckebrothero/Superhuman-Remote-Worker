@@ -143,12 +143,17 @@ class TestAccountDefaultsLayer:
         return "11111111-1111-4111-8111-111111111111"
 
     @pytest.mark.asyncio
-    async def test_session_detail_off_by_default_reports_base_backend(self):
+    @pytest.mark.parametrize(
+        ("defaults_type", "backend"), [("worker", "sandbox"), ("session", "virtual")]
+    )
+    async def test_detail_without_account_defaults_reports_execution_backend(
+        self, defaults_type, backend
+    ):
         detail = await catalogue_service().load_expert_detail(
-            "defaults", defaults_type="session"
+            "defaults", defaults_type=defaults_type
         )
 
-        assert detail["config"]["workspace"]["backend"] == "sandbox"
+        assert detail["config"]["workspace"]["backend"] == backend
 
     @pytest.mark.asyncio
     async def test_session_detail_reports_the_backend_create_will_resolve(
@@ -161,8 +166,7 @@ class TestAccountDefaultsLayer:
             include_account_defaults=True,
         )
 
-        # The account default, not session_base's `sandbox` — this is the value
-        # the picker's lite-tier gate has to agree with.
+        # The picker's tier gate must agree with managed Session admission.
         assert detail["config"]["workspace"]["backend"] == "virtual"
         assert detail["config"]["llm"]["model"] == "account-pinned-model"
 
@@ -196,9 +200,7 @@ class TestAccountDefaultsLayer:
         )
 
         assert detail["config"]["llm"]["model"] == "account-pinned-model"
-        # Jobs have no account workspace layer at dispatch, so the worker base's
-        # own backend must survive — feeding sessions' `virtual` here would make
-        # the New Job form lie in the opposite direction.
+        # The worker execution fallback stays independent of Session preferences.
         assert detail["config"]["workspace"]["backend"] == "sandbox"
 
     @pytest.mark.asyncio
@@ -240,7 +242,7 @@ class TestAccountDefaultsLayer:
             "defaults", defaults_type="session", include_account_defaults=True
         )
 
-        assert detail["config"]["workspace"]["backend"] == "sandbox"
+        assert detail["config"]["workspace"]["backend"] == "virtual"
 
 
 # --- U1 WP2: the public base ids and the bundled listing survive the split ---
@@ -276,6 +278,10 @@ class TestPublicBaseIdsAfterTheRootSplit:
 
         expected = dict(load_role_base(role))
         expected.pop("connections", None)
+        expected["workspace"] = {
+            **expected["workspace"],
+            "backend": "virtual" if role == "session" else "sandbox",
+        }
         assert detail["config"] == expected
         assert detail["config"]["agent_id"] == ROLE_ROOTS[role]
         # a raw read of an overlay alone would lack these
