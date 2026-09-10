@@ -33,8 +33,10 @@ Themes work via **CSS custom properties + body class swap**. There is no per-com
    ```scss
    .theme-senate     { @include theme.apply-app-theme('senate'); }
    ```
-4. `apply-app-theme($name)` walks the map and emits `--<token>: <value>;` for each entry.
+4. `apply-app-theme($name)` walks the map and emits `--<token>: <value>;` for each entry, then emits the **default accent** and one nested `&.accent-<name>` block per accent (see below).
 5. Components consume `var(--token-name)` and stay theme-agnostic.
+
+**Accent axis (since 2026-09-10).** The brand / interactive colour is a second body class beside `theme-<mode>`: `<body class="theme-senate accent-graphite">`. `$accents` in `_theme-config.scss` holds five tokens per accent per mode — `--accent-color`, `--accent-hover`, `--on-accent`, `--user-bubble`, `--user-bubble-text` — and the base theme maps carry none of them (`theme-config.spec.ts` enforces that). Everything else that looks accent-coloured (focus `--ring`, selection tint, approval rule, header inlay, `--shadow-glow`, Senate's `--shadow-md` inlay) derives from `--accent-color` with `color-mix`, so it follows any accent for free. `$default-accent` (`tyrian`) is emitted on the bare `.theme-*` class, which is what the no-JS first paint and a fresh device get; `theme.service.ts` mirrors it as `DEFAULT_ACCENT` and stamps `accent-<key>` from `localStorage['cockpit:accent']`.
 
 Token names are bare (`--accent-color`, `--panel-bg`, `--text-primary`) — no prefix. They're stable across themes, so adding a new theme rarely requires touching components.
 
@@ -61,7 +63,17 @@ Themes override at the tier that gives the right scope:
 | `travertine` | Light | **Light default + initial paint fallback.** Default when `system` resolves to light. |
 | `senate` | Dark | Default when `system` resolves to dark. Lifted slate base (was charcoal in earlier revisions — the lift fixed contrast and obviated Praetorian). |
 
-First-run preference is `'system'` — the app respects the OS preference. A pre-paint script in `index.html` resolves the right body class before Angular hydrates so dark-OS users don't flash through the Travertine fallback.
+First-run preference is `'system'` — the app respects the OS preference. A pre-paint script in `index.html` resolves the right body class (and the stored accent class) before Angular hydrates so dark-OS users don't flash through the Travertine fallback.
+
+### Accents
+
+| Key | Travertine fill | Senate fill | Notes |
+|---|---|---|---|
+| `tyrian` | `#5f499c` (white label, 7.2:1) | `#7f65ca` (white label, 4.6:1) | **Default.** Senatorial purple, ~90° from the danger red in OKLCH hue, so primary and destructive never share a hex. |
+| `porphyry` | `#9c2832` | `#cc4647` | The original blood red, kept as an option. It *is* the danger hex — the user opts into that collision knowingly. |
+| `graphite` | `#3d2f22` (white label) | `#e8e4dc` (dark label) | No hue. Status colours become the only colour on screen; the label colour flips per mode. |
+
+Picker: `app-accent-toggle` (`src/app/ui/accent-toggle/`) on the Settings page, labels from `settings.appearance.accents.<key>`. Danger, Success, Warning and Info do not change with the accent.
 
 `theme.service.ts` migrates legacy localStorage values transparently:
 - `dark` → `senate` (Catppuccin era)
@@ -96,6 +108,19 @@ If your theme departs from the shared shape language (different radii, different
 - Override the relevant tokens (`--font-display`, `--radius-md`) inside the map, or
 - Add a `.theme-mytheme { ... }` block to `_roman-accents.scss` that resets/overrides the shared Roman overrides.
 
+A new theme must also appear under every accent in `$accents` (each accent lists its modes by theme key), or `apply-app-theme` errors at build time.
+
+## How to add an accent
+
+1. **Add the sub-maps** to `$accents` in `_theme-config.scss`: one `'<key>': ('travertine': (...), 'senate': (...))` entry with all five tokens per mode. Check the label contrast on the fill (≥ 4.5:1) and pick `on-accent` per mode accordingly — Graphite is the precedent for a dark label in Senate.
+2. **Extend the union** in `src/app/core/services/theme.service.ts`: `AccentPreference` and `ACCENT_OPTIONS` (the picker renders that array).
+3. **Name it** in `src/assets/i18n/en.json` and `de-DE.json` under `settings.appearance.accents.<key>`.
+4. **Pre-paint**: add the key to the `validAccent` table in `src/index.html`.
+5. **Capture it**: `VISUAL_WALK_ACCENT=<key> VISUAL_WALK_LABEL=accent-<key> npm run test:e2e:visual-walk`.
+6. **Document the intent** in `knowledge-base/knowledge/design/cockpit/themes/README.md`.
+
+`theme-config.spec.ts` checks the structure (every accent for both modes, all five tokens, base maps free of accent tokens, default ≠ danger); `theme.service.spec.ts` covers the class swap and persistence.
+
 ## Token catalog
 
 The current token set:
@@ -108,7 +133,7 @@ The current token set:
 
 **Text**: `--text-primary`, `--text-secondary`, `--text-muted`
 
-**Accent**: `--accent-color`, `--accent-hover`
+**Accent**: `--accent-color`, `--accent-hover`, `--on-accent`, `--user-bubble`, `--user-bubble-text` — per accent, from `$accents` (see the accent axis above); `--ring` and the accent-tinted shadows derive from `--accent-color`.
 
 **Tracks/gutters** (split panes, sliders): `--track-bg`, `--gutter-color`, `--gutter-hover`
 
@@ -215,7 +240,7 @@ A primitive that exposes `--btn-radius` (as in the button example above) can be 
 
 ## Roman accents
 
-`_roman-accents.scss` is scoped under `.theme-travertine, .theme-senate` and declares what is left of the Roman look: Cinzel as the brand face (read by three selectors) and the approval-card left rule. Per-theme tweaks (Travertine's gold inlay under panel headers, Senate's blood-red equivalent) follow in their own scoped blocks.
+`_roman-accents.scss` is scoped under `.theme-travertine, .theme-senate` and declares what is left of the Roman look: Cinzel as the brand face (read by three selectors) and the approval-card left rule. Per-theme tweaks (Travertine's gold inlay under panel headers, Senate's accent-mix equivalent) follow in their own scoped blocks. Both the rule and the Senate inlay read `--accent-color`, so they follow the accent axis.
 
 Radii are deliberately **not** overridden there any more. The original sharp-corner pass (`--radius-sm/md/xl: 0`, `--radius-lg: 2px`) was retired on 2026-09-10; both themes use the rounded primitive scale via the role tokens — controls `md` (0.5rem, 8px), surfaces `lg` (0.75rem, 12px), small tags `sm` (0.25rem, 4px), pills and functional circles unchanged. `roman-accents.spec.ts` guards against the flatten creeping back.
 
@@ -232,7 +257,10 @@ npm test -- --run              # vitest, incl. theme.service.spec.ts and styles/
 npm run build                  # full Angular production build (the only template type-check; vitest does not type-check)
 npm run lint:styles            # stylelint on src/**/*.scss — the gate is the delta, baseline 73 (2026-09-10)
 VISUAL_WALK_LABEL=x npm run test:e2e:visual-walk   # capture walk against https://localhost, reviewed by eye
+VISUAL_WALK_ACCENT=graphite VISUAL_WALK_LABEL=x-graphite npm run test:e2e:visual-walk   # same, under another accent
 ```
+
+The Python side mirrors the default accent: `tests/test_brand_palette.py` (brand.py ↔ SCSS), `tests/test_keycloak_theme_infra.py` (login CSS + email wrapper ↔ brand.py). Run them from the repo root with `PYTHONPATH=src .venv/bin/python -m pytest tests/test_brand_palette.py tests/test_keycloak_theme_infra.py`.
 
 The theme service spec covers preference resolution, legacy migration, system-mode listening, and body-class swapping. SCSS errors surface during the production build (the dev server's HMR can hide them).
 

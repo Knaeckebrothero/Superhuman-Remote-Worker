@@ -10,7 +10,21 @@ export type ThemePreference = ConcreteTheme | 'system';
 /** Effective theme that's actually applied to <body>. */
 export type ResolvedTheme = ConcreteTheme;
 
+/**
+ * Accent keys — the second appearance axis. Each maps to a body class
+ * `accent-<key>` beside the `theme-<key>` class; `_theme-config.scss`
+ * ($accents) holds the tokens. Tyrian is the default there too
+ * ($default-accent) so the no-JS first paint and a fresh device agree.
+ */
+export type AccentPreference = 'tyrian' | 'porphyry' | 'graphite';
+export const ACCENT_OPTIONS: readonly AccentPreference[] = ['tyrian', 'porphyry', 'graphite'];
+export const DEFAULT_ACCENT: AccentPreference = 'tyrian';
+export function isAccentPreference(value: unknown): value is AccentPreference {
+  return typeof value === 'string' && (ACCENT_OPTIONS as readonly string[]).includes(value);
+}
+
 const STORAGE_KEY = 'cockpit:theme';
+const ACCENT_STORAGE_KEY = 'cockpit:accent';
 const VALID_PREFERENCES: ReadonlySet<ThemePreference> = new Set<ThemePreference>([
   'travertine', 'senate', 'system',
 ]);
@@ -44,6 +58,9 @@ export class ThemeService {
   /** What the user picked. `system` means follow OS preference live. */
   readonly preference = signal<ThemePreference>(this.readStoredPreference());
 
+  /** Accent axis. No `system` value: the OS has no opinion on brand colour. */
+  readonly accent = signal<AccentPreference>(this.readStoredAccent());
+
   /** Live OS preference. Updates when the user flips dark/light at the OS level. */
   private readonly systemPrefersDark = signal<boolean>(this.readSystemPrefersDark());
 
@@ -75,6 +92,12 @@ export class ThemeService {
       const theme = this.resolved();
       this.applyBodyClass(theme);
     });
+
+    // Same contract for the accent: one `accent-*` class on <body>, swapped
+    // in lockstep with the signal.
+    effect(() => {
+      this.applyAccentClass(this.accent());
+    });
   }
 
   /** User picks a theme (or 'system'). Persists locally; body class follows via effect. */
@@ -88,6 +111,30 @@ export class ThemeService {
         // takes effect for the session, just doesn't survive a reload.
       }
     }
+  }
+
+  /** User picks an accent. Persists locally; body class follows via effect. */
+  setAccent(accent: AccentPreference): void {
+    if (!isAccentPreference(accent)) return;
+    this.accent.set(accent);
+    if (this.isBrowser) {
+      try {
+        window.localStorage.setItem(ACCENT_STORAGE_KEY, accent);
+      } catch {
+        // see setPreference — the choice still holds for the session
+      }
+    }
+  }
+
+  private readStoredAccent(): AccentPreference {
+    if (!this.isBrowser) return DEFAULT_ACCENT;
+    try {
+      const raw = window.localStorage.getItem(ACCENT_STORAGE_KEY);
+      if (isAccentPreference(raw)) return raw;
+    } catch {
+      // ignore
+    }
+    return DEFAULT_ACCENT;
   }
 
   private readStoredPreference(): ThemePreference {
@@ -127,5 +174,16 @@ export class ThemeService {
     });
     toRemove.forEach((c) => body.classList.remove(c));
     body.classList.add(`theme-${theme}`);
+  }
+
+  private applyAccentClass(accent: AccentPreference): void {
+    if (!this.isBrowser) return;
+    const body = document.body;
+    const toRemove: string[] = [];
+    body.classList.forEach((c) => {
+      if (c.startsWith('accent-')) toRemove.push(c);
+    });
+    toRemove.forEach((c) => body.classList.remove(c));
+    body.classList.add(`accent-${accent}`);
   }
 }

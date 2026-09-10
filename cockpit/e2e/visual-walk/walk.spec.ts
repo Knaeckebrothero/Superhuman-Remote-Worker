@@ -13,6 +13,9 @@ const PASSWORD = process.env['VISUAL_WALK_PASSWORD'] || 'test';
 // The app resolves its language from navigator.languages (i18n.service.ts
 // fromBrowser), so the locale is a browser-context property, not storage.
 const LOCALE = process.env['VISUAL_WALK_LOCALE'] || 'en-US';
+// Accent axis (tyrian default, porphyry, graphite) — a second body class
+// beside theme-*; see theme.service.ts.
+const ACCENT = process.env['VISUAL_WALK_ACCENT'] || 'tyrian';
 const OUT = join(process.cwd(), 'playwright-report', 'visual-walk', LABEL);
 
 const ROUTES = ['/', '/jobs', '/projects', '/settings', '/datasources', '/admin/users', '/experts'];
@@ -40,10 +43,15 @@ async function login(page: Page): Promise<void> {
 }
 
 async function setTheme(page: Page, theme: (typeof THEMES)[number]): Promise<void> {
-  await page.evaluate((t) => {
-    document.body.classList.remove('theme-travertine', 'theme-senate');
-    document.body.classList.add(`theme-${t}`);
-  }, theme);
+  await page.evaluate(
+    ({t, a}) => {
+      document.body.classList.remove('theme-travertine', 'theme-senate');
+      document.body.classList.add(`theme-${t}`);
+      [...document.body.classList].filter((c) => c.startsWith('accent-')).forEach((c) => document.body.classList.remove(c));
+      document.body.classList.add(`accent-${a}`);
+    },
+    {t: theme, a: ACCENT},
+  );
 }
 
 function slug(route: string): string {

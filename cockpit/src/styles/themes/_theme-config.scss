@@ -5,9 +5,16 @@
 // --accent-color, etc.) so existing feature components continue to resolve.
 //
 // Active themes: Travertine (light default), Senate (dark default).
-// Both share a closed four-hue Imperial palette — Blood (accent/danger),
-// Gold (warning), Lapis (info), Laurel (success) — OKLCH-calibrated to
-// read as a tight family on each background.
+// Both share a closed four-hue status palette — Blood (danger), Gold
+// (warning), Lapis (info), Laurel (success) — OKLCH-calibrated to read as a
+// tight family on each background.
+//
+// The ACCENT is a second axis (2026-09-10): $accents below holds the brand /
+// interactive colour per accent per mode. Tyrian purple is the default so a
+// primary button never shares a hex with the danger red; Porphyry (the
+// original blood red) and Graphite (no hue) are user-selectable alternatives.
+// The base maps carry no accent tokens — apply-app-theme emits the default
+// accent on the bare .theme-* class and every accent under .accent-<name>.
 //
 // Praetorian was retired in favor of a lifted Senate that meets contrast
 // targets on its own. Legacy localStorage values ('praetorian', 'dark',
@@ -42,10 +49,6 @@ $travertine-theme: (
   'text-secondary': #5a4632,
   'text-muted':     #8a7b66,
 
-  // Accent (porphyry red — L≈38)
-  'accent-color': #9c2832,
-  'accent-hover': #7d1e26,
-
   // Track / gutter
   'track-bg':      #ede4d2,
   'gutter-color':  #dccfb6,
@@ -78,9 +81,9 @@ $travertine-theme: (
   'info-tint':    rgba(63, 94, 140, 0.15),
   'danger-tint':  rgba(156, 40, 50, 0.15),
 
-  // Foreground on solid-fill variants (WCAG-AA-tuned)
-  // Warning fill (gold ochre L≈53) wants dark text; the rest pass with white.
-  'on-accent':  #fff,
+  // Foreground on solid-fill variants (WCAG-AA-tuned). on-accent lives with
+  // its accent in $accents. Warning fill (gold ochre L≈53) wants dark text;
+  // the rest pass with white.
   'on-warning': #2a1d12,
   'on-success': #fff,
   'on-danger':  #fff,
@@ -89,11 +92,7 @@ $travertine-theme: (
   // Shadows
   'shadow-sm':   '0 1px 2px 0 rgba(42, 29, 18, 0.06)',
   'shadow-md':   '0 1px 2px rgba(42,29,18,0.05), 0 12px 28px rgba(42,29,18,0.08)',
-  'shadow-glow': '0 0 20px rgba(156, 40, 50, 0.12)',
-
-  // Chat bubble tokens
-  'user-bubble':      #fbe4d4,
-  'user-bubble-text': #7a2c12,
+  'shadow-glow': '0 0 20px color-mix(in srgb, var(--accent-color) 12%, transparent)',
 );
 
 // =============================================================================
@@ -123,10 +122,6 @@ $senate-theme: (
   'text-primary':   #f4f2ee,
   'text-secondary': #c9c5be,
   'text-muted':     #8c8a87,
-
-  // Accent (blood red — L≈58)
-  'accent-color': #cc4647,
-  'accent-hover': #d65a5b,
 
   // Track / gutter
   'track-bg':      #24242c,
@@ -159,10 +154,10 @@ $senate-theme: (
   'info-tint':    rgba(122, 155, 198, 0.18),
   'danger-tint':  rgba(204, 70, 71, 0.20),
 
-  // Foreground on solid-fill variants (WCAG-AA-tuned)
-  // Senate's semantic fills are light (L≈68-73) so warning/success/info want
-  // dark text; accent and danger sit at L≈58 where white still wins.
-  'on-accent':  #fff,
+  // Foreground on solid-fill variants (WCAG-AA-tuned). on-accent lives with
+  // its accent in $accents. Senate's semantic fills are light (L≈68-73) so
+  // warning/success/info want dark text; danger sits at L≈58 where white
+  // still wins.
   'on-warning': #1c1c22,
   'on-success': #1c1c22,
   'on-danger':  #fff,
@@ -170,12 +165,8 @@ $senate-theme: (
 
   // Shadows
   'shadow-sm':   '0 1px 2px 0 rgba(0, 0, 0, 0.5)',
-  'shadow-md':   '0 1px 0 rgba(204,70,71,0.14) inset, 0 12px 30px rgba(0,0,0,0.6)',
-  'shadow-glow': '0 0 20px rgba(204, 70, 71, 0.25)',
-
-  // Chat bubbles
-  'user-bubble':      #3a1620,
-  'user-bubble-text': #ffd9d9,
+  'shadow-md':   '0 1px 0 color-mix(in srgb, var(--accent-color) 14%, transparent) inset, 0 12px 30px rgba(0,0,0,0.6)',
+  'shadow-glow': '0 0 20px color-mix(in srgb, var(--accent-color) 25%, transparent)',
 );
 
 // Central registry. apply-app-theme($name) reads from this.
@@ -183,3 +174,72 @@ $themes: (
   'travertine': $travertine-theme,
   'senate':     $senate-theme,
 );
+
+// =============================================================================
+// ACCENTS — the brand / interactive colour, per accent per mode.
+// Five tokens each: the fill, its hover, the label colour on the fill, and the
+// user chat bubble (the one large accent-tinted surface). Everything else
+// that looks accent-coloured (focus ring, selection tint, approval rule,
+// header inlay, glow) derives from --accent-color with color-mix.
+//
+// Tyrian (default): senatorial purple, ~90° from the danger red in OKLCH hue,
+//   so Approve/New never read as Delete. White labels pass AA on both fills.
+// Porphyry: the original blood red, kept as an option. It is the danger hex,
+//   which is the very collision the default avoids — the user opts in.
+// Graphite: no hue. Umber fills on cream, bone fills on slate; the label
+//   colour flips per mode. Status colours become the only colour on screen.
+// =============================================================================
+$accents: (
+  'tyrian': (
+    'travertine': (
+      'accent-color':     #5f499c, // L≈47 C.13 H292 — white on it 7.2:1
+      'accent-hover':     #574093,
+      'on-accent':        #fff,
+      'user-bubble':      #ebe5f7,
+      'user-bubble-text': #3a2d66,
+    ),
+    'senate': (
+      'accent-color':     #7f65ca, // L≈58 C.15 H296 — white on it 4.6:1
+      'accent-hover':     #8a75cd,
+      'on-accent':        #fff,
+      'user-bubble':      #2b2545,
+      'user-bubble-text': #e4dcff,
+    ),
+  ),
+  'porphyry': (
+    'travertine': (
+      'accent-color':     #9c2832, // porphyry — L≈38
+      'accent-hover':     #7d1e26,
+      'on-accent':        #fff,
+      'user-bubble':      #fbe4d4,
+      'user-bubble-text': #7a2c12,
+    ),
+    'senate': (
+      'accent-color':     #cc4647, // blood — L≈58
+      'accent-hover':     #d65a5b,
+      'on-accent':        #fff,
+      'user-bubble':      #3a1620,
+      'user-bubble-text': #ffd9d9,
+    ),
+  ),
+  'graphite': (
+    'travertine': (
+      'accent-color':     #3d2f22, // deep umber — L≈32
+      'accent-hover':     #2a1d12,
+      'on-accent':        #fff,
+      'user-bubble':      #e9e2d4,
+      'user-bubble-text': #2a1d12,
+    ),
+    'senate': (
+      'accent-color':     #e8e4dc, // bone — L≈92, dark label
+      'accent-hover':     #f4f2ee,
+      'on-accent':        #1c1c22,
+      'user-bubble':      #2e2e36,
+      'user-bubble-text': #f4f2ee,
+    ),
+  ),
+);
+
+// Emitted on the bare .theme-* class so the no-JS first paint and a fresh
+// device both get it. theme.service.ts mirrors this as DEFAULT_ACCENT.
+$default-accent: 'tyrian';

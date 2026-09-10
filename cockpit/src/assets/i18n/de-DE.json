@@ -1066,8 +1066,14 @@
     "title": "Einstellungen",
     "appearance": {
       "title": "Erscheinungsbild",
-      "desc": "Wählen Sie zwischen hellem und dunklem Modus oder folgen Sie der Systemeinstellung. Die Auswahl wird auf diesem Gerät gespeichert.",
-      "themeLabel": "Design"
+      "desc": "Wählen Sie zwischen hellem und dunklem Modus oder folgen Sie der Systemeinstellung, und legen Sie die Akzentfarbe fest. Beide Einstellungen werden auf diesem Gerät gespeichert.",
+      "themeLabel": "Design",
+      "accentLabel": "Akzentfarbe",
+      "accents": {
+        "tyrian": "Tyrisches Purpur",
+        "porphyry": "Porphyrrot",
+        "graphite": "Graphit"
+      }
     },
     "language": {
       "title": "Sprache",

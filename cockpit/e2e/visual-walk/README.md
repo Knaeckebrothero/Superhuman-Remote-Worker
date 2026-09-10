@@ -7,11 +7,14 @@ looked at by a person; the spec only asserts structure (see the end of
 
     VISUAL_WALK_LABEL=slice2 npm run test:e2e:visual-walk
     VISUAL_WALK_LOCALE=de-DE VISUAL_WALK_LABEL=slice2-de npm run test:e2e:visual-walk
+    VISUAL_WALK_ACCENT=graphite VISUAL_WALK_LABEL=accent-graphite npm run test:e2e:visual-walk
 
 Env: `VISUAL_WALK_BASE_URL` (default https://localhost), `VISUAL_WALK_USER` /
 `VISUAL_WALK_PASSWORD` (default test/test, the local k3d stack's user),
 `VISUAL_WALK_LOCALE` (`en-US` default, or `de-DE`; applied as the browser
-context locale — the app resolves its language from `navigator.languages`).
+context locale — the app resolves its language from `navigator.languages`),
+`VISUAL_WALK_ACCENT` (`tyrian` default, `porphyry` or `graphite`; stamped as
+the `accent-*` body class beside `theme-*`).
 
 Design context: `knowledge-base/knowledge/features/cockpit_modern_visual_refresh.md`
 §7 (gates) and the plan next to it.

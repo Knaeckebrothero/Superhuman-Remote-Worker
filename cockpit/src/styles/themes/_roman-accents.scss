@@ -24,9 +24,10 @@
   // must re-declare the role tokens under the same class: the :root role
   // declarations resolve their var() against <html>.
 
-  // Approval card — porphyry-red 3px left rule. The one Roman accent kept
+  // Approval card — 3px accent-coloured left rule (porphyry red under the
+  // Porphyry accent, Tyrian purple by default). The one Roman accent kept
   // beside the header inlays below; it is also the selected-row idiom for
-  // data tables (see _data-table.scss).
+  // data tables (see _app-table.scss).
   .approval-card,
   .tool-approval {
     border-left: 3px solid var(--accent-color);
@@ -48,7 +49,7 @@
 // SENATE — dark-specific overrides
 // =============================================================================
 .theme-senate {
-  // Subtle blood-red inlay under panel headers — mirrors travertine's gold
+  // Subtle accent inlay under panel headers — mirrors travertine's gold
   .panel-header,
   .session-topbar {
     box-shadow: 0 1px 0 color-mix(in srgb, var(--accent-color) 40%, transparent);

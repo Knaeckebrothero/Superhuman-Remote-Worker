@@ -44,6 +44,7 @@ import {
 } from '../../core/models/tts-voices';
 import { SidebarToggleComponent } from '../../shell/sidebar-toggle/sidebar-toggle.component';
 import { AppThemeToggleComponent } from '../../ui/theme-toggle';
+import { AppAccentToggleComponent } from '../../ui/accent-toggle';
 import { TranslocoPipe, TranslocoService } from '@jsverse/transloco';
 import { AppButtonComponent } from '../../ui/button';
 import { AppInputComponent } from '../../ui/input';
@@ -80,6 +81,7 @@ const EXPIRY_OPTIONS = [
   imports: [
     SidebarToggleComponent,
     AppThemeToggleComponent,
+    AppAccentToggleComponent,
     TranslocoPipe,
     AppButtonComponent,
     AppInputComponent,
@@ -109,6 +111,9 @@ const EXPIRY_OPTIONS = [
                 [showLabels]="true"
                 [ariaLabel]="'settings.appearance.themeLabel' | transloco"
               />
+            </app-form-field>
+            <app-form-field [label]="'settings.appearance.accentLabel' | transloco">
+              <app-accent-toggle [ariaLabel]="'settings.appearance.accentLabel' | transloco" />
             </app-form-field>
           </div>
         </section>

@@ -1066,8 +1066,14 @@
     "title": "Settings",
     "appearance": {
       "title": "Appearance",
-      "desc": "Choose between light and dark mode, or follow your system setting. The choice is saved on this device.",
-      "themeLabel": "Theme"
+      "desc": "Choose between light and dark mode, or follow your system setting, and pick the accent colour. Both choices are saved on this device.",
+      "themeLabel": "Theme",
+      "accentLabel": "Accent",
+      "accents": {
+        "tyrian": "Tyrian purple",
+        "porphyry": "Porphyry red",
+        "graphite": "Graphite"
+      }
     },
     "language": {
       "title": "Language",
