@@ -20,8 +20,8 @@
   // flattened the primitive scale (--radius-sm/md/xl: 0, --radius-lg: 2px);
   // that was retired on 2026-09-10 in favour of the rounded scale declared in
   // _root-tokens.scss and the role bindings in _semantic-tokens.scss: controls
-  // --radius-md (0.5rem = 7px at the cockpit's 14px root), surfaces --radius-lg
-  // (0.75rem = 10.5px), tags --radius-sm (0.25rem = 3.5px). The brand is
+  // --radius-md (0.5rem, 8px), surfaces --radius-lg (0.75rem, 12px), tags
+  // --radius-sm (0.25rem, 4px). The brand is
   // carried by the palette and the Cinzel display type, not by the corners.
   //
   // If a theme ever needs to rebind a primitive radius under .theme-*, it must

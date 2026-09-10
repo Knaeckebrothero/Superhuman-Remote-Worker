@@ -217,7 +217,7 @@ A primitive that exposes `--btn-radius` (as in the button example above) can be 
 
 `_shape-overrides.scss` is scoped under `.theme-travertine, .theme-senate` and declares the **token overrides** that produce the Roman look: Cinzel as the display family and the Inset Stamp shadow stack (`--stamp-highlight/shadow/drop/press/press-shadow`). Per-theme tweaks (Travertine's gold inlay under panel headers, Senate's blood-red equivalent) follow in their own scoped blocks.
 
-Radii are deliberately **not** overridden there any more. The original sharp-corner pass (`--radius-sm/md/xl: 0`, `--radius-lg: 2px`) was retired on 2026-09-10; both themes use the rounded primitive scale via the role tokens — controls `md` (0.5rem, 7px at the cockpit's 14px root), surfaces `lg` (0.75rem, 10.5px), small tags `sm` (0.25rem, 3.5px), pills and functional circles unchanged. `shape-overrides.spec.ts` guards against the flatten creeping back.
+Radii are deliberately **not** overridden there any more. The original sharp-corner pass (`--radius-sm/md/xl: 0`, `--radius-lg: 2px`) was retired on 2026-09-10; both themes use the rounded primitive scale via the role tokens — controls `md` (0.5rem, 8px), surfaces `lg` (0.75rem, 12px), small tags `sm` (0.25rem, 4px), pills and functional circles unchanged. `shape-overrides.spec.ts` guards against the flatten creeping back.
 
 The Inset Stamp recipe lives in `_shape-recipes.scss` as `@mixin stamp($variant)`. The token contract: Roman themes set the `--stamp-*` family; non-Roman themes leave them unset and the recipe falls back to `transparent`, collapsing to a flat button. Tinted button variants (warning, info, success, danger) get `stamp('soft')` to avoid the muddy inner shadow on translucent fills.
 

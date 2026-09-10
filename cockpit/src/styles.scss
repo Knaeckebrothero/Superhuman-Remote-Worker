@@ -41,10 +41,21 @@ body {
   background: var(--app-bg);
   color: var(--text-primary);
   font-family: v.$font-family-base;
-  font-size: v.$font-size-sm;
   line-height: v.$line-height-base;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+}
+
+// The rem base. This used to be 0.875rem on BOTH html and body, which
+// compounded to a 12.25px body and shrank every rem token (radii, spacing,
+// type scale) by 12.5% against its own comments. html stays at the browser
+// default; body carries the app text size.
+html {
+  font-size: 100%;
+}
+
+body {
+  font-size: v.$font-size-sm; // 14px
 }
 
 // --- Angular-split gutter styling ---

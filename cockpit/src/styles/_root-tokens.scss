@@ -12,12 +12,11 @@
 
 :root {
   // --- Radii ---
-  // rem-based; styles.scss sets the html font-size to 14px, so the rendered
-  // values are 3.5 / 7 / 10.5 / 21px (not the 16px-root 4 / 8 / 12 / 24).
-  --radius-sm:   0.25rem; //  3.5px
-  --radius-md:   0.5rem;  //  7px
-  --radius-lg:   0.75rem; // 10.5px
-  --radius-xl:   1.5rem;  // 21px
+  // rem-based on the browser's 16px root (styles.scss keeps html at 100%).
+  --radius-sm:   0.25rem; //  4px
+  --radius-md:   0.5rem;  //  8px
+  --radius-lg:   0.75rem; // 12px
+  --radius-xl:   1.5rem;  // 24px
   --radius-full: 999px;   // pill / functional circles
 
   // --- Typography families ---
