@@ -18,6 +18,8 @@ import {buildCytoscapeStyles, resolveGraphColors} from './graph-colors';
 import {TimelineRenderer} from './timeline-renderer';
 import type {Core} from 'cytoscape';
 import {AppSpinnerComponent} from '../../../ui/spinner';
+import {AppButtonComponent} from '../../../ui/button';
+import {AppIconButtonComponent} from '../../../ui/icon-button';
 
 // Dynamic import for Cytoscape (loaded at runtime)
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -33,30 +35,31 @@ let cytoscape: any;
 @Component({
   selector: 'app-graph-timeline',
   standalone: true,
-  imports: [AppSpinnerComponent],
+  imports: [AppSpinnerComponent, AppButtonComponent, AppIconButtonComponent],
   changeDetection: ChangeDetectionStrategy.OnPush,
   template: `
     <div class="graph-timeline-container">
       <!-- Header with controls -->
       <div class="header">
         <div class="left-controls">
-          <button
-            class="btn"
-            (click)="loadGraphChanges()"
+          <app-button
+            variant="secondary"
+            size="sm"
             [disabled]="graph.loading() || !data.currentJobId()"
-            title="Load graph changes for selected job"
+            ariaLabel="Load graph changes for selected job"
+            (clicked)="loadGraphChanges()"
           >
             Load Graph
-          </button>
+          </app-button>
         </div>
         <div class="right-controls">
           @if (graph.hasData()) {
-            <button class="btn icon-btn" (click)="fitGraph()" title="Fit to view">
+            <app-icon-button size="sm" ariaLabel="Fit to view" tooltip="Fit to view" (clicked)="fitGraph()">
               &#x26F6;
-            </button>
-            <button class="btn icon-btn" (click)="runLayout()" title="Re-layout">
+            </app-icon-button>
+            <app-icon-button size="sm" ariaLabel="Re-layout" tooltip="Re-layout" (clicked)="runLayout()">
               &#x21BB;
-            </button>
+            </app-icon-button>
           }
         </div>
       </div>
@@ -86,22 +89,24 @@ let cytoscape: any;
       <!-- Timeline slider -->
       @if (graph.hasData()) {
         <div class="timeline-controls">
-          <button
-            class="btn icon-btn"
-            (click)="graph.jumpToStart()"
+          <app-icon-button
+            size="sm"
+            ariaLabel="Jump to start"
+            tooltip="Jump to start"
             [disabled]="graph.currentIndex() === 0"
-            title="Jump to start"
+            (clicked)="graph.jumpToStart()"
           >
             &#x23EE;
-          </button>
-          <button
-            class="btn icon-btn"
-            (click)="graph.stepBackward()"
+          </app-icon-button>
+          <app-icon-button
+            size="sm"
+            ariaLabel="Step backward"
+            tooltip="Step backward"
             [disabled]="graph.currentIndex() === 0"
-            title="Step backward"
+            (clicked)="graph.stepBackward()"
           >
             &#x23F4;
-          </button>
+          </app-icon-button>
           <input
             type="range"
             class="timeline-slider"
@@ -110,22 +115,24 @@ let cytoscape: any;
             [value]="graph.currentIndex()"
             (input)="onTimelineChange($event)"
           />
-          <button
-            class="btn icon-btn"
-            (click)="graph.stepForward()"
+          <app-icon-button
+            size="sm"
+            ariaLabel="Step forward"
+            tooltip="Step forward"
             [disabled]="graph.currentIndex() >= graph.totalOperations() - 1"
-            title="Step forward"
+            (clicked)="graph.stepForward()"
           >
             &#x23F5;
-          </button>
-          <button
-            class="btn icon-btn"
-            (click)="graph.jumpToEnd()"
+          </app-icon-button>
+          <app-icon-button
+            size="sm"
+            ariaLabel="Jump to end"
+            tooltip="Jump to end"
             [disabled]="graph.currentIndex() >= graph.totalOperations() - 1"
-            title="Jump to end"
+            (clicked)="graph.jumpToEnd()"
           >
             &#x23ED;
-          </button>
+          </app-icon-button>
           <span class="timeline-position">
             {{ graph.currentIndex() + 1 }} / {{ graph.totalOperations() }}
           </span>
@@ -153,7 +160,7 @@ let cytoscape: any;
         <div class="error-state">
           <span class="error-icon">&#x26A0;</span>
           <span>{{ graph.error() }}</span>
-          <button class="btn" (click)="loadGraphChanges()">Retry</button>
+          <app-button variant="secondary" size="sm" (clicked)="loadGraphChanges()">Retry</app-button>
         </div>
       }
 
@@ -229,33 +236,6 @@ let cytoscape: any;
       display: flex;
       gap: 8px;
       align-items: center;
-    }
-
-    .btn {
-      padding: 6px 12px;
-      border: 1px solid var(--border-color);
-      border-radius: var(--radius-control);
-      background: var(--panel-header-bg);
-      color: var(--text-secondary);
-      font-size: 12px;
-      cursor: pointer;
-      transition: all 0.15s ease;
-    }
-
-    .btn:hover:not(:disabled) {
-      background: var(--surface-0);
-      color: var(--text-primary);
-      border-color: var(--text-muted);
-    }
-
-    .btn:disabled {
-      opacity: 0.5;
-      cursor: not-allowed;
-    }
-
-    .icon-btn {
-      padding: 6px 8px;
-      font-size: 14px;
     }
 
     /* Summary bar */

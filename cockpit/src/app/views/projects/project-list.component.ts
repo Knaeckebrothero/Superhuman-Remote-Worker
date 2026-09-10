@@ -10,6 +10,8 @@ import {TranslocoPipe} from '@jsverse/transloco';
 import {AppSpinnerComponent} from '../../ui/spinner';
 import {AppInlineEditableTextComponent} from '../../ui/inline-editable-text';
 import {AppTabBarComponent, AppTabComponent} from '../../ui/tab-bar';
+import {AppButtonComponent} from '../../ui/button';
+import {AppBadgeComponent} from '../../ui/badge';
 import {ViewportService} from '../../core/services/viewport.service';
 
 /** The API's own explanation, when it gave one. Connector refusals name the
@@ -29,8 +31,7 @@ function errorDetail(err: unknown): string {
     AppSpinnerComponent,
     AppInlineEditableTextComponent,
     AppTabBarComponent,
-    AppTabComponent,
-  ],
+    AppTabComponent,, AppButtonComponent, AppBadgeComponent],
   template: `
     <div class="page-container">
       <!-- Header -->
@@ -40,16 +41,16 @@ function errorDetail(err: unknown): string {
           <h1 class="page-title">{{ 'projects.title' | transloco }}</h1>
         </div>
         <div class="header-actions">
-          <button class="btn btn-primary" (click)="toggleCreateForm()">
+          <app-button variant="primary" size="sm" data-testid="projects-new" (clicked)="toggleCreateForm()">
             {{ (showCreateForm() ? 'projects.cancel' : 'projects.newProject') | transloco }}
-          </button>
+          </app-button>
           <!-- Refresh is desktop-only: on mobile the list reloads on navigation
                and pull-to-refresh works, so the button is dropped (matches the
                Jobs header) — and removing it keeps the header to one tidy row. -->
           @if (!viewport.isMobile()) {
-            <button class="btn btn-ghost" (click)="refresh()" [disabled]="isLoading()">
+            <app-button variant="ghost" size="sm" data-testid="projects-refresh" [disabled]="isLoading()" (clicked)="refresh()">
               {{ 'projects.refresh' | transloco }}
-            </button>
+            </app-button>
           }
         </div>
       </div>
@@ -105,9 +106,9 @@ function errorDetail(err: unknown): string {
                 <p class="form-hint">{{ 'projects.externalKb.loading' | transloco }}</p>
               } @else if (kbConnectors().length === 0) {
                 <p class="form-hint">{{ 'projects.externalKb.noConnectors' | transloco }}</p>
-                <button class="btn btn-ghost kb-connector-link" (click)="openConnectors()">
+                <app-button variant="ghost" size="sm" class="kb-connector-link" (clicked)="openConnectors()">
                   {{ 'projects.externalKb.createConnector' | transloco }}
-                </button>
+                </app-button>
               } @else {
                 <select
                   class="form-input"
@@ -132,13 +133,15 @@ function errorDetail(err: unknown): string {
             </div>
           }
           <div class="form-actions">
-            <button
-              class="btn btn-primary"
+            <app-button
+              variant="primary"
+              size="sm"
+              data-testid="projects-create"
               [disabled]="isCreating() || !canCreate()"
-              (click)="createProject()"
+              (clicked)="createProject()"
             >
               {{ (isCreating() ? 'projects.creating' : 'projects.createProject') | transloco }}
-            </button>
+            </app-button>
           </div>
         </div>
       }
@@ -217,31 +220,33 @@ function errorDetail(err: unknown): string {
                 </span>
                 <div class="card-badges">
                   @if (project.is_default) {
-                    <span class="badge badge-personal">{{ 'projects.badgePersonal' | transloco }}</span>
+                    <app-badge tone="accent" size="sm">{{ 'projects.badgePersonal' | transloco }}</app-badge>
                   }
-                  <span class="badge" [class]="'badge-' + statusOf(project)">
+                  <app-badge [tone]="statusOf(project) === 'active' ? 'success' : 'neutral'" size="sm" shape="pill">
                     {{ 'projects.status.' + statusOf(project) | transloco }}
-                  </span>
+                  </app-badge>
                 </div>
               </div>
               @if (project.description) {
                 <p class="card-desc">{{ truncate(project.description, 120) }}</p>
               }
               <div class="card-footer">
-                <span class="chip">{{ ((project.job_count ?? 0) === 1 ? 'projects.jobsCountOne' : 'projects.jobsCount') | transloco:{ count: project.job_count ?? 0 } }}</span>
-                <span class="chip">{{ ((project.repo_count ?? 0) === 1 ? 'projects.reposCountOne' : 'projects.reposCount') | transloco:{ count: project.repo_count ?? 0 } }}</span>
-                <span class="chip">{{ ((project.member_count ?? 0) === 1 ? 'projects.membersCountOne' : 'projects.membersCount') | transloco:{ count: project.member_count ?? 0 } }}</span>
+                <app-badge tone="neutral" size="sm">{{ ((project.job_count ?? 0) === 1 ? 'projects.jobsCountOne' : 'projects.jobsCount') | transloco:{ count: project.job_count ?? 0 } }}</app-badge>
+                <app-badge tone="neutral" size="sm">{{ ((project.repo_count ?? 0) === 1 ? 'projects.reposCountOne' : 'projects.reposCount') | transloco:{ count: project.repo_count ?? 0 } }}</app-badge>
+                <app-badge tone="neutral" size="sm">{{ ((project.member_count ?? 0) === 1 ? 'projects.membersCountOne' : 'projects.membersCount') | transloco:{ count: project.member_count ?? 0 } }}</app-badge>
                 @if (statusOf(project) === 'archived') {
                   <!-- The way back out. Opening the card still works, so this is
                        a shortcut rather than the only route. -->
-                  <button
-                    class="btn btn-ghost card-action"
+                  <app-button
+                    variant="ghost"
+                    size="sm"
+                    class="card-action"
                     [attr.title]="'projects.tooltip.unarchive' | transloco"
                     [disabled]="unarchivingId() === project.id"
-                    (click)="unarchiveProject(project, $event)"
+                    (clicked)="unarchiveProject(project, $event)"
                   >
                     {{ (unarchivingId() === project.id ? 'projects.action.unarchiving' : 'projects.action.unarchive') | transloco }}
-                  </button>
+                  </app-button>
                 }
               </div>
             </div>
@@ -283,33 +288,6 @@ function errorDetail(err: unknown): string {
     }
 
     .header-actions { display: flex; gap: 8px; }
-
-    .btn {
-      padding: 8px 16px;
-      border-radius: var(--radius-control);
-      font-size: 13px;
-      font-family: inherit;
-      cursor: pointer;
-      border: 1px solid var(--border-color, var(--surface-1));
-      transition: all 0.15s ease;
-    }
-
-    .btn-primary {
-      background: var(--accent-color, var(--accent-color));
-      color: var(--on-accent, var(--timeline-bg));
-      border-color: var(--accent-color, var(--accent-color));
-      font-weight: 600;
-    }
-
-    .btn-primary:hover:not(:disabled) { opacity: 0.9; }
-    .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
-
-    .btn-ghost {
-      background: transparent;
-      color: var(--text-secondary, var(--text-secondary));
-    }
-
-    .btn-ghost:hover:not(:disabled) { background: var(--surface-0, var(--surface-0)); }
 
     /* Create Form */
     .create-form {
@@ -405,16 +383,16 @@ function errorDetail(err: unknown): string {
 
     .project-card {
       background: var(--panel-bg, var(--panel-bg));
-      border: 1px solid var(--border-color, var(--surface-0));
+      border: 1px solid var(--border-hairline);
       border-radius: var(--radius-surface);
       padding: 16px;
       cursor: pointer;
-      transition: border-color 0.15s ease, transform 0.1s ease;
+      transition: border-color 0.15s ease, box-shadow 0.15s ease;
     }
 
     .project-card:hover {
-      border-color: var(--accent-color, var(--accent-color));
-      transform: translateY(-1px);
+      border-color: var(--surface-2);
+      box-shadow: var(--shadow-sm);
     }
 
     .card-header {
@@ -426,24 +404,15 @@ function errorDetail(err: unknown): string {
     }
 
     .card-name {
+      min-width: 0;
+      overflow-wrap: anywhere;
       font-size: 15px;
       font-weight: 600;
       color: var(--text-primary, var(--text-primary));
     }
 
-    .card-badges { display: flex; gap: 6px; flex-shrink: 0; }
-
-    .badge {
-      padding: 2px 8px;
-      border-radius: var(--radius-tag);
-      font-size: 10px;
-      font-weight: 500;
-      text-transform: capitalize;
-    }
-
-    .badge-active { background: var(--success-tint); color: var(--success); }
-    .badge-archived { background: color-mix(in srgb, var(--text-muted) 25%, transparent); color: var(--text-muted); }
-    .badge-personal { background: color-mix(in srgb, var(--accent-color) 20%, transparent); color: var(--accent-color); }
+    /* Wraps instead of clipping when the title is long. */
+    .card-badges { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; flex-shrink: 0; }
 
     .card-desc {
       font-size: 12px;
@@ -454,19 +423,7 @@ function errorDetail(err: unknown): string {
 
     .card-footer { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 
-    .card-action {
-      margin-left: auto;
-      padding: 4px 10px;
-      font-size: 11px;
-    }
-
-    .chip {
-      padding: 3px 8px;
-      background: var(--surface-0, var(--surface-0));
-      border-radius: var(--radius-tag);
-      font-size: 11px;
-      color: var(--text-muted, var(--text-muted));
-    }
+    .card-action { margin-left: auto; }
 
     @media (max-width: 768px) {
       .page-container { padding: 12px; }

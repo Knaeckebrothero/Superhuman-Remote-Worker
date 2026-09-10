@@ -1717,11 +1717,11 @@ export function clearDraft(threadId: string | null): void {
               <div class="parked-reason">{{ parkedReasonKey() | transloco }}</div>
               @if (chat.queueState()?.retryable) {
                 <div class="parked-actions">
-                  <button type="button" class="queued-action parked-retry" data-testid="chat-parked-retry"
-                          [disabled]="retryingParked()"
-                          (click)="retryParked()">
+                  <app-button variant="ghost" size="sm" data-testid="chat-parked-retry"
+                              [disabled]="retryingParked()"
+                              (clicked)="retryParked()">
                     {{ (retryingParked() ? 'chat.parked.retrying' : 'chat.parked.retry') | transloco }}
-                  </button>
+                  </app-button>
                 </div>
               }
             </div>

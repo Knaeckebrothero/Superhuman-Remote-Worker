@@ -127,3 +127,11 @@ describe('surfaces — data tables', () => {
     expect(bare, bare.join('\n')).toEqual([]);
   });
 });
+
+describe('templates — no raw legacy buttons', () => {
+  it('every button in a view is a primitive', () => {
+    // Legacy variants only: class hooks such as btn-add-env on a primitive are fine.
+    const hits = scanSources(join(here, '../app'), /class="btn(?:[\s"]|-primary|-ghost|-text)|queued-action parked-retry/);
+    expect(hits, hits.join('\n')).toEqual([]);
+  });
+});
