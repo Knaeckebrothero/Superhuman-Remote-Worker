@@ -1266,7 +1266,7 @@ export function nextWakeLabel(
         display: flex;
         flex-direction: column;
         gap: 12px;
-        background: var(--bg-secondary);
+        background: var(--surface-0);
       }
       .officer-status-row {
         display: flex;
@@ -1280,7 +1280,7 @@ export function nextWakeLabel(
         letter-spacing: 0.06em;
         padding: 2px 8px;
         border-radius: var(--radius-pill);
-        background: var(--bg-tertiary);
+        background: var(--surface-1);
         color: var(--text-secondary);
       }
       .officer-badge[data-status='active'] {
@@ -1313,7 +1313,7 @@ export function nextWakeLabel(
       .officer-slots .k {
         display: block;
         font-size: 11px;
-        color: var(--text-tertiary);
+        color: var(--text-muted);
         text-transform: uppercase;
         letter-spacing: 0.06em;
       }
@@ -1335,7 +1335,7 @@ export function nextWakeLabel(
         padding: 2px 10px;
         border-radius: var(--radius-pill);
         border: 1px solid var(--border-color);
-        background: var(--bg-tertiary);
+        background: var(--surface-1);
       }
       /* A starved or broken pool. Border + text rather than a fill: it must
          read as attention-needed at a glance without competing with a real
@@ -1357,13 +1357,13 @@ export function nextWakeLabel(
       }
       .officer-section-title {
         font-size: 12px;
-        color: var(--text-tertiary);
+        color: var(--text-muted);
         text-transform: uppercase;
         letter-spacing: 0.06em;
       }
       .officer-immediacy {
         font-size: 11px;
-        color: var(--text-tertiary);
+        color: var(--text-muted);
         font-style: italic;
         padding: 1px 8px;
         border-radius: var(--radius-pill);
@@ -1394,7 +1394,7 @@ export function nextWakeLabel(
         display: flex;
         flex-direction: column;
         gap: 8px;
-        background: var(--bg-tertiary);
+        background: var(--surface-1);
       }
       .officer-policy {
         display: flex;
@@ -1429,7 +1429,7 @@ export function nextWakeLabel(
       }
       .officer-recent-title {
         font-size: 12px;
-        color: var(--text-tertiary);
+        color: var(--text-muted);
         text-transform: uppercase;
         letter-spacing: 0.06em;
       }
@@ -1469,7 +1469,7 @@ export function nextWakeLabel(
         color: var(--text-secondary);
       }
       .officer-hint.dim {
-        color: var(--text-tertiary);
+        color: var(--text-muted);
         font-size: 12px;
       }
       .officer-message {
@@ -1477,7 +1477,7 @@ export function nextWakeLabel(
         color: var(--text-secondary);
       }
       .dim {
-        color: var(--text-tertiary);
+        color: var(--text-muted);
       }
     `,
   ],

@@ -991,7 +991,7 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
       max-height: 320px;
       overflow-y: auto;
       border: 1px solid var(--border-color);
-      border-radius: var(--radius-card);
+      border-radius: var(--radius-surface);
       padding: 8px;
     }
     .subs-model-row {

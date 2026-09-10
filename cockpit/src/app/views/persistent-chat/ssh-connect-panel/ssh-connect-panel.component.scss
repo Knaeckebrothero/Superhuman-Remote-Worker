@@ -14,7 +14,7 @@
 }
 
 .ssh-connect-panel__unavailable {
-  color: var(--text-tertiary);
+  color: var(--text-muted);
   font-size: 0.85rem;
   font-style: italic;
   padding: 12px 4px;
@@ -41,7 +41,7 @@
 
 .ssh-connect-panel__hint {
   margin: 0;
-  color: var(--text-tertiary);
+  color: var(--text-muted);
   font-size: 0.8rem;
 }
 
@@ -58,7 +58,7 @@
 
 .ssh-connect-panel__seams {
   padding-top: 10px;
-  border-top: 1px solid var(--border-1);
+  border-top: 1px solid var(--border-color);
 }
 
 .ssh-connect-panel__block-row {
@@ -86,7 +86,7 @@
   flex-shrink: 0;
   background: var(--surface-1);
   color: var(--text-primary);
-  border: 1px solid var(--border-1);
+  border: 1px solid var(--border-color);
   border-radius: var(--radius-control);
   padding: 6px 10px;
   font-size: 0.8rem;

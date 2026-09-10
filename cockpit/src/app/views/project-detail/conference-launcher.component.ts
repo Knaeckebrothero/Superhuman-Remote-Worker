@@ -45,7 +45,7 @@ import {AppSpinnerComponent} from '../../ui/spinner';
         color: var(--text-muted);
       }
       .launcher-error {
-        color: var(--text);
+        color: var(--text-primary);
       }
     `,
   ],
