@@ -60,24 +60,24 @@
   }
 
   &[data-size='md'] {
-    height: 36px;
-    padding: 0 v.$space-md;
-    font-size: v.$font-size-sm;
+    height: 32px;
+    padding: 0 v.$space-12;
+    font-size: v.$font-size-control;
   }
 
   &[data-size='lg'] {
-    height: 44px;
-    padding: 0 v.$space-lg;
-    font-size: v.$font-size-base;
+    height: 40px;
+    padding: 0 v.$space-md;
+    font-size: v.$font-size-sm;
   }
 }
 
 // CDK FocusMonitor adds .cdk-keyboard-focused on the host when focused via
 // keyboard. Show the focus ring only then; mouse clicks stay clean.
 :host.cdk-keyboard-focused .app-input__field {
-  outline: 2px solid var(--accent-color);
-  outline-offset: 1px;
+  outline: none;
   border-color: var(--accent-color);
+  box-shadow: 0 0 0 3px var(--ring);
 }
 
 @media (max-width: v.$breakpoint-md) {

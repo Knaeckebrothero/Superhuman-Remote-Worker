@@ -155,7 +155,7 @@ select:focus-visible,
 textarea:focus-visible {
   outline: none;
   border-color: var(--accent-color) !important;
-  box-shadow: 0 0 0 1px var(--accent-color);
+  box-shadow: 0 0 0 3px var(--ring);
 }
 
 // --- Selection ---
