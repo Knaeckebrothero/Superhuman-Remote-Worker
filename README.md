@@ -147,8 +147,10 @@ setting:
 | **VM** | Work requiring a stronger boundary or gated root access | Separate guest kernel through QEMU/KubeVirt; higher startup and resource cost |
 | **None** | Conversation and tools that need no files | No workspace files, shell, browser, or git |
 
-The platform default is Virtual. Available upgrades and tools still depend on
-deployment configuration and the user's grants.
+Managed Sessions default to Virtual; workers default to Container (`sandbox`).
+Explicit workspace selections and Project/account defaults take precedence over
+these role defaults; see [workspace configuration](config/README.md).
+Available upgrades and tools depend on deployment configuration and the user's grants.
 
 ## Architecture
 
