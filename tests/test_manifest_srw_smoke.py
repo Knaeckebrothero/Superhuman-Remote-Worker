@@ -495,10 +495,21 @@ async def check():
         print(json.dumps({'customModelAccepted':True,'unknownModelRejected':True}))
 asyncio.run(check())
 """
+    repo_root = Path(__file__).resolve().parents[1]
+    # `python -c` only reaches the fixture package through the current
+    # directory, which the CI runner does not put on the child's path. Name the
+    # repo root explicitly so the import does not depend on that default.
+    environment = {**os.environ, "E2E_CHAT_MODEL_ID": "zz-srw-manifest-test"}
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [
+            str(repo_root),
+            *([environment["PYTHONPATH"]] if environment.get("PYTHONPATH") else []),
+        ]
+    )
     result = subprocess.run(
         [sys.executable, "-c", code],
-        cwd=Path(__file__).resolve().parents[1],
-        env={**os.environ, "E2E_CHAT_MODEL_ID": "zz-srw-manifest-test"},
+        cwd=repo_root,
+        env=environment,
         capture_output=True,
         text=True,
         timeout=30,
