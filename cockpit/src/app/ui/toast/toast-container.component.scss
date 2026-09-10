@@ -29,7 +29,7 @@
   @include shape.surface;
 
   background: var(--surface-2, var(--surface-1));
-  border: 1px solid var(--border-color);
+  border: 1px solid var(--border-hairline);
   box-shadow: var(--shadow-md, 0 8px 24px rgb(0, 0, 0, 0.3));
   font-size: v.$font-size-sm;
   line-height: v.$line-height-base;
@@ -45,22 +45,22 @@
   // sticky danger toast ended up unreadable on top of an artifact.
   // knowledge-history/done/session_resume_cloud_sync_race_late_provision.md
   &[data-tone='success'] {
-    border-color: var(--success);
+    border-left: 3px solid var(--success);
     background-image: linear-gradient(var(--success-tint), var(--success-tint));
   }
 
   &[data-tone='warning'] {
-    border-color: var(--warning);
+    border-left: 3px solid var(--warning);
     background-image: linear-gradient(var(--warning-tint), var(--warning-tint));
   }
 
   &[data-tone='danger'] {
-    border-color: var(--danger);
+    border-left: 3px solid var(--danger);
     background-image: linear-gradient(var(--danger-tint), var(--danger-tint));
   }
 
   &[data-tone='info'] {
-    border-color: var(--info);
+    border-left: 3px solid var(--info);
     background-image: linear-gradient(var(--info-tint), var(--info-tint));
   }
 }

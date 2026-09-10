@@ -27,7 +27,7 @@
   --dialog-radius: var(--radius-lg);  // Same primitive as --radius-surface today; kept as a local override surface so dialogs can diverge from cards later.
 
   background: var(--panel-bg);
-  border: 1px solid var(--border-color);
+  border: 1px solid var(--border-hairline);
   border-radius: var(--dialog-radius);
   box-shadow: var(--shadow-md);
   display: flex;

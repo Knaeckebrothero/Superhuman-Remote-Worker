@@ -5,8 +5,9 @@
   display: flex;
   align-items: center;
   gap: v.$space-sm;
-  padding: 8px 12px;
-  font-size: v.$font-size-sm;
+  min-height: 32px;
+  padding: 6px v.$space-12;
+  font-size: v.$font-size-control;
   line-height: v.$line-height-tight;
   color: var(--text-primary);
   cursor: pointer;

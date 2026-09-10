@@ -17,7 +17,7 @@
     max-width: 320px;
     padding: v.$space-xs;
     background: var(--surface-2, var(--surface-1));
-    border: 1px solid var(--border-color);
+    border: 1px solid var(--border-hairline);
 
     @include shape.surface;
 
