@@ -1016,7 +1016,7 @@ jobs:
       # covers a dispatch, where selection is skipped on purpose, and any path
       # where the output is unset. loadfile keeps each selected file on one worker.
       - name: Run tests
-        run: ./scripts/pytest-fast.sh ${{ needs.changes.outputs.pytest-target || 'tests/' }} -x -q --tb=short
+        run: ./scripts/pytest-fast.sh ${{ needs.changes.outputs.pytest-target || 'tests/' }} -q --tb=short
 
   # ---------------------------------------------------------------------------
   # Cockpit unit + production-browser conformance tests (change-based)
