@@ -236,9 +236,91 @@ async def historical_project(db):
 
 
 @pytest.mark.asyncio
+async def test_unclaimed_projects_do_not_block_migration_or_gain_an_owner(db):
+    await historical_project(db)
+    orphan = uuid4()
+    await db.execute(
+        "INSERT INTO projects(id,name,is_default,default_config_override) "
+        "VALUES($1,'Unclaimed legacy Project',TRUE,$2::jsonb)",
+        orphan,
+        json.dumps({"settings": {"preserve": True}}),
+    )
+    before = await db.fetchval("SELECT to_jsonb(p) FROM projects p WHERE id=$1", orphan)
+
+    assert await migrate_projects(db) == {
+        "migrated": 1,
+        "preserved": 0,
+        "deferred": 1,
+    }
+    assert await active_project_resource(db, PROJECT)
+    assert await ManifestStore(db).by_link("Project", orphan) is None
+    assert (
+        await db.fetchval("SELECT to_jsonb(p) FROM projects p WHERE id=$1", orphan)
+        == before
+    )
+    assert not await db.fetchval(
+        "SELECT EXISTS(SELECT 1 FROM project_members WHERE project_id=$1)", orphan
+    )
+    assert await migrate_projects(db) == {
+        "migrated": 0,
+        "preserved": 1,
+        "deferred": 1,
+    }
+
+    # An explicit owner assignment makes this Project eligible, without
+    # converting an unrelated member or administrator into its owner.
+    await db.execute(
+        "INSERT INTO project_members(project_id,user_id,role) VALUES($1,$2,'owner')",
+        orphan,
+        OWNER,
+    )
+    assert await migrate_projects(db) == {
+        "migrated": 1,
+        "preserved": 1,
+        "deferred": 0,
+    }
+    recovered = await active_project_resource(db, orphan)
+    assert recovered["owner_id"] == OWNER
+    assert (await db.get_project(str(orphan)))["default_config_override"] == {
+        "settings": {"preserve": True}
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reference", ("member", "user-default"))
+async def test_claimed_ownerless_project_still_requires_explicit_ownership(
+    db, reference
+):
+    await historical_project(db)
+    orphan = uuid4()
+    await db.execute(
+        "INSERT INTO projects(id,name) VALUES($1,'Needs ownership repair')", orphan
+    )
+    if reference == "member":
+        await db.execute(
+            "INSERT INTO project_members(project_id,user_id,role) VALUES($1,$2,'viewer')",
+            orphan,
+            OWNER,
+        )
+    else:
+        await db.execute(
+            "UPDATE users SET default_project_id=$1 WHERE id=$2", orphan, OWNER
+        )
+    with pytest.raises(HTTPException, match="needs an owner") as error:
+        await migrate_projects(db)
+    assert error.value.status_code == 409
+    assert await ManifestStore(db).by_link("Project", PROJECT) is None
+    assert await ManifestStore(db).by_link("Project", orphan) is None
+    assert not await db.fetchval(
+        "SELECT EXISTS(SELECT 1 FROM project_members WHERE project_id=$1 AND role='owner')",
+        orphan,
+    )
+
+
+@pytest.mark.asyncio
 async def test_project_migration_is_canonical_repeatable_and_freezes_source_content(db):
     await historical_project(db)
-    assert await migrate_projects(db) == {"migrated": 1, "preserved": 0}
+    assert await migrate_projects(db) == {"migrated": 1, "preserved": 0, "deferred": 0}
     before = await active_project_resource(db, PROJECT)
     raw = await db.fetchrow("SELECT * FROM projects WHERE id=$1", PROJECT)
     assert raw["manifest_resource_id"] == before["id"]
@@ -276,7 +358,7 @@ async def test_project_migration_is_canonical_repeatable_and_freezes_source_cont
     renamed = await project_expert_for_execution(db, PROJECT, EXPERT)
     assert renamed["config"] == frozen["config"]
     assert renamed["prompts"] == frozen["prompts"]
-    assert await migrate_projects(db) == {"migrated": 0, "preserved": 1}
+    assert await migrate_projects(db) == {"migrated": 0, "preserved": 1, "deferred": 0}
     assert (await active_project_resource(db, PROJECT))["revision"] == before[
         "revision"
     ]

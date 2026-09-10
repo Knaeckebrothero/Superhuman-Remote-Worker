@@ -8,6 +8,7 @@ It is never interpreted as authored metadata or as an authorization grant.
 
 from copy import deepcopy
 import json
+import logging
 from uuid import UUID, uuid4
 
 from fastapi import HTTPException
@@ -26,6 +27,7 @@ from shared.runtime.core.srw_manifest_config import (
 )
 
 SOURCE_FORMAT = "srw/project-source-v1"
+logger = logging.getLogger(__name__)
 _KINDS = {
     "experts": "Expert",
     "workspaces": "WorkspaceTemplate",
@@ -1015,7 +1017,7 @@ async def validate_project_activation(
 
 
 async def migrate_projects(db):
-    migrated = preserved = 0
+    migrated = preserved = deferred = 0
     async with db.transaction_scope():
         await ManifestStore(db).lock_catalog()
         projects = await db.fetch(
@@ -1037,6 +1039,25 @@ async def migrate_projects(db):
                     )
                 preserved += 1
                 continue
+            if row.get("manifest_resource_id") is None and await db.fetchval(
+                """SELECT NOT EXISTS(
+                    SELECT 1 FROM project_members WHERE project_id=$1
+                ) AND NOT EXISTS(
+                    SELECT 1 FROM users WHERE default_project_id=$1
+                )""",
+                row["id"],
+            ):
+                # Historical user deletion can leave an unclaimed Project.
+                # Its data has no Account authority for a portable manifest;
+                # keep it intact until ownership is explicitly established.
+                # Referenced Projects and broken canonical links still fail.
+                deferred += 1
+                logger.warning(
+                    "Deferred manifest migration for unclaimed Project %s: "
+                    "assign an owner before migrating this Project",
+                    row["id"],
+                )
+                continue
             await persist_project_resource(db, row["id"])
             migrated += 1
-    return {"migrated": migrated, "preserved": preserved}
+    return {"migrated": migrated, "preserved": preserved, "deferred": deferred}
