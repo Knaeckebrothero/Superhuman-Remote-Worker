@@ -124,7 +124,7 @@ The current token set:
 
 **Typography roles**: `--font-primary`, `--font-control`, `--font-mono`
 
-**Roman-only**: `--font-display` (legacy alias for `--font-family-display`), `--letter-spacing-display`, `--text-transform-display`, `--stamp-highlight/shadow/drop/press/press-shadow`, `--user-bubble`, `--user-bubble-text`
+**Brand-only**: `--font-display` (legacy alias for `--font-family-display`) — read by exactly three selectors (rail brand block, chat hero); guarded by `visual-language.spec.ts`. `--letter-spacing-display` / `--text-transform-display` are optional theme hooks no active theme sets. `--user-bubble`, `--user-bubble-text` are chat-bubble colour tokens.
 
 Don't introduce hex literals in component SCSS. If a needed color token is missing, add it to **every** theme map at once — leaving a token undefined for one theme means components break under that theme.
 

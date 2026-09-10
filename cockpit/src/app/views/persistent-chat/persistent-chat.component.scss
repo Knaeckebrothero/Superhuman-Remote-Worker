@@ -376,9 +376,6 @@
       }
 
       .startup-card-title {
-        font-family: var(--font-display, inherit);
-        text-transform: uppercase;
-        letter-spacing: 0.18em;
         font-weight: 600;
         font-size: 15px;
         color: var(--text-primary);
@@ -1204,11 +1201,10 @@
       }
 
       .mile-label {
-        font-family: var(--font-display, inherit);
         text-transform: uppercase;
-        letter-spacing: 0.20em;
+        letter-spacing: 0.06em;
         font-weight: 600;
-        font-size: 10px;
+        font-size: 11px;
         color: var(--accent-color);
       }
 
@@ -1371,9 +1367,6 @@
       }
 
       .reconnect-banner .rb-body strong {
-        font-family: var(--font-display, inherit);
-        text-transform: uppercase;
-        letter-spacing: 0.18em;
         font-weight: 600;
         font-size: 11px;
         color: var(--danger);
@@ -1407,9 +1400,6 @@
         color: #fff;
         border: 0;
         cursor: pointer;
-        font-family: var(--font-display, inherit);
-        text-transform: uppercase;
-        letter-spacing: 0.18em;
         font-weight: 600;
         font-size: 10.5px;
         box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
@@ -1451,11 +1441,10 @@
         padding: 6px 12px;
         background: var(--surface-0);
         border: 1px solid var(--border-color, var(--surface-0));
-        font-family: var(--font-display, inherit);
         text-transform: uppercase;
-        letter-spacing: 0.20em;
+        letter-spacing: 0.06em;
         font-weight: 600;
-        font-size: 10px;
+        font-size: 11px;
         color: var(--text-muted);
       }
 
@@ -1476,11 +1465,10 @@
       }
 
       .resume-eyebrow {
-        font-family: var(--font-display, inherit);
         text-transform: uppercase;
-        letter-spacing: 0.28em;
+        letter-spacing: 0.06em;
         font-weight: 600;
-        font-size: 9.5px;
+        font-size: 11px;
         color: var(--accent-color);
         margin-bottom: 4px;
       }

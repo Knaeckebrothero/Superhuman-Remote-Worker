@@ -90,3 +90,13 @@ describe('typography — recipes and scale', () => {
     expect(styles).not.toMatch(/\nh[1-4][^{]*\{[^}]*text-transform:\s*uppercase/);
   });
 });
+
+describe('typography — --font-display readers', () => {
+  it('only the rail brand block and the chat hero read the Cinzel token', () => {
+    const sites = scanSources(join(here, '../app'), /var\(--font-display/);
+    const allowed = /sidebar\.component\.ts|chat-empty-state\.component\.scss/;
+    const offenders = sites.filter((l) => !allowed.test(l));
+    expect(offenders, offenders.join('\n')).toEqual([]);
+    expect(sites.length).toBe(3);
+  });
+});
