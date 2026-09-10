@@ -149,6 +149,7 @@ def _wire(*, store=None, cloud_router=None, admin_gate=None, rebind=None):
         store=backing,
         cloud_router=cloud_router if cloud_router is not None else _router(),
         rebind_cloud_router=rebind or calls.rebound.append,
+        thread_mount_dependencies=lambda: None,
     )
     dependencies = route_module.MainCloudSettingsRouteDependencies(
         operations=operations,
@@ -928,6 +929,7 @@ def test_a_rebound_router_singleton_is_observed_by_the_next_request():
                 store=_store(),
                 cloud_router=state["router"],
                 rebind_cloud_router=lambda _new: None,
+                thread_mount_dependencies=lambda: None,
             ),
             require_admin=require_admin,
         )

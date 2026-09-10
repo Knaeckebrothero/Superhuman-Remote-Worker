@@ -272,6 +272,97 @@ async def build_default_project_mount_row(
     }
 
 
+def _project_folder_transport(
+    project_id: str,
+    project: dict[str, Any],
+    *,
+    dependencies: ThreadMountDependencies,
+) -> dict[str, Any]:
+    """Resolve the transport columns of a non-default project's mount row.
+
+    Returns the four columns a ``project`` row carries; any of them may be
+    ``None``. A project with no provider or folder handle has no transport at
+    all. A project whose installation the router refuses — a pre-0186 row, an
+    instance this replica has not cached, a backend that is down — keeps its
+    identity columns but resolves no ``webdav_url``; the caller decides what
+    such a partial transport means.
+    """
+    backend_id = project.get("main_cloud_backend")
+    handle_str = project.get("main_cloud_folder_handle")
+    webdav_url: str | None = None
+    if backend_id and handle_str:
+        try:
+            backend = dependencies.cloud_router.for_project(project)
+            if backend.is_initialized:
+                handle = ProjectFolderHandle.from_db(
+                    handle_str, backend=backend.backend_id
+                )
+                webdav_url = backend.get_project_folder_webdav_url(handle)
+        except Exception as e:
+            logger.warning(
+                "Project %s: failed to resolve webdav URL for thread mount: %s",
+                project_id,
+                e,
+            )
+    return {
+        "backend_id": backend_id,
+        "backend_instance_id": project.get("main_cloud_backend_instance_id"),
+        "cloud_handle": handle_str,
+        "webdav_url": webdav_url,
+    }
+
+
+def transport_is_complete(row: dict[str, Any]) -> bool:
+    """Whether a mount row carries everything workspace delivery needs.
+
+    ``_build_agent_cloud_mount`` resolves a row through
+    ``for_backend_instance(backend_instance_id)`` and mounts its
+    ``webdav_url``; a row missing either fails there, and — the delivery
+    being all-or-fallback — takes every other mount of the thread down with
+    it. This is the shape the transport repair looks for and refuses to write.
+    """
+    return bool(
+        row.get("backend_id")
+        and row.get("backend_instance_id")
+        and row.get("webdav_url")
+    )
+
+
+async def build_project_mount_row(
+    project_id: str,
+    project: dict[str, Any],
+    *,
+    dependencies: ThreadMountDependencies,
+) -> Optional[dict[str, Any]]:
+    """One *complete* mount row for ``project``, or ``None``.
+
+    The single-project form of :func:`build_thread_mount_rows`, used by the
+    transport repair. A default project yields its ``project_default`` row
+    through :func:`build_default_project_mount_row`; any other project yields
+    a ``project`` row only when every transport column resolved. A partial
+    transport is ``None`` here on purpose: the repair exists to remove that
+    shape and must never mint it. ``target_path`` is the uncollided slug — a
+    caller repairing a persisted row keeps the ``target_path`` decided at
+    create time, suffix and all.
+    """
+    if project.get("is_default"):
+        return await build_default_project_mount_row(
+            project_id, project, dependencies=dependencies
+        )
+    transport = _project_folder_transport(
+        project_id, project, dependencies=dependencies
+    )
+    if not transport_is_complete(transport):
+        return None
+    return {
+        "mount_kind": "project",
+        "target_path": f"projects/{slugify_mount_name(project.get('name', ''))}",
+        "source_kind": "project_folder",
+        "source_ref": project_id,
+        **transport,
+    }
+
+
 async def build_thread_mount_rows(
     project_ids: list[str], *, dependencies: ThreadMountDependencies
 ) -> list[dict[str, Any]]:
@@ -317,23 +408,9 @@ async def build_thread_mount_rows(
                 rows.append(default_row)
                 used_paths.add(default_row.get("target_path", ""))
             continue
-        backend_id = project.get("main_cloud_backend")
-        handle_str = project.get("main_cloud_folder_handle")
-        webdav_url: str | None = None
-        if backend_id and handle_str:
-            try:
-                backend = dependencies.cloud_router.for_project(project)
-                if backend.is_initialized:
-                    handle = ProjectFolderHandle.from_db(
-                        handle_str, backend=backend.backend_id
-                    )
-                    webdav_url = backend.get_project_folder_webdav_url(handle)
-            except Exception as e:
-                logger.warning(
-                    "Project %s: failed to resolve webdav URL for thread mount: %s",
-                    project_id,
-                    e,
-                )
+        transport = _project_folder_transport(
+            project_id, project, dependencies=dependencies
+        )
         base_path = f"projects/{slugify_mount_name(project.get('name', ''))}"
         target_path = base_path
         suffix = 2
@@ -347,10 +424,7 @@ async def build_thread_mount_rows(
                 "target_path": target_path,
                 "source_kind": "project_folder",
                 "source_ref": project_id,
-                "backend_id": backend_id,
-                "backend_instance_id": project.get("main_cloud_backend_instance_id"),
-                "cloud_handle": handle_str,
-                "webdav_url": webdav_url,
+                **transport,
             }
         )
     return rows
@@ -430,6 +504,7 @@ async def resolve_thread_repositories(
 __all__ = [
     "ThreadMountDependencies",
     "build_default_project_mount_row",
+    "build_project_mount_row",
     "build_thread_mount_rows",
     "project_ids_from_mounts",
     "resolve_thread_datasources",
@@ -437,4 +512,5 @@ __all__ = [
     "should_skip_session_folder",
     "slugify_mount_name",
     "thread_project_ids",
+    "transport_is_complete",
 ]

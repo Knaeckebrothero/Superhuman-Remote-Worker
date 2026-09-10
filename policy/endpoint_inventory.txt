@@ -65,6 +65,7 @@ GET    /api/admin/system-settings/main_cloud                                    
 PUT    /api/admin/system-settings/main_cloud                                            admin:_require_admin
 POST   /api/admin/system-settings/main_cloud/backfill-instance-authority                admin:_require_admin
 POST   /api/admin/system-settings/main_cloud/reload                                     admin:_require_admin
+POST   /api/admin/system-settings/main_cloud/repair-thread-mounts                       admin:_require_admin
 POST   /api/admin/system-settings/main_cloud/test                                       admin:_require_admin
 GET    /api/admin/system-settings/tts_library                                           admin:_require_admin
 PUT    /api/admin/system-settings/tts_library                                           admin:_require_admin

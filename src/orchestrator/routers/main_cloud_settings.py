@@ -1,6 +1,6 @@
 """HTTP adapters for the admin "Cloud Storage" panel.
 
-Six routes on ``/api/admin/system-settings/main_cloud``. Every one of them
+Seven routes on ``/api/admin/system-settings/main_cloud``. Every one of them
 awaits the admin gate first — before the body is inspected, before any
 validation refusal — so a non-admin can never learn which backend ids the
 deployment accepts or whether a secret env var is wired.
@@ -9,9 +9,10 @@ Only two routes need the admin's identity beyond the gate (PUT and DELETE
 record an actor on the activation), so those two pass it down; the rest
 discard it exactly as ``main`` did.
 
-Route order is part of the contract: the literal ``/test``, ``/reload`` and
-``/backfill-instance-authority`` sub-paths are POSTs on a base path whose only
-other verbs are GET/PUT/DELETE, so nothing here shadows anything.
+Route order is part of the contract: the literal ``/test``, ``/reload``,
+``/backfill-instance-authority`` and ``/repair-thread-mounts`` sub-paths are
+POSTs on a base path whose only other verbs are GET/PUT/DELETE, so nothing
+here shadows anything.
 """
 
 from __future__ import annotations
@@ -196,6 +197,34 @@ async def backfill_main_cloud_instance_authority(
     """
     await dependencies.require_admin(request)
     return await main_cloud_settings.backfill_main_cloud_instance_authority(
+        apply=apply, dependencies=dependencies.operations
+    )
+
+
+@router.post("/api/admin/system-settings/main_cloud/repair-thread-mounts")
+async def repair_thread_mount_transport(
+    request: Request,
+    apply: bool = False,
+    *,
+    dependencies: MainCloudSettingsRouteDependencies = Depends(
+        get_main_cloud_settings_dependencies
+    ),
+) -> dict[str, Any]:
+    """Re-derive the transport of partial project mount rows.
+
+    Admin-only. **Dry run by default** — pass ``?apply=true`` to write.
+
+    The other half of the instance-authority backfill: stamping a project
+    does not touch the ``thread_mounts`` rows minted while it was unstamped,
+    and one such row (no installation, no WebDAV URL) makes workspace
+    delivery discard every mount the thread has and fall back to the legacy
+    session folder. Each row is rebuilt through the same builder thread
+    create uses, against the project's stamped installation, and written in
+    place only when every transport column resolved. Unstamped projects and
+    unresolvable installations are skipped and reported, never guessed.
+    """
+    await dependencies.require_admin(request)
+    return await main_cloud_settings.repair_thread_mount_transport(
         apply=apply, dependencies=dependencies.operations
     )
 

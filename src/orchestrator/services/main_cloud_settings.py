@@ -42,6 +42,7 @@ from orchestrator.services.cloud.instance_registry import (
     reload_active_main_cloud_instance,
 )
 from orchestrator.services.cloud.reload import fire_reload
+from orchestrator.services import thread_mount_rows
 
 logger = logging.getLogger(__name__)
 
@@ -56,11 +57,18 @@ class MainCloudSettingsDependencies:
     ``replace_active``, and nothing in the moved code reassigns it — but a
     service must never be the thing that rebinds an application global, so the
     seam is declared here rather than invented later.
+
+    ``thread_mount_dependencies`` is main's ``_thread_mount_dependencies``
+    factory: the transport repair rebuilds mount rows through the same
+    builder thread create uses, so it needs that lane's collaborators, and it
+    needs them resolved per call for the same rebinding reason as the two
+    above.
     """
 
     store: Any
     cloud_router: Any
     rebind_cloud_router: Callable[[Any], None]
+    thread_mount_dependencies: Callable[[], Any]
 
 
 _MAIN_CLOUD_NONSECRET_FIELDS_BY_BACKEND: dict[str, list[str]] = {
@@ -639,6 +647,165 @@ async def backfill_main_cloud_instance_authority(
         "plan": plan,
         "projects": stamped["projects"],
         "threads": stamped["threads"],
+    }
+
+
+async def repair_thread_mount_transport(
+    *, apply: bool, dependencies: MainCloudSettingsDependencies
+) -> dict[str, Any]:
+    """Re-derive the transport of partial project mount rows.
+
+    Admin-only. **Dry run by default** — pass ``?apply=true`` to write.
+
+    ``thread_mounts`` rows minted while their project was still unstamped
+    (pre-0186) carry a provider name but no installation and no WebDAV URL,
+    and the instance-authority backfill leaves them exactly so: mount rows
+    are only re-derived for a thread that has none. At delivery one such row
+    is fatal to the whole set — ``_build_agent_cloud_mount`` mounts every row
+    or falls back to the legacy session folder — so a stamped project still
+    yields a session that writes to ``sessions/<id>``.
+
+    Every row is rebuilt through the builder that creates rows
+    (``thread_mount_rows.build_project_mount_row``) against the project's
+    *stamped* installation, and written only when every transport column
+    resolved. Nothing here guesses: an unstamped project is skipped with a
+    pointer at the backfill, an installation this replica cannot resolve is
+    skipped, and a rebuilt row that is itself partial is never written — the
+    repair must not mint the shape it exists to remove. Rows are updated in
+    place, so mount ids and the collision-suffixed ``target_path`` decided at
+    create time survive. Re-running is a no-op.
+    """
+    postgres_db = dependencies.store
+
+    partial = await postgres_db.survey_partial_thread_mounts()
+    if not partial:
+        return {
+            "status": "noop",
+            "applied": False,
+            "detail": "No project mount row lacks its transport.",
+            "rows": 0,
+            "repairable": 0,
+            "repaired": 0,
+            "skipped": 0,
+        }
+
+    mount_dependencies = dependencies.thread_mount_dependencies()
+    plan: list[dict[str, Any]] = []
+    writes: dict[str, dict[str, Any]] = {}
+    projects: dict[str, Any] = {}
+    for row in partial:
+        mount_id = str(row["id"])
+        entry: dict[str, Any] = {
+            "mount_id": mount_id,
+            "thread_id": str(row["thread_id"]),
+            "thread_status": row.get("thread_status"),
+            "mount_kind": row.get("mount_kind"),
+            "target_path": row.get("target_path"),
+            "project_id": str(row["source_ref"]) if row.get("source_ref") else None,
+        }
+        project_id = entry["project_id"]
+        if not project_id:
+            plan.append({**entry, "action": "skip", "reason": "no_project"})
+            continue
+        if project_id not in projects:
+            projects[project_id] = await postgres_db.get_project(project_id)
+        project = projects[project_id]
+        if not project:
+            plan.append({**entry, "action": "skip", "reason": "project_missing"})
+            continue
+        if project.get("main_cloud_backend") and not project.get(
+            "main_cloud_backend_instance_id"
+        ):
+            plan.append(
+                {
+                    **entry,
+                    "action": "skip",
+                    "reason": "project_unstamped",
+                    "detail": "run backfill-instance-authority first",
+                }
+            )
+            continue
+        try:
+            rebuilt = await thread_mount_rows.build_project_mount_row(
+                project_id, project, dependencies=mount_dependencies
+            )
+        except Exception as e:
+            logger.warning(
+                "thread mount transport repair: rebuilding row %s for project "
+                "%s failed: %s",
+                mount_id,
+                project_id,
+                e,
+            )
+            rebuilt = None
+        if rebuilt is None:
+            plan.append({**entry, "action": "skip", "reason": "transport_unresolvable"})
+            continue
+        if rebuilt.get("mount_kind") != row.get("mount_kind"):
+            plan.append(
+                {
+                    **entry,
+                    "action": "skip",
+                    "reason": "mount_kind_changed",
+                    "detail": f"project now yields {rebuilt.get('mount_kind')!r}",
+                }
+            )
+            continue
+        writes[mount_id] = {
+            "backend_id": str(rebuilt["backend_id"]),
+            "backend_instance_id": str(rebuilt["backend_instance_id"]),
+            "cloud_handle": rebuilt.get("cloud_handle"),
+            "webdav_url": str(rebuilt["webdav_url"]),
+            "target_user_sub": rebuilt.get("target_user_sub"),
+        }
+        plan.append(
+            {
+                **entry,
+                "action": "repair",
+                "backend_id": writes[mount_id]["backend_id"],
+                "backend_instance_id": writes[mount_id]["backend_instance_id"],
+                "webdav_url": writes[mount_id]["webdav_url"],
+                "target_user_sub": bool(writes[mount_id]["target_user_sub"]),
+            }
+        )
+
+    skipped = len(plan) - len(writes)
+    if not apply:
+        return {
+            "status": "dry_run",
+            "applied": False,
+            "detail": "Re-run with ?apply=true to write these transports.",
+            "plan": plan,
+            "rows": len(plan),
+            "repairable": len(writes),
+            "repaired": 0,
+            "skipped": skipped,
+        }
+
+    repaired = 0
+    for entry in plan:
+        write = writes.get(entry["mount_id"])
+        if write is None:
+            continue
+        written = await postgres_db.repair_thread_mount_transport(
+            entry["mount_id"], **write
+        )
+        entry["written"] = bool(written)
+        repaired += int(bool(written))
+    logger.warning(
+        "thread mount transport repair: rewrote %d of %d partial row(s); %d skipped",
+        repaired,
+        len(plan),
+        skipped,
+    )
+    return {
+        "status": "ok",
+        "applied": True,
+        "plan": plan,
+        "rows": len(plan),
+        "repairable": len(writes),
+        "repaired": repaired,
+        "skipped": skipped,
     }
 
 

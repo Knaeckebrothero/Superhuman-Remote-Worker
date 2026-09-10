@@ -11973,6 +11973,7 @@ def _main_cloud_settings_dependencies() -> (
             store=postgres_db,
             cloud_router=main_cloud_router,
             rebind_cloud_router=_rebind_main_cloud_router,
+            thread_mount_dependencies=_thread_mount_dependencies,
         ),
         require_admin=_require_admin,
     )
