@@ -205,7 +205,7 @@ const MODE_ROUTES: Record<RailMode, string> = {
         /* 16px 12px, not a flat 16px: horizontal only, so row height
            (vertical rhythm) is unchanged. */
         padding: 16px 12px;
-        border-bottom: 1px solid var(--border-color);
+        border-bottom: 1px solid var(--border-hairline);
         flex-shrink: 0;
       }
 
@@ -397,10 +397,10 @@ const MODE_ROUTES: Record<RailMode, string> = {
       .rail-group {
         margin: 0 8px;
         padding: 12px 4px 4px;
-        font-size: 10px;
+        font-size: 11px;
         font-weight: 600;
         text-transform: uppercase;
-        letter-spacing: 1px;
+        letter-spacing: 0.06em;
         color: var(--text-muted);
       }
 
@@ -428,6 +428,7 @@ const MODE_ROUTES: Record<RailMode, string> = {
       .rail-item.active {
         background: var(--surface-0);
         color: var(--accent-color);
+        font-weight: 600;
       }
 
       /* sessionGroups() is [] both for "no sessions yet" and "no matches" —
@@ -517,7 +518,7 @@ const MODE_ROUTES: Record<RailMode, string> = {
 
       .section {
         padding: 8px;
-        border-top: 1px solid var(--border-color);
+        border-top: 1px solid var(--border-hairline);
       }
 
       .section-title {
@@ -566,7 +567,7 @@ const MODE_ROUTES: Record<RailMode, string> = {
 
       .sidebar-footer {
         padding: 12px;
-        border-top: 1px solid var(--border-color);
+        border-top: 1px solid var(--border-hairline);
         display: flex;
         flex-direction: column;
         gap: 8px;
@@ -574,7 +575,7 @@ const MODE_ROUTES: Record<RailMode, string> = {
       }
 
       .rail-divider {
-        border-top: 1px solid var(--border-color);
+        border-top: 1px solid var(--border-hairline);
       }
     `,
   ],
