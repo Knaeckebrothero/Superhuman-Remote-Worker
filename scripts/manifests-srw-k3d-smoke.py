@@ -639,6 +639,8 @@ async def inspect():
               'workspace':snapshot['document']['spec']['execution'].get('workspace'),
               'resolvedWorkspace':snapshot['resolved']['spec']['execution'].get('workspace'),
               'sourceDigest':hashlib.sha256(json.dumps(source,sort_keys=True).encode()).hexdigest()}
+            if kind=='Job':
+                result['job']=dict(await db.fetchrow("SELECT execution_lane,status FROM jobs WHERE id=$1",UUID(work_id)))
             if kind=='Session':
                 row=await db.fetchrow("SELECT execution_lane,status,runtime_generation::text AS generation,total_turns FROM threads WHERE id=$1",UUID(work_id))
                 result['thread']=dict(row) if row else None

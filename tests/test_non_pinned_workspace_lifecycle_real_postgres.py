@@ -127,6 +127,133 @@ async def test_0195_raw_runtime_insert_requires_creation_reservation(db, owner_k
     )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("remove_projection", (False, True))
+async def test_0238_legacy_job_activity_is_metadata(db, remove_projection):
+    job_id = uuid4()
+    async with db.acquire() as conn:
+        await _execute_pre_0195(
+            conn,
+            "INSERT INTO jobs (id, description, status, context) "
+            "VALUES ($1, 'legacy heartbeat', 'completed', $2::jsonb)",
+            job_id,
+            json.dumps(
+                {"workspace_container": {"last_activity": "2026-09-10T00:00:00Z"}}
+            ),
+        )
+        if remove_projection:
+            assert (
+                await conn.execute(
+                    "UPDATE jobs SET context = context - 'workspace_container' WHERE id = $1",
+                    job_id,
+                )
+                == "UPDATE 1"
+            )
+        assert (
+            await conn.execute("DELETE FROM jobs WHERE id = $1", job_id) == "DELETE 1"
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "projection",
+    (
+        {"last_activity": "2026-09-10T00:00:00Z", "pod_name": "legacy-pod"},
+        {"last_activity": "2026-09-10T00:00:00Z", "unknown": True},
+        {"last_activity": 123},
+        {"last_activity": None},
+    ),
+)
+async def test_0238_activity_does_not_hide_unknown_or_runtime_authority(db, projection):
+    job_id = uuid4()
+    async with db.acquire() as conn:
+        await _execute_pre_0195(
+            conn,
+            "INSERT INTO jobs (id, description, status, context) "
+            "VALUES ($1, 'legacy authority', 'completed', $2::jsonb)",
+            job_id,
+            json.dumps({"workspace_container": projection}),
+        )
+        with pytest.raises(asyncpg.CheckViolationError):
+            await conn.execute("DELETE FROM jobs WHERE id = $1", job_id)
+        with pytest.raises(asyncpg.CheckViolationError):
+            await conn.execute(
+                "UPDATE jobs SET context = context - 'workspace_container' WHERE id = $1",
+                job_id,
+            )
+
+
+@pytest.mark.asyncio
+async def test_0238_job_heartbeat_exception_does_not_apply_to_threads(db):
+    thread_id = uuid4()
+    async with db.acquire() as conn:
+        await _execute_pre_0195(
+            conn,
+            "INSERT INTO threads (id, status, execution_lane, metadata) "
+            "VALUES ($1, 'ended', 'stateless', $2::jsonb)",
+            thread_id,
+            json.dumps(
+                {"workspace_container": {"last_activity": "2026-09-10T00:00:00Z"}}
+            ),
+        )
+        with pytest.raises(asyncpg.CheckViolationError):
+            await conn.execute("DELETE FROM threads WHERE id = $1", thread_id)
+
+
+@pytest.mark.asyncio
+async def test_0238_activity_cannot_hide_pending_creation_authority(db):
+    job_id = uuid4()
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO jobs (id, description, status) "
+            "VALUES ($1, 'pending workspace', 'paused')",
+            job_id,
+        )
+    assert await db.reserve_managed_repository_workspace_creation(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        claimant="activity-regression",
+        desired_manifest_digest="0" * 64,
+    )
+    async with db.acquire() as conn:
+        await _execute_pre_0195(
+            conn,
+            "UPDATE jobs SET context = $2::jsonb WHERE id = $1",
+            job_id,
+            json.dumps(
+                {"workspace_container": {"last_activity": "2026-09-10T00:00:00Z"}}
+            ),
+        )
+        with pytest.raises(asyncpg.CheckViolationError) as refused:
+            await conn.execute("DELETE FROM jobs WHERE id = $1", job_id)
+    assert refused.value.constraint_name == (
+        "managed_repository_workspace_cleanup_required_before_owner_delete"
+    )
+
+
+@pytest.mark.asyncio
+async def test_activity_still_updates_an_authoritative_workspace(db):
+    job_id, _, _, state = await _create_settled_authoritative_runtime(
+        db, owner_kind="job", scope="workspace_container"
+    )
+    assert await db.merge_workspace_container_context(
+        str(job_id),
+        {"last_activity": "2026-09-10T00:00:00Z"},
+        existing_only=True,
+    )
+    async with db.acquire() as conn:
+        workspace = await conn.fetchval(
+            "SELECT context->'workspace_container' FROM jobs WHERE id = $1", job_id
+        )
+    if isinstance(workspace, str):
+        workspace = json.loads(workspace)
+    assert workspace == {
+        **state["workspace_container"],
+        "last_activity": "2026-09-10T00:00:00Z",
+    }
+
+
 async def _create_settled_authoritative_runtime(
     db: PostgresDB, *, owner_kind: str, scope: str, settle: bool = True
 ) -> tuple[UUID, str, dict, dict]:

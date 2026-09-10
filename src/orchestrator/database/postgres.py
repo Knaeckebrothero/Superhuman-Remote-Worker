@@ -9804,6 +9804,7 @@ class PostgresDB:
         *,
         completion_command_id: str | None = None,
         completion_finalizing_by: str | None = None,
+        existing_only: bool = False,
     ) -> bool:
         """Atomically merge updates into context.workspace_container.
 
@@ -9813,6 +9814,8 @@ class PostgresDB:
         Args:
             job_id: Job UUID as string
             container_updates: Dictionary of keys to merge into context.workspace_container
+            existing_only: Only touch a projection naming its provisioner. Routine
+                activity must not create infrastructure state for virtual/none jobs.
 
         Returns:
             True if updated, False if not found
@@ -9854,6 +9857,8 @@ class PostgresDB:
             "    updated_at = CURRENT_TIMESTAMP "
             f"WHERE id = $2{command_guard}"
         )
+        if existing_only:
+            query += " AND context->'workspace_container'->>'provisioner' IN ('k8s', 'docker')"
         async with self.acquire() as conn:
             result = await conn.execute(query, *values)
 

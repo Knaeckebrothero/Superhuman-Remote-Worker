@@ -216,7 +216,9 @@ existing authorized workspace-upgrade flow.
 
 The existing Job and Session endpoints accept a top-level `workspace` using the
 manifest binding shape, for example `{"template":{"ref":{"name":"build-env"}}}`.
-Inline templates work too. Existing `config_override.workspace` requests remain
+References resolve in the selected Project/Account scope; use `ref.scope` when
+selecting a template from another scope. Inline templates work too. Existing
+`config_override.workspace` requests remain
 compatible, but cannot be combined with a second top-level backend selection.
 Selected template and Project revisions are captured at admission; source edits
 do not change existing execution snapshots. Children keep their existing

@@ -371,3 +371,31 @@ async def test_project_workspace_default_precedence_and_activation_race(
         )
     assert stale.value.status_code == 409
     assert await database.fetchval("SELECT count(*) FROM threads") == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["virtual", "none"])
+async def test_activity_does_not_invent_workspace_authority_or_block_job_deletion(
+    database, actor, backend
+):
+    job = await database.create_job(
+        description="Independent workspace heartbeat",
+        user_id=str(actor["id"]),
+        config_override={
+            "workspace": {"backend": backend},
+            "llm": {"model": "admitted-model"},
+        },
+        datasource_ids=[],
+        status="completed",
+    )
+    changed = await database.merge_workspace_container_context(
+        str(job["id"]),
+        {"last_activity": "2026-09-10T00:00:00+00:00"},
+        existing_only=True,
+    )
+    assert changed is False
+    current = await database.get_job(str(job["id"]))
+    assert "workspace_container" not in current["context"]
+    assert await database.delete_job(
+        str(job["id"]), deletion_actor_user_id=str(actor["id"])
+    )

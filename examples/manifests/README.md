@@ -61,8 +61,12 @@ The existing `POST /api/jobs` and `POST /api/persistent/threads` requests accept
 the same binding as a top-level `workspace` field:
 
 ```json
-{"workspace": {"template": {"ref": {"name": "build-env"}}}}
+{"workspace": {"template": {"ref": {"name": "build-env", "scope": {"kind": "Account", "name": "me"}}}}}
 ```
+
+References without a scope resolve in the selected Project, or in the Account
+for a standalone execution. The example explicitly selects an Account resource;
+Jobs can acquire a default Project even when no project ID is submitted.
 
 Omission inherits the active Project default, then account/role defaults. Explicit
 null selects no workspace. `config_override.workspace.backend` remains an

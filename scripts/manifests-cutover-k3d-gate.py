@@ -90,6 +90,7 @@ def source_paths():
         "src/shared/runtime/core/workspace_selection.py",
         "src/shared/runtime/core/tool_report.py",
         "src/orchestrator/services/config_resolver.py",
+        "src/orchestrator/services/agent_registration.py",
         "src/orchestrator/services/job_admission.py",
         "src/orchestrator/services/job_admission_config.py",
         "src/orchestrator/services/thread_admission.py",
@@ -106,6 +107,7 @@ def source_paths():
         "src/orchestrator/database/migrations/app/*manifest*.sql",
         "src/orchestrator/database/migrations/app/0236_*.sql",
         "src/orchestrator/database/migrations/app/0237_*.sql",
+        "src/orchestrator/database/migrations/app/0238_*.sql",
         "config/experts/*/config.yaml",
         "config/subagents/*/config.yaml",
     ):

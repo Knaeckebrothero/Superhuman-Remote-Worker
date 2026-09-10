@@ -687,6 +687,7 @@ async def agent_heartbeat(
                 await postgres_db.merge_workspace_container_context(
                     heartbeat.current_job_id,
                     {"last_activity": datetime.now(timezone.utc).isoformat()},
+                    existing_only=True,
                 )
             except Exception:
                 pass  # Non-critical — don't fail heartbeat

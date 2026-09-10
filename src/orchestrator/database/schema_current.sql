@@ -3072,6 +3072,13 @@ BEGIN
        -- repository authority to retire.  Sanitized untrusted creation paths
        -- legitimately move that placeholder between pending/ready states.
        AND old_workspace - 'status' <> '{}'::JSONB
+       -- A legacy Job heartbeat can leave only a timestamp. It never named
+       -- compute, credentials, an endpoint or a provisioner to retire.
+       AND NOT (
+           source_kind = 'job'
+           AND old_workspace - 'last_activity' = '{}'::JSONB
+           AND jsonb_typeof(old_workspace -> 'last_activity') = 'string'
+       )
        AND (
            TG_OP = 'DELETE'
            OR new_workspace IS DISTINCT FROM old_workspace
@@ -9705,6 +9712,14 @@ BEGIN
                 AND runtime_state ->> 'provisioner' <> 'k8s')
            OR (scope_name = 'ide'
                 AND runtime_state ->> 'restore_type' <> 'k8s_container') THEN
+            CONTINUE;
+        END IF;
+        -- Only the legacy heartbeat's exact timestamp-only Job placeholder
+        -- is metadata. Resource fields and all creation/cleanup receipts keep
+        -- their existing authority requirements.
+        IF source_kind = 'job' AND scope_name = 'workspace_container'
+           AND runtime_state - 'last_activity' = '{}'::JSONB
+           AND jsonb_typeof(runtime_state -> 'last_activity') = 'string' THEN
             CONTINUE;
         END IF;
         runtime_uid := runtime_state ->> '_runtime_incarnation';
