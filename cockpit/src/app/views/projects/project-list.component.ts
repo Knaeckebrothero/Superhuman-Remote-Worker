@@ -31,7 +31,7 @@ function errorDetail(err: unknown): string {
     AppSpinnerComponent,
     AppInlineEditableTextComponent,
     AppTabBarComponent,
-    AppTabComponent,, AppButtonComponent, AppBadgeComponent],
+    AppTabComponent, AppButtonComponent, AppBadgeComponent],
   template: `
     <div class="page-container">
       <!-- Header -->
