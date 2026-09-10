@@ -149,7 +149,7 @@ const INHERIT = '__inherit__';
        the grants table (the newest capability rows) was clipped away with no
        scrollbar. Same shape every other admin screen uses. */
     :host { display: block; height: 100%; overflow: auto; }
-    .admin-container { padding: 1rem 1.5rem; max-width: var(--content-max-width); margin: 0 auto; }
+    .admin-container { padding: 32px; max-width: var(--content-max-width); margin: 0 auto; }
     .page-header { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 1rem; }
     .page-title { margin: 0; color: var(--text-primary); }
     .admin-section {

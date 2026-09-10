@@ -1826,6 +1826,9 @@ const EXPIRY_OPTIONS = [
         padding: 24px;
       }
 
+      /* Every card gets the same breathing room; .section-spacer used to be
+         the only source of it, so the first three cards sat flush. */
+      .settings-section + .settings-section,
       .section-spacer {
         margin-top: 24px;
       }
@@ -2073,7 +2076,7 @@ const EXPIRY_OPTIONS = [
         padding: 12px 16px;
         background: var(--surface-0);
         border: 1px solid var(--border-color);
-        border-radius: var(--radius-card);
+        border-radius: var(--radius-surface);
         margin-bottom: 16px;
       }
 
@@ -2099,7 +2102,7 @@ const EXPIRY_OPTIONS = [
         padding: 14px 16px;
         background: var(--surface-0);
         border: 1px dashed var(--border-color);
-        border-radius: var(--radius-card);
+        border-radius: var(--radius-surface);
       }
 
       .subs-disabled-title {
@@ -2138,7 +2141,7 @@ const EXPIRY_OPTIONS = [
         padding: 10px 14px;
         background: var(--surface-0);
         border: 1px solid var(--border-color);
-        border-radius: var(--radius-card);
+        border-radius: var(--radius-surface);
         font-size: 13px;
       }
 
@@ -2199,7 +2202,7 @@ const EXPIRY_OPTIONS = [
         padding: 14px;
         background: var(--surface-0);
         border: 1px solid var(--border-color);
-        border-radius: var(--radius-card);
+        border-radius: var(--radius-surface);
       }
 
       .subs-provider-card.busy {
@@ -2236,7 +2239,7 @@ const EXPIRY_OPTIONS = [
         padding: 14px 16px;
         background: var(--surface-0);
         border: 1px solid var(--border-color);
-        border-radius: var(--radius-card);
+        border-radius: var(--radius-surface);
       }
 
       .subs-login-title {
@@ -2291,7 +2294,7 @@ const EXPIRY_OPTIONS = [
         margin: 0 0 8px 0;
         background: var(--surface-0);
         border: 1px solid var(--border-color);
-        border-radius: var(--radius-card);
+        border-radius: var(--radius-surface);
       }
 
       .subs-usage-title {
@@ -2536,7 +2539,7 @@ const EXPIRY_OPTIONS = [
         margin: 0;
         font-size: 13px;
         font-weight: 600;
-        color: var(--text);
+        color: var(--text-primary);
       }
       .voice-library {
         margin-top: 14px;
@@ -2595,7 +2598,7 @@ const EXPIRY_OPTIONS = [
       .voice-library-card__name {
         font-size: 13px;
         font-weight: 500;
-        color: var(--text);
+        color: var(--text-primary);
       }
       .voice-library-card__tags {
         font-size: 12px;

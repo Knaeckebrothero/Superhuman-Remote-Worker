@@ -57,13 +57,14 @@
 }
 
 .empty-state {
-  color: var(--text-tertiary);
+  color: var(--text-muted);
   font-style: italic;
 }
 
 .keys-section,
 .create-section {
-  background: var(--surface-1);
+  background: var(--panel-bg);
+  border: 1px solid var(--border-hairline);
   border-radius: var(--radius-surface);
   padding: 16px 20px;
 }
@@ -87,11 +88,11 @@
   font-weight: 600;
   font-size: 0.85rem;
   color: var(--text-secondary);
-  border-bottom: 1px solid var(--border-1);
+  border-bottom: 1px solid var(--border-color);
 }
 
 .keys-row {
-  border-bottom: 1px solid var(--border-1);
+  border-bottom: 1px solid var(--border-color);
 }
 
 .keys-row.disabled {
@@ -135,7 +136,7 @@
   flex-direction: column;
   gap: 4px;
   padding-top: 16px;
-  border-top: 1px solid var(--border-1);
+  border-top: 1px solid var(--border-color);
 }
 
 .step:first-child {

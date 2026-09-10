@@ -153,3 +153,17 @@
   cursor: pointer;
   text-decoration: underline;
 }
+
+/* Below ~480px the two-column grid leaves ~90px per label and the longest
+   chip wraps to five lines; one column of single-line chips is shorter. */
+@media (width <= 480px) {
+  .suggestion-grid {
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+
+  .suggestion-chip {
+    padding-inline: 14px;
+    font-size: 15px;
+  }
+}

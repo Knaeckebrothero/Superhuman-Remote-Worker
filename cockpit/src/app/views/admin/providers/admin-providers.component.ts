@@ -348,7 +348,7 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
                     </app-button>
                     @if (!isCodexEndpoint(endpoint.label)) {
                       <app-button
-                        variant="ghost"
+                        variant="secondary"
                         size="sm"
                         [disabled]="editingEndpointId() === endpoint.id"
                         (clicked)="startEditEndpoint(endpoint)"

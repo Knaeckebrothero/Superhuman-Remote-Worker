@@ -248,8 +248,8 @@ const DEFAULT_SCOPES = ['jobs:read', 'chat:read'];
     .page-desc { color: var(--text-secondary); margin: 0; }
     .section-title { margin: 0 0 4px; font-size: 1.1rem; }
     .section-desc { color: var(--text-secondary); margin: 0 0 12px; font-size: 0.9rem; }
-    .empty-state { color: var(--text-tertiary); font-style: italic; }
-    .keys-section, .create-section, .hint-section { background: var(--surface-1); border-radius: var(--radius-surface); padding: 16px 20px; }
+    .empty-state { color: var(--text-muted); font-style: italic; }
+    .keys-section, .create-section, .hint-section { background: var(--panel-bg); border: 1px solid var(--border-hairline); border-radius: var(--radius-surface); padding: 16px 20px; }
 
     .keys-table { display: flex; flex-direction: column; gap: 4px; }
     .keys-header, .keys-row {
@@ -259,8 +259,8 @@ const DEFAULT_SCOPES = ['jobs:read', 'chat:read'];
       align-items: center;
       padding: 8px 4px;
     }
-    .keys-header { font-weight: 600; font-size: 0.85rem; color: var(--text-secondary); border-bottom: 1px solid var(--border-1); }
-    .keys-row { border-bottom: 1px solid var(--border-1); }
+    .keys-header { font-weight: 600; font-size: 0.85rem; color: var(--text-secondary); border-bottom: 1px solid var(--border-color); }
+    .keys-row { border-bottom: 1px solid var(--border-color); }
     .keys-row.stale { background: color-mix(in srgb, var(--warning) 8%, transparent); }
     .keys-row.superseded { opacity: 0.6; }
     .col-action { display: flex; gap: 6px; justify-content: flex-end; }
@@ -293,20 +293,21 @@ const DEFAULT_SCOPES = ['jobs:read', 'chat:read'];
     .reveal-header { display: flex; align-items: center; gap: 8px; }
     .reveal-detail { color: var(--text-secondary); margin: 0; }
     .reveal-row { display: flex; gap: 8px; align-items: center; }
-    .reveal-input { flex: 1; padding: 8px 12px; border: 1px solid var(--border-1); border-radius: var(--radius-control); background: var(--surface-2); color: var(--text-primary); }
+    .reveal-input { flex: 1; padding: 8px 12px; border: 1px solid var(--border-color); border-radius: var(--radius-control); background: var(--surface-2); color: var(--text-primary); }
     .reveal-ack { display: flex; align-items: center; gap: 8px; color: var(--text-secondary); }
 
     .create-form { display: flex; flex-direction: column; gap: 12px; }
     .form-row { display: flex; flex-direction: column; gap: 4px; }
     .form-label { font-weight: 500; font-size: 0.9rem; color: var(--text-secondary); }
-    .scopes-fieldset { border: 1px solid var(--border-1); border-radius: var(--radius-surface); padding: 12px 16px; }
-    .scopes-fieldset legend { padding: 0 6px; font-weight: 600; font-size: 0.9rem; }
+    /* Reset the UA fieldset box so the scope grid lines up with the sibling fields. */
+    .scopes-fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
+    .scopes-fieldset legend { padding: 0; margin-bottom: 8px; font-weight: 600; font-size: 0.9rem; }
     .scopes-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 8px; }
     .scope-checkbox { display: flex; gap: 8px; align-items: flex-start; cursor: pointer; }
     .scope-checkbox small { display: block; color: var(--text-secondary); font-size: 0.8rem; }
     .create-error { color: var(--danger); padding: 8px 12px; border-radius: var(--radius-control); background: color-mix(in srgb, var(--danger) 12%, transparent); }
 
-    .code-block { background: var(--surface-2); padding: 12px; border-radius: var(--radius-control); overflow-x: auto; font-family: var(--font-mono); font-size: 0.85rem; }
+    .code-block { background: var(--surface-0); padding: 12px; border-radius: var(--radius-control); overflow-x: auto; font-family: var(--font-mono); font-size: 0.85rem; }
   `],
 })
 export class ApiKeysPageComponent {

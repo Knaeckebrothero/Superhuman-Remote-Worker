@@ -1137,13 +1137,15 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
       margin-bottom: 20px;
     }
 
-    .header-info { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+    .header-info { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; flex: 1 1 auto; min-width: 0; }
 
     .page-title {
       font-size: 22px;
       font-weight: 700;
       color: var(--text-primary);
       margin: 0;
+      min-width: 0;
+      max-width: 100%;
     }
 
     .header-badges { display: flex; gap: 6px; }
@@ -1213,12 +1215,16 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
       border-bottom-color: var(--accent-color);
     }
 
+    /* Mirrors app-button[ghost][md] so it sits level with its button siblings. */
     .ghost-link {
       display: inline-flex;
       align-items: center;
-      padding: 8px 16px;
+      height: 32px;
+      padding: 0 12px;
       border-radius: var(--radius-control);
       font-size: 13px;
+      font-weight: 500;
+      line-height: 1.25;
       color: var(--text-secondary);
       text-decoration: none;
       border: 1px solid transparent;

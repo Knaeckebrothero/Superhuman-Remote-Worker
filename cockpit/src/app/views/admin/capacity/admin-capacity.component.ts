@@ -170,9 +170,9 @@ export const CAPACITY_REFRESH_MS = 10_000;
         flex-direction: column;
         gap: 4px;
         padding: 14px 16px;
-        border: 1px solid var(--border-color);
+        border: 1px solid var(--border-hairline);
         border-radius: var(--radius-surface);
-        background: var(--surface-1);
+        background: var(--panel-bg);
       }
       .kpi-label {
         font-size: 12px;
@@ -215,7 +215,9 @@ export const CAPACITY_REFRESH_MS = 10_000;
       .cell-title a {
         color: var(--text-primary);
       }
-      .cell-reason {
+      /* Must outrank the .parked-table td rule above, or the reason never wraps and
+         the table runs past its wrapper (the Unpark button was clipped at 1440px). */
+      .parked-table td.cell-reason {
         white-space: normal;
         min-width: 220px;
       }
