@@ -91,11 +91,18 @@ test('capture walk', async ({browser}) => {
     }
 
     // Structural assertions live here so a slice cannot regress them silently.
-    // (Task 14 of the plan adds the jobs-row check.)
+    // Jobs rows: at most two text buttons (View + one contextual) and exactly
+    // one kebab per row on desktop.
     await page.setViewportSize({width: 1440, height: 900});
     await page.goto('/jobs', {waitUntil: 'load'});
     await page.waitForTimeout(1_200);
-    expect(await page.locator('body').count()).toBe(1);
+    const rows = page.locator('table.app-table tbody tr:not(.promote-row)');
+    const n = await rows.count();
+    for (let i = 0; i < n; i++) {
+      const cell = rows.nth(i).locator('td.actions-cell');
+      expect(await cell.locator('app-button').count(), `row ${i} text buttons`).toBeLessThanOrEqual(2);
+      expect(await cell.locator('app-icon-button').count(), `row ${i} kebab`).toBe(1);
+    }
 
     await context.close();
   }
