@@ -30,7 +30,7 @@ const MODE_ROUTES: Record<RailMode, string> = {
   standalone: true,
   imports: [RouterLink, RouterLinkActive, LayoutPickerComponent, NotificationBellComponent, TranslocoPipe, AppIconComponent, LegionMarkComponent, AppTabNavComponent, AppTabNavItemComponent, RailMoreMenuComponent, RailAccountMenuComponent],
   template: `
-    <nav class="sidebar" (click)="onSidebarClick($event)">
+    <nav class="sidebar" id="sidebar-rail" (click)="onSidebarClick($event)">
       <div class="sidebar-header">
         <div class="sidebar-brand">
           <srw-legion-mark [size]="22" />
@@ -164,9 +164,12 @@ const MODE_ROUTES: Record<RailMode, string> = {
   `,
   styles: [
     `
+      /* --sidebar-width is bound on this host from SidebarService (see the
+         host block below); the literal is the fallback for the frame before
+         the binding applies, and for SSR. */
       :host {
         display: block;
-        width: 200px;
+        width: var(--sidebar-width, 260px);
         flex-shrink: 0;
         overflow: hidden;
         transition: width 0.2s ease;
@@ -176,10 +179,21 @@ const MODE_ROUTES: Record<RailMode, string> = {
         width: 0;
       }
 
+      /* The width animation belongs to collapse/expand, where it reads as a
+         wipe. During a drag the same transition makes the rail's edge lag the
+         pointer by 200ms, which feels like the handle has come loose. */
+      :host(.resizing) {
+        transition: none;
+      }
+
       .sidebar {
         display: flex;
         flex-direction: column;
-        width: 200px;
+        /* The same width as the host, not 100%: while the host animates to 0 on
+           collapse, this keeps its width and is clipped by the host's
+           overflow: hidden — a wipe. At 100% the content would reflow through
+           every intermediate width instead, thrashing the title ellipses. */
+        width: var(--sidebar-width, 260px);
         height: 100%;
         background: var(--panel-bg);
         border-right: 1px solid var(--border-color);
@@ -292,9 +306,10 @@ const MODE_ROUTES: Record<RailMode, string> = {
         margin: 8px;
       }
 
-      /* Three modes share one row in the 200px rail. The tab primitive's
-         20px side padding plus wrap-on-overflow pushed "Projects" onto a
-         second line; distribute the slack across the items instead. */
+      /* Three modes share one row in the rail, 200px wide at its narrowest.
+         The tab primitive's 20px side padding plus wrap-on-overflow pushed
+         "Projects" onto a second line; distribute the slack across the items
+         instead. */
       .mode-switcher[data-orientation='horizontal'] {
         flex-wrap: nowrap;
       }
@@ -480,10 +495,14 @@ const MODE_ROUTES: Record<RailMode, string> = {
         color: var(--text-primary);
       }
 
-      /* Mobile drawer sizing: the 200px/13px desktop rail reads cramped as an
-         overlay drawer. Widen it (capped below the viewport so the backdrop
-         stays tappable) and scale the type/targets for thumbs. The width:0
-         collapse still wins via :host(.collapsed) specificity, unchanged. */
+      /* Mobile drawer sizing: the desktop rail's width/13px type reads cramped
+         as an overlay drawer. Widen it (capped below the viewport so the
+         backdrop stays tappable) and scale the type/targets for thumbs. The
+         width:0 collapse still wins via :host(.collapsed) specificity,
+         unchanged. Overriding the width property outright — rather than
+         --sidebar-width — is what keeps the drawer off the resizable desktop
+         width: a drawer sized by a handle the shell doesn't even render below
+         this breakpoint would be a width the user can't get back. */
       @media (max-width: 768px) {
         :host,
         .sidebar {
@@ -596,6 +615,13 @@ const MODE_ROUTES: Record<RailMode, string> = {
       }
     `,
   ],
+  host: {
+    // The rail's width, as a CSS custom property both :host and .sidebar read.
+    // A custom property rather than a direct [style.width]: an inline width
+    // would beat the collapse and mobile-drawer rules that have to override it.
+    '[style.--sidebar-width]': 'sidebar.widthPx()',
+    '[class.resizing]': 'sidebar.resizing()',
+  },
 })
 export class SidebarComponent {
   readonly sidebar = inject(SidebarService);

@@ -401,6 +401,7 @@
     "sshKeys": "SSH keys",
     "collapseSidebar": "Collapse sidebar",
     "openSidebar": "Open sidebar",
+    "resizeSidebar": "Resize sidebar",
     "recency": {
       "today": "Today",
       "yesterday": "Yesterday",

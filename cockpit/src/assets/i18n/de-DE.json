@@ -401,6 +401,7 @@
     "sshKeys": "SSH-Schlüssel",
     "collapseSidebar": "Seitenleiste einklappen",
     "openSidebar": "Seitenleiste öffnen",
+    "resizeSidebar": "Seitenleiste anpassen",
     "recency": {
       "today": "Heute",
       "yesterday": "Gestern",

@@ -238,6 +238,20 @@ textarea:focus-visible {
   }
 }
 
+// --- Sidebar resize gesture ---
+// Held on <body> for the duration of a rail drag (SidebarResizerComponent).
+// Pointer capture keeps the events flowing to the handle once the pointer
+// leaves its 8px strip, but the *cursor* is still resolved from whatever
+// element is under the pointer — without this it flips to a text caret the
+// moment the drag crosses into the transcript. The descendant rule is not
+// redundant with the inherited one: cursor inherits, but every button, link
+// and input in the app sets its own.
+body.sidebar-resizing,
+body.sidebar-resizing * {
+  cursor: col-resize !important;
+  user-select: none !important;
+}
+
 // --- Disable hover effects on touch devices ---
 @media (hover: none) {
   .interactive:hover {
