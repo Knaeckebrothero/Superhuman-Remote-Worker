@@ -95,7 +95,16 @@ class AgentHeartbeat(BaseModel):
     status: str = Field(
         ...,
         description="Agent status",
-        pattern="^(booting|available|ready|working|session|draining|completed|failed)$",
+        # The `agents.valid_agent_status` check constraint is the authority
+        # here, and it does not accept 'available': 0001_initial creates the
+        # constraint with that value and then immediately drops and re-adds it
+        # without, adding 'session'. This pattern kept advertising the dropped
+        # value, so a heartbeat reporting it passed validation and then took
+        # the DB error as a 500 — which returned the failing row's contents to
+        # the caller. Nothing in the agent ever sent it. 'offline' stays out
+        # deliberately: it is what the orchestrator writes about an agent that
+        # stopped reporting, not something an agent may claim about itself.
+        pattern="^(booting|ready|working|session|draining|completed|failed)$",
     )
     current_job_id: str | None = Field(None, description="Current job UUID if working")
     metrics: dict[str, Any] | None = Field(

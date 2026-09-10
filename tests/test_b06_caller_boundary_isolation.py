@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import pathlib
 from types import SimpleNamespace
 from typing import Any
 
@@ -31,6 +32,8 @@ from orchestrator.services import (
 )
 
 from ._mounted_router import mount_router
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
 _ENTITY_ID = "c3333333-3333-4333-8333-333333333333"
@@ -201,3 +204,45 @@ def test_schedulers_receive_the_binder_as_an_explicit_port(dependencies_class) -
 def test_schedulers_no_longer_import_the_binder_at_the_call_site(module) -> None:
     source = inspect.getsource(module)
     assert "from orchestrator.services.provision_or_assign import" not in source
+
+
+# --------------------------------------------------------------------------- #
+# The heartbeat vocabulary matches the constraint the database enforces
+# --------------------------------------------------------------------------- #
+
+
+def test_heartbeat_status_vocabulary_matches_the_database_constraint() -> None:
+    """A status this model accepts must be one the `agents` table accepts.
+
+    `0001_initial` creates `valid_agent_status` with 'available' and then
+    immediately drops and re-adds it without, adding 'session'. While the model
+    still advertised 'available', a heartbeat reporting it passed validation and
+    took the check-constraint violation as a 500 — with the failing row's
+    contents in the response body, on an internal-only route.
+
+    'offline' is deliberately absent from the model: it is what the orchestrator
+    writes about an agent that stopped reporting, not something an agent may
+    claim about itself. So the model's vocabulary must be a strict subset.
+    """
+
+    import re
+
+    from orchestrator.schemas.agent_runtime import AgentHeartbeat
+
+    pattern = AgentHeartbeat.model_fields["status"].metadata[0].pattern
+    accepted = set(re.fullmatch(r"\^\((.*)\)\$", pattern).group(1).split("|"))
+
+    initial = (
+        ROOT / "src/orchestrator/database/migrations/app/0001_initial.sql"
+    ).read_text()
+    # The last definition of the constraint wins.
+    checks = re.findall(
+        r"CONSTRAINT valid_agent_status\s+CHECK \(status IN \(([^)]*)\)\)",
+        initial,
+    )
+    assert checks, "no valid_agent_status constraint found in 0001_initial"
+    enforced = {value.strip().strip("'") for value in checks[-1].split(",")}
+
+    assert accepted <= enforced, sorted(accepted - enforced)
+    assert "available" not in accepted
+    assert "offline" in enforced and "offline" not in accepted
