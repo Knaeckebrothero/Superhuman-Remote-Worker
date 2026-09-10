@@ -18,7 +18,7 @@
   --radius-tag:     var(--radius-sm);   // small inline markers, checkbox tile
 
   // --- Typography roles ---
-  --font-primary: var(--font-family-base); // primary-variant buttons; Roman themes override to display
+  --font-primary: var(--font-family-base); // primary-variant buttons; no active theme rebinds it (Cinzel is brand-only since 2026-09-10)
   --font-control: var(--font-family-base); // body of buttons, inputs, labels
   --font-mono:    var(--font-family-mono); // code, tool args, workbench surfaces
   --font-heading: var(--font-family-base); // page/section titles; type.heading()

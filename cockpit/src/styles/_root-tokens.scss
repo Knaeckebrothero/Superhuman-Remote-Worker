@@ -32,7 +32,8 @@
     ubuntu,
     sans-serif;
 
-  // Display family defaults to the base; Roman themes override to Cinzel via
+  // Display family defaults to the base; the two active themes bind it to
+  // Cinzel (read only by the rail brand block and the chat hero) via
   // _roman-accents.scss. Loaded in cockpit/src/index.html.
   --font-family-display: var(--font-family-base);
   --font-family-mono:

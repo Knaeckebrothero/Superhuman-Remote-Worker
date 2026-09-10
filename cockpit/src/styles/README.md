@@ -11,7 +11,9 @@ src/styles/
 ├── _root-tokens.scss          Primitive CSS variables at :root (--radius-sm/md/lg/xl/full, --font-family-base/display/mono).
 ├── _semantic-tokens.scss      Role tokens at :root (--radius-control/surface/pill/tag, --font-primary/control/mono).
 ├── _shape-recipes.scss        Shape archetype mixins (control, surface, pill, tag, circle).
-├── _typography-recipes.scss   Typography recipe mixins (display, eyebrow, mono).
+├── _typography-recipes.scss   Typography recipe mixins (display, eyebrow, heading, mono).
+├── _app-table.scss            Global .app-table look for every data table (class hook on <table>).
+├── visual-language.spec.ts    Text-level guards for the 2026-09-10 refresh: root scale, Cinzel readers, no stamp, table hook, no raw buttons, token radii, eyebrow tracking.
 └── themes/
     ├── _theme-config.scss     Token maps — one per theme. Source of truth for palette + on-tokens.
     ├── _themes.scss           apply-app-theme($name) mixin. Emits the map as CSS custom properties.
@@ -226,9 +228,10 @@ Legacy component-class selectors (`.btn`, `.session-message .message-bubble`, `.
 When changing themes or tokens, run:
 
 ```bash
-npm test -- --run        # vitest, including theme.service.spec.ts
-npm run build            # full Angular production build
-npm run lint:styles      # stylelint on src/**/*.scss
+npm test -- --run              # vitest, incl. theme.service.spec.ts and styles/visual-language.spec.ts
+npm run build                  # full Angular production build (the only template type-check; vitest does not type-check)
+npm run lint:styles            # stylelint on src/**/*.scss — the gate is the delta, baseline 73 (2026-09-10)
+VISUAL_WALK_LABEL=x npm run test:e2e:visual-walk   # capture walk against https://localhost, reviewed by eye
 ```
 
 The theme service spec covers preference resolution, legacy migration, system-mode listening, and body-class swapping. SCSS errors surface during the production build (the dev server's HMR can hide them).
