@@ -1,6 +1,7 @@
 """Workspace selections shared by the existing SRW Job and Session APIs."""
 
 from copy import deepcopy
+import re
 from typing import Any
 
 from fastapi import HTTPException
@@ -18,19 +19,62 @@ def srw_workspace_config(workspace: dict | None) -> dict:
     """Render supported workspace recipes; never silently discard recipe fields."""
     if workspace is None:
         return {"backend": "none"}
+    try:
+        validate_workspace_selection(workspace)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
     recipe = workspace.get("template", {}).get("inline")
     if (
         not isinstance(recipe, dict)
-        or set(recipe) - {"backend", "retention"}
+        or set(recipe) - {"backend", "retention", "resources", "environment"}
         or recipe.get("retention", "Delete") != "Delete"
     ):
         raise HTTPException(
             422,
-            "The SRW workspace provisioner currently supports backend-only templates "
-            "with Delete retention. Prepared/initialized recipes, retained instances "
+            "The SRW workspace provisioner supports backend-only templates and "
+            "prebuilt VM images/resources with Delete retention. Initialized recipes, retained instances "
             "and instanceRef require a supported workspace provisioner.",
         )
-    return execution_workspace_config({"workspace": recipe})
+    result = {"backend": recipe["backend"]}
+    if not set(recipe) & {"resources", "environment"}:
+        return result
+    if recipe["backend"] != "vm":
+        raise HTTPException(
+            422, "SRW template images and resources require backend vm."
+        )
+    environment = recipe.get("environment", {})
+    if (
+        set(environment) - {"image", "pullPolicy", "cache"}
+        or environment.get("pullPolicy", "IfNotPresent") != "IfNotPresent"
+        or environment.get("cache", "Reuse") != "Reuse"
+    ):
+        raise HTTPException(
+            422,
+            "VM templates support prebuilt images with IfNotPresent/Reuse only; "
+            "preparation and other pull/cache policies are not supported.",
+        )
+    vm = {}
+    if "image" in environment:
+        image = environment["image"]
+        # The VM controller embeds this registry reference in its disk manifest.
+        # Accept registry paths/tags/digests, never whitespace or YAML syntax.
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/@-]*", image) is None:
+            raise HTTPException(422, "VM image must be a registry image reference.")
+        vm["image"] = image
+    resources = recipe.get("resources", {})
+    if "cpu" in resources:
+        cpu = resources["cpu"]
+        if int(cpu) != cpu:
+            raise HTTPException(
+                422, "VM templates require a whole number of CPU cores."
+            )
+        vm["cpu_cores"] = int(cpu)
+    for field, target in (("memory", "memory"), ("storage", "disk_size")):
+        if field in resources:
+            vm[target] = resources[field]
+    if vm:
+        result["vm"] = vm
+    return result
 
 
 async def select_execution_workspace(

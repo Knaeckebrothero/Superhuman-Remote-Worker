@@ -121,6 +121,15 @@ class ManifestExecutionService:
             if workspace
             else "none"
         )
+        if adapter == "srw/v1" and backend == "vm":
+            from orchestrator.services.vm_workspace_policy import (
+                VmPermissionDependencies,
+                check_vm_permission,
+            )
+
+            await check_vm_permission(
+                user, job_needs_vm=True, dependencies=VmPermissionDependencies(self.db)
+            )
         if datasource_ids:
             if not self.authorize_datasources:
                 raise HTTPException(503, "Datasource admission is unavailable.")

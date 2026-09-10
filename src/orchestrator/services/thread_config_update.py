@@ -61,6 +61,7 @@ from orchestrator.schemas.thread_config import (
 )
 from orchestrator.security.access import redact_config_override
 from orchestrator.services.manifest_runtime_ownership import require_srw_runtime
+from orchestrator.services.vm_workspace_config import vm_provisioning_options
 from orchestrator.services.session_runtime_admission import (
     protected_cloud_marker_state,
     thread_runtime_authority,
@@ -375,8 +376,15 @@ async def agent_upgrade_thread_to_vm(
                 "message": "VM already provisioned or in progress",
             }
 
+        options = await vm_provisioning_options(
+            dependencies.store,
+            "Session",
+            thread,
+            fallback=metadata.get("config_override"),
+        )
         ok = await vm_provisioner.create_thread_vm(
             thread_id=thread_id,
+            **options,
             agent_config=canonical_config_name(
                 thread.get("config_name", "session_base")
             ),

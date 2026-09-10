@@ -812,6 +812,35 @@ class TestCreateThreadOperation:
 
 class TestWorkspaceActuation:
     @pytest.mark.asyncio
+    async def test_vm_create_forwards_the_selected_image_and_rootdisk(self):
+        vm = {
+            "image": "registry.example/dev-vm:v1",
+            "cpu_cores": 12,
+            "memory": "24Gi",
+            "disk_size": "120Gi",
+        }
+        override = {"workspace": {"backend": "vm", "vm": vm}}
+        deps = _deps(
+            vm_provisioner=SimpleNamespace(
+                is_available=True, create_thread_vm=AsyncMock(return_value=True)
+            ),
+            store={
+                "get_thread": AsyncMock(
+                    return_value=_created_thread(metadata={"config_override": override})
+                )
+            },
+        )
+        plan = await _plan(ThreadCreateRequest(config_override=override), deps)
+        await ta.provision_thread_workspace(plan, THREAD, dependencies=deps)
+        await asyncio.sleep(0)
+        called = deps.vm_provisioner.create_thread_vm.await_args.kwargs
+        assert called["vm_image"] == vm["image"]
+        assert called["cpu_cores"] == 12
+        assert called["memory"] == "24Gi"
+        assert called["disk_size"] == "120Gi"
+        assert called["expected_runtime_generation"] == GENERATION
+
+    @pytest.mark.asyncio
     async def test_a_lite_session_provisions_no_workspace_pod(self):
         deps = _deps(
             container_provisioner=SimpleNamespace(

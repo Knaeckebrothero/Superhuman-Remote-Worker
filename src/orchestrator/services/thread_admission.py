@@ -1052,13 +1052,14 @@ async def commit_thread_creation(
 
 async def _provision_thread_vm(
     tid: str,
-    cpu: int,
-    mem: str,
     cfg: str,
+    config_override: dict,
     *,
     dependencies: ThreadAdmissionDependencies,
 ) -> None:
     """Install the VM provision intent under the thread's current authority."""
+    from orchestrator.services.vm_workspace_config import vm_provisioning_options
+
     store = dependencies.store
     vm_provisioner = dependencies.vm_provisioner
     try:
@@ -1072,11 +1073,16 @@ async def _provision_thread_vm(
             elif current_authority is None:
                 ok = False
             else:
+                options = await vm_provisioning_options(
+                    store,
+                    "Session",
+                    current,
+                    fallback=current_metadata.get("config_override", config_override),
+                )
                 ok = await vm_provisioner.create_thread_vm(
                     thread_id=tid,
                     agent_config=cfg,
-                    cpu_cores=cpu,
-                    memory=mem,
+                    **options,
                     expected_runtime_generation=(current_authority.generation),
                     expected_agent_id=(
                         str(current["agent_id"])
@@ -1158,20 +1164,11 @@ async def provision_thread_workspace(
         # fire-and-forget (mirrors the container task) with the requested
         # sizing; the agent pod provisioned below SSHes into the VM once it
         # reports ready. (knowledge-base/knowledge/features/session_create_on_vm.md)
-        _vm_ws = (config_override.get("workspace") or {}).get("vm") or {}
-        try:
-            _vm_cpu = int(_vm_ws.get("cpu_cores") or 8)
-        except (TypeError, ValueError):
-            _vm_cpu = 8
-        _vm_mem = str(_vm_ws.get("memory") or "16Gi")
-        _vm_agent_config = plan.config_name
-
         asyncio.create_task(
             _provision_thread_vm(
                 thread_id,
-                _vm_cpu,
-                _vm_mem,
-                _vm_agent_config,
+                plan.config_name,
+                config_override,
                 dependencies=dependencies,
             )
         )

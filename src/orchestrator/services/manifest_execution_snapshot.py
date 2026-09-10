@@ -385,8 +385,9 @@ async def prepare_srw_snapshot(
             srw_workspace_config,
         )
 
-        expected = srw_workspace_config(workspace_selection["resolved"])["backend"]
-        if blob["agent"]["workspace"]["backend"] != expected:
+        expected = srw_workspace_config(workspace_selection["resolved"])
+        actual = policy.get("workspace") or {}
+        if any(actual.get(key) != value for key, value in expected.items()):
             raise HTTPException(409, "Workspace assignment changed during admission.")
         for key in ("document", "resolved"):
             prepared[key]["spec"]["execution"]["workspace"] = deepcopy(
@@ -565,6 +566,15 @@ async def prepare_srw_session_patch(
         )
 
     if backend_of(old_workspace) == backend_of(new_workspace):
+        _, old_policy = srw_snapshot_config(current)
+        if (policy.get("workspace") or {}).get("vm") != (
+            old_policy.get("workspace") or {}
+        ).get("vm"):
+            raise HTTPException(
+                422,
+                "Session settings cannot change the captured VM image or resources; "
+                "create a new session with the selected workspace.",
+            )
         for key in ("document", "resolved"):
             prepared[key]["spec"]["execution"]["workspace"] = deepcopy(
                 current[key]["spec"]["execution"]["workspace"]
