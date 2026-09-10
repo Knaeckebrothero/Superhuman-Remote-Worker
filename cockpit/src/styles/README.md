@@ -10,12 +10,12 @@ src/styles/
 ├── _mixins.scss               Utility mixins (focus-ring, breakpoints, truncate, visually-hidden).
 ├── _root-tokens.scss          Primitive CSS variables at :root (--radius-sm/md/lg/xl/full, --font-family-base/display/mono).
 ├── _semantic-tokens.scss      Role tokens at :root (--radius-control/surface/pill/tag, --font-primary/control/mono).
-├── _shape-recipes.scss        Shape archetype mixins (control, surface, pill, tag, circle, stamp).
+├── _shape-recipes.scss        Shape archetype mixins (control, surface, pill, tag, circle).
 ├── _typography-recipes.scss   Typography recipe mixins (display, eyebrow, mono).
 └── themes/
     ├── _theme-config.scss     Token maps — one per theme. Source of truth for palette + on-tokens.
     ├── _themes.scss           apply-app-theme($name) mixin. Emits the map as CSS custom properties.
-    ├── _shape-overrides.scss  Roman theme overrides: Cinzel typography, Inset Stamp shadow tokens, header inlays. Scoped under .theme-* selectors. Radii are NOT overridden here (rounded since 2026-09-10).
+    ├── _shape-overrides.scss  Roman accents: the Cinzel brand face, the approval-card rule, header inlays. Scoped under .theme-* selectors. No radii, no stamps (retired 2026-09-10).
     └── _typography.scss       Type-scale Sass maps (legacy; being folded into recipes).
 ```
 
@@ -147,8 +147,6 @@ Three rules:
 | Pill chip, status pill | `@include shape.pill` |
 | Checkbox tile, small inline tag | `@include shape.tag` |
 | Radio dot, switch knob, spinner, avatar, round icon-button | `@include shape.circle` |
-| Primary / secondary button (full Inset Stamp) | + `@include shape.stamp` |
-| Tinted button: warning / info / success / danger (soft stamp) | + `@include shape.stamp('soft')` |
 
 | Typographic role | Recipe |
 |---|---|
@@ -165,7 +163,6 @@ Three rules:
 .app-button__btn {
   --btn-radius: var(--radius-control);   // opt-in local override surface
   border-radius: var(--btn-radius);
-  @include shape.stamp;
 
   &[data-variant='primary'] {
     @include type.display;
@@ -174,7 +171,6 @@ Three rules:
   }
 
   &[data-variant='warning'] {
-    @include shape.stamp('soft');
     background: var(--warning);
     color: var(--on-warning);
   }
@@ -217,11 +213,11 @@ A primitive that exposes `--btn-radius` (as in the button example above) can be 
 
 ## Shape overrides
 
-`_shape-overrides.scss` is scoped under `.theme-travertine, .theme-senate` and declares the **token overrides** that produce the Roman look: Cinzel as the display family and the Inset Stamp shadow stack (`--stamp-highlight/shadow/drop/press/press-shadow`). Per-theme tweaks (Travertine's gold inlay under panel headers, Senate's blood-red equivalent) follow in their own scoped blocks.
+`_shape-overrides.scss` is scoped under `.theme-travertine, .theme-senate` and declares what is left of the Roman look: Cinzel as the brand face (read by three selectors) and the approval-card left rule. Per-theme tweaks (Travertine's gold inlay under panel headers, Senate's blood-red equivalent) follow in their own scoped blocks.
 
 Radii are deliberately **not** overridden there any more. The original sharp-corner pass (`--radius-sm/md/xl: 0`, `--radius-lg: 2px`) was retired on 2026-09-10; both themes use the rounded primitive scale via the role tokens — controls `md` (0.5rem, 8px), surfaces `lg` (0.75rem, 12px), small tags `sm` (0.25rem, 4px), pills and functional circles unchanged. `shape-overrides.spec.ts` guards against the flatten creeping back.
 
-The Inset Stamp recipe lives in `_shape-recipes.scss` as `@mixin stamp($variant)`. The token contract: Roman themes set the `--stamp-*` family; non-Roman themes leave them unset and the recipe falls back to `transparent`, collapsing to a flat button. Tinted button variants (warning, info, success, danger) get `stamp('soft')` to avoid the muddy inner shadow on translucent fills.
+Buttons are flat since 2026-09-10: the Inset Stamp recipe and its `--stamp-*` tokens were removed (`visual-language.spec.ts` guards against their return). Tinted button variants render subtle by default; `appearance="solid"` is the opt-in for the one destructive confirm button in a dialog.
 
 Legacy component-class selectors (`.btn`, `.session-message .message-bubble`, `.approval-card`) in `_shape-overrides.scss` predate the recipe model and target classes that have largely been renamed during the BEM migration. They're being removed as primitives migrate to recipes (`knowledge-base/knowledge/features/design_system_completion.md` Phase 3). New shape rules belong in a recipe mixin, not as a body-class-scoped selector.
 

@@ -100,3 +100,14 @@ describe('typography — --font-display readers', () => {
     expect(sites.length).toBe(3);
   });
 });
+
+describe('controls — no stamp, compact sizes', () => {
+  it('nothing includes shape.stamp and the recipe is gone', () => {
+    const hits = scanSources(join(here, '..'), /shape\.stamp|--stamp-/);
+    expect(hits, hits.join('\n')).toEqual([]);
+  });
+
+  it('md buttons are 32px', () => {
+    expect(code(read('../app/ui/button/button.component.scss'))).toMatch(/data-size='md'\]\s*\{[^}]*height:\s*32px/);
+  });
+});
