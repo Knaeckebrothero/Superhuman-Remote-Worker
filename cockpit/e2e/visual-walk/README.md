@@ -15,3 +15,22 @@ context locale — the app resolves its language from `navigator.languages`).
 
 Design context: `knowledge-base/knowledge/features/cockpit_modern_visual_refresh.md`
 §7 (gates) and the plan next to it.
+
+## Overflow probe
+
+`overflow-probe.cjs` is the companion sweep for polish work: the same login and
+routes, both viewports, plus the rail menus — and on every page it runs an
+in-page probe that lists elements past the viewport edge, content spilling out
+of its box, and text clipped without an ellipsis (`probe.json`), alongside the
+PNGs and any console errors. Read `probe.json` first, then only the screenshots
+it points at.
+
+    node e2e/visual-walk/overflow-probe.cjs
+    PROBE_ROUTES=/jobs,/projects PROBE_MENUS=0 node e2e/visual-walk/overflow-probe.cjs
+    PROBE_THREAD=<thread id> PROBE_PROJECT=<project id> node e2e/visual-walk/overflow-probe.cjs
+
+Env: `PROBE_BASE`, `PROBE_OUT` (default `playwright-report/overflow-probe/`),
+`PROBE_ONLY=desktop|mobile`, `PROBE_USER` / `PROBE_PASSWORD`, `PROBE_LOCALE`.
+Known noise is listed at the top of the script. The dev server keeps serving the
+old bundle when a rebuild fails, so check the `ng serve` log for `✘ [ERROR]`
+before trusting a capture.
