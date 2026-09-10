@@ -353,7 +353,7 @@ const FAMILIES = ['gemma', 'gpt-5', 'gpt-5.6', 'gpt-oss', 'deepseek', 'glm', 'mi
     .editor-toolbar__label {
       font-size: 11px;
       text-transform: uppercase;
-      letter-spacing: 0.05em;
+      letter-spacing: 0.06em;
       color: var(--text-muted);
     }
     .editor-toolbar__actions {

@@ -95,10 +95,10 @@ import { LayoutPreviewComponent } from './layout-preview.component';
       }
 
       .section-title {
-        font-size: 10px;
+        font-size: 11px;
         font-weight: 600;
         text-transform: uppercase;
-        letter-spacing: 1px;
+        letter-spacing: 0.06em;
         color: var(--text-muted);
         margin: 0 0 10px 0;
       }

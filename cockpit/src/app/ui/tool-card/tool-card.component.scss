@@ -148,9 +148,9 @@ $mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
   display: flex;
   align-items: center;
   gap: 8px;
-  font-size: 10.5px;
+  font-size: 11px;
   text-transform: uppercase;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.06em;
   font-weight: 600;
   color: var(--text-muted);
 }
@@ -355,9 +355,9 @@ $mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
   gap: 6px;
 
   dt {
-    font-size: 10.5px;
+    font-size: 11px;
     text-transform: uppercase;
-    letter-spacing: 0.08em;
+    letter-spacing: 0.06em;
     color: var(--text-muted);
   }
 

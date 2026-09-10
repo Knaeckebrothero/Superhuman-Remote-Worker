@@ -182,7 +182,7 @@ type StorageKey = keyof typeof STORAGE_KEYS;
       font-size: 11px;
       font-weight: 600;
       text-transform: uppercase;
-      letter-spacing: 0.5px;
+      letter-spacing: 0.06em;
       color: var(--text-muted);
       margin-bottom: 12px;
       padding-bottom: 6px;

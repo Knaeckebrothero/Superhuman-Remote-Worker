@@ -823,10 +823,10 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
         display: inline-block;
         padding: 1px 5px;
         border-radius: var(--radius-tag);
-        font-size: 9px;
+        font-size: 11px;
         font-weight: 500;
         text-transform: uppercase;
-        letter-spacing: 0.3px;
+        letter-spacing: 0.06em;
         background: color-mix(in srgb, var(--accent-color) 15%, transparent);
         color: var(--accent-color);
         margin-left: 2px;
@@ -839,7 +839,6 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
         border-radius: var(--radius-tag);
         font-size: 9px;
         font-weight: 500;
-        letter-spacing: 0.3px;
         background: var(--info-tint);
         color: var(--info);
         margin-left: 4px;

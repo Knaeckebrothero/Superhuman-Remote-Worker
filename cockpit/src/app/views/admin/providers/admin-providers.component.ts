@@ -586,7 +586,7 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
       font-size: 12px;
       color: var(--text-muted);
       text-transform: uppercase;
-      letter-spacing: 0.5px;
+      letter-spacing: 0.06em;
     }
     .key-row {
       border-top: 1px solid var(--border-color);
@@ -722,7 +722,7 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
     .discovery-tier-title {
       font-size: 12px;
       text-transform: uppercase;
-      letter-spacing: 0.4px;
+      letter-spacing: 0.06em;
       color: var(--text-muted);
       margin: 8px 0 6px 0;
       display: flex;

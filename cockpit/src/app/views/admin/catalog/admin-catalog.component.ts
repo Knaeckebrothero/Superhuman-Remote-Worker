@@ -788,7 +788,7 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
       font-weight: 600;
       color: var(--text-muted);
       text-transform: uppercase;
-      letter-spacing: 0.4px;
+      letter-spacing: 0.06em;
       margin: 12px 0 6px 0;
     }
     .model-table {
@@ -809,7 +809,7 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
       font-weight: 600;
       color: var(--text-muted);
       text-transform: uppercase;
-      letter-spacing: 0.3px;
+      letter-spacing: 0.06em;
       font-size: 11px;
     }
     .model-row {
@@ -943,9 +943,9 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
       color: var(--accent-color);
     }
     .discover-cap {
-      font-size: 10px;
+      font-size: 11px;
       text-transform: uppercase;
-      letter-spacing: 0.4px;
+      letter-spacing: 0.06em;
       color: var(--text-muted);
     }
     .subs-banner {

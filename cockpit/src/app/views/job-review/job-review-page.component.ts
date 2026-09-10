@@ -225,9 +225,9 @@ function relativeTime(iso: string | null | undefined, nowLabel: string): string 
 
       .item-badge {
         text-transform: uppercase;
-        letter-spacing: 0.5px;
+        letter-spacing: 0.06em;
         font-weight: 600;
-        font-size: 10px;
+        font-size: 11px;
         /* Theme token (was the non-existent --warning-color → invisible
            Catppuccin fallback on the light theme). Mixed toward text for WCAG AA at 10px. */
         color: color-mix(in srgb, var(--warning) 55%, var(--text-primary));

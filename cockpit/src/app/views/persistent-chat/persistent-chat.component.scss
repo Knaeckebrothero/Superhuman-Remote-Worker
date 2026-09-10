@@ -1010,10 +1010,10 @@
       }
 
       .divider-text {
-        font-size: 10px;
+        font-size: 11px;
         color: var(--text-muted);
         text-transform: uppercase;
-        letter-spacing: 0.5px;
+        letter-spacing: 0.06em;
         white-space: nowrap;
       }
 
@@ -1026,10 +1026,10 @@
       .compaction-summary > summary {
         cursor: pointer;
         text-align: center;
-        font-size: 10px;
+        font-size: 11px;
         color: var(--text-muted);
         text-transform: uppercase;
-        letter-spacing: 0.5px;
+        letter-spacing: 0.06em;
       }
       .compaction-summary-body {
         margin-top: 6px;
@@ -1301,10 +1301,10 @@
         gap: 3px;
         padding: 1px 6px;
         border-radius: var(--radius-tag);
-        font-size: 10px;
+        font-size: 11px;
         font-weight: 600;
         text-transform: uppercase;
-        letter-spacing: 0.04em;
+        letter-spacing: 0.06em;
         flex-shrink: 0;
       }
 
@@ -2194,7 +2194,7 @@
         color: var(--accent-color);
         font-size: 11px;
         text-transform: uppercase;
-        letter-spacing: 0.5px;
+        letter-spacing: 0.06em;
       }
 
       .message-body ::ng-deep tr:hover {
@@ -2500,7 +2500,7 @@
 
   .compaction-title {
     font-weight: 600;
-    letter-spacing: 0.08em;
+    letter-spacing: 0.06em;
     text-transform: uppercase;
     color: var(--warning, #e0707a);
   }
@@ -2599,8 +2599,8 @@
   .usage-k {
     color: var(--text-muted);
     text-transform: uppercase;
-    letter-spacing: 0.07em;
-    font-size: 9.5px;
+    letter-spacing: 0.06em;
+    font-size: 11px;
   }
 
   // primary: context-window fill (hero)
@@ -2613,9 +2613,9 @@
   }
 
   .usage-ctx-label {
-    font-size: 9.5px;
+    font-size: 11px;
     font-weight: 700;
-    letter-spacing: 0.1em;
+    letter-spacing: 0.06em;
     text-transform: uppercase;
     color: var(--text-muted);
   }

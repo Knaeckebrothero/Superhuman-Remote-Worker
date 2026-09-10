@@ -29,7 +29,7 @@ import { Component } from '@angular/core';
       .placeholder-text {
         font-size: 14px;
         text-transform: uppercase;
-        letter-spacing: 2px;
+        letter-spacing: 0.06em;
       }
     `,
   ],

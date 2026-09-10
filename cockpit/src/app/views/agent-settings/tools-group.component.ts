@@ -236,7 +236,7 @@ export function delegationOverride(
       font-size: 11px;
       font-weight: 600;
       text-transform: uppercase;
-      letter-spacing: 0.5px;
+      letter-spacing: 0.06em;
       color: var(--text-muted);
     }
     .select-all-btn {
@@ -248,8 +248,6 @@ export function delegationOverride(
       font-family: inherit;
       font-size: 11px;
       font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
       color: var(--accent-color, var(--accent-color));
     }
     .select-all-btn:hover:not(:disabled) {
@@ -329,10 +327,10 @@ export function delegationOverride(
     }
     .tool-count {
       margin-left: 6px;
-      font-size: 10px;
+      font-size: 11px;
       font-weight: 500;
       text-transform: uppercase;
-      letter-spacing: 0.4px;
+      letter-spacing: 0.06em;
       color: var(--text-muted);
     }
     .tool-toggle input[type="checkbox"] {

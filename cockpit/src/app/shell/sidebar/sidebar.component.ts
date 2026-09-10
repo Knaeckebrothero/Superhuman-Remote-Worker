@@ -247,7 +247,7 @@ const MODE_ROUTES: Record<RailMode, string> = {
       .sidebar-label {
         font-family: var(--font-display, inherit);
         font-size: 11px;
-        letter-spacing: 0.18em;
+        letter-spacing: 0.18em; /* brand */
         text-transform: uppercase;
         color: var(--text-muted);
       }
@@ -522,10 +522,10 @@ const MODE_ROUTES: Record<RailMode, string> = {
       }
 
       .section-title {
-        font-size: 10px;
+        font-size: 11px;
         font-weight: 600;
         text-transform: uppercase;
-        letter-spacing: 1px;
+        letter-spacing: 0.06em;
         color: var(--text-muted);
         padding: 4px 8px 6px;
         margin: 0;

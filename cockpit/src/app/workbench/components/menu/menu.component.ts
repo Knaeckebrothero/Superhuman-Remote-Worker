@@ -170,10 +170,10 @@ interface MenuSection {
       }
 
       .section-title {
-        font-size: 10px;
+        font-size: 11px;
         font-weight: 600;
         text-transform: uppercase;
-        letter-spacing: 1px;
+        letter-spacing: 0.06em;
         color: var(--text-muted);
         padding: 4px 8px;
         margin: 0;

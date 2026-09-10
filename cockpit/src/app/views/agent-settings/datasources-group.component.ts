@@ -250,7 +250,7 @@ export function allDatasourcesSelected(
       font-size: 11px;
       font-weight: 600;
       text-transform: uppercase;
-      letter-spacing: 0.5px;
+      letter-spacing: 0.06em;
       color: var(--text-muted, var(--text-muted));
     }
     .select-all-btn {
@@ -262,8 +262,6 @@ export function allDatasourcesSelected(
       font-family: inherit;
       font-size: 11px;
       font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
       color: var(--accent-color, var(--accent-color));
     }
     .select-all-btn:hover:not(:disabled) {
@@ -335,10 +333,10 @@ export function allDatasourcesSelected(
       white-space: normal;
     }
     .ds-type-badge {
-      font-size: 10px;
+      font-size: 11px;
       font-weight: 500;
       text-transform: uppercase;
-      letter-spacing: 0.3px;
+      letter-spacing: 0.06em;
       padding: 2px 6px;
       border-radius: var(--radius-tag);
       background: rgba(255, 255, 255, 0.06);

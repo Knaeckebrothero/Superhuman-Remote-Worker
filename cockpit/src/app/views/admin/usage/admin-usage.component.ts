@@ -484,9 +484,9 @@ import {TranslocoPipe} from '@jsverse/transloco';
         border-radius: var(--radius-pill);
         color: var(--text-muted);
         background: var(--surface-0);
-        font-size: 10px;
+        font-size: 11px;
         font-weight: 700;
-        letter-spacing: 0.6px;
+        letter-spacing: 0.06em;
         text-transform: uppercase;
       }
       .cloud-grid {
@@ -509,9 +509,9 @@ import {TranslocoPipe} from '@jsverse/transloco';
       }
       .cloud-provider {
         color: var(--text-muted);
-        font-size: 10px;
+        font-size: 11px;
         font-weight: 700;
-        letter-spacing: 0.7px;
+        letter-spacing: 0.06em;
         text-transform: uppercase;
       }
       .cloud-card h3 {
@@ -600,7 +600,7 @@ import {TranslocoPipe} from '@jsverse/transloco';
         font-size: 12px;
         color: var(--text-muted);
         text-transform: uppercase;
-        letter-spacing: 0.5px;
+        letter-spacing: 0.06em;
       }
       .usage-row {
         border-top: 1px solid var(--border-color);
@@ -640,7 +640,7 @@ import {TranslocoPipe} from '@jsverse/transloco';
         font-weight: 600;
         color: var(--text-muted);
         text-transform: uppercase;
-        letter-spacing: 0.5px;
+        letter-spacing: 0.06em;
       }
       .kpi-value {
         font-size: 22px;
@@ -674,7 +674,7 @@ import {TranslocoPipe} from '@jsverse/transloco';
         font-size: 12px;
         color: var(--text-muted);
         text-transform: uppercase;
-        letter-spacing: 0.5px;
+        letter-spacing: 0.06em;
       }
       .breakdown-row {
         border-top: 1px solid var(--border-color);
@@ -729,7 +729,7 @@ import {TranslocoPipe} from '@jsverse/transloco';
         color: var(--text-muted);
         font-weight: 600;
         text-transform: uppercase;
-        letter-spacing: 0.4px;
+        letter-spacing: 0.06em;
       }
       .fleet-count {
         font-size: 20px;
@@ -848,10 +848,10 @@ import {TranslocoPipe} from '@jsverse/transloco';
         font-variant-numeric: tabular-nums;
       }
       .donut-cap {
-        font-size: 10px;
+        font-size: 11px;
         color: var(--text-muted);
         text-transform: uppercase;
-        letter-spacing: 0.4px;
+        letter-spacing: 0.06em;
       }
       .legend {
         list-style: none;

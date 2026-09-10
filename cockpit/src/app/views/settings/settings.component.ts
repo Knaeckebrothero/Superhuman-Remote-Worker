@@ -1886,7 +1886,7 @@ const EXPIRY_OPTIONS = [
         font-size: 12px;
         color: var(--text-muted);
         text-transform: uppercase;
-        letter-spacing: 0.5px;
+        letter-spacing: 0.06em;
       }
 
       .key-row,
@@ -2015,7 +2015,7 @@ const EXPIRY_OPTIONS = [
         font-size: 12px;
         font-weight: 600;
         text-transform: uppercase;
-        letter-spacing: 0.5px;
+        letter-spacing: 0.06em;
         color: var(--text-muted);
         margin: 16px 0 8px;
         padding-top: 12px;

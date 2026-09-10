@@ -615,10 +615,10 @@ export function selectDeliveryRepository(
       }
 
       .section-header {
-        font-size: 10px;
+        font-size: 11px;
         font-weight: 600;
         text-transform: uppercase;
-        letter-spacing: 0.5px;
+        letter-spacing: 0.06em;
         color: var(--text-muted);
       }
 
@@ -761,10 +761,10 @@ export function selectDeliveryRepository(
         position: relative;
         padding: 0 12px;
         background: var(--panel-bg, var(--panel-bg));
-        font-size: 10px;
+        font-size: 11px;
         color: var(--text-muted);
         text-transform: uppercase;
-        letter-spacing: 0.5px;
+        letter-spacing: 0.06em;
       }
 
       /* Result Message */

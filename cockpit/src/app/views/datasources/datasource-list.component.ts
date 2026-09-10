@@ -1989,7 +1989,7 @@ type KeyValueRow = {key: string; value: string};
         font-size: 12px;
         font-weight: 600;
         text-transform: uppercase;
-        letter-spacing: 0.4px;
+        letter-spacing: 0.06em;
         color: var(--text-muted);
       }
 

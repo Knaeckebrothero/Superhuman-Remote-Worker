@@ -373,7 +373,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
         font-size: 11px;
         font-weight: 600;
         text-transform: uppercase;
-        letter-spacing: 0.5px;
+        letter-spacing: 0.06em;
         color: var(--text-muted);
         margin: 16px 0 8px 0;
         padding-bottom: 4px;
@@ -448,10 +448,10 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       }
 
       .message-role {
-        font-size: 10px;
+        font-size: 11px;
         font-weight: 600;
         text-transform: uppercase;
-        letter-spacing: 0.5px;
+        letter-spacing: 0.06em;
         margin-bottom: 4px;
         opacity: 0.7;
       }
@@ -469,10 +469,10 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       }
 
       .tool-calls-header {
-        font-size: 10px;
+        font-size: 11px;
         font-weight: 600;
         text-transform: uppercase;
-        letter-spacing: 0.5px;
+        letter-spacing: 0.06em;
         color: var(--cat-2);
         margin-bottom: 8px;
       }

@@ -179,7 +179,7 @@ export const CAPACITY_REFRESH_MS = 10_000;
         font-weight: 600;
         color: var(--text-muted);
         text-transform: uppercase;
-        letter-spacing: 0.04em;
+        letter-spacing: 0.06em;
       }
       .kpi-value {
         font-size: 26px;

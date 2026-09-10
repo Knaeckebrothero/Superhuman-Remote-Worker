@@ -1255,7 +1255,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
       font-size: 11px;
       color: var(--text-muted);
       text-transform: uppercase;
-      letter-spacing: 0.5px;
+      letter-spacing: 0.06em;
       margin-bottom: 6px;
     }
 
@@ -1808,7 +1808,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
     }
     .kb-detail-content ::ng-deep th {
       font-weight: 600; color: var(--accent-color);
-      font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px;
+      font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em;
     }
 
     .kb-detail-content ::ng-deep hr {
@@ -1824,7 +1824,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
     }
 
     .kb-relationships h4 {
-      font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;
+      font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em;
       color: var(--text-muted); margin: 0 0 8px 0;
     }
 

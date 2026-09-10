@@ -512,9 +512,9 @@ export function subjobBlockedKey(
         min-width: 0;
       }
       .fact-label {
-        font-size: 10px;
+        font-size: 11px;
         text-transform: uppercase;
-        letter-spacing: 0.4px;
+        letter-spacing: 0.06em;
         color: var(--text-muted);
       }
       .fact-value {
@@ -545,9 +545,9 @@ export function subjobBlockedKey(
         gap: 8px;
       }
       .usage-title {
-        font-size: 10px;
+        font-size: 11px;
         text-transform: uppercase;
-        letter-spacing: 0.4px;
+        letter-spacing: 0.06em;
         color: var(--text-muted);
       }
       .usage-note {
@@ -644,7 +644,7 @@ export function subjobBlockedKey(
       }
       .subjobs-label {
         font-size: 11px;
-        letter-spacing: 0.04em;
+        letter-spacing: 0.06em;
         text-transform: uppercase;
         color: var(--text-muted);
       }

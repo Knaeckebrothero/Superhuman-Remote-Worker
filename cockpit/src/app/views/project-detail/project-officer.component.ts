@@ -1277,7 +1277,7 @@ export function nextWakeLabel(
       .officer-badge {
         font-size: 11px;
         text-transform: uppercase;
-        letter-spacing: 0.4px;
+        letter-spacing: 0.06em;
         padding: 2px 8px;
         border-radius: var(--radius-pill);
         background: var(--bg-tertiary);
@@ -1315,7 +1315,7 @@ export function nextWakeLabel(
         font-size: 11px;
         color: var(--text-tertiary);
         text-transform: uppercase;
-        letter-spacing: 0.4px;
+        letter-spacing: 0.06em;
       }
       .officer-meta .v {
         font-size: 13px;
@@ -1359,7 +1359,7 @@ export function nextWakeLabel(
         font-size: 12px;
         color: var(--text-tertiary);
         text-transform: uppercase;
-        letter-spacing: 0.4px;
+        letter-spacing: 0.06em;
       }
       .officer-immediacy {
         font-size: 11px;
@@ -1431,7 +1431,7 @@ export function nextWakeLabel(
         font-size: 12px;
         color: var(--text-tertiary);
         text-transform: uppercase;
-        letter-spacing: 0.4px;
+        letter-spacing: 0.06em;
       }
       .officer-recent-item {
         display: flex;
@@ -1448,7 +1448,7 @@ export function nextWakeLabel(
       .officer-recent-severity {
         font-size: 11px;
         text-transform: uppercase;
-        letter-spacing: 0.3px;
+        letter-spacing: 0.06em;
         color: var(--text-secondary);
       }
       .officer-recent-severity[data-severity='high'] {
