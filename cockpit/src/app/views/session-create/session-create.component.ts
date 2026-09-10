@@ -189,11 +189,9 @@ interface ExpertDetail extends Expert {
              "Show all experts" lists every role — the server accepts a
              cross-role pick and resolves it on the session overlay. -->
         <app-form-field [label]="'sessions.create.expertLabel' | transloco">
-          <div class="expert-toolbar">
-            <app-switch size="sm" [checked]="showAllExperts()" [disabled]="creating()" (changed)="setShowAllExperts($event)">
-              {{ 'experts.showAll' | transloco }}
-            </app-switch>
-          </div>
+          <app-switch formFieldAction size="sm" [checked]="showAllExperts()" [disabled]="creating()" (changed)="setShowAllExperts($event)">
+            {{ 'experts.showAll' | transloco }}
+          </app-switch>
           @if (loadingExperts()) {
             <div class="loading-hint">{{ 'sessions.create.expertLoading' | transloco }}</div>
           } @else if (experts().length > 0) {
@@ -334,7 +332,7 @@ interface ExpertDetail extends Expert {
       border-radius: var(--radius-control);
       background: var(--danger-tint);
       border: 1px solid var(--danger-tint);
-      color: var(--danger-color);
+      color: var(--danger);
       font-size: 13px;
     }
 
@@ -361,11 +359,6 @@ interface ExpertDetail extends Expert {
       font-size: 12px;
       color: var(--text-muted);
       padding: 8px 0;
-    }
-    .expert-toolbar {
-      display: flex;
-      justify-content: flex-end;
-      margin-bottom: 8px;
     }
     .expert-grid {
       display: grid;

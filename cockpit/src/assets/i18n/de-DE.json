@@ -2845,7 +2845,6 @@
     "timeNow": "jetzt"
   },
   "jobReview": {
-    "title": "Job-Review",
     "empty": {
       "selectJob": "Wählen Sie einen Job zur Prüfung aus",
       "notFound": "Job nicht gefunden",

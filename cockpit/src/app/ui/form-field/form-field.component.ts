@@ -15,15 +15,20 @@ let nextFormFieldId = 0;
   changeDetection: ChangeDetectionStrategy.OnPush,
   template: `
     @if (label()) {
-      <label class="app-form-field__label" [attr.for]="forId() || null">
-        {{ label() }}
-        @if (required()) {
-          <span class="app-form-field__required" aria-hidden="true">*</span>
-        }
-        @if (optional()) {
-          <span class="app-form-field__hint-inline">{{ optional() }}</span>
-        }
-      </label>
+      <div class="app-form-field__head">
+        <label class="app-form-field__label" [attr.for]="forId() || null">
+          {{ label() }}
+          @if (required()) {
+            <span class="app-form-field__required" aria-hidden="true">*</span>
+          }
+          @if (optional()) {
+            <span class="app-form-field__hint-inline">{{ optional() }}</span>
+          }
+        </label>
+        <!-- Optional control on the label row (a toggle, a link): mark the
+             projected element with the formFieldAction attribute. -->
+        <ng-content select="[formFieldAction]"></ng-content>
+      </div>
     }
     <div class="app-form-field__control">
       <ng-content></ng-content>

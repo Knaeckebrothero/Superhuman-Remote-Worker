@@ -2845,7 +2845,6 @@
     "timeNow": "now"
   },
   "jobReview": {
-    "title": "Job Review",
     "empty": {
       "selectJob": "Select a job to review",
       "notFound": "Job not found",
