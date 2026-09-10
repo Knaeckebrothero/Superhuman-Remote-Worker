@@ -259,3 +259,80 @@ async def test_anthropic_only_seeded_inserts_only_claude_rows():
         call.kwargs["provider_ref"] for call in db.create_model.await_args_list
     }
     assert inserted_providers == {"anthropic"}
+
+
+_TEST_HELM_VALUES_WITH_DEFAULTS = dedent(
+    """
+    llm:
+      seed:
+        enabled: true
+        systemModels:
+          - provider: openai
+            id: gpt-4o
+            displayName: GPT-4o
+            capability: chat
+            family: default
+        defaults:
+          chat: gpt-4o
+          auxiliary: gpt-4o
+          embedding: text-embedding-3-large   # not in the catalog -> skipped
+    """
+)
+
+
+@pytest.mark.asyncio
+async def test_defaults_block_pins_only_catalog_models(tmp_path):
+    (tmp_path / "helm" / "values.yaml").write_text(_TEST_HELM_VALUES_WITH_DEFAULTS)
+    db = _fake_db(seeded_providers=["openai"])
+    catalog: list[dict] = []
+
+    async def _create_model(**kwargs):
+        catalog.append(
+            {
+                "model_id": kwargs["model_id"],
+                "capabilities": list(kwargs["capabilities"]),
+                "enabled": True,
+            }
+        )
+        return {"id": "00000000-0000-0000-0000-000000000001"}
+
+    async def _list_models(*, capabilities=None, enabled_only=False, **_):
+        return [
+            row
+            for row in catalog
+            if not capabilities or set(capabilities) & set(row["capabilities"])
+        ]
+
+    db.create_model = AsyncMock(side_effect=_create_model)
+    db.list_models = AsyncMock(side_effect=_list_models)
+    db.get_default_llm_model = AsyncMock(return_value=None)
+    db.set_default_llm_model = AsyncMock()
+
+    await init_mod._seed_models_from_helm(db)
+
+    pinned = {
+        call.args[0]: call.args[1] for call in db.set_default_llm_model.await_args_list
+    }
+    assert pinned == {"chat": "gpt-4o", "auxiliary": "gpt-4o"}
+    for call in db.set_default_llm_model.await_args_list:
+        assert call.kwargs == {"updated_by": "helm:llm.seed"}
+
+
+@pytest.mark.asyncio
+async def test_defaults_only_values_still_run_the_seed(tmp_path):
+    (tmp_path / "helm" / "values.yaml").write_text(
+        "llm:\n  seed:\n    defaults:\n      chat: gpt-4o\n"
+    )
+    db = _fake_db(seeded_providers=["openai"])
+    db.list_models = AsyncMock(
+        return_value=[{"model_id": "gpt-4o", "capabilities": ["chat"], "enabled": True}]
+    )
+    db.get_default_llm_model = AsyncMock(return_value=None)
+    db.set_default_llm_model = AsyncMock()
+
+    await init_mod._seed_models_from_helm(db)
+
+    db.create_model.assert_not_awaited()
+    db.set_default_llm_model.assert_awaited_once_with(
+        "chat", "gpt-4o", updated_by="helm:llm.seed"
+    )

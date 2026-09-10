@@ -87,9 +87,10 @@ deadline and hard FPM handler bound.
 LLM seed
 ========
 Helm will run a one-shot seed Job (`{{ include "srw.fullname" . }}-llm-seed`)
-post-install and post-upgrade. It inserts rows into system_api_keys and
-llm_endpoints only when they are absent — existing rows, whether
-previously seeded or created via Admin → Providers, are never overwritten.
+post-install and post-upgrade. It inserts provider keys, endpoints and
+catalog rows, and pins default models (llm.seed.defaults), only where they
+are absent — existing rows and pins, whether previously seeded or set via
+Admin → Models, are never overwritten.
 
 Inspect the run:
 

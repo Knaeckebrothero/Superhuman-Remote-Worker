@@ -23,6 +23,13 @@ a fresh stack. On each run:
   ``(provider_kind, provider_ref, model_id, capability)``, so admin edits
   via the Cockpit survive subsequent helm upgrades. Entries whose provider
   is not (yet) in ``system_api_keys`` are skipped with a log line.
+* ``defaults`` entries pin ``system_settings`` keys ``llm.default_<kind>_model``
+  (the rows behind Admin → Models → Defaults) for kinds that have no pin
+  yet. A pin an admin already set, or one the boot-time research/TTS seeders
+  claimed, is left alone. The declared model must be an enabled catalog row
+  carrying the kind's capability; otherwise the entry is skipped with a
+  warning, so a typo in values.yaml cannot pin a model the resolver has no
+  transport for.
 
 The Job is re-run on every upgrade, so the seeder's success path must be
 idempotent. Non-zero exits are reserved for genuine DB errors — a re-run
@@ -62,6 +69,10 @@ Payload shape::
         id: "text-embedding-3-large"
         displayName: "OpenAI Embedding (Large)"
         capability: embedding
+
+    defaults:                            # kind -> catalog model_id
+      chat: "claude-opus-4-7"
+      embedding: "text-embedding-3-large"
 
 ``apiKeyEnv`` lets helm keep the payload ConfigMap plaintext-free: the Job pod
 mounts the referenced Secret via ``envFrom`` and the seeder resolves the
@@ -192,6 +203,28 @@ _CAPABILITY_ENUM = (
     "fetch",
 )
 
+# Default-model pins the payload's ``defaults`` map may set — one
+# ``system_settings`` row ``llm.default_<kind>_model`` per kind — and the
+# catalog capability a pinned model must carry for that kind. ``browser`` and
+# ``citation`` are chat workloads (dispatch resolves ``citation`` against
+# ``chat``); ``search_fallback`` is the secondary search provider. The key set
+# mirrors ``orchestrator.schemas.provider_catalog.VALID_DEFAULT_MODEL_KINDS``
+# (pinned by a test) so the seed and Admin → Models → Defaults accept the same
+# kinds; the chart template carries the same list to fail a typo at render.
+DEFAULT_PIN_CAPABILITY_BY_KIND: dict[str, str] = {
+    "chat": "chat",
+    "auxiliary": "auxiliary",
+    "browser": "chat",
+    "citation": "chat",
+    "embedding": "embedding",
+    "vision": "vision",
+    "whisper": "whisper",
+    "tts": "tts",
+    "search": "search",
+    "fetch": "fetch",
+    "search_fallback": "search",
+}
+
 
 def _resolve_capabilities_from_entry(
     entry: dict[str, Any], *, context: str
@@ -252,17 +285,22 @@ class SeedReport:
     endpoints_skipped: list[str] = field(default_factory=list)
     models_seeded: list[tuple[str, str]] = field(default_factory=list)
     models_skipped: list[tuple[str, str]] = field(default_factory=list)
+    defaults_seeded: list[tuple[str, str]] = field(default_factory=list)
+    defaults_skipped: list[tuple[str, str]] = field(default_factory=list)
 
     def log(self) -> None:
         logger.info(
             "seed summary — keys seeded=%d skipped=%d, endpoints seeded=%d "
-            "skipped=%d, models seeded=%d skipped=%d",
+            "skipped=%d, models seeded=%d skipped=%d, defaults seeded=%d "
+            "skipped=%d",
             len(self.api_keys_seeded),
             len(self.api_keys_skipped),
             len(self.endpoints_seeded),
             len(self.endpoints_skipped),
             len(self.models_seeded),
             len(self.models_skipped),
+            len(self.defaults_seeded),
+            len(self.defaults_skipped),
         )
 
 
@@ -559,12 +597,77 @@ async def _seed_system_models(
         )
 
 
+def _default_model_from_entry(value: Any) -> str | None:
+    """Accept ``kind: "<model_id>"`` or ``kind: {model: "<model_id>"}``."""
+    if isinstance(value, dict):
+        value = value.get("model")
+    if isinstance(value, str):
+        value = value.strip()
+        return value or None
+    return None
+
+
+async def _seed_defaults(
+    db: PostgresDB, entries: dict[str, Any], report: SeedReport
+) -> None:
+    """Pin ``llm.default_<kind>_model`` for every kind that has no pin yet.
+
+    Insert-only like the other sections: an existing pin — set by an admin
+    in Admin → Models → Defaults, or claimed by a boot-time seeder such as
+    Tavily/SearXNG for ``search``/``fetch`` — is never overwritten. The
+    declared model must be an enabled catalog row carrying the kind's
+    capability (rows this same run just seeded count), so a typo in
+    values.yaml is a logged skip rather than a dangling pin the resolver
+    silently falls through.
+    """
+    catalog_by_capability: dict[str, set[str]] = {}
+    for kind in sorted(entries):
+        model = _default_model_from_entry(entries[kind])
+        capability = DEFAULT_PIN_CAPABILITY_BY_KIND.get(kind)
+        if capability is None:
+            report.defaults_skipped.append((kind, model or ""))
+            logger.warning(
+                "defaults[%s]: unknown kind — valid kinds: %s; skipped",
+                kind,
+                ", ".join(sorted(DEFAULT_PIN_CAPABILITY_BY_KIND)),
+            )
+            continue
+        if model is None:
+            logger.info("defaults[%s]: no model declared — skipped", kind)
+            continue
+        existing = await db.get_default_llm_model(kind)
+        if existing:
+            report.defaults_skipped.append((kind, existing))
+            logger.info(
+                "default %s already pinned to %s — leaving untouched", kind, existing
+            )
+            continue
+        if capability not in catalog_by_capability:
+            rows = await db.list_models(capabilities=[capability], enabled_only=True)
+            catalog_by_capability[capability] = {row["model_id"] for row in rows}
+        if model not in catalog_by_capability[capability]:
+            report.defaults_skipped.append((kind, model))
+            logger.warning(
+                "defaults[%s]: %r is not an enabled catalog row with capability %r "
+                "— skipped (seed the model in systemModels/systemEndpoints first, "
+                "or pick one that exists in Admin → Models)",
+                kind,
+                model,
+                capability,
+            )
+            continue
+        await db.set_default_llm_model(kind, model, updated_by=SEEDED_FROM_TAG)
+        report.defaults_seeded.append((kind, model))
+        logger.info("pinned default %s model to %s", kind, model)
+
+
 async def seed(db: PostgresDB, payload: dict[str, Any]) -> SeedReport:
     """Apply the seed payload against an already-connected ``PostgresDB``."""
     report = SeedReport()
     api_keys = payload.get("systemApiKeys") or []
     endpoints = payload.get("systemEndpoints") or []
     system_models = payload.get("systemModels") or []
+    defaults = payload.get("defaults") or {}
 
     if (
         not isinstance(api_keys, list)
@@ -574,6 +677,8 @@ async def seed(db: PostgresDB, payload: dict[str, Any]) -> SeedReport:
         raise ValueError(
             "systemApiKeys, systemEndpoints, and systemModels must be lists when present"
         )
+    if not isinstance(defaults, dict):
+        raise ValueError("defaults must be a mapping of kind -> model id when present")
 
     if api_keys:
         await _seed_api_keys(db, api_keys, report)
@@ -581,6 +686,9 @@ async def seed(db: PostgresDB, payload: dict[str, Any]) -> SeedReport:
         await _seed_endpoints(db, endpoints, report)
     if system_models:
         await _seed_system_models(db, system_models, report)
+    # Last on purpose: catalog rows seeded above are visible to the pin check.
+    if defaults:
+        await _seed_defaults(db, defaults, report)
     return report
 
 

@@ -467,3 +467,14 @@ keycloak:
 llm:
   seed:
     researchProviderWaitSeconds: 900
+    # Pin default models here too, so a rebuilt cluster comes up with the same
+    # Admin → Models → Defaults you would otherwise click through again.
+    # Insert-only: a kind that is already pinned is left alone. Each model
+    # must be an enabled catalog row for that kind (seeded via systemModels /
+    # systemEndpoints, or added in the Cockpit); an unknown model is skipped
+    # with a warning in the srw-llm-seed Job log, an unknown kind fails the
+    # render. Full kind list in helm/values.yaml under llm.seed.defaults.
+    # defaults:
+    #   chat: "gpt-5-mini"
+    #   auxiliary: "gpt-5-mini"
+    #   embedding: "qwen/qwen3-embedding-8b"

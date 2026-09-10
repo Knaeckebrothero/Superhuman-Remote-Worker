@@ -13,7 +13,9 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import yaml
 
+from orchestrator.schemas.provider_catalog import VALID_DEFAULT_MODEL_KINDS
 from orchestrator.seed.llm_config import (
+    DEFAULT_PIN_CAPABILITY_BY_KIND,
     SEEDED_FROM_TAG,
     load_payload,
     seed,
@@ -26,12 +28,20 @@ def _fake_db(
     existing_api_keys: list[dict] | None = None,
     existing_endpoints: list[dict] | None = None,
     existing_catalog_keys: set[tuple[str, str]] | None = None,
+    catalog_rows: list[dict] | None = None,
+    existing_defaults: dict[str, str] | None = None,
 ):
     """Build a ``PostgresDB``-shaped mock that tracks mutations.
 
     ``existing_catalog_keys`` is a set of (provider_ref, model_id) pairs
     that simulate already-present catalog rows: ``create_model`` returns
     None for those (matching the ``ON CONFLICT DO NOTHING`` path).
+
+    ``catalog_rows`` are pre-existing rows as ``list_models`` returns them
+    (``model_id`` + ``capabilities`` + ``enabled``); rows ``create_model``
+    inserts during the run are appended, so the defaults section sees what
+    the same payload just seeded. ``existing_defaults`` pre-populates the
+    ``llm.default_<kind>_model`` pins.
     """
     db = MagicMock()
     db.list_system_api_keys = AsyncMock(return_value=list(existing_api_keys or []))
@@ -54,19 +64,52 @@ def _fake_db(
 
     catalog_keys = set(existing_catalog_keys or set())
 
+    rows = [dict(r) for r in (catalog_rows or [])]
+
     async def _create_model(**kwargs):
         key = (kwargs["provider_ref"], kwargs["model_id"])
         if key in catalog_keys:
             return None
         catalog_keys.add(key)
-        return {
+        row = {
             "id": f"catalog-{kwargs['model_id']}",
             "provider_ref": kwargs["provider_ref"],
             "model_id": kwargs["model_id"],
+            "capabilities": list(kwargs.get("capabilities") or []),
+            "enabled": kwargs.get("enabled", True),
         }
+        rows.append(row)
+        return row
+
+    async def _list_models(
+        *, capabilities=None, provider_kind=None, provider_ref=None, enabled_only=False
+    ):
+        out = []
+        for row in rows:
+            if capabilities and not (set(capabilities) & set(row["capabilities"])):
+                continue
+            if enabled_only and not row.get("enabled", True):
+                continue
+            out.append(dict(row))
+        return out
+
+    pins = dict(existing_defaults or {})
+
+    async def _get_default(kind):
+        return pins.get(kind)
+
+    async def _set_default(kind, model, *, updated_by=None):
+        if model:
+            pins[kind] = model
+        else:
+            pins.pop(kind, None)
 
     db.create_system_llm_endpoint = AsyncMock(side_effect=_create_endpoint)
     db.create_model = AsyncMock(side_effect=_create_model)
+    db.list_models = AsyncMock(side_effect=_list_models)
+    db.get_default_llm_model = AsyncMock(side_effect=_get_default)
+    db.set_default_llm_model = AsyncMock(side_effect=_set_default)
+    db._pins = pins
     return db
 
 
@@ -564,3 +607,157 @@ class TestCapabilitiesArraySemantics:
             "auxiliary",
             "vision",
         ]
+
+
+# ---------------------------------------------------------------------------
+# seed — default-model pins
+# ---------------------------------------------------------------------------
+
+
+def _chat_row(model_id: str, *, enabled: bool = True, caps=("chat", "auxiliary")):
+    return {"model_id": model_id, "capabilities": list(caps), "enabled": enabled}
+
+
+class TestSeedDefaults:
+    def test_kind_map_matches_admin_schema(self):
+        # Admin → Models → Defaults and the seed must accept the same kinds;
+        # a kind added to one side without the other is a drift bug.
+        assert set(DEFAULT_PIN_CAPABILITY_BY_KIND) == VALID_DEFAULT_MODEL_KINDS
+
+    @pytest.mark.asyncio
+    async def test_pins_absent_kind_to_catalog_model(self):
+        db = _fake_db(catalog_rows=[_chat_row("gpt-5-mini")])
+        report = await seed(db, {"defaults": {"chat": "gpt-5-mini"}})
+
+        db.set_default_llm_model.assert_awaited_once_with(
+            "chat", "gpt-5-mini", updated_by=SEEDED_FROM_TAG
+        )
+        assert report.defaults_seeded == [("chat", "gpt-5-mini")]
+        assert report.defaults_skipped == []
+        assert db._pins == {"chat": "gpt-5-mini"}
+
+    @pytest.mark.asyncio
+    async def test_existing_pin_is_left_alone(self):
+        db = _fake_db(
+            catalog_rows=[_chat_row("gpt-5-mini"), _chat_row("MiniMax-M3")],
+            existing_defaults={"chat": "MiniMax-M3"},
+        )
+        report = await seed(db, {"defaults": {"chat": "gpt-5-mini"}})
+
+        db.set_default_llm_model.assert_not_awaited()
+        assert report.defaults_seeded == []
+        assert report.defaults_skipped == [("chat", "MiniMax-M3")]
+        assert db._pins == {"chat": "MiniMax-M3"}
+
+    @pytest.mark.asyncio
+    async def test_model_missing_from_catalog_is_skipped_with_warning(self, caplog):
+        db = _fake_db(catalog_rows=[_chat_row("gpt-5-mini")])
+        with caplog.at_level("WARNING", logger="orchestrator.seed.llm_config"):
+            report = await seed(db, {"defaults": {"chat": "gpt-5-minl"}})
+
+        db.set_default_llm_model.assert_not_awaited()
+        assert report.defaults_skipped == [("chat", "gpt-5-minl")]
+        assert "gpt-5-minl" in caplog.text
+        assert "not an enabled catalog row" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_model_without_the_kinds_capability_is_skipped(self):
+        # A chat-only row cannot be the embedding default.
+        db = _fake_db(catalog_rows=[_chat_row("gpt-5-mini", caps=("chat",))])
+        report = await seed(db, {"defaults": {"embedding": "gpt-5-mini"}})
+
+        db.set_default_llm_model.assert_not_awaited()
+        assert report.defaults_skipped == [("embedding", "gpt-5-mini")]
+
+    @pytest.mark.asyncio
+    async def test_disabled_catalog_row_is_skipped(self):
+        db = _fake_db(catalog_rows=[_chat_row("gpt-5-mini", enabled=False)])
+        report = await seed(db, {"defaults": {"chat": "gpt-5-mini"}})
+
+        db.set_default_llm_model.assert_not_awaited()
+        assert report.defaults_skipped == [("chat", "gpt-5-mini")]
+
+    @pytest.mark.asyncio
+    async def test_browser_and_citation_validate_against_chat(self):
+        db = _fake_db(catalog_rows=[_chat_row("gpt-5-mini", caps=("chat",))])
+        report = await seed(
+            db, {"defaults": {"browser": "gpt-5-mini", "citation": "gpt-5-mini"}}
+        )
+        assert sorted(report.defaults_seeded) == [
+            ("browser", "gpt-5-mini"),
+            ("citation", "gpt-5-mini"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_search_fallback_validates_against_search(self):
+        db = _fake_db(
+            catalog_rows=[{"model_id": "searxng", "capabilities": ["search"]}]
+        )
+        report = await seed(db, {"defaults": {"search_fallback": "searxng"}})
+        assert report.defaults_seeded == [("search_fallback", "searxng")]
+
+    @pytest.mark.asyncio
+    async def test_unknown_kind_is_skipped_with_warning(self, caplog):
+        db = _fake_db(catalog_rows=[_chat_row("gpt-5-mini")])
+        with caplog.at_level("WARNING", logger="orchestrator.seed.llm_config"):
+            report = await seed(db, {"defaults": {"chatt": "gpt-5-mini"}})
+
+        db.set_default_llm_model.assert_not_awaited()
+        assert report.defaults_skipped == [("chatt", "gpt-5-mini")]
+        assert "unknown kind" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_empty_or_null_model_is_ignored(self):
+        db = _fake_db(catalog_rows=[_chat_row("gpt-5-mini")])
+        report = await seed(db, {"defaults": {"chat": "", "auxiliary": None}})
+
+        db.set_default_llm_model.assert_not_awaited()
+        db.get_default_llm_model.assert_not_awaited()
+        assert report.defaults_seeded == []
+        assert report.defaults_skipped == []
+
+    @pytest.mark.asyncio
+    async def test_accepts_mapping_form(self):
+        db = _fake_db(catalog_rows=[_chat_row("gpt-5-mini")])
+        report = await seed(db, {"defaults": {"chat": {"model": " gpt-5-mini "}}})
+        assert report.defaults_seeded == [("chat", "gpt-5-mini")]
+
+    @pytest.mark.asyncio
+    async def test_rows_seeded_in_the_same_payload_are_pinnable(self):
+        db = _fake_db(existing_api_keys=[{"provider": "openai"}])
+        payload = {
+            "systemModels": [
+                {
+                    "provider": "openai",
+                    "id": "gpt-5-mini",
+                    "capability": "chat",
+                    "family": "gpt-5",
+                }
+            ],
+            "defaults": {"chat": "gpt-5-mini", "auxiliary": "gpt-5-mini"},
+        }
+        report = await seed(db, payload)
+
+        assert report.models_seeded == [("openai", "gpt-5-mini")]
+        assert sorted(report.defaults_seeded) == [
+            ("auxiliary", "gpt-5-mini"),
+            ("chat", "gpt-5-mini"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_second_run_is_noop(self):
+        db = _fake_db(catalog_rows=[_chat_row("gpt-5-mini")])
+        payload = {"defaults": {"chat": "gpt-5-mini"}}
+        first = await seed(db, payload)
+        second = await seed(db, payload)
+
+        assert first.defaults_seeded == [("chat", "gpt-5-mini")]
+        assert second.defaults_seeded == []
+        assert second.defaults_skipped == [("chat", "gpt-5-mini")]
+        assert db.set_default_llm_model.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_rejects_non_mapping_defaults(self):
+        db = _fake_db()
+        with pytest.raises(ValueError):
+            await seed(db, {"defaults": ["chat"]})

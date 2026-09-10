@@ -889,7 +889,9 @@ async def _seed_models_from_helm(db) -> None:
     delegates to :func:`orchestrator.seed.llm_config.seed`. Each entry becomes
     one ``(model, capability)`` catalog row with ``provider_kind='system'``,
     inserted via ``ON CONFLICT DO NOTHING`` so admin edits made via the
-    Cockpit are never clobbered.
+    Cockpit are never clobbered. The sibling ``llm.seed.defaults`` map rides
+    along: it pins ``llm.default_<kind>_model`` only for kinds that have no
+    pin yet, and only to models present in the catalog.
 
     Rows whose ``provider`` has no ``system_api_keys`` entry yet are skipped
     by the seeder — they would not be reachable. Bare-metal devs running
@@ -899,6 +901,7 @@ async def _seed_models_from_helm(db) -> None:
     """
     helm_values_path = Path(__file__).resolve().parents[2] / "helm" / "values.yaml"
     system_models: list[dict] = []
+    defaults: dict = {}
 
     if helm_values_path.exists():
         try:
@@ -908,9 +911,12 @@ async def _seed_models_from_helm(db) -> None:
             helm_raw = {}
         seed_block = (helm_raw.get("llm") or {}).get("seed") or {}
         system_models = list(seed_block.get("systemModels") or [])
+        defaults = dict(seed_block.get("defaults") or {})
 
-    if not system_models:
-        logger.info("  Catalog seed skipped — no helm.llm.seed.systemModels entries")
+    if not system_models and not defaults:
+        logger.info(
+            "  Catalog seed skipped — no helm.llm.seed.systemModels or defaults entries"
+        )
         return
 
     try:
@@ -919,9 +925,9 @@ async def _seed_models_from_helm(db) -> None:
         logger.warning(f"  Could not import seed.llm_config: {e}")
         return
 
-    # Only systemModels here. Endpoint seeding is owned by
+    # Only systemModels + defaults here. Endpoint seeding is owned by
     # _seed_codex_proxy_endpoint (init.py) and the helm post-install Job.
-    report = await llm_seed(db, {"systemModels": system_models})
+    report = await llm_seed(db, {"systemModels": system_models, "defaults": defaults})
 
     if report.models_seeded:
         logger.info(f"  Seeded {len(report.models_seeded)} catalog rows from helm seed")
@@ -931,6 +937,15 @@ async def _seed_models_from_helm(db) -> None:
         logger.info(
             f"  Skipped {len(report.models_skipped)} catalog rows "
             "(already present or provider not seeded)"
+        )
+    if report.defaults_seeded:
+        logger.info(
+            f"  Pinned {len(report.defaults_seeded)} default model(s) from helm seed"
+        )
+    if report.defaults_skipped:
+        logger.info(
+            f"  Skipped {len(report.defaults_skipped)} default pin(s) "
+            "(already pinned or model not in the catalog)"
         )
 
 

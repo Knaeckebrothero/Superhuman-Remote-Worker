@@ -3063,6 +3063,36 @@ llm:
     #     capability: embedding                     # singleton: [embedding]
     systemModels: []
 
+    # -- Optional: default-model pins, one per workload kind. Each entry
+    # writes the system_settings row `llm.default_<kind>_model` — the same
+    # rows Admin → Models → Defaults edits — so a rebuilt cluster comes up
+    # with its defaults chosen instead of waiting for an admin to click
+    # through them. Same insert-only contract as everything above: a kind
+    # that already has a pin (set by an admin, or claimed by the boot-time
+    # Tavily/SearXNG/Crawl4AI/ElevenLabs seeders) is left alone.
+    #
+    # The model must be an enabled catalog row carrying the kind's
+    # capability — seeded via systemModels / systemEndpoints above, imported
+    # from the subscription proxy, or added by an admin. Anything else is
+    # skipped with a warning in the Job log rather than pinning a model the
+    # resolver has no transport for. An unknown kind fails the render.
+    #
+    # Kinds and the capability their model must carry:
+    #   chat, browser, citation        -> chat
+    #   auxiliary                      -> auxiliary
+    #   embedding / vision / whisper / tts -> the same-named capability
+    #   search, search_fallback        -> search
+    #   fetch                          -> fetch
+    # The readiness gate needs chat, auxiliary and embedding pinned before
+    # jobs and sessions can start.
+    #
+    # defaults:
+    #   chat: "claude-opus-4-7"
+    #   auxiliary: "gpt-4o"
+    #   vision: "claude-opus-4-7"
+    #   embedding: "text-embedding-3-large"
+    defaults: {}
+
     # -- Resource requests for the short-lived seed Job pod.
     resources:
       requests:
