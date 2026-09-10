@@ -1268,7 +1268,11 @@ class Smoke:
             {
                 "apiVersion": "srw/v1alpha1",
                 "kind": "WorkspaceTemplate",
-                "metadata": {"name": name},
+                "metadata": {
+                    "name": name,
+                    "scope": {"kind": "Account", "name": "me"},
+                    "annotations": {cutover.OWNER_LABEL: self.prefix},
+                },
                 "spec": {"backend": backend},
             }
         )
@@ -1513,6 +1517,7 @@ class Smoke:
         document = authored_expert(
             self.prefix + "workspace-", self.image, self.model, session=True
         )
+        document["metadata"]["annotations"][cutover.OWNER_LABEL] = self.prefix
         tools = document["spec"]["runtime"]["config"]["config"]["tools"]
         tools.update(workspace=["read_file"], shell=["run_command"])
         item = self.gate.apply(document)["resources"][0]
