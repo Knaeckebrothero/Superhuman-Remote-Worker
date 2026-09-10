@@ -24,6 +24,7 @@ from orchestrator.services.stateless_workspace_gate import (
     stateless_session_workspace_check,
     stateless_workspace_check,
 )
+from orchestrator.services import grant_enforcement  # noqa: E402
 
 
 THREAD_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -476,9 +477,10 @@ def test_session_admission_defaults_to_pinned_while_pool_is_off(monkeypatch):
 
     for backend in ("sandbox", "virtual", "none", "vm"):
         assert (
-            orch_main._resolve_thread_execution_lane(
+            session_class_policy.resolve_thread_execution_lane(
                 workspace_backend=backend,
                 effective_config={"workspace": {"backend": backend}},
+                dependencies=orch_main._execution_lane_dependencies(),
             )
             == "pinned"
         )
@@ -501,9 +503,10 @@ def test_enabled_pool_auto_admits_supported_ordinary_tiers(monkeypatch, backend)
     )
 
     assert (
-        orch_main._resolve_thread_execution_lane(
+        session_class_policy.resolve_thread_execution_lane(
             workspace_backend=backend,
             effective_config={"workspace": {"backend": backend}},
+            dependencies=orch_main._execution_lane_dependencies(),
         )
         == "stateless"
     )
@@ -523,16 +526,18 @@ def test_enabled_pool_falls_back_to_pinned_when_supported_tier_is_unready(monkey
     )
 
     assert (
-        orch_main._resolve_thread_execution_lane(
+        session_class_policy.resolve_thread_execution_lane(
             workspace_backend="sandbox",
             effective_config={"workspace": {"backend": "sandbox"}},
+            dependencies=orch_main._execution_lane_dependencies(),
         )
         == "pinned"
     )
     assert (
-        orch_main._resolve_thread_execution_lane(
+        session_class_policy.resolve_thread_execution_lane(
             workspace_backend="virtual",
             effective_config={"workspace": {"backend": "virtual"}},
+            dependencies=orch_main._execution_lane_dependencies(),
         )
         == "pinned"
     )
@@ -553,9 +558,10 @@ def test_enabled_pool_keeps_unsupported_tiers_pinned_on_omission(monkeypatch, ba
     monkeypatch.setattr(orch_main, "STATELESS_SESSION_ENABLED", True)
 
     assert (
-        orch_main._resolve_thread_execution_lane(
+        session_class_policy.resolve_thread_execution_lane(
             workspace_backend=backend,
             effective_config={"workspace": {"backend": backend}},
+            dependencies=orch_main._execution_lane_dependencies(),
         )
         == "pinned"
     )
@@ -569,8 +575,10 @@ def test_pinned_only_session_classes_do_not_auto_admit(monkeypatch, officer):
     config = {"workspace": {"backend": "none"}, "officer": officer}
 
     assert (
-        orch_main._resolve_thread_execution_lane(
-            workspace_backend="none", effective_config=config
+        session_class_policy.resolve_thread_execution_lane(
+            workspace_backend="none",
+            effective_config=config,
+            dependencies=orch_main._execution_lane_dependencies(),
         )
         == "pinned"
     )
@@ -594,8 +602,10 @@ def test_malformed_session_class_pins_and_cannot_be_materialized(monkeypatch, of
     config = {"workspace": {"backend": "none"}, "officer": officer}
 
     assert (
-        orch_main._resolve_thread_execution_lane(
-            workspace_backend="none", effective_config=config
+        session_class_policy.resolve_thread_execution_lane(
+            workspace_backend="none",
+            effective_config=config,
+            dependencies=orch_main._execution_lane_dependencies(),
         )
         == "pinned"
     )
@@ -678,7 +688,7 @@ async def test_stateless_vm_upgrade_refuses_before_grants_or_provisioning():
         patch.object(orch_main, "require_internal", AsyncMock()),
         patch.object(orch_main, "postgres_db", db),
         patch.object(orch_main, "vm_provisioner", provisioner),
-        patch.object(orch_main, "_enforce_workspace_upgrade_grants", grants),
+        patch.object(grant_enforcement, "enforce_workspace_upgrade_grants", grants),
     ):
         with pytest.raises(HTTPException) as exc:
             await thread_config_update.agent_upgrade_thread_to_vm(
@@ -715,7 +725,7 @@ async def test_stateless_sandbox_upgrade_refuses_before_any_workspace_write():
         patch.object(orch_main, "require_internal", AsyncMock()),
         patch.object(orch_main, "postgres_db", db),
         patch.object(orch_main, "container_provisioner", provisioner),
-        patch.object(orch_main, "_enforce_workspace_upgrade_grants", grants),
+        patch.object(grant_enforcement, "enforce_workspace_upgrade_grants", grants),
     ):
         with pytest.raises(HTTPException) as exc:
             await thread_config_update.agent_upgrade_thread_to_workspace(
@@ -810,7 +820,7 @@ async def test_protected_workspace_upgrade_refuses_before_every_effect(
         patch.object(orch_main, "postgres_db", db),
         patch.object(orch_main, "vm_provisioner", vm),
         patch.object(orch_main, "container_provisioner", container),
-        patch.object(orch_main, "_enforce_workspace_upgrade_grants", grants),
+        patch.object(grant_enforcement, "enforce_workspace_upgrade_grants", grants),
     ):
         with pytest.raises(HTTPException) as exc:
             await thread_config_update.agent_upgrade_thread_to_workspace(

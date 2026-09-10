@@ -20,6 +20,7 @@ import pytest
 from fastapi import HTTPException
 
 from shared.runtime.core.session_tool_overrides import SESSION_TOOL_OVERRIDE_NAMES
+from orchestrator.services import session_config_resolution
 
 
 def _patch_caller_and_db(user: dict, db):
@@ -284,7 +285,9 @@ class TestLeanResolveFidelity:
             }
         )
         with patch("orchestrator.main.postgres_db", fake_db):
-            defaults = await orch_main._resolve_session_account_defaults(str(_UID_A))
+            defaults = await session_config_resolution.resolve_session_account_defaults(
+                str(_UID_A), dependencies=orch_main._session_config_dependencies()
+            )
 
         assert "tools" not in (defaults or {})
 

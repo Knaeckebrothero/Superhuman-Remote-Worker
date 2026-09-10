@@ -7,6 +7,7 @@ import pytest
 
 from orchestrator import main as orch_main
 from shared.runtime_actor import RuntimeActorContext
+from orchestrator.services import session_attach_payload
 
 DATASOURCE_ID = "22222222-2222-4222-8222-222222222222"
 FOREIGN_ID = "33333333-3333-4333-8333-333333333333"
@@ -294,8 +295,10 @@ async def test_persistent_reattach_payload_uses_resolved_repository_uuid():
             orch_main, "mint_thread_runtime_actor", AsyncMock(return_value=actor)
         ),
     ):
-        payload = await orch_main._assemble_session_attach_payload(
-            thread["id"], runtime_agent_id=AGENT_ID
+        payload = await session_attach_payload.assemble_session_attach_payload(
+            thread["id"],
+            runtime_agent_id=AGENT_ID,
+            dependencies=orch_main._session_attach_payload_dependencies(),
         )
 
     assert payload is not None

@@ -2964,12 +2964,6 @@ async def _prefetch_roster_refs(*args: Any, **kwargs: Any) -> Any:
     )
 
 
-async def _resolve_session_account_defaults(*args: Any, **kwargs: Any) -> Any:
-    return await session_config_resolution.resolve_session_account_defaults(
-        *args, **kwargs, dependencies=_session_config_dependencies()
-    )
-
-
 async def _account_defaults_layer(*args: Any, **kwargs: Any) -> Any:
     return await session_config_resolution.account_defaults_layer(
         *args, **kwargs, dependencies=_session_config_dependencies()
@@ -4173,28 +4167,6 @@ def _session_attach_payload_dependencies() -> (
     )
 
 
-async def _assemble_session_attach_payload(
-    thread_id: str,
-    *,
-    config_override: Optional[dict] = None,
-    config_name: Optional[str] = None,
-    runtime_agent_id: str | None = None,
-) -> Optional[dict[str, Any]]:
-    """Bridge to ``services/session_attach_payload.py`` (R1.B05 root lane).
-
-    Retained with the pre-extraction signature: ``_send_session_attach_locked``
-    and ``internal_unit_claim_bundle`` are B06's, and several suites patch this
-    name. Goes when B06 migrates those callers.
-    """
-    return await session_attach_payload.assemble_session_attach_payload(
-        thread_id,
-        config_override=config_override,
-        config_name=config_name,
-        runtime_agent_id=runtime_agent_id,
-        dependencies=_session_attach_payload_dependencies(),
-    )
-
-
 from orchestrator.services.workspace_tier_policy import (  # noqa: E402
     LiteWorkspaceConfigError as LiteWorkspaceConfigError,
 )
@@ -4242,12 +4214,6 @@ def _execution_lane_dependencies() -> session_class_policy.ExecutionLaneDependen
     )
 
 
-def _resolve_thread_execution_lane(*args: Any, **kwargs: Any) -> Any:
-    return session_class_policy.resolve_thread_execution_lane(
-        *args, **kwargs, dependencies=_execution_lane_dependencies()
-    )
-
-
 # Reasoning-effort vocabulary accepted at session create. The superset across
 # families — the family capability clamps to what the chosen model actually
 # supports at attach (loader._clamp_reasoning_level), so over-asking degrades
@@ -4275,12 +4241,6 @@ from orchestrator.services.session_create_overrides import (  # noqa: E402
 from orchestrator.services.session_create_overrides import (  # noqa: E402
     validated_session_officer_override as _validated_session_officer_override,
 )
-
-
-def _validated_post_owned_officer_create_fragment(*args: Any, **kwargs: Any) -> Any:
-    return session_create_overrides.validated_post_owned_officer_create_fragment(
-        *args, **kwargs, validated_officer_post_patch=_validated_officer_post_patch
-    )
 
 
 from orchestrator.services.session_tool_policy import (  # noqa: E402
@@ -4670,12 +4630,6 @@ def _vm_permission_dependencies() -> vm_workspace_policy.VmPermissionDependencie
 async def _check_vm_permission(*args: Any, **kwargs: Any) -> Any:
     return await vm_workspace_policy.check_vm_permission(
         *args, **kwargs, dependencies=_vm_permission_dependencies()
-    )
-
-
-async def _enforce_workspace_upgrade_grants(*args: Any, **kwargs: Any) -> Any:
-    return await grant_enforcement.enforce_workspace_upgrade_grants(
-        *args, **kwargs, dependencies=_grant_enforcement_dependencies()
     )
 
 
@@ -10170,7 +10124,15 @@ def _session_attach_binding_dependencies() -> (
         release_pinned_warm_binding_protection=release_pinned_warm_binding_protection,
         await_protected_cloud_runtime_ready=_await_protected_cloud_runtime_ready,
         prepare_thread_repository_authority=prepare_thread_repository_authority,
-        assemble_session_attach_payload=_assemble_session_attach_payload,
+        assemble_session_attach_payload=(
+            lambda *args, **kwargs: (
+                session_attach_payload.assemble_session_attach_payload(
+                    *args,
+                    **kwargs,
+                    dependencies=_session_attach_payload_dependencies(),
+                )
+            )
+        ),
         schedule_attach_abort_successor=_schedule_attach_abort_successor,
         prepare_pinned_session_mutation_target=_prepare_pinned_session_mutation_target,
         pinned_session_mutation_target_is_current=(
@@ -10600,7 +10562,13 @@ def _agent_child_threads_dependencies() -> (
         is_experts_db_enabled=_is_experts_db_enabled,
         resolve_config=resolve_config,
         prefetch_roster_refs=_prefetch_roster_refs,
-        resolve_session_account_defaults=_resolve_session_account_defaults,
+        resolve_session_account_defaults=(
+            lambda *args, **kwargs: (
+                session_config_resolution.resolve_session_account_defaults(
+                    *args, **kwargs, dependencies=_session_config_dependencies()
+                )
+            )
+        ),
         backend_from_override=_backend_from_override,
     )
 
@@ -10651,7 +10619,13 @@ def _thread_config_update_dependencies() -> (
         vm_provisioner=vm_provisioner,
         container_provisioner=container_provisioner,
         apply_thread_config_update_locked=_apply_thread_config_update_locked,
-        enforce_workspace_upgrade_grants=_enforce_workspace_upgrade_grants,
+        enforce_workspace_upgrade_grants=(
+            lambda *args, **kwargs: (
+                grant_enforcement.enforce_workspace_upgrade_grants(
+                    *args, **kwargs, dependencies=_grant_enforcement_dependencies()
+                )
+            )
+        ),
         require_internal=require_internal,
         require_thread_owner=require_thread_owner,
     )
@@ -10677,16 +10651,38 @@ def _thread_admission_dependencies() -> (
         is_protected_cloud_mode_enabled=_is_protected_cloud_mode_enabled,
         authorize_thread_project_ids=_authorize_thread_project_ids,
         authorize_thread_datasource_selection=_authorize_thread_datasource_selection,
-        resolve_session_account_defaults=_resolve_session_account_defaults,
+        resolve_session_account_defaults=(
+            lambda *args, **kwargs: (
+                session_config_resolution.resolve_session_account_defaults(
+                    *args, **kwargs, dependencies=_session_config_dependencies()
+                )
+            )
+        ),
         prefetch_roster_refs=_prefetch_roster_refs,
-        resolve_thread_execution_lane=_resolve_thread_execution_lane,
-        build_thread_mount_rows=_build_thread_mount_rows,
+        resolve_thread_execution_lane=(
+            lambda *args, **kwargs: (
+                session_class_policy.resolve_thread_execution_lane(
+                    *args, **kwargs, dependencies=_execution_lane_dependencies()
+                )
+            )
+        ),
+        build_thread_mount_rows=(
+            lambda *args, **kwargs: thread_mount_rows.build_thread_mount_rows(
+                *args, **kwargs, dependencies=_thread_mount_dependencies()
+            )
+        ),
         should_skip_session_folder=_should_skip_session_folder,
         enforce_session_create_grants=_enforce_session_create_grants,
         check_vm_permission=_check_vm_permission,
         resolve_cloud_session_url=_resolve_cloud_session_url,
         validated_post_owned_officer_create_fragment=(
-            _validated_post_owned_officer_create_fragment
+            lambda *args, **kwargs: (
+                session_create_overrides.validated_post_owned_officer_create_fragment(
+                    *args,
+                    **kwargs,
+                    validated_officer_post_patch=_validated_officer_post_patch,
+                )
+            )
         ),
         enforce_officer_auto_pull_release=_enforce_officer_auto_pull_release,
         can_manage_project_officer=_can_manage_project_officer,
@@ -28174,14 +28170,6 @@ def _should_skip_session_folder(mounts: list[dict[str, Any]]) -> bool:
 async def _thread_project_ids(thread_id: str) -> list[str]:
     return await thread_mount_rows.thread_project_ids(
         thread_id, dependencies=_thread_mount_dependencies()
-    )
-
-
-async def _build_thread_mount_rows(
-    project_ids: list[str],
-) -> list[dict[str, Any]]:
-    return await thread_mount_rows.build_thread_mount_rows(
-        project_ids, dependencies=_thread_mount_dependencies()
     )
 
 

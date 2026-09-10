@@ -38,10 +38,7 @@ from orchestrator.services import (
     job_start_bundle,
     job_workspace_authority,
     job_workspace_runtime,
-    session_attach_payload,
-    session_class_policy,
     session_config_resolution,
-    session_create_overrides,
     stateless_workspace_scheduler,
     thread_mount_rows,
     thread_workspace_delivery,
@@ -52,9 +49,6 @@ from orchestrator.services import (
 BRIDGES = {
     "_resolve_default_models": session_config_resolution.resolve_default_models,
     "_prefetch_roster_refs": session_config_resolution.prefetch_roster_refs,
-    "_resolve_session_account_defaults": (
-        session_config_resolution.resolve_session_account_defaults
-    ),
     "_account_defaults_layer": session_config_resolution.account_defaults_layer,
     "_acknowledged_grant_strip": session_config_resolution.acknowledged_grant_strip,
     "_resolve_session_config": session_config_resolution.resolve_session_config,
@@ -62,12 +56,6 @@ BRIDGES = {
         session_config_resolution.require_supported_protected_session_class
     ),
     "_agent_toolset_measurement": agent_toolset_probe.agent_toolset_measurement,
-    "_resolve_thread_execution_lane": (
-        session_class_policy.resolve_thread_execution_lane
-    ),
-    "_validated_post_owned_officer_create_fragment": (
-        session_create_overrides.validated_post_owned_officer_create_fragment
-    ),
     "_user_experts_enabled": grant_enforcement.user_experts_enabled,
     "_grant_project_ids": grant_enforcement.grant_project_ids,
     "_strip_save_grants": grant_enforcement.strip_save_grants,
@@ -78,9 +66,6 @@ BRIDGES = {
     "_enforce_session_create_grants": (grant_enforcement.enforce_session_create_grants),
     "_enforce_job_create_grants": grant_enforcement.enforce_job_create_grants,
     "_check_vm_permission": vm_workspace_policy.check_vm_permission,
-    "_enforce_workspace_upgrade_grants": (
-        grant_enforcement.enforce_workspace_upgrade_grants
-    ),
     "_enforce_job_workspace_upgrade_grants": (
         grant_enforcement.enforce_job_workspace_upgrade_grants
     ),
@@ -155,7 +140,6 @@ BRIDGES = {
     "_build_job_start_request": job_start_bundle.build_job_start_request,
     "_thread_project_ids": thread_mount_rows.thread_project_ids,
     "_should_skip_session_folder": thread_mount_rows.should_skip_session_folder,
-    "_build_thread_mount_rows": thread_mount_rows.build_thread_mount_rows,
     "_resolve_thread_datasources": thread_mount_rows.resolve_thread_datasources,
     "_resolve_thread_repositories": thread_mount_rows.resolve_thread_repositories,
     "_require_pinned_workspace_credential_owner": (
@@ -163,9 +147,6 @@ BRIDGES = {
     ),
     "_agent_get_thread_workspace_locked": (
         thread_workspace_delivery.agent_get_thread_workspace_locked
-    ),
-    "_assemble_session_attach_payload": (
-        session_attach_payload.assemble_session_attach_payload
     ),
     "_schedule_stateless_workspace_ensure": (
         stateless_workspace_scheduler.schedule_stateless_workspace_ensure

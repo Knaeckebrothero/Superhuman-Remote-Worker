@@ -22,6 +22,7 @@ from orchestrator.services.job_completion_commands import (
     CompletionFenceRejected,
     accept_completion_command,
 )
+from orchestrator.services import session_config_resolution  # noqa: E402
 
 
 WORK = "22222222-2222-4222-8222-222222222222"
@@ -51,7 +52,9 @@ async def test_generic_expert_is_refused_before_interactive_loader(
         main, "_authorize_thread_project_ids", AsyncMock(return_value=[])
     )
     monkeypatch.setattr(
-        main, "_resolve_session_account_defaults", AsyncMock(return_value={})
+        session_config_resolution,
+        "resolve_session_account_defaults",
+        AsyncMock(return_value={}),
     )
     monkeypatch.setattr(main, "_is_experts_db_enabled", lambda: True)
     monkeypatch.setattr(main, "_user_experts_enabled", AsyncMock(return_value=True))

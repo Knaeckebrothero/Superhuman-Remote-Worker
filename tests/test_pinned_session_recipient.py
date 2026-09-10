@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from shared.pinned_session_identity import PinnedSessionBinding
+from orchestrator.services import session_attach_payload
 
 THREAD_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 AGENT_ID = "11111111-1111-4111-8111-111111111111"
@@ -478,8 +479,8 @@ async def test_attach_wrapper_sends_server_recipient_and_postchecks(monkeypatch)
         main, "_reserve_session_attach_binding", AsyncMock(return_value=ATTACH_TOKEN)
     )
     monkeypatch.setattr(
-        main,
-        "_assemble_session_attach_payload",
+        session_attach_payload,
+        "assemble_session_attach_payload",
         AsyncMock(return_value={"session_runtime_generation": GENERATION}),
     )
     monkeypatch.setattr(

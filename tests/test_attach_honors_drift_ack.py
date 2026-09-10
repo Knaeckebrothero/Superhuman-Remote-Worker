@@ -129,10 +129,6 @@ async def test_resolve_session_config_strips_the_delivered_blob_not_just_the_cap
         # delegates to ``services.session_config_resolution`` — patch both so
         # the stub is reached before AND after the extraction.
         patch(
-            "orchestrator.main._resolve_session_account_defaults",
-            AsyncMock(return_value={}),
-        ),
-        patch(
             "orchestrator.services.session_config_resolution"
             ".resolve_session_account_defaults",
             AsyncMock(return_value={}),

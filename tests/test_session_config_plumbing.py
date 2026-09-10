@@ -48,6 +48,7 @@ from shared.runtime.core.tool_policy import (
     validate_tool_override_fragment,
 )
 from shared.runtime_actor import RuntimeActorContext
+from orchestrator.services import session_attach_payload
 
 
 _ATTACH_THREAD_ID = "10000000-0000-4000-8000-000000000001"
@@ -708,8 +709,8 @@ class TestSendSessionAttachPayload:
                 AsyncMock(return_value=thread),
             ),
             patch.object(
-                orch_main,
-                "_assemble_session_attach_payload",
+                session_attach_payload,
+                "assemble_session_attach_payload",
                 AsyncMock(
                     return_value={
                         "thread_id": self.thread_id,
@@ -811,8 +812,8 @@ class TestSendSessionAttachPayload:
                 AsyncMock(return_value=thread),
             ),
             patch.object(
-                orch_main,
-                "_assemble_session_attach_payload",
+                session_attach_payload,
+                "assemble_session_attach_payload",
                 AsyncMock(
                     return_value={
                         "thread_id": self.thread_id,
@@ -847,8 +848,8 @@ class TestSendSessionAttachPayload:
                 AsyncMock(return_value=thread),
             ),
             patch.object(
-                orch_main,
-                "_assemble_session_attach_payload",
+                session_attach_payload,
+                "assemble_session_attach_payload",
                 AsyncMock(
                     return_value={
                         "thread_id": self.thread_id,
@@ -890,8 +891,8 @@ class TestSendSessionAttachPayload:
                 AsyncMock(return_value=thread),
             ),
             patch.object(
-                orch_main,
-                "_assemble_session_attach_payload",
+                session_attach_payload,
+                "assemble_session_attach_payload",
                 AsyncMock(
                     return_value={
                         "thread_id": self.thread_id,
@@ -921,8 +922,8 @@ class TestSendSessionAttachPayload:
                 AsyncMock(return_value=thread),
             ),
             patch.object(
-                orch_main,
-                "_assemble_session_attach_payload",
+                session_attach_payload,
+                "assemble_session_attach_payload",
                 AsyncMock(
                     return_value={
                         "thread_id": self.thread_id,
@@ -952,8 +953,8 @@ class TestSendSessionAttachPayload:
                 AsyncMock(return_value=thread),
             ),
             patch.object(
-                orch_main,
-                "_assemble_session_attach_payload",
+                session_attach_payload,
+                "assemble_session_attach_payload",
                 AsyncMock(
                     return_value={
                         "thread_id": self.thread_id,
@@ -1073,7 +1074,10 @@ class TestSendSessionAttachPayload:
                 orch_main, "_resolve_session_config", AsyncMock(return_value=resolved)
             ),
         ):
-            payload = await orch_main._assemble_session_attach_payload(self.thread_id)
+            payload = await session_attach_payload.assemble_session_attach_payload(
+                self.thread_id,
+                dependencies=orch_main._session_attach_payload_dependencies(),
+            )
 
         interactive = payload["resolved_config"]["agent"]["interactive"]
         assert interactive == {
@@ -1114,8 +1118,10 @@ class TestSendSessionAttachPayload:
                 orch_main, "_resolve_session_config", AsyncMock(return_value=None)
             ),
         ):
-            payload = await orch_main._assemble_session_attach_payload(
-                self.thread_id, config_override={"llm": {"model": "m"}}
+            payload = await session_attach_payload.assemble_session_attach_payload(
+                self.thread_id,
+                config_override={"llm": {"model": "m"}},
+                dependencies=orch_main._session_attach_payload_dependencies(),
             )
 
         assert payload["resolved_config"] is None
@@ -1168,9 +1174,10 @@ class TestSendSessionAttachPayload:
                 orch_main, "_resolve_session_config", AsyncMock(return_value=None)
             ),
         ):
-            payload = await orch_main._assemble_session_attach_payload(
+            payload = await session_attach_payload.assemble_session_attach_payload(
                 self.thread_id,
                 config_override={"workspace": {"backend": "virtual"}},
+                dependencies=orch_main._session_attach_payload_dependencies(),
             )
 
         assert payload is not None
@@ -1218,9 +1225,10 @@ class TestSendSessionAttachPayload:
                 orch_main, "_resolve_session_config", AsyncMock(return_value=None)
             ),
         ):
-            payload = await orch_main._assemble_session_attach_payload(
+            payload = await session_attach_payload.assemble_session_attach_payload(
                 self.thread_id,
                 config_override={"workspace": {"backend": "sandbox"}},
+                dependencies=orch_main._session_attach_payload_dependencies(),
             )
 
         assert payload is None
