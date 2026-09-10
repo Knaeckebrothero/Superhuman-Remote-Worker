@@ -100,7 +100,9 @@ The current token set:
 
 **Surfaces**: `--app-bg`, `--panel-bg`, `--panel-header-bg`, `--timeline-bg`, `--surface-0`, `--surface-1`, `--surface-2`
 
-**Borders**: `--border-color`
+**Borders**: `--border-color` (controls), `--border-hairline` (derived: 55% border over panel — cards, dividers, panel edges)
+
+**Focus**: `--ring` (derived: 28% accent — the focus halo on every primitive)
 
 **Text**: `--text-primary`, `--text-secondary`, `--text-muted`
 

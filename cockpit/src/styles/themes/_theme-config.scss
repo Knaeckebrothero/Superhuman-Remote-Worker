@@ -33,6 +33,10 @@ $travertine-theme: (
   // Borders
   'border-color': #dccfb6,
 
+  // Derived (2026-09-10 refresh) — mixes of existing tokens, never new hex.
+  'border-hairline': 'color-mix(in srgb, var(--border-color) 55%, var(--panel-bg))', // cards, dividers, panel edges
+  'ring':            'color-mix(in srgb, var(--accent-color) 28%, transparent)',    // focus halo
+
   // Text
   'text-primary':   #2a1d12,
   'text-secondary': #5a4632,
@@ -110,6 +114,10 @@ $senate-theme: (
 
   // Borders
   'border-color': #33333d,
+
+  // Derived (2026-09-10 refresh) — mixes of existing tokens, never new hex.
+  'border-hairline': 'color-mix(in srgb, var(--border-color) 55%, var(--panel-bg))', // cards, dividers, panel edges
+  'ring':            'color-mix(in srgb, var(--accent-color) 28%, transparent)',    // focus halo
 
   // Text — body lifted to F4 for ~13:1 contrast, muted lifted to ~5.5:1
   'text-primary':   #f4f2ee,

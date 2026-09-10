@@ -14,3 +14,11 @@ describe('_theme-config.scss ramp tokens', () => {
     }
   });
 });
+
+describe('_theme-config.scss derived tokens', () => {
+  for (const token of ['ring', 'border-hairline']) {
+    it(`defines ${token} in BOTH theme maps`, () => {
+      expect(scss.split(`'${token}':`).length - 1, `--${token} must appear in both maps`).toBe(2);
+    });
+  }
+});
