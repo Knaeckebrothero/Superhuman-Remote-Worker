@@ -1278,7 +1278,7 @@ class Smoke:
         )
         return {"template": {"ref": {"name": name}}}
 
-    def exercise_job(self, backend="sandbox"):
+    def exercise_job(self, backend="sandbox", *, compatibility=False):
         run_id = self.prefix + "job"
         self.fixture.arm(run_id, "worker-job", 100)
         document = authored_job(
@@ -1286,23 +1286,52 @@ class Smoke:
         )
         document["metadata"]["name"] += "-" + backend
         worker = authored_expert(self.prefix, self.image, self.model)
-        self.gate.apply(worker)
+        worker_item = self.gate.apply(worker)["resources"][0]
         document["spec"]["execution"]["expert"] = {
             "ref": {"name": worker["metadata"]["name"]}
         }
         selected = self.workspace_binding(backend)
         document["spec"]["execution"]["workspace"] = selected
-        result = self.gate.apply(document, key=self.prefix + "job-create-" + backend)
-        require(
-            len(result["executions"]) == 1,
-            "Job admission did not return one work identity.",
-        )
-        self.job_id = str(UUID(next(iter(result["executions"].values()))))
-        item = result["resources"][0]
+        if compatibility:
+            # The compatibility Job API supplies a default Project. Explicitly
+            # name the Account scope of this independently owned template.
+            selected["template"]["ref"]["scope"] = worker_item["resource"]["metadata"][
+                "scope"
+            ]
+            result = self.gate.request(
+                "POST",
+                "/api/jobs",
+                payload={
+                    "description": "E2E-" + run_id,
+                    "expert_id": self.gate.catalog_identity(worker_item),
+                    "workspace": selected,
+                    "datasource_ids": [],
+                },
+            )
+            self.job_id = str(UUID(result["id"]))
+            item = None
+        else:
+            result = self.gate.apply(
+                document, key=self.prefix + "job-create-" + backend
+            )
+            require(
+                len(result["executions"]) == 1,
+                "Job admission did not return one work identity.",
+            )
+            self.job_id = str(UUID(next(iter(result["executions"].values()))))
+            item = result["resources"][0]
 
         def finished():
-            current = self.gate.current(item)
-            phase = current.get("status", {}).get("phase")
+            current = (
+                self.gate.request("GET", "/api/jobs/" + self.job_id)
+                if compatibility
+                else self.gate.current(item)
+            )
+            phase = (
+                current.get("status")
+                if compatibility
+                else current.get("status", {}).get("phase")
+            )
             require(
                 phase not in {"failed", "paused", "pending_review"},
                 "The deterministic Job did not complete successfully.",
@@ -1318,13 +1347,14 @@ class Smoke:
             and snapshot["workspace"] == selected,
             "The Job did not bind its referenced workspace independently of the Expert.",
         )
-        repeated = self.gate.apply(document)
-        require(
-            next(iter(repeated["executions"].values())) == self.job_id
-            and repeated["resources"][0]["uid"] == item["uid"]
-            and not repeated["resources"][0]["changed"],
-            "Reapply replayed a completed Job.",
-        )
+        if not compatibility:
+            repeated = self.gate.apply(document)
+            require(
+                next(iter(repeated["executions"].values())) == self.job_id
+                and repeated["resources"][0]["uid"] == item["uid"]
+                and not repeated["resources"][0]["changed"],
+                "Reapply replayed a completed Job.",
+            )
         state = self.fixture.state(run_id)
         require(
             state["worker_job_tool_steps"] >= 10
@@ -1332,13 +1362,20 @@ class Smoke:
             and state["pending_calls"] == 0,
             "The Job fixture observed missing or unexpected inference.",
         )
-        result = {"workID": self.job_id, "snapshot": snapshot, "provider": state}
+        result = {
+            "workID": self.job_id,
+            "snapshot": snapshot,
+            "provider": state,
+            "ingress": "job-api" if compatibility else "manifest-api",
+        }
         self.evidence.setdefault("workspaceJobs", []).append(result)
         if backend == "sandbox":
             self.evidence["job"] = result
         self.fixture.reset(run_id)
         self.check(
-            f"Native SRW manifest Job on {backend} completes through the same Expert and reapply preserves its execution identity"
+            f"Existing Job API selects a referenced {backend} workspace independently of its Expert"
+            if compatibility
+            else f"Native SRW manifest Job on {backend} completes through the same Expert and reapply preserves its execution identity"
         )
 
     def reply(self, number):
@@ -1692,6 +1729,11 @@ def main(argv=None):
         "--fixture-image",
         help="Previously published immutable srw-registry:5000 fixture image; omit to build current source",
     )
+    parser.add_argument(
+        "--compatibility-job-only",
+        action="store_true",
+        help="Exercise only workspace selection through the existing Job API",
+    )
     args = parser.parse_args(argv)
     prefix = "cutover-" + uuid4().hex[:12] + "-"
     evidence = {
@@ -1752,10 +1794,17 @@ def main(argv=None):
             smoke.gate.login()
             fixture.create(fixture_image)
             smoke.register_model()
-            smoke.exercise_job()
-            smoke.exercise_job("virtual")
-            smoke.exercise_session()
-            smoke.exercise_workspace_sessions()
+            if args.compatibility_job_only:
+                evidence["scope"] = (
+                    "Real existing Job API with a referenced virtual workspace and independently selected Expert"
+                )
+                smoke.exercise_job("virtual", compatibility=True)
+            else:
+                smoke.exercise_job()
+                smoke.exercise_job("virtual")
+                smoke.exercise_job("virtual", compatibility=True)
+                smoke.exercise_session()
+                smoke.exercise_workspace_sessions()
             succeeded = True
         except GateFailure as exc:
             evidence["failure"] = str(exc)

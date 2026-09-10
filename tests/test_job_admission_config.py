@@ -444,3 +444,30 @@ async def test_interleaved_preparations_keep_dependency_and_context_isolation(
         PARENT,
     )
     assert second_deps.resolve_worker_expert.await_args.kwargs["user_id"] == EXPERT
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("origin", ["user_rest", "internal_rest"])
+async def test_manifest_workspace_overrides_inherited_legacy_project_backend(
+    deps, scope, origin
+):
+    deps.store.get_project.return_value = {
+        "id": PROJECT,
+        "default_config_override": {"workspace": {"backend": "vm"}, "autonomy": "full"},
+    }
+    result = await prepare(deps, scope, origin=origin, workspace=None)
+    assert result.config_override["workspace"]["backend"] == "none"
+    assert result.config_override["autonomy"] == "full"
+    assert result.workspace_selection["document"] is None
+
+
+@pytest.mark.asyncio
+async def test_two_authored_workspace_selections_remain_an_error(deps, scope):
+    with pytest.raises(HTTPException) as denied:
+        await prepare(
+            deps,
+            scope,
+            workspace=None,
+            config_override={"workspace": {"backend": "sandbox"}},
+        )
+    assert denied.value.status_code == 422

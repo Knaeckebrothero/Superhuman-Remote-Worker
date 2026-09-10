@@ -320,7 +320,11 @@ async def prepare_job_admission_config(
             role="worker",
             workspace=job.workspace,
             supplied=workspace_supplied,
-            config_override=config_override,
+            # Duplicate-selection validation concerns authored request fields;
+            # an inherited legacy Project backend must yield to this choice.
+            config_override=request_config_override
+            if workspace_supplied
+            else config_override,
         )
         config_override = bind_execution_workspace(
             config_override or {}, workspace_config
