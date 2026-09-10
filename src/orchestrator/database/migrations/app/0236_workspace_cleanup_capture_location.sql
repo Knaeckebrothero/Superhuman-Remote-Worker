@@ -1,3 +1,16 @@
+-- migration:     0236_workspace_cleanup_capture_location.sql
+-- description:   Preserve the location of an exact Kubernetes cleanup capture.
+-- depends-on:    0235_manifest_user_retirement.sql
+-- expected:      < 5s. One nullable column; no capture backfill.
+-- locks:         managed_repository_workspace_cleanup_intents only.
+-- transactional: yes
+
+BEGIN;
+SET LOCAL lock_timeout = '2s';
+SET LOCAL statement_timeout = '5min';
+SET LOCAL idle_in_transaction_session_timeout = '5min';
+SET LOCAL timezone = 'UTC';
+
 -- Preserve the location of a new exact Kubernetes cleanup capture. Existing
 -- captures remain unknown: today's namespace must not be invented as history.
 ALTER TABLE public.managed_repository_workspace_cleanup_intents
@@ -28,7 +41,7 @@ ALTER TABLE public.managed_repository_workspace_cleanup_intents
             AND length(resource_location->>'service') BETWEEN 1 AND 253
             AND resource_location->>'service' ~ '^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$'
         )
-    );
+    ) NOT VALID;
 
 CREATE FUNCTION public.protect_workspace_cleanup_capture_location()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
@@ -61,3 +74,5 @@ FOR EACH ROW EXECUTE FUNCTION public.protect_workspace_cleanup_capture_location(
 
 COMMENT ON COLUMN public.managed_repository_workspace_cleanup_intents.resource_location IS
     'Namespace and immutable Kubernetes resource names observed with this UID capture; NULL historical captures remain unproven.';
+
+COMMIT;

@@ -1,3 +1,17 @@
+-- migration:     0234_manifest_resources.sql
+-- description:   Authored resources, immutable revisions and execution
+--                admission snapshots for the manifest tier.
+-- depends-on:    0233_run_queue_bg_tasks.sql
+-- expected:      < 5s. New tables only; no row backfill.
+-- locks:         New tables, plus one ADD COLUMN each on experts and projects.
+-- transactional: yes
+
+BEGIN;
+SET LOCAL lock_timeout = '2s';
+SET LOCAL statement_timeout = '5min';
+SET LOCAL idle_in_transaction_session_timeout = '5min';
+SET LOCAL timezone = 'UTC';
+
 -- Authored resources, immutable revisions and execution admission snapshots.
 -- Existing lifecycle tables remain the authority for work and workspace status.
 CREATE TABLE srw_resources (
@@ -27,8 +41,19 @@ CREATE INDEX srw_resources_project ON srw_resources(project_id) WHERE deleted_at
 CREATE UNIQUE INDEX srw_resources_link ON srw_resources(kind, linked_id)
     WHERE linked_id IS NOT NULL AND deleted_at IS NULL;
 
-ALTER TABLE experts ADD COLUMN manifest_resource_id UUID REFERENCES srw_resources(id) ON DELETE RESTRICT;
-ALTER TABLE projects ADD COLUMN manifest_resource_id UUID REFERENCES srw_resources(id) ON DELETE RESTRICT;
+-- experts and projects predate this chain, so the reference is added NOT VALID
+-- and validated by 0239. The column arrives all-NULL and no row can reference a
+-- resource yet, so the deferred scan can only ever confirm what is already true.
+ALTER TABLE experts ADD COLUMN manifest_resource_id UUID;
+ALTER TABLE experts
+    ADD CONSTRAINT experts_manifest_resource_id_fkey
+    FOREIGN KEY (manifest_resource_id) REFERENCES srw_resources(id)
+    ON DELETE RESTRICT NOT VALID;
+ALTER TABLE projects ADD COLUMN manifest_resource_id UUID;
+ALTER TABLE projects
+    ADD CONSTRAINT projects_manifest_resource_id_fkey
+    FOREIGN KEY (manifest_resource_id) REFERENCES srw_resources(id)
+    ON DELETE RESTRICT NOT VALID;
 
 CREATE TABLE srw_resource_revisions (
     resource_id UUID NOT NULL REFERENCES srw_resources(id) ON DELETE RESTRICT,
@@ -177,3 +202,5 @@ $$;
 CREATE TRIGGER trg_manifest_job_dispatch
 BEFORE UPDATE OF status,assigned_agent_id,lease_expires_at,execution_lane ON jobs
 FOR EACH ROW EXECUTE FUNCTION enforce_manifest_job_dispatch();
+
+COMMIT;

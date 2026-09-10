@@ -182,6 +182,20 @@ excluded_rules = [
 #                that replacing the inline CHECK must be one atomic change so
 #                no row can be written between the DROP and the ADD — and a
 #                NOT VALID split would reopen exactly that window.
+#        - app/0235: two ban-drop-not-null findings. The rule's stated risk is
+#                breaking existing clients, and there are none: both columns
+#                belong to srw_workspace_instances and srw_resource_secrets,
+#                tables CREATEd by app/0234 one file earlier in this same
+#                chain. No database has ever held these tables with a NOT NULL
+#                owner_id, because every database that applies 0235 applied
+#                0234 in the same startup sequence moments earlier. Relaxing
+#                the column is this migration's entire documented purpose:
+#                deleting a principal must preserve completed manifest history
+#                and shared Project credentials rather than cascade through
+#                them. The two constraint-missing-not-valid findings the file
+#                also raised are fixed rather than excluded: both CHECKs are
+#                now added NOT VALID and validated by app/0239, so this entry
+#                covers only the two deliberate nullability relaxations.
 excluded_paths = [
     "src/orchestrator/database/migrations/app/0001_initial.sql",
     "src/orchestrator/database/migrations/vector/0001_initial.sql",
@@ -200,5 +214,6 @@ excluded_paths = [
     "src/orchestrator/database/migrations/app/0203_threads_ssh_handle_idx.notx.sql",
     "src/orchestrator/database/migrations/app/0204_ssh_attachments.sql",
     "src/orchestrator/database/migrations/app/0212_search_fetch_capabilities.sql",
+    "src/orchestrator/database/migrations/app/0235_manifest_user_retirement.sql",
     "src/orchestrator/database/migrations/vector/0008_kb_index_chunking.sql",
 ]
