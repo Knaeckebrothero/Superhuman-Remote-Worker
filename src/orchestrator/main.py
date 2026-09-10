@@ -775,6 +775,10 @@ from orchestrator.services.vm_readiness import vm_readiness_prober  # noqa: E402
 from orchestrator.services.container_provisioner import (  # noqa: E402
     WORKSPACE_RUNTIME_INCARNATION_KEY,
     WorkspaceCleanupOutcome,
+    # A deliberate type re-export, not an operation wrapper: several suites
+    # name it through this module. It forwards no call and carries no
+    # dependency object, so it is not part of the bridge ledger.
+    WorkspaceRuntimeAttestation,  # noqa: F401
     WorkspaceRuntimeAuthorityError,
     WorkspaceTeardownIdentity,
     container_provisioner,
