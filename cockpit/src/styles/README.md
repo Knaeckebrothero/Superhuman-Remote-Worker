@@ -153,7 +153,7 @@ The current token set:
 
 **Typography roles**: `--font-primary`, `--font-control`, `--font-mono`
 
-**Brand-only**: `--font-display` (legacy alias for `--font-family-display`) — read by exactly three selectors (rail brand block, chat hero); guarded by `visual-language.spec.ts`. `--letter-spacing-display` / `--text-transform-display` are optional theme hooks no active theme sets. `--user-bubble`, `--user-bubble-text` are chat-bubble colour tokens.
+**Brand-only**: `--font-display` (legacy alias for `--font-family-display`) — read by four selectors (rail brand block, chat hero title, vexillum lettering); guarded by `visual-language.spec.ts`. `--letter-spacing-display` / `--text-transform-display` are optional theme hooks no active theme sets. `--user-bubble`, `--user-bubble-text` are chat-bubble colour tokens.
 
 Don't introduce hex literals in component SCSS. If a needed color token is missing, add it to **every** theme map at once — leaving a token undefined for one theme means components break under that theme.
 
@@ -240,7 +240,7 @@ A primitive that exposes `--btn-radius` (as in the button example above) can be 
 
 ## Roman accents
 
-`_roman-accents.scss` is scoped under `.theme-travertine, .theme-senate` and declares what is left of the Roman look: Cinzel as the brand face (read by three selectors) and the approval-card left rule. Per-theme tweaks (Travertine's gold inlay under panel headers, Senate's accent-mix equivalent) follow in their own scoped blocks. Both the rule and the Senate inlay read `--accent-color`, so they follow the accent axis.
+`_roman-accents.scss` is scoped under `.theme-travertine, .theme-senate` and declares what is left of the Roman look: Cinzel as the brand face (read by four selectors: the rail brand block, the hero title and the SRW lettering of the inline vexillum) and the approval-card left rule. Per-theme tweaks (Travertine's gold inlay under panel headers, Senate's accent-mix equivalent) follow in their own scoped blocks. Both the rule and the Senate inlay read `--accent-color`, so they follow the accent axis.
 
 Radii are deliberately **not** overridden there any more. The original sharp-corner pass (`--radius-sm/md/xl: 0`, `--radius-lg: 2px`) was retired on 2026-09-10; both themes use the rounded primitive scale via the role tokens — controls `md` (0.5rem, 8px), surfaces `lg` (0.75rem, 12px), small tags `sm` (0.25rem, 4px), pills and functional circles unchanged. `roman-accents.spec.ts` guards against the flatten creeping back.
 

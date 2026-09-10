@@ -8,9 +8,10 @@
 // =============================================================================
 .theme-travertine,
 .theme-senate {
-  // Cinzel is the BRAND face, not the UI face. Exactly three selectors read
-  // it: .sidebar-logo and .sidebar-label (rail brand block, sidebar.component.ts)
-  // and .empty-title (chat hero, chat-empty-state.component.scss). Everything
+  // Cinzel is the BRAND face, not the UI face. Exactly four selectors read
+  // it: .sidebar-logo and .sidebar-label (rail brand block, sidebar.component.ts),
+  // .empty-title (chat hero, chat-empty-state.component.scss) and the SRW
+  // lettering of the inline vexillum (ui/vexillum). Everything
   // else is Inter via --font-family-base; --font-primary is NOT rebound here,
   // so type.display renders sentence-case Inter by its own fallbacks.
   // Guarded by styles/visual-language.spec.ts.

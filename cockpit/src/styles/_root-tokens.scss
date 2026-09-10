@@ -33,7 +33,8 @@
     sans-serif;
 
   // Display family defaults to the base; the two active themes bind it to
-  // Cinzel (read only by the rail brand block and the chat hero) via
+  // Cinzel (read only by the rail brand block, the chat hero title and the
+  // vexillum lettering) via
   // _roman-accents.scss. Loaded in cockpit/src/index.html.
   --font-family-display: var(--font-family-base);
   --font-family-mono:

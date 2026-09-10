@@ -92,12 +92,12 @@ describe('typography — recipes and scale', () => {
 });
 
 describe('typography — --font-display readers', () => {
-  it('only the rail brand block and the chat hero read the Cinzel token', () => {
+  it('only the rail brand block, the chat hero and the vexillum lettering read the Cinzel token', () => {
     const sites = scanSources(join(here, '../app'), /var\(--font-display/);
-    const allowed = /sidebar\.component\.ts|chat-empty-state\.component\.scss/;
+    const allowed = /sidebar\.component\.ts|chat-empty-state\.component\.scss|vexillum\.component\.ts/;
     const offenders = sites.filter((l) => !allowed.test(l));
     expect(offenders, offenders.join('\n')).toEqual([]);
-    expect(sites.length).toBe(3);
+    expect(sites.length).toBe(4);
   });
 });
 

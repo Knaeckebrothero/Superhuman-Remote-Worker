@@ -2,6 +2,7 @@ import {ChangeDetectionStrategy, Component, computed, input, output} from '@angu
 import {RouterLink} from '@angular/router';
 import {TranslocoPipe} from '@jsverse/transloco';
 import {AppIconComponent} from '../../../ui/icon';
+import {VexillumComponent} from '../../../ui/vexillum';
 
 /** One suggestion chip, already resolved to the active language. */
 export interface DisplayedSuggestion {
@@ -25,11 +26,11 @@ export interface DisplayedSuggestion {
   selector: 'app-chat-empty-state',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [RouterLink, TranslocoPipe, AppIconComponent],
+  imports: [RouterLink, TranslocoPipe, AppIconComponent, VexillumComponent],
   styleUrl: './chat-empty-state.component.scss',
   template: `
     <div class="empty-inner">
-      <img class="empty-mark" src="assets/icons/icon-mark.svg" alt="" />
+      <srw-vexillum class="empty-mark" />
       <h2 class="empty-title">{{ titleKey() | transloco }}</h2>
       <p class="empty-subtitle">{{ subtitleKey() | transloco }}</p>
 
