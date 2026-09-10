@@ -190,8 +190,8 @@ def test_agent_recipes_prepare_final_cache_and_verify_as_nonroot_offline(recipe)
         if line.startswith("COPY ") and script in line
     ]
     assert len(copies) == 1
-    assert copies[0][1] == script
-    target = copies[0][2]
+    assert copies[0][-2] == script
+    target = copies[0][-1]
     preparation = instructions.index(f"RUN python {target} prepare")
     verification = instructions.index(f"RUN --network=none python {target} verify")
     runtime_user = instructions.index("USER srw")

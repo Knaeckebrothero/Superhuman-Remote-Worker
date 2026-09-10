@@ -221,8 +221,8 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright
 #     SSH (exec_command), so Chrome's CDP stays on the workspace loopback and
 #     never crosses the pod network. See knowledge-base/knowledge/features/browser_workspace_executor.md
 # ---------------------------------------------------------------------------
-COPY docker/browser-exec /usr/local/bin/browser-exec
-RUN chmod +x /usr/local/bin/browser-exec
+# The workspace user needs read and execute access even from a private checkout.
+COPY --chmod=0755 docker/browser-exec /usr/local/bin/browser-exec
 
 # ---------------------------------------------------------------------------
 # 2d. Browser stack conformance gate — the SAME script the VM golden image runs
@@ -233,10 +233,9 @@ RUN chmod +x /usr/local/bin/browser-exec
 #     See knowledge-base/knowledge/issues/vm_workspace_missing_browser_exec.md. Installed permanently
 #     as well as run, so any live workspace can be interrogated in five seconds.
 # ---------------------------------------------------------------------------
-COPY docker/check-browser-stream.py /usr/local/bin/check-browser-stream
-COPY docker/assert-browser-stack.sh /usr/local/bin/assert-browser-stack
-RUN chmod +x /usr/local/bin/check-browser-stream /usr/local/bin/assert-browser-stack \
-    && /usr/local/bin/assert-browser-stack
+COPY --chmod=0755 docker/check-browser-stream.py /usr/local/bin/check-browser-stream
+COPY --chmod=0755 docker/assert-browser-stack.sh /usr/local/bin/assert-browser-stack
+RUN /usr/local/bin/assert-browser-stack
 
 # ---------------------------------------------------------------------------
 # 3. code-server (IDE)
@@ -399,8 +398,7 @@ RUN cp -a /home/agent-host /etc/skel.agent-host
 # ---------------------------------------------------------------------------
 # 10. Entrypoint — SSHD (foreground) + code-server (background)
 # ---------------------------------------------------------------------------
-COPY docker/workspace-entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh
+COPY --chmod=0755 docker/workspace-entrypoint.sh /usr/local/bin/entrypoint.sh
 
 EXPOSE 30022 38080 9222
 
