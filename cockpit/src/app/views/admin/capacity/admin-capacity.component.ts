@@ -78,7 +78,7 @@ export const CAPACITY_REFRESH_MS = 10_000;
               <p class="section-note">{{ 'admin.capacity.none' | transloco }}</p>
             } @else {
               <div class="table-wrap">
-                <table class="parked-table" data-testid="parked-table">
+                <table class="parked-table app-table" data-testid="parked-table">
                   <thead>
                     <tr>
                       <th>{{ 'admin.capacity.colTitle' | transloco }}</th>
@@ -207,23 +207,10 @@ export const CAPACITY_REFRESH_MS = 10_000;
       .table-wrap {
         overflow-x: auto;
       }
-      .parked-table {
-        width: 100%;
-        border-collapse: collapse;
-        font-size: 13px;
-      }
       .parked-table th,
       .parked-table td {
-        text-align: left;
-        padding: 8px 10px;
-        border-bottom: 1px solid var(--border-color);
         vertical-align: top;
         white-space: nowrap;
-      }
-      .parked-table th {
-        font-size: 12px;
-        color: var(--text-muted);
-        font-weight: 600;
       }
       .cell-title a {
         color: var(--text-primary);

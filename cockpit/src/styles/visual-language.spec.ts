@@ -124,7 +124,6 @@ describe('surfaces — data tables', () => {
       const text = read(join(dir, file)).split('\n')[Number(line) - 1];
       return !/app-table/.test(text);
     });
-    // Task 11 converts the jobs table; Task 12 tightens this to toEqual([]).
-    expect(bare.length, bare.join('\n')).toBeLessThanOrEqual(12);
+    expect(bare, bare.join('\n')).toEqual([]);
   });
 });

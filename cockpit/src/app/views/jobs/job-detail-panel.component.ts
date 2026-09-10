@@ -386,7 +386,7 @@ export function subjobBlockedKey(
               </button>
             }
           </div>
-          <table class="subjob-table">
+          <table class="subjob-table app-table">
             <tbody>
               @for (sub of subjobs(); track sub.id) {
                 <tr
@@ -430,7 +430,7 @@ export function subjobBlockedKey(
               {{ 'jobs.detail.subagents' | transloco: {count: subagents().length} }}
             </span>
           </div>
-          <table class="subjob-table subagent-table">
+          <table class="subjob-table subagent-table app-table">
             <tbody>
               @for (child of subagents(); track child.thread_id) {
                 <tr
@@ -664,14 +664,8 @@ export function subjobBlockedKey(
       .subjobs-reveal:hover {
         color: var(--accent-hover);
       }
-      .subjob-table {
-        width: 100%;
-        border-collapse: collapse;
-        font-size: 12px;
-      }
       .subjob-row {
         cursor: pointer;
-        border-top: 1px solid var(--border-color);
       }
       .subjob-row:hover {
         background: var(--hover);

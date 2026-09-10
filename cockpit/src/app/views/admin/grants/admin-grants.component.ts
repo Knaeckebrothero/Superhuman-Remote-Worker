@@ -101,7 +101,7 @@ const INHERIT = '__inherit__';
           }
 
           @if (scopeReady()) {
-            <table class="grid">
+            <table class="grid app-table">
               <thead><tr><th>Capability</th><th>Default</th><th>Grant</th></tr></thead>
               <tbody>
                 @for (k of catalogKeys(); track k) {
@@ -166,8 +166,6 @@ const INHERIT = '__inherit__';
       padding: 0.35rem 0.5rem; background: var(--surface-0); color: var(--text-primary);
       border: 1px solid var(--border-color); border-radius: var(--radius-surface);
     }
-    .grid { width: 100%; border-collapse: collapse; }
-    .grid th, .grid td { text-align: left; padding: 0.5rem; border-bottom: 1px solid var(--border-color); color: var(--text-primary); }
     .grid .muted, .muted { color: var(--text-muted); }
     .banner { margin-top: 1rem; padding: 0.5rem 0.75rem; border-radius: 6px; }
     .banner.err { background: var(--danger-tint); color: var(--danger); }

@@ -245,7 +245,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                 <div class="empty-inline">{{ 'projectDetail.jobs.empty' | transloco }}</div>
               } @else {
                 <div class="table-scroll">
-                <table class="data-table">
+                <table class="data-table app-table">
                   <thead>
                     <tr>
                       <th>{{ 'projectDetail.jobs.colStatus' | transloco }}</th>
@@ -603,7 +603,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                 <div class="empty-inline">{{ 'projectDetail.datasources.empty' | transloco }}</div>
               } @else {
                 <div class="table-scroll">
-                <table class="data-table">
+                <table class="data-table app-table">
                   <thead>
                     <tr>
                       <th>{{ 'projectDetail.datasources.colName' | transloco }}</th>
@@ -719,7 +719,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                 <div class="empty-inline">{{ 'projectDetail.repos.empty' | transloco }}</div>
               } @else {
                 <div class="table-scroll">
-                <table class="data-table">
+                <table class="data-table app-table">
                   <thead>
                     <tr>
                       <th>{{ 'projectDetail.repos.colRole' | transloco }}</th>
@@ -838,7 +838,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                 <div class="empty-inline">{{ 'projectDetail.members.empty' | transloco }}</div>
               } @else {
                 <div class="table-scroll">
-                <table class="data-table">
+                <table class="data-table app-table">
                   <thead>
                     <tr>
                       <th>{{ 'projectDetail.members.colUser' | transloco }}</th>
@@ -1304,32 +1304,6 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
 
     /* Tables */
     .table-section { display: flex; flex-direction: column; gap: 12px; }
-
-    .data-table {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 12px;
-    }
-
-    .data-table th {
-      text-align: left;
-      padding: 10px 12px;
-      background: var(--surface-0);
-      color: var(--text-muted);
-      font-weight: 500;
-      text-transform: uppercase;
-      font-size: 10px;
-      letter-spacing: 0.5px;
-      border-bottom: 1px solid var(--border-color);
-    }
-
-    .data-table td {
-      padding: 10px 12px;
-      border-bottom: 1px solid var(--border-color);
-      color: var(--text-primary);
-      vertical-align: middle;
-    }
-
     .desc-cell { max-width: 250px; }
     .url-cell { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 

@@ -108,7 +108,7 @@ export function duplicateResultTranslationArgs(
       } @else if (filtered().length === 0) {
         <p class="empty">{{ 'experts.empty' | transloco }}</p>
       } @else {
-        <table class="grid">
+        <table class="grid app-table">
           <thead>
             <tr>
               <th>{{ 'experts.colName' | transloco }}</th>
@@ -272,17 +272,6 @@ export function duplicateResultTranslationArgs(
         display: flex;
         gap: 0.5rem;
         margin-bottom: 1rem;
-      }
-      .grid {
-        width: 100%;
-        border-collapse: collapse;
-      }
-      .grid th,
-      .grid td {
-        text-align: left;
-        padding: 0.5rem;
-        border-bottom: 1px solid var(--border-color);
-        color: var(--text-primary);
       }
       .name-cell .name-inner {
         display: inline-flex;

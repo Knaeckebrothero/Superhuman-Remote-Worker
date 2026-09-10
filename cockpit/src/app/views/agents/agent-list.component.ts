@@ -96,7 +96,7 @@ import {AppSpinnerComponent} from '../../ui/spinner';
       <!-- Agent Table -->
       @if (agents().length > 0) {
         <div class="table-container">
-          <table class="agent-table">
+          <table class="agent-table app-table">
             <thead>
               <tr>
                 <th>{{ 'agentList.table.status' | transloco }}</th>
@@ -302,34 +302,6 @@ import {AppSpinnerComponent} from '../../ui/spinner';
         flex: 1;
         overflow: auto;
         padding: 8px;
-      }
-
-      .agent-table {
-        width: 100%;
-        border-collapse: collapse;
-        font-size: 12px;
-      }
-
-      .agent-table th {
-        text-align: left;
-        padding: 8px 10px;
-        background: var(--surface-0, var(--surface-0));
-        color: var(--text-muted);
-        font-weight: 500;
-        text-transform: uppercase;
-        font-size: 10px;
-        letter-spacing: 0.5px;
-        border-bottom: 1px solid var(--border-color, var(--surface-1));
-      }
-
-      .agent-table td {
-        padding: 10px;
-        border-bottom: 1px solid var(--border-color, var(--surface-0));
-        color: var(--text-primary, var(--text-primary));
-      }
-
-      .agent-table tbody tr:hover {
-        background: var(--surface-0, var(--surface-0));
       }
 
       .aux-degraded {

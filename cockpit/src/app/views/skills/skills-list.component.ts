@@ -52,7 +52,7 @@ export function isBundledSkill(s: Skill): boolean {
       } @else if (rows().length === 0) {
         <p class="empty">{{ 'skills.empty' | transloco }}</p>
       } @else {
-        <table class="grid">
+        <table class="grid app-table">
           <thead>
             <tr>
               <th>{{ 'skills.colName' | transloco }}</th>
@@ -203,16 +203,8 @@ export function isBundledSkill(s: Skill): boolean {
         display: flex;
         gap: 0.5rem;
       }
-      .grid {
-        width: 100%;
-        border-collapse: collapse;
-      }
       .grid th,
       .grid td {
-        text-align: left;
-        padding: 0.5rem;
-        border-bottom: 1px solid var(--border-color);
-        color: var(--text-primary);
         vertical-align: top;
       }
       .name-cell .name-inner {

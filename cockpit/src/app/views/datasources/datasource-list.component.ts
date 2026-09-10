@@ -1365,7 +1365,7 @@ type KeyValueRow = {key: string; value: string};
       @if (filteredDatasources().length > 0) {
         <div class="table-container">
           <div class="table-inner">
-            <table class="ds-table">
+            <table class="ds-table app-table">
               <thead>
                 <tr>
                   <th>{{ 'datasources.table.colType' | transloco }}</th>
@@ -2225,35 +2225,6 @@ type KeyValueRow = {key: string; value: string};
         display: flex;
         justify-content: center;
         padding: 8px 12px 4px;
-      }
-
-      .ds-table {
-        width: 100%;
-        border-collapse: collapse;
-        font-size: 12px;
-      }
-
-      .ds-table th {
-        text-align: left;
-        padding: 8px 10px;
-        background: var(--surface-0, var(--surface-0));
-        color: var(--text-muted);
-        font-weight: 500;
-        text-transform: uppercase;
-        font-size: 10px;
-        letter-spacing: 0.5px;
-        border-bottom: 1px solid var(--border-color, var(--surface-1));
-      }
-
-      .ds-table td {
-        padding: 10px;
-        border-bottom: 1px solid var(--border-color, var(--surface-0));
-        color: var(--text-primary, var(--text-primary));
-        vertical-align: middle;
-      }
-
-      .ds-table tbody tr:hover {
-        background: var(--surface-0, var(--surface-0));
       }
 
       app-badge app-icon {
