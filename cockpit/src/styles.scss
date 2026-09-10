@@ -58,6 +58,38 @@ body {
   font-size: v.$font-size-sm; // 14px
 }
 
+// --- Headings ---
+// Sentence case, weight + size carry hierarchy, tracking tightens with size.
+// Components that title without an h-tag use type.heading($level).
+h1,
+h2,
+h3,
+h4 {
+  font-family: var(--font-heading);
+  font-weight: 600;
+  line-height: 1.25;
+  color: var(--text-primary);
+}
+
+h1 {
+  font-size: 1.5rem;
+  letter-spacing: -0.02em;
+}
+
+h2 {
+  font-size: 1.25rem;
+  letter-spacing: -0.015em;
+}
+
+h3 {
+  font-size: 1rem;
+  letter-spacing: -0.01em;
+}
+
+h4 {
+  font-size: 0.875rem;
+}
+
 // --- Angular-split gutter styling ---
 .as-split-gutter {
   background: var(--gutter-color) !important;

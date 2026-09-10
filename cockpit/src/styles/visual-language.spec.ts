@@ -67,3 +67,26 @@ describe('typography — Cinzel only on the brand mark and hero', () => {
     expect(overrides).toMatch(/\.approval-card,\s*\n\s*\.tool-approval\s*\{[^}]*border-left:\s*3px solid var\(--accent-color\)/);
   });
 });
+
+describe('typography — recipes and scale', () => {
+  const recipes = code(read('./_typography-recipes.scss'));
+  const variables = code(read('./_variables.scss'));
+  const styles = code(read('../styles.scss'));
+
+  it('eyebrow tracking is modest and the display recipe is medium weight', () => {
+    expect(recipes).toMatch(/@mixin eyebrow\s*\{[^}]*letter-spacing:\s*0\.06em/);
+    expect(recipes).not.toMatch(/letter-spacing:\s*0\.2[0-9]em/);
+    expect(recipes).toMatch(/@mixin display\s*\{[^}]*font-weight:\s*500/);
+    expect(recipes).toMatch(/@mixin heading\(\$level\)/);
+  });
+
+  it('the scale has a 13px control size and a 12px spacing step', () => {
+    expect(variables).toMatch(/\$font-size-control:\s*0\.8125rem/);
+    expect(variables).toMatch(/\$space-12:\s*0\.75rem/);
+  });
+
+  it('headings are styled globally, sentence case, tight tracking', () => {
+    expect(styles).toMatch(/\nh1\s*\{[^}]*letter-spacing:\s*-0\.02em/);
+    expect(styles).not.toMatch(/\nh[1-4][^{]*\{[^}]*text-transform:\s*uppercase/);
+  });
+});

@@ -21,6 +21,7 @@
   --font-primary: var(--font-family-base); // primary-variant buttons; Roman themes override to display
   --font-control: var(--font-family-base); // body of buttons, inputs, labels
   --font-mono:    var(--font-family-mono); // code, tool args, workbench surfaces
+  --font-heading: var(--font-family-base); // page/section titles; type.heading()
 
   // --- Layout roles ---
   --content-max-width:      var(--width-content);      // centered page content: forms, settings, lists, grids

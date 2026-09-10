@@ -13,25 +13,53 @@
 //
 //   .app-button[data-variant='primary'] { @include type.display; }
 //   .section-label                      { @include type.eyebrow; }
+//   .page-title                         { @include type.heading(1); }
 //   .tool-args                          { @include type.mono; }
 
-// Display — primary buttons, brand surfaces. Roman themes: Cinzel + uppercase
-// + letterspaced. Non-Roman: inherits the base font, sentence case.
+// Display — brand-adjacent emphasis (primary button labels, dialog titles).
+// Sentence case, medium weight. A theme MAY rebind the two optional tokens.
 @mixin display {
   font-family: var(--font-primary);
   letter-spacing: var(--letter-spacing-display, normal);
   text-transform: var(--text-transform-display, none);
-  font-weight: 600;
+  font-weight: 500;
 }
 
-// Eyebrow — section labels, kicker text above a heading. Structurally always
-// uppercase + heavily letterspaced; theme controls the font family.
+// Eyebrow — section labels, table headers, kicker text. The ONLY sanctioned
+// uppercase in the UI. 11px, modest tracking, muted.
 @mixin eyebrow {
   font-family: var(--font-primary);
-  letter-spacing: 0.28em;
-  text-transform: uppercase;
-  font-size: 10px;
+  font-size: 0.6875rem; // 11px
   font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+// Heading — page and section titles. Weight and size carry hierarchy; tracking
+// tightens as size grows. Mirrors the global h1–h4 rules in styles.scss for
+// components that render a title without an h-tag.
+@mixin heading($level) {
+  font-family: var(--font-heading);
+  font-weight: 600;
+  line-height: 1.25;
+  text-transform: none;
+
+  @if $level == 1 {
+    font-size: 1.5rem; // 24px
+    letter-spacing: -0.02em;
+  } @else if $level == 2 {
+    font-size: 1.25rem; // 20px
+    letter-spacing: -0.015em;
+  } @else if $level == 3 {
+    font-size: 1rem; // 16px
+    letter-spacing: -0.01em;
+  } @else if $level == 4 {
+    font-size: 0.875rem; // 14px
+    letter-spacing: 0;
+  } @else {
+    @error "type.heading(): level must be 1..4, got #{$level}.";
+  }
 }
 
 // Mono — code, tool args, workbench surfaces. Theme-invariant.
