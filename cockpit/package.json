@@ -18,6 +18,7 @@
     "test:e2e:cloud-review:no-build": "playwright test --config=e2e/cloud-review/playwright.config.ts",
     "test:e2e:cloud-review:capture": "CLOUD_REVIEW_CAPTURE=1 npm run test:e2e:cloud-review:no-build",
     "test:e2e:empty-state": "playwright test --config=e2e/empty-state/playwright.config.ts",
+    "test:e2e:visual-walk": "playwright test --config=e2e/visual-walk/playwright.config.ts",
     "test:e2e:upload-progress": "npm run build && npm run test:e2e:upload-progress:no-build",
     "test:e2e:upload-progress:no-build": "playwright test --config=e2e/upload-progress/playwright.config.ts",
     "test:e2e:app:unit": "vitest run --config=e2e/app/vitest.config.ts",
