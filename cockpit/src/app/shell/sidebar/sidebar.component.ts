@@ -292,6 +292,21 @@ const MODE_ROUTES: Record<RailMode, string> = {
         margin: 8px;
       }
 
+      /* Three modes share one row in the 200px rail. The tab primitive's
+         20px side padding plus wrap-on-overflow pushed "Projects" onto a
+         second line; distribute the slack across the items instead. */
+      .mode-switcher[data-orientation='horizontal'] {
+        flex-wrap: nowrap;
+      }
+
+      .mode-switcher ::ng-deep app-tab-nav-item {
+        flex: 1 1 auto;
+        min-width: 0;
+        justify-content: center;
+        padding-inline: 6px;
+        white-space: nowrap;
+      }
+
       /* Rail session list: the Chat mode's "New chat" action and the
          recency-grouped thread list that fills the space below the
          switcher. */
@@ -341,10 +356,12 @@ const MODE_ROUTES: Record<RailMode, string> = {
         font: inherit;
         font-size: 13px;
         color: var(--text-primary);
+        text-overflow: ellipsis;
       }
 
       .rail-search input::placeholder {
         color: var(--text-muted);
+        text-overflow: ellipsis;
       }
 
       /* The custom icon + <kbd> hint own this affordance — suppress the

@@ -427,7 +427,10 @@ function errorDetail(err: unknown): string {
 
     @media (max-width: 768px) {
       .page-container { padding: 12px; }
-      .projects-grid { grid-template-columns: 1fr; }
+      /* minmax(0, 1fr), not a bare 1fr: a bare 1fr's implicit auto minimum
+         lets the nowrap inline-edit title force the card wider than the phone
+         (measured 456px in a 366px column), cutting off the badges. */
+      .projects-grid { grid-template-columns: minmax(0, 1fr); }
     }
   `],
 })
