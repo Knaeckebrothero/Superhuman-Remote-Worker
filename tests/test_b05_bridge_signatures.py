@@ -61,10 +61,6 @@ BRIDGES = {
     "_require_supported_protected_session_class": (
         session_config_resolution.require_supported_protected_session_class
     ),
-    "_session_grant_violations": session_config_resolution.session_grant_violations,
-    "_session_endpoint_violations": (
-        session_config_resolution.session_endpoint_violations
-    ),
     "_agent_toolset_measurement": agent_toolset_probe.agent_toolset_measurement,
     "_resolve_thread_execution_lane": (
         session_class_policy.resolve_thread_execution_lane
@@ -74,8 +70,6 @@ BRIDGES = {
     ),
     "_user_experts_enabled": grant_enforcement.user_experts_enabled,
     "_grant_project_ids": grant_enforcement.grant_project_ids,
-    "_resolve_user_save_grants": grant_enforcement.resolve_user_save_grants,
-    "_enforce_save_grants": grant_enforcement.enforce_save_grants,
     "_strip_save_grants": grant_enforcement.strip_save_grants,
     "_enforce_expert_save_prelude": grant_enforcement.enforce_expert_save_prelude,
     "_enforce_expert_save": grant_enforcement.enforce_expert_save,
@@ -84,9 +78,6 @@ BRIDGES = {
     "_enforce_session_create_grants": (grant_enforcement.enforce_session_create_grants),
     "_enforce_job_create_grants": grant_enforcement.enforce_job_create_grants,
     "_check_vm_permission": vm_workspace_policy.check_vm_permission,
-    "_enforce_workspace_upgrade_grants_for_config": (
-        grant_enforcement.enforce_workspace_upgrade_grants_for_config
-    ),
     "_enforce_workspace_upgrade_grants": (
         grant_enforcement.enforce_workspace_upgrade_grants
     ),
@@ -109,9 +100,6 @@ BRIDGES = {
         agent_datasource_payload.build_datasource_tool_override
     ),
     "_build_datasources_payload": agent_datasource_payload.build_datasources_payload,
-    "_mcp_datasource_runtime_allowed": (
-        agent_datasource_payload.mcp_datasource_runtime_allowed
-    ),
     "_inherit_parent_datasource_ids": (
         job_datasource_selection.inherit_parent_datasource_ids
     ),
@@ -123,9 +111,6 @@ BRIDGES = {
     ),
     "_resolve_authorized_job_datasources": (
         job_datasource_selection.resolve_authorized_job_datasources
-    ),
-    "_revalidate_job_datasource_ids": (
-        job_datasource_selection.revalidate_job_datasource_ids
     ),
     "_fail_vm_parked_job": job_workspace_runtime.fail_vm_parked_job,
     "_job_needs_sandbox": job_workspace_runtime.job_needs_sandbox,
@@ -144,12 +129,6 @@ BRIDGES = {
     ),
     "_pinned_k8s_job_workspace_authority_is_current": (
         job_workspace_authority.pinned_k8s_job_workspace_authority_is_current
-    ),
-    "_attest_stateless_worker_workspace": (
-        job_workspace_authority.attest_stateless_worker_workspace
-    ),
-    "_attest_stateless_worker_vm_workspace": (
-        job_workspace_authority.attest_stateless_worker_vm_workspace
     ),
     "_workspace_runtime_unchanged_before_delivery": (
         job_workspace_authority.workspace_runtime_unchanged_before_delivery
@@ -176,19 +155,9 @@ BRIDGES = {
     "_build_job_start_request": job_start_bundle.build_job_start_request,
     "_thread_project_ids": thread_mount_rows.thread_project_ids,
     "_should_skip_session_folder": thread_mount_rows.should_skip_session_folder,
-    "_project_ids_from_mounts": thread_mount_rows.project_ids_from_mounts,
-    "_build_default_project_mount_row": (
-        thread_mount_rows.build_default_project_mount_row
-    ),
     "_build_thread_mount_rows": thread_mount_rows.build_thread_mount_rows,
     "_resolve_thread_datasources": thread_mount_rows.resolve_thread_datasources,
     "_resolve_thread_repositories": thread_mount_rows.resolve_thread_repositories,
-    "_agent_canvas_workspace_capabilities": (
-        thread_workspace_delivery.agent_canvas_workspace_capabilities
-    ),
-    "_attest_pinned_thread_k8s_workspace": (
-        thread_workspace_delivery.attest_pinned_thread_k8s_workspace
-    ),
     "_require_pinned_workspace_credential_owner": (
         thread_workspace_delivery.require_pinned_workspace_credential_owner
     ),

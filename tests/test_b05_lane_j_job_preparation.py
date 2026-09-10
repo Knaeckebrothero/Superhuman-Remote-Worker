@@ -624,12 +624,38 @@ class TestDatasourcePayload:
     )
     @pytest.mark.parametrize("mcp_on", [False, True])
     @pytest.mark.parametrize("stdio_on", [False, True])
-    def test_mcp_runtime_gate_parity(self, datasource, mcp_on, stdio_on, monkeypatch):
+    def test_mcp_runtime_gate_answers_from_the_deployment_flags(
+        self, datasource, mcp_on, stdio_on, monkeypatch
+    ):
+        """B06 deleted the `main` bridge this used to compare against, so the
+        gate is asserted against the two flags it actually reads instead of
+        against a second spelling of itself."""
         monkeypatch.setenv("MCP_DATASOURCES_ENABLED", "true" if mcp_on else "false")
         monkeypatch.setenv("MCP_STDIO_ENABLED", "true" if stdio_on else "false")
-        assert agent_datasource_payload.mcp_datasource_runtime_allowed(
+
+        allowed = agent_datasource_payload.mcp_datasource_runtime_allowed(
             datasource, dependencies=_datasource_payload_deps()
-        ) == main._mcp_datasource_runtime_allowed(datasource)
+        )
+
+        credentials = datasource.get("credentials") or {}
+        if isinstance(credentials, str):
+            try:
+                credentials = json.loads(credentials)
+            except (json.JSONDecodeError, ValueError):
+                credentials = {}
+        transport = (
+            credentials.get("transport", "http")
+            if isinstance(credentials, dict)
+            else "http"
+        )
+        if datasource.get("type") != "mcp":
+            assert allowed is True
+        elif not mcp_on:
+            assert allowed is False
+        elif str(transport).lower() == "stdio":
+            assert allowed is stdio_on
+        else:
+            assert allowed is True
 
     def test_read_only_managed_connector_withholds_credentials(self):
         rows = [_ds(project_read_only=True)]

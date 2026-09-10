@@ -12,6 +12,7 @@ from orchestrator.services import thread_config_update  # noqa: E402
 from fastapi import HTTPException
 
 from orchestrator import main
+from orchestrator.services import thread_workspace_delivery
 
 
 JOB_ID = "11111111-1111-4111-8111-111111111111"
@@ -142,13 +143,14 @@ async def test_pinned_thread_same_ip_successor_is_refused_before_key_payload():
         patch.object(main.postgres_db, "get_thread", AsyncMock(return_value=thread)),
         pytest.raises(HTTPException) as refused,
     ):
-        await main._attest_pinned_thread_k8s_workspace(
+        await thread_workspace_delivery.attest_pinned_thread_k8s_workspace(
             THREAD_ID,
             thread,
             thread["metadata"],
             workspace,
             binding,
             "sandbox",
+            dependencies=main._thread_workspace_delivery_dependencies(),
         )
 
     assert refused.value.status_code == 409
@@ -165,13 +167,14 @@ async def test_pinned_thread_positive_attestation_binds_backing_and_host_key():
         ),
         patch.object(main.postgres_db, "get_thread", AsyncMock(return_value=thread)),
     ):
-        result = await main._attest_pinned_thread_k8s_workspace(
+        result = await thread_workspace_delivery.attest_pinned_thread_k8s_workspace(
             THREAD_ID,
             thread,
             thread["metadata"],
             workspace,
             binding,
             "sandbox",
+            dependencies=main._thread_workspace_delivery_dependencies(),
         )
 
     assert result == _attestation()

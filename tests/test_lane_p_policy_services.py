@@ -972,7 +972,6 @@ class TestGrantRefusalShapes:
     def test_endpoint_violations_detail_is_the_rendered_string(self):
         detail = sessioncfg.endpoint_violations_detail(["llm: no url"])
         assert detail == "session cannot start — unusable model transport: llm: no url"
-        assert detail == main._endpoint_violations_detail(["llm: no url"])
 
 
 class TestStripAcknowledgedGrants:

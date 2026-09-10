@@ -417,9 +417,6 @@ from orchestrator.services.job_workspace_runtime import (  # noqa: E402,F401
 from orchestrator.services.session_class_policy import (  # noqa: E402,F401
     protected_cloud_officer_active as _protected_cloud_officer_active,
 )
-from orchestrator.services.session_config_resolution import (  # noqa: E402,F401
-    endpoint_violations_detail as _endpoint_violations_detail,
-)
 from orchestrator.services.session_tool_policy import (  # noqa: E402,F401
     SESSION_TOOL_DISABLED_MARKERS as _SESSION_TOOL_DISABLED_MARKERS,
     agent_catalog_explicitly_disabled as _agent_catalog_explicitly_disabled,
@@ -432,7 +429,6 @@ from orchestrator.services.session_tool_policy import (  # noqa: E402,F401
 )
 from orchestrator.services.session_workspace_policy import (  # noqa: E402,F401
     default_session_workspace_backend as _default_session_workspace_backend,
-    session_ready_timeout_s as _session_ready_timeout_s,
 )
 from orchestrator.services.virtual_workspace import (  # noqa: E402,F401
     object_store_startup_warning as _object_store_startup_warning,
@@ -779,7 +775,6 @@ from orchestrator.services.vm_readiness import vm_readiness_prober  # noqa: E402
 from orchestrator.services.container_provisioner import (  # noqa: E402
     WORKSPACE_RUNTIME_INCARNATION_KEY,
     WorkspaceCleanupOutcome,
-    WorkspaceRuntimeAttestation,
     WorkspaceRuntimeAuthorityError,
     WorkspaceTeardownIdentity,
     container_provisioner,
@@ -3040,18 +3035,6 @@ async def _require_supported_protected_session_class(*args: Any, **kwargs: Any) 
     )
 
 
-async def _session_grant_violations(*args: Any, **kwargs: Any) -> Any:
-    return await session_config_resolution.session_grant_violations(
-        *args, **kwargs, dependencies=_session_config_dependencies()
-    )
-
-
-async def _session_endpoint_violations(*args: Any, **kwargs: Any) -> Any:
-    return await session_config_resolution.session_endpoint_violations(
-        *args, **kwargs, dependencies=_session_config_dependencies()
-    )
-
-
 from orchestrator.services.config_overrides import looks_like_uuid as _looks_like_uuid  # noqa: E402
 
 
@@ -4370,12 +4353,6 @@ async def _resolve_authorized_job_datasources(*args: Any, **kwargs: Any) -> Any:
     )
 
 
-async def _revalidate_job_datasource_ids(*args: Any, **kwargs: Any) -> Any:
-    return await job_datasource_selection.revalidate_job_datasource_ids(
-        *args, **kwargs, dependencies=_job_datasource_selection_dependencies()
-    )
-
-
 from orchestrator.services.job_workspace_runtime import job_needs_vm as _job_needs_vm  # noqa: E402
 
 
@@ -4468,18 +4445,6 @@ async def _pinned_k8s_job_workspace_authority_is_current(
     *args: Any, **kwargs: Any
 ) -> Any:
     return await job_workspace_authority.pinned_k8s_job_workspace_authority_is_current(
-        *args, **kwargs, dependencies=_job_workspace_authority_dependencies()
-    )
-
-
-async def _attest_stateless_worker_workspace(*args: Any, **kwargs: Any) -> Any:
-    return await job_workspace_authority.attest_stateless_worker_workspace(
-        *args, **kwargs, dependencies=_job_workspace_authority_dependencies()
-    )
-
-
-async def _attest_stateless_worker_vm_workspace(*args: Any, **kwargs: Any) -> Any:
-    return await job_workspace_authority.attest_stateless_worker_vm_workspace(
         *args, **kwargs, dependencies=_job_workspace_authority_dependencies()
     )
 
@@ -4652,18 +4617,6 @@ async def _grant_project_ids(*args: Any, **kwargs: Any) -> Any:
     )
 
 
-async def _resolve_user_save_grants(*args: Any, **kwargs: Any) -> Any:
-    return await grant_enforcement.resolve_user_save_grants(
-        *args, **kwargs, dependencies=_grant_enforcement_dependencies()
-    )
-
-
-async def _enforce_save_grants(*args: Any, **kwargs: Any) -> Any:
-    return await grant_enforcement.enforce_save_grants(
-        *args, **kwargs, dependencies=_grant_enforcement_dependencies()
-    )
-
-
 async def _strip_save_grants(*args: Any, **kwargs: Any) -> Any:
     return await grant_enforcement.strip_save_grants(
         *args, **kwargs, dependencies=_grant_enforcement_dependencies()
@@ -4713,14 +4666,6 @@ def _vm_permission_dependencies() -> vm_workspace_policy.VmPermissionDependencie
 async def _check_vm_permission(*args: Any, **kwargs: Any) -> Any:
     return await vm_workspace_policy.check_vm_permission(
         *args, **kwargs, dependencies=_vm_permission_dependencies()
-    )
-
-
-async def _enforce_workspace_upgrade_grants_for_config(
-    *args: Any, **kwargs: Any
-) -> Any:
-    return await grant_enforcement.enforce_workspace_upgrade_grants_for_config(
-        *args, **kwargs, dependencies=_grant_enforcement_dependencies()
     )
 
 
@@ -27742,12 +27687,6 @@ def _build_datasources_payload(*args: Any, **kwargs: Any) -> Any:
     )
 
 
-def _mcp_datasource_runtime_allowed(*args: Any, **kwargs: Any) -> Any:
-    return agent_datasource_payload.mcp_datasource_runtime_allowed(
-        *args, **kwargs, dependencies=_datasource_payload_dependencies()
-    )
-
-
 def _job_assignment_dependencies() -> job_assignment.JobAssignmentDependencies:
     """Rebuilt per call; the completion-control operations are B08's four
     injected callables, the same boundary B04 established rather than a
@@ -28228,21 +28167,9 @@ def _should_skip_session_folder(mounts: list[dict[str, Any]]) -> bool:
     )
 
 
-def _project_ids_from_mounts(mounts: list[dict[str, Any]]) -> list[str]:
-    return thread_mount_rows.project_ids_from_mounts(mounts)
-
-
 async def _thread_project_ids(thread_id: str) -> list[str]:
     return await thread_mount_rows.thread_project_ids(
         thread_id, dependencies=_thread_mount_dependencies()
-    )
-
-
-async def _build_default_project_mount_row(
-    project_id: str, project: dict[str, Any]
-) -> Optional[dict[str, Any]]:
-    return await thread_mount_rows.build_default_project_mount_row(
-        project_id, project, dependencies=_thread_mount_dependencies()
     )
 
 
@@ -28317,35 +28244,6 @@ def _thread_workspace_delivery_dependencies() -> (
         vm_workspaces_on_pod_network=vm_workspaces_on_pod_network,
         require_internal=require_internal,
         capture_session_config=_capture_session_delivery,
-    )
-
-
-def _agent_canvas_workspace_capabilities(
-    metadata: dict[str, Any],
-    workspace_context: dict[str, Any],
-    vm_context: dict[str, Any],
-) -> tuple[bool, bool, bool]:
-    return thread_workspace_delivery.agent_canvas_workspace_capabilities(
-        metadata, workspace_context, vm_context
-    )
-
-
-async def _attest_pinned_thread_k8s_workspace(
-    thread_id: str,
-    thread: Mapping[str, Any],
-    metadata: Mapping[str, Any],
-    workspace: Mapping[str, Any],
-    binding: Mapping[str, Any],
-    workspace_backend: str | None,
-) -> WorkspaceRuntimeAttestation | None:
-    return await thread_workspace_delivery.attest_pinned_thread_k8s_workspace(
-        thread_id,
-        thread,
-        metadata,
-        workspace,
-        binding,
-        workspace_backend,
-        dependencies=_thread_workspace_delivery_dependencies(),
     )
 
 

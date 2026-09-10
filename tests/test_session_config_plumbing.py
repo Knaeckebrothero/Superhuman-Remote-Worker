@@ -32,6 +32,7 @@ import orchestrator.main as orch_main
 # R1.B05 lane P: the tier constants keep their owner; main no longer
 # re-exports them.
 from orchestrator.services import session_workspace_policy
+from orchestrator.services import thread_workspace_delivery
 from orchestrator.routers import (
     agent_thread_workspace as agent_thread_workspace_routes,
 )
@@ -294,26 +295,26 @@ class TestSessionReadyTimeout:
 
     def test_non_vm_uses_fast_default(self, monkeypatch):
         monkeypatch.delenv("WS_READY_TIMEOUT_S", raising=False)
-        assert orch_main._session_ready_timeout_s("sandbox") == 180
-        assert orch_main._session_ready_timeout_s("virtual") == 180
-        assert orch_main._session_ready_timeout_s(None) == 180
+        assert session_workspace_policy.session_ready_timeout_s("sandbox") == 180
+        assert session_workspace_policy.session_ready_timeout_s("virtual") == 180
+        assert session_workspace_policy.session_ready_timeout_s(None) == 180
 
     def test_vm_uses_extended_budget(self, monkeypatch):
         monkeypatch.delenv("VM_WS_READY_TIMEOUT_S", raising=False)
-        assert orch_main._session_ready_timeout_s("vm") == 960
+        assert session_workspace_policy.session_ready_timeout_s("vm") == 960
 
     def test_budgets_are_env_tunable(self, monkeypatch):
         monkeypatch.setenv("WS_READY_TIMEOUT_S", "200")
         monkeypatch.setenv("VM_WS_READY_TIMEOUT_S", "1200")
-        assert orch_main._session_ready_timeout_s("sandbox") == 200
-        assert orch_main._session_ready_timeout_s("vm") == 1200
+        assert session_workspace_policy.session_ready_timeout_s("sandbox") == 200
+        assert session_workspace_policy.session_ready_timeout_s("vm") == 1200
 
     def test_vm_budget_exceeds_non_vm(self):
         # Nested-budget invariant: the server ready wait must outlast a cold VM
         # boot, so vm must be strictly larger than the sandbox default.
-        assert orch_main._session_ready_timeout_s(
+        assert session_workspace_policy.session_ready_timeout_s(
             "vm"
-        ) > orch_main._session_ready_timeout_s("sandbox")
+        ) > session_workspace_policy.session_ready_timeout_s("sandbox")
 
 
 class TestThreadWorkspaceBackend:
@@ -1575,8 +1576,8 @@ class TestColdSessionDatasourceDelivery:
                 AsyncMock(return_value=[]),
             ),
             patch.object(
-                orch_main,
-                "_agent_canvas_workspace_capabilities",
+                thread_workspace_delivery,
+                "agent_canvas_workspace_capabilities",
                 return_value=(False, False, False),
             ),
             patch.object(
@@ -1783,8 +1784,8 @@ class TestColdSessionDatasourceDelivery:
                 AsyncMock(return_value=[]),
             ),
             patch.object(
-                orch_main,
-                "_agent_canvas_workspace_capabilities",
+                thread_workspace_delivery,
+                "agent_canvas_workspace_capabilities",
                 return_value=(False, False, False),
             ),
             patch.object(
@@ -1891,8 +1892,8 @@ class TestColdSessionDatasourceDelivery:
             patch.object(orch_main, "require_internal", AsyncMock()),
             patch.object(orch_main, "_thread_project_ids", AsyncMock(return_value=[])),
             patch.object(
-                orch_main,
-                "_agent_canvas_workspace_capabilities",
+                thread_workspace_delivery,
+                "agent_canvas_workspace_capabilities",
                 return_value=(False, False, False),
             ),
             patch.object(

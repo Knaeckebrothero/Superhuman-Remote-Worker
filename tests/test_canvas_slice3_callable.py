@@ -11,6 +11,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 from orchestrator.routers import canvases
+from orchestrator.services import thread_workspace_delivery
 from orchestrator.services.canvas import (
     CanvasMutation,
     CanvasRecord,
@@ -197,8 +198,6 @@ def _state_url() -> str:
 def test_agent_attach_live_capability_requires_gate_attestation_and_non_vm(
     monkeypatch,
 ) -> None:
-    import orchestrator.main
-
     metadata = _thread()["metadata"]
     workspace = metadata["workspace_container"]
     monkeypatch.setattr(
@@ -206,7 +205,7 @@ def test_agent_attach_live_capability_requires_gate_attestation_and_non_vm(
     )
     monkeypatch.delenv("CANVAS_LIVE_PREVIEW_ENABLED", raising=False)
     monkeypatch.delenv("CANVAS_SHARED_BROWSER_ENABLED", raising=False)
-    assert orchestrator.main._agent_canvas_workspace_capabilities(
+    assert thread_workspace_delivery.agent_canvas_workspace_capabilities(
         metadata, workspace, {}
     ) == (
         True,
@@ -216,7 +215,7 @@ def test_agent_attach_live_capability_requires_gate_attestation_and_non_vm(
 
     monkeypatch.setenv("CANVAS_LIVE_PREVIEW_ENABLED", "true")
     monkeypatch.setenv("CANVAS_SHARED_BROWSER_ENABLED", "true")
-    assert orchestrator.main._agent_canvas_workspace_capabilities(
+    assert thread_workspace_delivery.agent_canvas_workspace_capabilities(
         metadata, workspace, {}
     ) == (
         True,
@@ -227,7 +226,7 @@ def test_agent_attach_live_capability_requires_gate_attestation_and_non_vm(
     monkeypatch.setattr(
         "orchestrator.services.ssh_helpers.orchestrator_can_reach", lambda host: False
     )
-    assert orchestrator.main._agent_canvas_workspace_capabilities(
+    assert thread_workspace_delivery.agent_canvas_workspace_capabilities(
         metadata, workspace, {}
     ) == (
         True,
@@ -237,12 +236,12 @@ def test_agent_attach_live_capability_requires_gate_attestation_and_non_vm(
 
     unattested = _thread()["metadata"]
     unattested["_workspace_binding"].pop("ssh_host_key_fingerprint")
-    assert orchestrator.main._agent_canvas_workspace_capabilities(
+    assert thread_workspace_delivery.agent_canvas_workspace_capabilities(
         unattested, unattested["workspace_container"], {}
     ) == (False, False, False)
 
     vm = {"status": "ready", "ssh_host": "vm.test"}
-    assert orchestrator.main._agent_canvas_workspace_capabilities(
+    assert thread_workspace_delivery.agent_canvas_workspace_capabilities(
         metadata, workspace, vm
     ) == (
         False,

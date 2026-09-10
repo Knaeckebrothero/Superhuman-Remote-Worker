@@ -4,7 +4,7 @@ Phase 2 of ``knowledge-base/knowledge/features/cloud_collaboration_model.md`` §
 ``project_default`` row shape — default projects mount the owner's cloud
 home at the workspace root rather than under ``projects/<slug>/``. These
 tests cover the builder helpers (``_build_thread_mount_rows`` and
-``_build_default_project_mount_row``) directly so the wiring is exercised
+``build_default_project_mount_row``) directly so the wiring is exercised
 without standing up the full thread-create path.
 """
 
@@ -13,6 +13,8 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+import orchestrator.main as orch_main
 
 import orchestrator.main
 from orchestrator.main import _build_protected_cloud_mount
@@ -96,7 +98,9 @@ async def test_default_project_emits_user_home_row():
     the owner's home Space's webdav URL. ``target_user_sub`` carries the
     Keycloak ``sub`` of the owner so the agent can do RFC 8693 exchange.
     """
-    from orchestrator.main import _build_default_project_mount_row
+    from orchestrator.services.thread_mount_rows import (
+        build_default_project_mount_row,
+    )
 
     project = _project(project_id="p-default", is_default=True, name="Default")
     backend = _backend()
@@ -112,7 +116,9 @@ async def test_default_project_emits_user_home_row():
         patch("orchestrator.main.postgres_db", fake_db),
         patch("orchestrator.main.main_cloud_router", router),
     ):
-        row = await _build_default_project_mount_row("p-default", project)
+        row = await build_default_project_mount_row(
+            "p-default", project, dependencies=orch_main._thread_mount_dependencies()
+        )
 
     assert row is not None
     assert row["mount_kind"] == "project_default"
@@ -130,7 +136,9 @@ async def test_default_project_emits_user_home_row():
 @pytest.mark.asyncio
 async def test_default_project_no_owner_returns_none():
     """Owner missing from the project → fall back to legacy session folder."""
-    from orchestrator.main import _build_default_project_mount_row
+    from orchestrator.services.thread_mount_rows import (
+        build_default_project_mount_row,
+    )
 
     project = _project(project_id="p", is_default=True)
     fake_db = _fake_db()
@@ -145,7 +153,9 @@ async def test_default_project_no_owner_returns_none():
         patch("orchestrator.main.postgres_db", fake_db),
         patch("orchestrator.main.main_cloud_router", router),
     ):
-        row = await _build_default_project_mount_row("p", project)
+        row = await build_default_project_mount_row(
+            "p", project, dependencies=orch_main._thread_mount_dependencies()
+        )
     assert row is None
 
 
@@ -155,7 +165,9 @@ async def test_default_project_owner_missing_keycloak_sub_returns_none():
     sub yet → can't do token-exchange → no row. Caller falls back to
     legacy session folder so the thread still has SOMETHING.
     """
-    from orchestrator.main import _build_default_project_mount_row
+    from orchestrator.services.thread_mount_rows import (
+        build_default_project_mount_row,
+    )
 
     project = _project(project_id="p", is_default=True)
     fake_db = _fake_db()
@@ -172,7 +184,9 @@ async def test_default_project_owner_missing_keycloak_sub_returns_none():
         patch("orchestrator.main.postgres_db", fake_db),
         patch("orchestrator.main.main_cloud_router", router),
     ):
-        row = await _build_default_project_mount_row("p", project)
+        row = await build_default_project_mount_row(
+            "p", project, dependencies=orch_main._thread_mount_dependencies()
+        )
     assert row is None
 
 
@@ -181,7 +195,9 @@ async def test_default_project_user_home_unresolvable_returns_none():
     """Owner exists on the backend but ``get_user_home`` returns None
     (e.g. drive not yet provisioned) → fall back, no row.
     """
-    from orchestrator.main import _build_default_project_mount_row
+    from orchestrator.services.thread_mount_rows import (
+        build_default_project_mount_row,
+    )
 
     project = _project(project_id="p", is_default=True)
     backend = _backend()
@@ -200,13 +216,17 @@ async def test_default_project_user_home_unresolvable_returns_none():
         patch("orchestrator.main.postgres_db", fake_db),
         patch("orchestrator.main.main_cloud_router", router),
     ):
-        row = await _build_default_project_mount_row("p", project)
+        row = await build_default_project_mount_row(
+            "p", project, dependencies=orch_main._thread_mount_dependencies()
+        )
     assert row is None
 
 
 @pytest.mark.asyncio
 async def test_default_project_backend_uninitialized_returns_none():
-    from orchestrator.main import _build_default_project_mount_row
+    from orchestrator.services.thread_mount_rows import (
+        build_default_project_mount_row,
+    )
 
     project = _project(project_id="p", is_default=True)
     backend = _backend(initialized=False)
@@ -221,7 +241,9 @@ async def test_default_project_backend_uninitialized_returns_none():
         patch("orchestrator.main.postgres_db", fake_db),
         patch("orchestrator.main.main_cloud_router", router),
     ):
-        row = await _build_default_project_mount_row("p", project)
+        row = await build_default_project_mount_row(
+            "p", project, dependencies=orch_main._thread_mount_dependencies()
+        )
     assert row is None
 
 
@@ -272,14 +294,14 @@ async def test_project_ids_from_mounts_includes_project_default():
     """Phase 2: a ``project_default`` row counts as a project attachment
     for downstream datasource/visibility resolution.
     """
-    from orchestrator.main import _project_ids_from_mounts
+    from orchestrator.services.thread_mount_rows import project_ids_from_mounts
 
     rows = [
         {"mount_kind": "project_default", "source_ref": "p-default"},
         {"mount_kind": "project", "source_ref": "p-alpha"},
         {"mount_kind": "repo", "source_ref": "r-1"},
     ]
-    assert _project_ids_from_mounts(rows) == ["p-default", "p-alpha"]
+    assert project_ids_from_mounts(rows) == ["p-default", "p-alpha"]
 
 
 @pytest.mark.asyncio

@@ -466,6 +466,7 @@ async def test_workspace_poll_preserves_generation(
 @pytest.mark.asyncio
 async def test_internal_workspace_payload_exposes_private_binding_generation():
     import orchestrator.main as orch_main
+    from orchestrator.services import thread_workspace_delivery
 
     thread = {
         "id": THREAD_ID,
@@ -519,8 +520,8 @@ async def test_internal_workspace_payload_exposes_private_binding_generation():
             orch_main, "_resolve_thread_repositories", AsyncMock(return_value=None)
         ),
         patch.object(
-            orch_main,
-            "_agent_canvas_workspace_capabilities",
+            thread_workspace_delivery,
+            "agent_canvas_workspace_capabilities",
             return_value=(False, False, False),
         ),
         patch.object(
@@ -587,6 +588,7 @@ async def _internal_workspace_response_for_lite_thread(
     thread_reads=None,
 ):
     import orchestrator.main as orch_main
+    from orchestrator.services import thread_workspace_delivery
 
     def _with_live_runtime(row):
         normalized = dict(row)
@@ -641,8 +643,8 @@ async def _internal_workspace_response_for_lite_thread(
             orch_main, "_resolve_thread_repositories", AsyncMock(return_value=None)
         ),
         patch.object(
-            orch_main,
-            "_agent_canvas_workspace_capabilities",
+            thread_workspace_delivery,
+            "agent_canvas_workspace_capabilities",
             return_value=(False, False, False),
         ),
         patch.object(

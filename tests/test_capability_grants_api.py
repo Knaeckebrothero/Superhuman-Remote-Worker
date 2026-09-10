@@ -51,6 +51,7 @@ import pytest
 from fastapi import HTTPException
 
 import orchestrator.main as m
+from orchestrator.services import grant_enforcement
 
 _UID = "11111111-1111-1111-1111-111111111111"
 
@@ -74,8 +75,10 @@ def test_violations_detail_lists_keys():
 @pytest.mark.asyncio
 async def test_enforce_save_grants_admin_bypasses():
     # Admin short-circuits before any DB call (no mock needed).
-    await m._enforce_save_grants(
-        {"tools": {"shell": ["ls"]}}, user={"id": _UID, "is_admin": True}
+    await grant_enforcement.enforce_save_grants(
+        {"tools": {"shell": ["ls"]}},
+        user={"id": _UID, "is_admin": True},
+        dependencies=m._grant_enforcement_dependencies(),
     )
 
 
@@ -88,8 +91,12 @@ async def test_enforce_save_grants_raises_422_for_ungranted(monkeypatch):
     fake.get_projects_for_user = AsyncMock(return_value=[])
     monkeypatch.setattr(m, "postgres_db", fake)
     with pytest.raises(HTTPException) as ei:
-        await m._enforce_save_grants(
-            {"tools": {"shell": ["ls"]}}, user={"id": _UID, "is_admin": False}
+        await grant_enforcement.enforce_save_grants(
+            {"tools": {"shell": ["ls"]}},
+            user={"id": _UID, "is_admin": False},
+            # Built after the store is swapped, the way the composition root
+            # builds it per call.
+            dependencies=m._grant_enforcement_dependencies(),
         )
     assert ei.value.status_code == 422 and "shell_tools" in str(ei.value.detail)
 
