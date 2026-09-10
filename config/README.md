@@ -96,6 +96,20 @@ old Project override columns. Existing editors project those authored overrides
 from the active resource; changing a default publishes a complete new revision.
 Changing a source Expert alone leaves an active Project's composition unchanged.
 
+Startup defers an unclaimed legacy Project when it has no members and no user
+selecting it as their default. Its data stays intact and a warning identifies
+the Project; explicitly establishing ownership makes it eligible on a later run.
+A Project with members but no owner still requires ownership repair before
+migration. Startup never invents ownership or discards a Project to complete
+the conversion.
+
+Historical cloud-backed Projects and Sessions may also need their missing
+installation authority repaired before upgrading. The admin operation
+`POST /api/admin/system-settings/main_cloud/backfill-instance-authority` previews
+the mapping and verifies it against the live installation; inspect that preview
+before repeating with `?apply=true`. Ambiguous installation history is rejected.
+Do not fill those references with a guessed instance or relax the database checks.
+
 The existing Officer kit is represented by
 `team.controller: {type: srw/officer-v1, config: ...}`. Its private payload contains
 `config` and `communicationPolicy`; thread IDs, leases, holds and observed state
