@@ -1,3 +1,4 @@
+import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
 import {workspaceCreationFields, workspacePreviewConfig} from "../agent-settings/workspace-selection";
 import {Component, computed, effect, ElementRef, inject, OnInit, signal, ViewChild} from '@angular/core';
 import {ActivatedRoute, Router} from '@angular/router';
@@ -31,7 +32,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
   selector: 'app-job-create',
   standalone: true,
   imports: [
-    AgentSettingsComponent,
+    SidebarToggleComponent, AgentSettingsComponent,
     TranslocoPipe,
     AppButtonComponent,
     AppIconButtonComponent,
@@ -46,6 +47,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
   template: `
     <div class="job-create-container">
       <div class="header-bar">
+        <app-sidebar-toggle />
         <span class="title">{{ 'jobs.create.title' | transloco }}</span>
         <app-button variant="secondary" size="sm" class="back-btn" (clicked)="cancel()">
           {{ 'jobs.create.backToJobs' | transloco }}
@@ -362,6 +364,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
       .header-bar {
         display: flex;
         align-items: center;
+        gap: 12px;
         padding: 10px 12px;
         background: var(--panel-header-bg);
         border-bottom: 1px solid var(--border-color, var(--surface-0));
@@ -411,6 +414,13 @@ import {AppTooltipDirective} from '../../ui/tooltip';
 
       /* Form Groups */
       .form-group {
+        margin-bottom: 16px;
+      }
+
+      /* The shared field primitive carries no outer margin; without this the
+         project hint ran straight into the Description label. */
+      app-form-field {
+        display: block;
         margin-bottom: 16px;
       }
 

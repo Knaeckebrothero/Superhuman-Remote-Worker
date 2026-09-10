@@ -1,3 +1,4 @@
+import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
 import {
   Component,
   DestroyRef,
@@ -116,7 +117,7 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
   selector: 'app-job-list',
   standalone: true,
   imports: [
-    TranslocoPipe,
+    SidebarToggleComponent, TranslocoPipe,
     AppButtonComponent,
     AppBadgeComponent,
     AppInputComponent,
@@ -136,6 +137,7 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
     <div class="job-list-container">
       <!-- Header with filters -->
       <div class="header-bar">
+        <app-sidebar-toggle />
         <span class="title">{{ 'jobs.title' | transloco }}</span>
         <div class="header-actions">
           @if (snapshotStats()?.available) {

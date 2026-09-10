@@ -1,3 +1,4 @@
+import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
 import {Component, computed, DestroyRef, inject, OnInit, signal} from '@angular/core';
 import {takeUntilDestroyed} from '@angular/core/rxjs-interop';
 import {forkJoin, timer} from 'rxjs';
@@ -46,7 +47,7 @@ type KeyValueRow = {key: string; value: string};
   selector: 'app-datasource-list',
   standalone: true,
   imports: [
-    TranslocoPipe,
+    SidebarToggleComponent, TranslocoPipe,
     AppButtonComponent,
     AppIconButtonComponent,
     AppBadgeComponent,
@@ -67,6 +68,7 @@ type KeyValueRow = {key: string; value: string};
     <div class="ds-container" [class.form-open]="showForm()">
       <!-- Header -->
       <div class="header-bar">
+        <app-sidebar-toggle />
         <span class="title">{{ 'datasources.title' | transloco }}</span>
         <div class="filter-chips">
           @for (filter of typeFilters; track filter.value) {
@@ -81,7 +83,7 @@ type KeyValueRow = {key: string; value: string};
         </div>
         <div class="header-actions">
           <app-button
-            variant="success"
+            variant="primary"
             size="sm"
             [disabled]="showForm()"
             (clicked)="openCreateForm()"
@@ -1709,9 +1711,16 @@ type KeyValueRow = {key: string; value: string};
         color: var(--text-primary, var(--text-primary));
       }
 
+      /* Thirteen type chips never fit beside the title, so they take their
+         own row (order + full basis) and the actions stay on the title row —
+         the same shape the Jobs header uses. */
       .filter-chips {
         display: flex;
         gap: 4px;
+        flex-wrap: wrap;
+        order: 1;
+        flex-basis: 100%;
+        min-width: 0;
       }
 
       .header-actions {
@@ -2408,6 +2417,41 @@ type KeyValueRow = {key: string; value: string};
         .col-scope,
         .col-availability {
           display: none;
+        }
+
+        /* Fixed layout so the three remaining columns share the phone width:
+           under auto layout the type badge alone took 183px and pushed the
+           actions column (the kebab) off-screen (measured 461px in 390px). */
+        .ds-table {
+          table-layout: fixed;
+        }
+
+        .ds-table th:first-child,
+        .ds-table td:first-child {
+          width: 32%;
+        }
+
+        .ds-table th:last-child,
+        .ds-table td:last-child {
+          width: 48px;
+          padding-inline: 4px;
+        }
+
+        /* A lone kebab column: the "Actions" label doesn't fit 48px and clipped
+           at the screen edge (same trick as the jobs table; the text stays in
+           the accessibility tree). */
+        .ds-table th:last-child {
+          font-size: 0;
+        }
+
+        /* The type badge wraps to a second line in its narrower column
+           (same treatment the project cards give their badges). */
+        .ds-table td:first-child app-badge {
+          white-space: normal;
+          height: auto;
+          min-height: 20px;
+          padding-block: 2px;
+          line-height: 1.25;
         }
 
         /* Scope shown inline under the name on mobile (its own column is hidden). */

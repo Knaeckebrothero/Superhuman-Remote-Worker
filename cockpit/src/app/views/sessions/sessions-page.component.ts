@@ -56,12 +56,12 @@ interface Project {
         AppDialogComponent,
     ],
     template: `
-    <div class="page-toggle">
-      <app-sidebar-toggle />
-    </div>
     <div class="sessions-page">
       <div class="page-header">
-        <h2>{{ 'sessions.title' | transloco }}</h2>
+        <div class="header-left">
+          <app-sidebar-toggle />
+          <h2>{{ 'sessions.title' | transloco }}</h2>
+        </div>
       </div>
 
       <!-- Active session banner (hidden when filtering to ended sessions) -->
@@ -278,15 +278,6 @@ interface Project {
       background: var(--app-bg);
     }
 
-    .page-toggle {
-      padding: 8px 12px;
-      flex-shrink: 0;
-    }
-
-    .page-toggle:not(:has(.sidebar-toggle)) {
-      display: none;
-    }
-
     .sessions-page {
       max-width: var(--content-max-width);
       margin: 0 auto;
@@ -298,6 +289,12 @@ interface Project {
       align-items: center;
       justify-content: space-between;
       margin-bottom: 20px;
+    }
+
+    .header-left {
+      display: flex;
+      align-items: center;
+      gap: 12px;
     }
 
     .page-header h2 {
@@ -385,7 +382,7 @@ interface Project {
       border-radius: var(--radius-control);
       background: var(--danger-tint);
       border: 1px solid var(--danger-tint);
-      color: var(--danger-color);
+      color: var(--danger);
       font-size: 12px;
     }
 

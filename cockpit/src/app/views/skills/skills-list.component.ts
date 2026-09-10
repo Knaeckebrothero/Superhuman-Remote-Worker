@@ -1,3 +1,4 @@
+import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
 import {Component, inject, OnInit, signal} from '@angular/core';
 import {Router} from '@angular/router';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
@@ -21,7 +22,7 @@ export function isBundledSkill(s: Skill): boolean {
   selector: 'app-skills-list',
   standalone: true,
   imports: [
-    TranslocoPipe,
+    SidebarToggleComponent, TranslocoPipe,
     AppButtonComponent,
     AppIconButtonComponent,
     AppBadgeComponent,
@@ -35,7 +36,10 @@ export function isBundledSkill(s: Skill): boolean {
   template: `
     <div class="skills">
       <header class="head">
-        <h1>{{ 'skills.title' | transloco }}</h1>
+        <div class="head-left">
+          <app-sidebar-toggle />
+          <h1>{{ 'skills.title' | transloco }}</h1>
+        </div>
         <div class="head-actions">
           <app-button variant="secondary" (clicked)="fileInput.click()">
             {{ 'skills.import' | transloco }}
@@ -198,6 +202,11 @@ export function isBundledSkill(s: Skill): boolean {
       }
       .head h1 {
         margin: 0;
+      }
+      .head-left {
+        display: flex;
+        align-items: center;
+        gap: 12px;
       }
       .head-actions {
         display: flex;
