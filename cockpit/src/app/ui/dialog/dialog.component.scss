@@ -24,7 +24,7 @@
 .app-dialog__container {
   position: relative;
 
-  --dialog-radius: var(--radius-lg);  // Dialogs keep the larger primitive — feels more "important" than other surfaces. Roman themes flatten via --radius-lg = 2px.
+  --dialog-radius: var(--radius-lg);  // Same primitive as --radius-surface today; kept as a local override surface so dialogs can diverge from cards later.
 
   background: var(--panel-bg);
   border: 1px solid var(--border-color);

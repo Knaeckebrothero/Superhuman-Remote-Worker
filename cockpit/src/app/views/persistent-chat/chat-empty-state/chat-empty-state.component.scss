@@ -85,7 +85,7 @@
   font-weight: 500;
   text-align: left;
   cursor: pointer;
-  border-radius: 0;
+  border-radius: var(--radius-surface);
   transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
 }
 

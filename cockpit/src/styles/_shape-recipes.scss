@@ -43,7 +43,7 @@
 }
 
 // Circle — radio dots, switch knobs, spinner rings, avatars, round icon-buttons.
-// Theme-invariant: semantic, not decorative. Roman themes do not flatten these.
+// Theme-invariant: semantic, not decorative — never rebound by a theme.
 @mixin circle {
   border-radius: 50%;
 }

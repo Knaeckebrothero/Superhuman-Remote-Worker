@@ -15,7 +15,7 @@ src/styles/
 └── themes/
     ├── _theme-config.scss     Token maps — one per theme. Source of truth for palette + on-tokens.
     ├── _themes.scss           apply-app-theme($name) mixin. Emits the map as CSS custom properties.
-    ├── _shape-overrides.scss  Roman theme overrides: sharp radii, Cinzel typography, Inset Stamp shadow tokens. Scoped under .theme-* selectors.
+    ├── _shape-overrides.scss  Roman theme overrides: Cinzel typography, Inset Stamp shadow tokens, header inlays. Scoped under .theme-* selectors. Radii are NOT overridden here (rounded since 2026-09-10).
     └── _typography.scss       Type-scale Sass maps (legacy; being folded into recipes).
 ```
 
@@ -40,7 +40,7 @@ Token names are bare (`--accent-color`, `--panel-bg`, `--text-primary`) — no p
 
 Three layers. Only the middle one is what most primitives actually read.
 
-1. **Primitive scale** — declared in `_root-tokens.scss` at `:root`. Raw values: `--radius-sm/md/lg/xl/full`, `--font-family-base/display/mono`. Themes can override these to retheme the whole system (Roman themes flatten `--radius-md` to `0`, which cascades through every role that aliases it).
+1. **Primitive scale** — declared in `_root-tokens.scss` at `:root`. Raw values: `--radius-sm/md/lg/xl/full`, `--font-family-base/display/mono`. Themes can override these to retheme the whole system (setting `--radius-md: 0` would cascade through every role that aliases it — the Roman themes did exactly that until 2026-09-10; both active themes now use the scale as-is).
 
 2. **Semantic roles** — declared in `_semantic-tokens.scss` at `:root`. Each aliases a primitive: `--radius-control: var(--radius-md)`, `--font-primary: var(--font-family-base)`, etc. Primitives consume these via recipe mixins (`@include shape.control`), never the raw primitive scale directly.
 
@@ -48,7 +48,7 @@ Three layers. Only the middle one is what most primitives actually read.
 
 Themes override at the tier that gives the right scope:
 
-- **Global retheme** → override the primitive (`--radius-md: 0` in `_shape-overrides.scss` flattens everything that uses md).
+- **Global retheme** → override the primitive (`--radius-md: 0` under a `.theme-*` class would flatten everything that uses md — and the role tokens must be re-declared under the same class, see the note in `_shape-overrides.scss`).
 - **Role retheme** → override the role (`--radius-control: var(--radius-full)` makes every control pill-shaped without touching the surface or tag scales).
 - **One-off** → override the component-local (`--btn-radius: 12px` on a specific button).
 
@@ -90,7 +90,7 @@ First-run preference is `'system'` — the app respects the OS preference. A pre
 6. **Document the design intent** in `knowledge-base/knowledge/design/cockpit/themes/README.md` — palette story, when to use it, what it's *for*.
 7. **Test the picker test** — `theme.service.spec.ts` should already cover the new theme via the generic body-class swap test, but add a smoke test if your theme has special semantics.
 
-If your theme departs from the Roman shape language (rounded corners, different display font, etc.), you'll also need to either:
+If your theme departs from the shared shape language (different radii, different display font, etc.), you'll also need to either:
 - Override the relevant tokens (`--font-display`, `--radius-md`) inside the map, or
 - Add a `.theme-mytheme { ... }` block to `_shape-overrides.scss` that resets/overrides the shared Roman overrides.
 
@@ -215,7 +215,9 @@ A primitive that exposes `--btn-radius` (as in the button example above) can be 
 
 ## Shape overrides
 
-`_shape-overrides.scss` is scoped under `.theme-travertine, .theme-senate` and declares the **token overrides** that produce the Roman shape language: sharp radii (flattening the primitive scale), Cinzel as the display family, and the Inset Stamp shadow stack (`--stamp-highlight/shadow/drop/press/press-shadow`). Per-theme tweaks (Travertine's gold inlay under panel headers, Senate's blood-red equivalent) follow in their own scoped blocks.
+`_shape-overrides.scss` is scoped under `.theme-travertine, .theme-senate` and declares the **token overrides** that produce the Roman look: Cinzel as the display family and the Inset Stamp shadow stack (`--stamp-highlight/shadow/drop/press/press-shadow`). Per-theme tweaks (Travertine's gold inlay under panel headers, Senate's blood-red equivalent) follow in their own scoped blocks.
+
+Radii are deliberately **not** overridden there any more. The original sharp-corner pass (`--radius-sm/md/xl: 0`, `--radius-lg: 2px`) was retired on 2026-09-10; both themes use the rounded primitive scale via the role tokens — controls `md` (0.5rem, 7px at the cockpit's 14px root), surfaces `lg` (0.75rem, 10.5px), small tags `sm` (0.25rem, 3.5px), pills and functional circles unchanged. `shape-overrides.spec.ts` guards against the flatten creeping back.
 
 The Inset Stamp recipe lives in `_shape-recipes.scss` as `@mixin stamp($variant)`. The token contract: Roman themes set the `--stamp-*` family; non-Roman themes leave them unset and the recipe falls back to `transparent`, collapsing to a flat button. Tinted button variants (warning, info, success, danger) get `stamp('soft')` to avoid the muddy inner shadow on translucent fills.
 

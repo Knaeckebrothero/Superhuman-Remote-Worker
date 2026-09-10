@@ -16,27 +16,18 @@
   --font-display: 'Cinzel', 'Cormorant Garamond', 'Times New Roman', serif;
   --font-family-display: var(--font-display);
 
-  // Sharp Roman radii — override the primitive scale declared in
-  // _root-tokens.scss.
-  --radius-sm:   0;
-  --radius-md:   0;
-  --radius-lg:   2px;
-  --radius-xl:   0;
-
-  // --radius-full stays at the primitive default (999px) — functional circles
-  // (radio dots, switch knobs, spinners, avatars) keep their semantic shape.
-
-  // Role tokens must be re-declared here. Their var() references are resolved
-  // at computed-value time against the cascade *of the declaring element*.
-  // The :root declarations match <html> only, so var(--radius-md) there
-  // resolves against <html>'s --radius-md (the unflattened 8px) and inherits
-  // down to <body> as a pre-resolved 8px. Re-declaring under .theme-* makes
-  // the var() resolve against <body>'s cascade where the flatten lives.
-  --radius-control: var(--radius-md);
-  --radius-surface: var(--radius-md);
-  --radius-tag:     var(--radius-sm);
-  // --radius-pill aliases --radius-full (not overridden), so the :root
-  // declaration is correct everywhere — no re-decl needed.
+  // Radii are NOT overridden here any more. The original Roman shape pass
+  // flattened the primitive scale (--radius-sm/md/xl: 0, --radius-lg: 2px);
+  // that was retired on 2026-09-10 in favour of the rounded scale declared in
+  // _root-tokens.scss and the role bindings in _semantic-tokens.scss: controls
+  // --radius-md (0.5rem = 7px at the cockpit's 14px root), surfaces --radius-lg
+  // (0.75rem = 10.5px), tags --radius-sm (0.25rem = 3.5px). The brand is
+  // carried by the palette and the Cinzel display type, not by the corners.
+  //
+  // If a theme ever needs to rebind a primitive radius under .theme-*, it must
+  // re-declare the role tokens under the same class: the :root role
+  // declarations resolve their var() against <html>, so a body-scoped
+  // primitive override alone never reaches them.
 
   // Typography aliases — primary surfaces pick up the display font in Roman
   // themes. Consumed by the typography recipe mixins (Phase 2).
@@ -81,7 +72,6 @@
   // Banded chat bubbles — subtle inset rule at top
   .session-message .message-bubble,
   .chat-message .bubble {
-    border-radius: 0;
     background-image: linear-gradient(
       180deg,
       color-mix(in srgb, var(--accent-color) 5%, transparent),
@@ -100,19 +90,18 @@
   // Approval card — porphyry-red 3px left rule
   .approval-card,
   .tool-approval {
-    border-radius: 0;
     border-left: 3px solid var(--accent-color);
   }
 
   // ===========================================================================
   // BUTTONS — Inset Stamp
-  // Sharp 0px corners, dual inner highlight + shadow, accent-colored drop.
-  // Press state translates 1px down. Reads "stamped into stone".
+  // Dual inner highlight + shadow, accent-colored drop; corners come from the
+  // control radius token. Press state translates 1px down. Reads "stamped
+  // into stone".
   // ===========================================================================
   .btn,
   .filter-chip,
   .tab-button {
-    border-radius: 0;
     transition: transform 60ms ease, box-shadow 120ms ease, background-color 120ms ease;
   }
 

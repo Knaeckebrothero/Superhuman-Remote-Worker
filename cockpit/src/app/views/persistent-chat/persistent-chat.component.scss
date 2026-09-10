@@ -1197,7 +1197,7 @@
         background: var(--surface-0);
         border: 1px solid var(--border-color, var(--surface-0));
         border-left: 3px solid var(--accent-color);
-        border-radius: 0;
+        border-radius: var(--radius-surface);
         display: flex;
         flex-direction: column;
         gap: 6px;
@@ -1525,7 +1525,7 @@
         margin: 0 auto;
         background: var(--panel-bg);
         border: 1px solid var(--border-color, var(--surface-0));
-        border-radius: 0;
+        border-radius: var(--radius-surface);
         transition: outline-color 0.15s ease, border-color 0.15s ease;
       }
 
@@ -1592,7 +1592,7 @@
         padding: 0 10px;
         background: transparent;
         border: 1px solid transparent;
-        border-radius: 0;
+        border-radius: var(--radius-control);
         color: var(--text-muted);
         font-family: inherit;
         font-size: 11px;

@@ -7,13 +7,13 @@
 //
 // Each role token defaults to a primitive token. Theme files override the
 // role directly when the change is global; they override the primitive when
-// the change cascades through every role that references it (e.g. Roman
-// themes set --radius-sm: 0, which automatically flattens --radius-tag).
+// the change cascades through every role that references it (e.g. setting
+// --radius-sm: 0 under a theme would automatically flatten --radius-tag).
 
 :root {
   // --- Radii roles ---
   --radius-control: var(--radius-md);   // buttons, inputs, selects, chips, badges, tabs, icon-buttons
-  --radius-surface: var(--radius-md);   // cards, dialogs, menus, toasts, panels
+  --radius-surface: var(--radius-lg);   // cards, dialogs, menus, toasts, panels — one step softer than controls
   --radius-pill:    var(--radius-full); // pill-shaped chips, status pills
   --radius-tag:     var(--radius-sm);   // small inline markers, checkbox tile
 
