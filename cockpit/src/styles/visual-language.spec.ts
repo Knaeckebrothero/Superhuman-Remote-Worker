@@ -49,7 +49,7 @@ describe('root scale', () => {
 });
 
 describe('typography — Cinzel only on the brand mark and hero', () => {
-  const overrides = code(read('./themes/_shape-overrides.scss'));
+  const overrides = code(read('./themes/_roman-accents.scss'));
 
   it('themes no longer rebind the primary font or its display casing', () => {
     expect(overrides).not.toMatch(/--font-primary\s*:/);

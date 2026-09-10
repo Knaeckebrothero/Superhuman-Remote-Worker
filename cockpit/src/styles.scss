@@ -3,7 +3,7 @@
 @use 'styles/root-tokens';        // Primitive scale at :root (--radius-*, --font-family-*)
 @use 'styles/semantic-tokens';    // Role tokens at :root (--radius-control, --font-primary, …)
 @use 'styles/themes/themes' as theme;
-@use 'styles/themes/shape-overrides';
+@use 'styles/themes/roman-accents';
 @use 'styles/code-highlight';     // Global PrismJS token theme for <markdown> code blocks
 @use 'styles/katex';              // Global presentation tweaks for KaTeX math in <markdown>
 @use 'styles/canvas-content';     // Sanitized Dynamic Canvas markdown typography

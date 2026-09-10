@@ -15,7 +15,7 @@ src/styles/
 └── themes/
     ├── _theme-config.scss     Token maps — one per theme. Source of truth for palette + on-tokens.
     ├── _themes.scss           apply-app-theme($name) mixin. Emits the map as CSS custom properties.
-    ├── _shape-overrides.scss  Roman accents: the Cinzel brand face, the approval-card rule, header inlays. Scoped under .theme-* selectors. No radii, no stamps (retired 2026-09-10).
+    ├── _roman-accents.scss  Roman accents: the Cinzel brand face, the approval-card rule, header inlays. Scoped under .theme-* selectors. No radii, no stamps (retired 2026-09-10).
     └── _typography.scss       Type-scale Sass maps (legacy; being folded into recipes).
 ```
 
@@ -48,7 +48,7 @@ Three layers. Only the middle one is what most primitives actually read.
 
 Themes override at the tier that gives the right scope:
 
-- **Global retheme** → override the primitive (`--radius-md: 0` under a `.theme-*` class would flatten everything that uses md — and the role tokens must be re-declared under the same class, see the note in `_shape-overrides.scss`).
+- **Global retheme** → override the primitive (`--radius-md: 0` under a `.theme-*` class would flatten everything that uses md — and the role tokens must be re-declared under the same class, see the note in `_roman-accents.scss`).
 - **Role retheme** → override the role (`--radius-control: var(--radius-full)` makes every control pill-shaped without touching the surface or tag scales).
 - **One-off** → override the component-local (`--btn-radius: 12px` on a specific button).
 
@@ -92,7 +92,7 @@ First-run preference is `'system'` — the app respects the OS preference. A pre
 
 If your theme departs from the shared shape language (different radii, different display font, etc.), you'll also need to either:
 - Override the relevant tokens (`--font-display`, `--radius-md`) inside the map, or
-- Add a `.theme-mytheme { ... }` block to `_shape-overrides.scss` that resets/overrides the shared Roman overrides.
+- Add a `.theme-mytheme { ... }` block to `_roman-accents.scss` that resets/overrides the shared Roman overrides.
 
 ## Token catalog
 
@@ -211,15 +211,15 @@ A primitive that exposes `--btn-radius` (as in the button example above) can be 
 }
 ```
 
-## Shape overrides
+## Roman accents
 
-`_shape-overrides.scss` is scoped under `.theme-travertine, .theme-senate` and declares what is left of the Roman look: Cinzel as the brand face (read by three selectors) and the approval-card left rule. Per-theme tweaks (Travertine's gold inlay under panel headers, Senate's blood-red equivalent) follow in their own scoped blocks.
+`_roman-accents.scss` is scoped under `.theme-travertine, .theme-senate` and declares what is left of the Roman look: Cinzel as the brand face (read by three selectors) and the approval-card left rule. Per-theme tweaks (Travertine's gold inlay under panel headers, Senate's blood-red equivalent) follow in their own scoped blocks.
 
-Radii are deliberately **not** overridden there any more. The original sharp-corner pass (`--radius-sm/md/xl: 0`, `--radius-lg: 2px`) was retired on 2026-09-10; both themes use the rounded primitive scale via the role tokens — controls `md` (0.5rem, 8px), surfaces `lg` (0.75rem, 12px), small tags `sm` (0.25rem, 4px), pills and functional circles unchanged. `shape-overrides.spec.ts` guards against the flatten creeping back.
+Radii are deliberately **not** overridden there any more. The original sharp-corner pass (`--radius-sm/md/xl: 0`, `--radius-lg: 2px`) was retired on 2026-09-10; both themes use the rounded primitive scale via the role tokens — controls `md` (0.5rem, 8px), surfaces `lg` (0.75rem, 12px), small tags `sm` (0.25rem, 4px), pills and functional circles unchanged. `roman-accents.spec.ts` guards against the flatten creeping back.
 
 Buttons are flat since 2026-09-10: the Inset Stamp recipe and its `--stamp-*` tokens were removed (`visual-language.spec.ts` guards against their return). Tinted button variants render subtle by default; `appearance="solid"` is the opt-in for the one destructive confirm button in a dialog.
 
-Legacy component-class selectors (`.btn`, `.session-message .message-bubble`, `.approval-card`) in `_shape-overrides.scss` predate the recipe model and target classes that have largely been renamed during the BEM migration. They're being removed as primitives migrate to recipes (`knowledge-base/knowledge/features/design_system_completion.md` Phase 3). New shape rules belong in a recipe mixin, not as a body-class-scoped selector.
+Legacy component-class selectors (`.btn`, `.session-message .message-bubble`, `.approval-card`) in `_roman-accents.scss` predate the recipe model and target classes that have largely been renamed during the BEM migration. They're being removed as primitives migrate to recipes (`knowledge-base/knowledge/features/design_system_completion.md` Phase 3). New shape rules belong in a recipe mixin, not as a body-class-scoped selector.
 
 ## Verification
 

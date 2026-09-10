@@ -4,7 +4,7 @@ import {dirname, join} from 'node:path';
 import {describe, expect, it} from 'vitest';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const overrides = readFileSync(join(here, '_shape-overrides.scss'), 'utf8');
+const overrides = readFileSync(join(here, '_roman-accents.scss'), 'utf8');
 const semantic = readFileSync(join(here, '..', '_semantic-tokens.scss'), 'utf8');
 
 // Strip line comments so prose about the retired sharp-corner pass can't trip

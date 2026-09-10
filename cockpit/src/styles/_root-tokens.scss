@@ -3,7 +3,7 @@
 // These are the runtime contract for shape and typography across the cockpit.
 // Default values mirror the Sass scalars in _variables.scss; theme files may
 // override individual tokens under their scoped selectors (the active themes
-// use the radius scale as-is — see the note in _shape-overrides.scss).
+// use the radius scale as-is — see the note in _roman-accents.scss).
 //
 // Components should not read these directly. They consume role tokens from
 // _semantic-tokens.scss (--radius-control, --font-primary, etc.), which alias
@@ -33,7 +33,7 @@
     sans-serif;
 
   // Display family defaults to the base; Roman themes override to Cinzel via
-  // _shape-overrides.scss. Loaded in cockpit/src/index.html.
+  // _roman-accents.scss. Loaded in cockpit/src/index.html.
   --font-family-display: var(--font-family-base);
   --font-family-mono:
     'JetBrains Mono',
