@@ -414,7 +414,7 @@ import {TranslocoPipe} from '@jsverse/transloco';
         position: relative;
         width: 34px;
         height: 18px;
-        border-radius: 999px;
+        border-radius: var(--radius-pill);
         background: var(--surface-0);
         border: 1px solid var(--border-color);
         transition: background 0.15s, border-color 0.15s;
@@ -481,7 +481,7 @@ import {TranslocoPipe} from '@jsverse/transloco';
         flex: 0 0 auto;
         padding: 4px 8px;
         border: 1px solid var(--border-color);
-        border-radius: 999px;
+        border-radius: var(--radius-pill);
         color: var(--text-muted);
         background: var(--surface-0);
         font-size: 10px;
@@ -681,8 +681,8 @@ import {TranslocoPipe} from '@jsverse/transloco';
       }
       .col-wide { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       .col-role { color: var(--text-muted); font-size: 12px; }
-      .breakdown-row .col-share { position: relative; height: 6px; background: var(--surface-0); border-radius: 3px; overflow: hidden; }
-      .share-bar { display: block; height: 100%; background: var(--accent-color); border-radius: 3px; }
+      .breakdown-row .col-share { position: relative; height: 6px; background: var(--surface-0); border-radius: var(--radius-tag); overflow: hidden; }
+      .share-bar { display: block; height: 100%; background: var(--accent-color); border-radius: var(--radius-tag); }
       .model-grid { grid-template-columns: 1.6fr 96px 96px 78px 96px 70px 80px; }
       .project-grid { grid-template-columns: 1.6fr 100px 86px 100px 70px 80px; }
       .bar-chart {
@@ -705,7 +705,7 @@ import {TranslocoPipe} from '@jsverse/transloco';
         width: 100%;
         min-height: 2px;
         background: var(--accent-color);
-        border-radius: 2px 2px 0 0;
+        border-radius: var(--radius-tag) var(--radius-tag) 0 0;
         transition: height 0.2s;
       }
       .bar-label {
@@ -871,7 +871,7 @@ import {TranslocoPipe} from '@jsverse/transloco';
       .swatch {
         width: 10px;
         height: 10px;
-        border-radius: 2px;
+        border-radius: var(--radius-tag);
         flex: 0 0 auto;
       }
       .lg-label {

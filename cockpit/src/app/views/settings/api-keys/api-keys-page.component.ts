@@ -268,7 +268,7 @@ const DEFAULT_SCOPES = ['jobs:read', 'chat:read'];
     .scope-chip {
       font-size: 0.7rem;
       padding: 2px 6px;
-      border-radius: 4px;
+      border-radius: var(--radius-tag);
       background: var(--surface-2);
       color: var(--text-secondary);
       font-family: var(--font-mono);
@@ -276,7 +276,7 @@ const DEFAULT_SCOPES = ['jobs:read', 'chat:read'];
     .rot-badge {
       font-size: 0.7rem;
       padding: 2px 6px;
-      border-radius: 4px;
+      border-radius: var(--radius-tag);
       background: color-mix(in srgb, var(--warning) 30%, transparent);
       color: var(--warning);
       margin-left: 6px;

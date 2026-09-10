@@ -296,7 +296,7 @@ export function duplicateResultTranslationArgs(
       .banner {
         margin-top: 1rem;
         padding: 0.5rem 0.75rem;
-        border-radius: 6px;
+        border-radius: var(--radius-control);
       }
       .banner.ok {
         background: var(--success-tint);

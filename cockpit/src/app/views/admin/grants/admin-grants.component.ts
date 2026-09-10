@@ -167,7 +167,7 @@ const INHERIT = '__inherit__';
       border: 1px solid var(--border-color); border-radius: var(--radius-surface);
     }
     .grid .muted, .muted { color: var(--text-muted); }
-    .banner { margin-top: 1rem; padding: 0.5rem 0.75rem; border-radius: 6px; }
+    .banner { margin-top: 1rem; padding: 0.5rem 0.75rem; border-radius: var(--radius-control); }
     .banner.err { background: var(--danger-tint); color: var(--danger); }
     .banner.info {
       margin: 0 0 1rem; background: var(--surface-0);

@@ -3490,7 +3490,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         video.srcObject = stream;
         video.autoplay = true;
         video.playsInline = true;
-        video.style.cssText = 'max-width:90vw;max-height:70vh;border-radius:8px;background:#000;';
+        video.style.cssText = 'max-width:90vw;max-height:70vh;border-radius:var(--radius-control);background:#000;';
         const buttons = document.createElement('div');
         buttons.style.cssText = 'display:flex;gap:12px;';
         const captureBtn = document.createElement('button');
@@ -3498,13 +3498,13 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         captureBtn.textContent = this.transloco.translate('chat.composer.capturePhoto');
         captureBtn.style.cssText =
             'padding:10px 20px;font-size:14px;font-weight:500;border:none;' +
-            'border-radius:6px;background:#3399D6;color:#fff;cursor:pointer;';
+            'border-radius:var(--radius-control);background:#3399D6;color:#fff;cursor:pointer;';
         const cancelBtn = document.createElement('button');
         cancelBtn.type = 'button';
         cancelBtn.textContent = this.transloco.translate('common.cancel');
         cancelBtn.style.cssText =
             'padding:10px 20px;font-size:14px;font-weight:500;border:none;' +
-            'border-radius:6px;background:#444;color:#fff;cursor:pointer;';
+            'border-radius:var(--radius-control);background:#444;color:#fff;cursor:pointer;';
         buttons.appendChild(captureBtn);
         buttons.appendChild(cancelBtn);
         overlay.appendChild(video);

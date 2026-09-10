@@ -361,7 +361,7 @@ const MODE_ROUTES: Record<RailMode, string> = {
         flex-shrink: 0;
         padding: 1px 5px;
         border: 1px solid var(--border-color);
-        border-radius: 4px;
+        border-radius: var(--radius-tag);
         font-family: inherit;
         font-size: 10px;
         line-height: 1.4;

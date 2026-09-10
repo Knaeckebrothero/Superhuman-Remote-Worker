@@ -171,7 +171,7 @@ export const CAPACITY_REFRESH_MS = 10_000;
         gap: 4px;
         padding: 14px 16px;
         border: 1px solid var(--border-color);
-        border-radius: 10px;
+        border-radius: var(--radius-surface);
         background: var(--surface-1);
       }
       .kpi-label {
@@ -230,7 +230,7 @@ export const CAPACITY_REFRESH_MS = 10_000;
       }
       .unpark-btn {
         padding: 4px 10px;
-        border-radius: 6px;
+        border-radius: var(--radius-control);
         border: 1px solid var(--border-color);
         background: var(--surface-0);
         color: var(--text-primary);

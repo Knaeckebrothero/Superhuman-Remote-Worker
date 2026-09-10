@@ -67,7 +67,7 @@ import {ViewModeService} from '../../core/services/view-mode.service';
       .dot {
         width: 6px;
         height: 6px;
-        border-radius: 999px;
+        border-radius: var(--radius-pill);
         background-color: currentColor;
         opacity: 0.85;
         flex-shrink: 0;

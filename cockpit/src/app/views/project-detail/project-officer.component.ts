@@ -1261,7 +1261,7 @@ export function nextWakeLabel(
       }
       .officer-card {
         border: 1px solid var(--border-color);
-        border-radius: 10px;
+        border-radius: var(--radius-surface);
         padding: 16px;
         display: flex;
         flex-direction: column;
@@ -1279,7 +1279,7 @@ export function nextWakeLabel(
         text-transform: uppercase;
         letter-spacing: 0.4px;
         padding: 2px 8px;
-        border-radius: 999px;
+        border-radius: var(--radius-pill);
         background: var(--bg-tertiary);
         color: var(--text-secondary);
       }
@@ -1333,7 +1333,7 @@ export function nextWakeLabel(
       .officer-slot-chip {
         font-size: 12px;
         padding: 2px 10px;
-        border-radius: 999px;
+        border-radius: var(--radius-pill);
         border: 1px solid var(--border-color);
         background: var(--bg-tertiary);
       }
@@ -1366,7 +1366,7 @@ export function nextWakeLabel(
         color: var(--text-tertiary);
         font-style: italic;
         padding: 1px 8px;
-        border-radius: 999px;
+        border-radius: var(--radius-pill);
         border: 1px dashed var(--border-color);
       }
       .officer-drain {
@@ -1389,7 +1389,7 @@ export function nextWakeLabel(
       }
       .officer-confirm {
         border: 1px solid var(--border-color);
-        border-radius: 8px;
+        border-radius: var(--radius-control);
         padding: 10px 12px;
         display: flex;
         flex-direction: column;

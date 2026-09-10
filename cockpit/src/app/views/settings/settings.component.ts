@@ -2343,13 +2343,13 @@ const EXPIRY_OPTIONS = [
         flex: 1;
         height: 6px;
         background: var(--surface-1);
-        border-radius: 3px;
+        border-radius: var(--radius-tag);
         overflow: hidden;
       }
 
       .subs-usage-fill {
         height: 100%;
-        border-radius: 3px;
+        border-radius: var(--radius-tag);
         transition: width 0.3s ease;
       }
 
@@ -2581,7 +2581,7 @@ const EXPIRY_OPTIONS = [
         gap: 12px;
         padding: 8px 10px;
         border: 1px solid var(--border-color);
-        border-radius: 8px;
+        border-radius: var(--radius-control);
         background: var(--surface-1);
       }
       .voice-library-card.is-added {

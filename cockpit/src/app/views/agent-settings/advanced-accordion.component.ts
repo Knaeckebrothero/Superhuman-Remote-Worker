@@ -655,7 +655,7 @@ import {liftLegacyTiers} from '../experts/expert-config';
       line-height: 1.4;
       border-left: 2px solid var(--accent-color, var(--accent-color));
       background: var(--surface-1, rgba(127, 127, 127, 0.08));
-      border-radius: 3px;
+      border-radius: var(--radius-tag);
     }
     .form-input {
       flex: 1;

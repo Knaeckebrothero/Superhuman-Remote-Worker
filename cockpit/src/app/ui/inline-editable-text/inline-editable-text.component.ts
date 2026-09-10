@@ -100,7 +100,7 @@ import {AppIconComponent} from '../icon';
       .inline-edit__text--clickable {
         cursor: text;
         padding: 0 4px;
-        border-radius: 4px;
+        border-radius: var(--radius-tag);
         transition: background 0.12s ease;
       }
 

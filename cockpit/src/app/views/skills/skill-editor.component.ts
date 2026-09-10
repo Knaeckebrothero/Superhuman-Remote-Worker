@@ -153,7 +153,7 @@ import {
       .file-tab {
         padding: 0.25rem 0.6rem;
         border: 1px solid var(--border-color);
-        border-radius: 6px;
+        border-radius: var(--radius-control);
         background: var(--surface-2, transparent);
         color: var(--text-primary);
         cursor: pointer;
@@ -170,7 +170,7 @@ import {
       .banner {
         margin-top: 1rem;
         padding: 0.5rem 0.75rem;
-        border-radius: 6px;
+        border-radius: var(--radius-control);
       }
       .banner.err {
         background: var(--danger-tint);

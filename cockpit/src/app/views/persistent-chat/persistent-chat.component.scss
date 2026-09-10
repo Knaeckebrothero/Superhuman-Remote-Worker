@@ -2522,7 +2522,7 @@
   .compaction-segment {
     flex: 1;
     height: 4px;
-    border-radius: 2px;
+    border-radius: var(--radius-tag);
     background: color-mix(in srgb, var(--warning, #e0707a) 22%, transparent);
     overflow: hidden;
     position: relative;
@@ -2624,7 +2624,7 @@
     display: inline-block;
     width: 64px;
     height: 5px;
-    border-radius: 3px;
+    border-radius: var(--radius-tag);
     background: color-mix(in srgb, var(--text-muted) 22%, transparent);
     overflow: hidden;
   }
@@ -2632,7 +2632,7 @@
   .usage-gauge-fill {
     display: block;
     height: 100%;
-    border-radius: 3px;
+    border-radius: var(--radius-tag);
     background: var(--info, #7a9bc6);
     transition: width 300ms ease, background-color 300ms ease;
   }

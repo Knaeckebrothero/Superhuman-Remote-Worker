@@ -2293,7 +2293,7 @@ type KeyValueRow = {key: string; value: string};
         position: relative;
         width: 64px;
         height: 4px;
-        border-radius: 2px;
+        border-radius: var(--radius-tag);
         background: var(--surface-3, rgba(127, 127, 127, 0.25));
         overflow: hidden;
       }
@@ -2302,7 +2302,7 @@ type KeyValueRow = {key: string; value: string};
         position: absolute;
         inset: 0 auto 0 0;
         height: 100%;
-        border-radius: 2px;
+        border-radius: var(--radius-tag);
         background: var(--info, #3b82f6);
         transition: width 0.3s ease;
       }

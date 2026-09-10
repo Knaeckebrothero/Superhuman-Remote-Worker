@@ -135,3 +135,10 @@ describe('templates — no raw legacy buttons', () => {
     expect(hits, hits.join('\n')).toEqual([]);
   });
 });
+
+describe('debt — no px radii anywhere', () => {
+  it('inline styles obey the stylelint rule too', () => {
+    const hits = scanSources(join(here, '../app'), /border-radius:\s*[1-9][0-9]*px/);
+    expect(hits, hits.join('\n')).toEqual([]);
+  });
+});
