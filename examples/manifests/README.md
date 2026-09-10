@@ -36,6 +36,17 @@ Explicit `workspace: null` and `connectors: {}` suppress those defaults. No deep
 private settings. The protocol remains `v1alpha1` while migration and execution
 semantics are exercised.
 
+For the shipped harness, `runtime: {adapter: srw/v1}` selects the installed SRW
+worker pool. Omit `image` so the definition follows installation upgrades; an
+explicit image must match that installation at admission. Generic runtimes require
+their own image and launch it directly. See [installed SRW Expert](installed-srw-expert.yaml)
+and the [configuration guide](../../config/README.md) for existing-definition migration.
+New execution snapshots record the selected concrete SRW image; reapplying a Job
+after a rollout preserves its existing execution.
+The [2026-09-10 k3d verification](verification/k3d-installed-harness-2026-09-10.json)
+records migration of all 20 installed Experts, preserved execution history, and
+a successful real Job/Session run with this binding.
+
 ## Local use
 
 Install with `pip install -e '.[manifests]'` or use the configured orchestrator

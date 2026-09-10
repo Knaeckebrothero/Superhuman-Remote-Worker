@@ -1,0 +1,471 @@
+{
+  "gate": "installed-srw-harness-image-binding",
+  "status": "passed",
+  "context": "k3d-srw",
+  "namespace": "srw",
+  "contract": "With runtime.adapter=srw/v1, omitted image follows the installation; explicit image constraints remain enforced.",
+  "scope": "Installed Expert image binding, versioned migration, real SRW Job and stateless Session; this is not a complete scheduling/backend matrix.",
+  "baselineCommit": "ddfaf557f",
+  "deployment": {
+    "pod": "srw-orchestrator-7bf9c6d4d-bjmfw",
+    "imageID": "srw-registry:5000/srw-orchestrator@sha256:cce70cdb37655d7317e59316b4ee164598b7ca7214bac8bb70a06f1e38479afa",
+    "sourceFilesMatched": 62,
+    "sourceDigest": "104d3a71a63d1198722015f01a8f378f8e3b71eef124a6adb9484498ec8f7542",
+    "nativeHostingEnabled": false,
+    "nativeNamespace": "srw-native"
+  },
+  "rollout": {
+    "tiltCi": "passed on second invocation",
+    "initialAttempt": "10-minute timeout during workspace image build; resumed with a 30-minute limit"
+  },
+  "migration": {
+    "admissionImage": "srw-registry:5000/srw-agent:tilt-333bc834fa8c95c4",
+    "changes": [
+      {
+        "expectedResourceVersion": 2,
+        "nextResourceVersion": 3,
+        "nextRevision": "sha256:54b332fbfee3b98487a011e45fa06eb4b1f73b7600cdd5e483a2ec050adac660",
+        "previousRevision": "sha256:d8d4e5aa7503221f6c1a5fa1c4e2ed918c8b1f5aa2f122a9034810de4101dcad",
+        "scopeKind": "Catalog",
+        "sourceFingerprint": "sha256:3e4765ae7925a720a2e2d4293b039e6177355e9e41239859b207383a4285bd98",
+        "uid": "17f941d4-6fd9-437f-a44d-c1211c060af1"
+      },
+      {
+        "expectedResourceVersion": 2,
+        "nextResourceVersion": 3,
+        "nextRevision": "sha256:0edc2588e51b1e1e30964bc92c223e6b4ff4862d2941c383d2393eea0700c7ef",
+        "previousRevision": "sha256:a467ac65f9ab24b8e422f490de2c42ef5378630abdab39a756b308ba0e12c1c2",
+        "scopeKind": "Catalog",
+        "sourceFingerprint": "sha256:6c201697796a76641a00bd181a58f19699ab412452de5d68a7836e2e1eb86167",
+        "uid": "e2a919a9-c353-4193-ac9b-709772121d6e"
+      },
+      {
+        "expectedResourceVersion": 2,
+        "nextResourceVersion": 3,
+        "nextRevision": "sha256:5035d608bc034a5ece8fd34c78f2eace8b37b8c13913c8eaa051c16b624cb3dc",
+        "previousRevision": "sha256:44645c2d14b21b3a54b9541c35d53635d7787289c160b4885eadb461e3c9b2c8",
+        "scopeKind": "Catalog",
+        "sourceFingerprint": "sha256:f03f285e1ab14e7b481b27f9cf3686fa0a99a2d257278ee8873cb2d5a9210c01",
+        "uid": "235cb91c-2b4a-4749-8f1c-77601a7af86f"
+      },
+      {
+        "expectedResourceVersion": 2,
+        "nextResourceVersion": 3,
+        "nextRevision": "sha256:a4e14fa8a13d11607af412b6ec691d73f4567b8f6fd82fe8e43a64bc5cfb1abe",
+        "previousRevision": "sha256:d91750c58bc296b81094d1005e9db60176a14e4387ea3964fd5d31b31e4a7835",
+        "scopeKind": "Catalog",
+        "sourceFingerprint": "sha256:896c1822b2bdc806475338dd10e6d0811fde458a25a52dd371e116113b8480d8",
+        "uid": "81f000ed-8bc6-4811-ba5b-29f9e53aa085"
+      },
+      {
+        "expectedResourceVersion": 2,
+        "nextResourceVersion": 3,
+        "nextRevision": "sha256:042120413a22db10fe8f0b07aceda8dfdf1e943a43ba3f8f23012a12b1125151",
+        "previousRevision": "sha256:3e731a16ba74a87c6c9149c5b69c7c1636148b9700e3bb72b79a0f4d84a8ee68",
+        "scopeKind": "Catalog",
+        "sourceFingerprint": "sha256:c61f6b869d58148b182e58dc3dc69c46c99aaab6b541b342f476719de019d0ab",
+        "uid": "64c33f2c-b34b-4dbe-9ab1-a3641c3c16e5"
+      },
+      {
+        "expectedResourceVersion": 2,
+        "nextResourceVersion": 3,
+        "nextRevision": "sha256:2696232fdb4c51d6bd68bf7579f5bbf29ecaaac5c3c0ce4179f2d85e9a06505a",
+        "previousRevision": "sha256:dee341a9dd568448f35192e0ebc7b8be0dc81b0c5766e6a508431abc149fcf47",
+        "scopeKind": "Catalog",
+        "sourceFingerprint": "sha256:5925f3313a84d2cde0d521918896340fb8d378aa47c44c45b871ee4527b238ec",
+        "uid": "6a17fba5-70b0-4b99-b973-4f6e174c20fd"
+      },
+      {
+        "expectedResourceVersion": 2,
+        "nextResourceVersion": 3,
+        "nextRevision": "sha256:cba162cf5de907ab962960c8756d59916e68b87fea1ee0ae0f81fb8ce594eaa4",
+        "previousRevision": "sha256:ecb5b0ab281675ad3f7fc64ddff5f1cc80e108724ba4673f5a6c6cc95d381a7e",
+        "scopeKind": "Catalog",
+        "sourceFingerprint": "sha256:6f0488a1ec42ddc4009690a4f68a51e9dad9e5ce4a7c3a4d87d94d066039c88b",
+        "uid": "920b70c3-ee72-41f0-9284-20ee935630f7"
+      },
+      {
+        "expectedResourceVersion": 2,
+        "nextResourceVersion": 3,
+        "nextRevision": "sha256:2523c4826e6598c8c6e9b8a8e52d4e03758a8ebd93058abf0132221da5f1b578",
+        "previousRevision": "sha256:bb59d7c101f5c7850128bc3aba50c6ef3b62a0739f81ec6f57c0b778821fd808",
+        "scopeKind": "Catalog",
+        "sourceFingerprint": "sha256:ed3d8115c11628b0afc33bd9b35d9a2c10c2fcb193deb58b3da888f6fb96f521",
+        "uid": "14a94cbf-884d-4b7d-bc97-e19f654bfde8"
+      },
+      {
+        "expectedResourceVersion": 2,
+        "nextResourceVersion": 3,
+        "nextRevision": "sha256:dd815ef10e0b5f308ce7c2bc58210b84c796fb88aa89df93c063ac58ac05bd1a",
+        "previousRevision": "sha256:b8ae93d6d3aec233ec78b7b9697d80ce36731b154f799d9cd392728872cc55d0",
+        "scopeKind": "Catalog",
+        "sourceFingerprint": "sha256:3339150f946db602eabe9d78f09218e721e36b6954e290e5afd4ad4c386218bc",
+        "uid": "a4136799-ef77-4de5-8d3b-afb76270b853"
+      },
+      {
+        "expectedResourceVersion": 2,
+        "nextResourceVersion": 3,
+        "nextRevision": "sha256:77d01330561b7e9732a1e272cf3eb3b0385ee0518102da7104762e88d5e5ff91",
+        "previousRevision": "sha256:ef40f4b43823537786a3f37e47f651f43e351b22d02564d15e653ed4a291ad06",
+        "scopeKind": "Catalog",
+        "sourceFingerprint": "sha256:b07501c325a365ee0a5ca58cb54872f13df320252d20b1e32a77c2b4e28613da",
+        "uid": "0905ecb1-d214-4eab-9bcd-f0228821e24d"
+      },
+      {
+        "expectedResourceVersion": 2,
+        "nextResourceVersion": 3,
+        "nextRevision": "sha256:bf02bf638879cb8f4529e173ab86e8ed11eef4c419fb70b6d76470e8b633b32a",
+        "previousRevision": "sha256:1a0a9907e859615f64ec2b37a3f8c9533f67cf16d0ac6e1827418b8e81187e31",
+        "scopeKind": "Catalog",
+        "sourceFingerprint": "sha256:ecf02b4dfc4c1419fe12d4935d8fbfbb5b2a7fdc82c4d8337aae570df9dcbe39",
+        "uid": "8495e90b-ca6a-4ce6-830b-1b788ec70697"
+      },
+      {
+        "expectedResourceVersion": 2,
+        "nextResourceVersion": 3,
+        "nextRevision": "sha256:9c80749c9751aca8930af75c6ce7ff239f1877cb06dbfe0c1ff0b93d68f54125",
+        "previousRevision": "sha256:e4819699e3a467313cdbb34e48f1bdb5a260464dd19afd904570475f9b338e80",
+        "scopeKind": "Catalog",
+        "sourceFingerprint": "sha256:d6e24caccd834701162a1132f66b80326e90187ee8f63cab1ee2416e5ba36188",
+        "uid": "30125ec8-a6c9-442c-8927-5226bbc9c3a4"
+      },
+      {
+        "expectedResourceVersion": 2,
+        "nextResourceVersion": 3,
+        "nextRevision": "sha256:061f24b7dbc190ac250706944ad5d65cc83b2d59f34707888dff2875a324731a",
+        "previousRevision": "sha256:56f0aedf5002254dd08e6a6130fbb4fd5295da53137c30484628855768dff729",
+        "scopeKind": "Catalog",
+        "sourceFingerprint": "sha256:a3804082160055dad61c663f6ef0e42af3ae04076bbccec8051fdae64434c882",
+        "uid": "6e300997-6151-4289-966f-654043cf6175"
+      },
+      {
+        "expectedResourceVersion": 2,
+        "nextResourceVersion": 3,
+        "nextRevision": "sha256:47880935356295128f553823a6156180ebfb942bd58bae5439006aadf003422c",
+        "previousRevision": "sha256:a15a83ec8181d7d76573e6ff13270ce7e193adcfb031057023b423d9d0f7aeb7",
+        "scopeKind": "Catalog",
+        "sourceFingerprint": "sha256:d91ce00e7eb5c274f325e5a7564cf62dde934d7ff895e4312a19b66d4897b0ea",
+        "uid": "d56cb19e-0412-4339-9812-76a1f2b073be"
+      },
+      {
+        "expectedResourceVersion": 2,
+        "nextResourceVersion": 3,
+        "nextRevision": "sha256:4f5df1d9b03beae5c0e6cbc78eb96b495b6de9f4aaba343654e4ea4780d49e24",
+        "previousRevision": "sha256:753eea0ed8461cd9b13d50271ee640755aaf256571fbf3fa54c0657780793674",
+        "scopeKind": "Catalog",
+        "sourceFingerprint": "sha256:706909380bc13f5b840e0ada26b2662c7f9c445a293d2708c6a6116be83b41f6",
+        "uid": "93331a68-dcac-4d30-8a33-01db671dce50"
+      },
+      {
+        "expectedResourceVersion": 2,
+        "nextResourceVersion": 3,
+        "nextRevision": "sha256:9c3ef247da91806be9624b0e92bc9b0688a21072cece654e7e41cab91bab16c0",
+        "previousRevision": "sha256:8d8556c452feefb4bc1eed189205e103e08fa43dd141099b2b5371ee4ae30101",
+        "scopeKind": "Catalog",
+        "sourceFingerprint": "sha256:abab619f70576f4ec03d9cb72d7332c7228823cc9a79bc95350380c29b182b4a",
+        "uid": "562fe2a3-ed92-4255-89c6-73baa81b1dc6"
+      },
+      {
+        "expectedResourceVersion": 2,
+        "nextResourceVersion": 3,
+        "nextRevision": "sha256:9ba88a0f977f22ea1fa9ba791a48b1dd3ad6a253e9478405866cff272874fdb2",
+        "previousRevision": "sha256:b34fd6b73b6b5075374094829e224457f5651e43bdc5a1eef333fd0707ed45f4",
+        "scopeKind": "Catalog",
+        "sourceFingerprint": "sha256:ea54180960990788c392f7283db4d68b124db27e6c3b8b65949fe0c81a79a47a",
+        "uid": "468cd4c7-ca16-483f-84c3-869062423f92"
+      },
+      {
+        "expectedResourceVersion": 2,
+        "nextResourceVersion": 3,
+        "nextRevision": "sha256:ab03075f19a33ddec883e0accbbe46b4089669a7f1d0e9775ba8d1d1af725095",
+        "previousRevision": "sha256:a2299436ea5ef04a6a3d8feff35b9c2c5b69c873787baf51f19abf6e26893c6d",
+        "scopeKind": "Catalog",
+        "sourceFingerprint": "sha256:8c96fba79b3033988b7d9f3673de650449eba14f91ee5c339a101015ce3374b2",
+        "uid": "880f2d07-ecdc-4805-880d-342b6111a883"
+      },
+      {
+        "expectedResourceVersion": 2,
+        "nextResourceVersion": 3,
+        "nextRevision": "sha256:5b4ad4805ea558a1d1dfa290cf3a5e48eb52df1189f432693e999f1d4891ffe2",
+        "previousRevision": "sha256:260d843a0df78fd971a9097623de8362cae846a9d385d38ab073ba2b72031f6c",
+        "scopeKind": "Catalog",
+        "sourceFingerprint": "sha256:f02079fa808c7524269f71fb4178cd8f00a950b7153738ed5a1a1ab2e3df1432",
+        "uid": "52ca1b1e-2c6e-4d90-94ea-48e6da78533e"
+      },
+      {
+        "expectedResourceVersion": 2,
+        "nextResourceVersion": 3,
+        "nextRevision": "sha256:895d35f80de2fa2e5f5e6e09709cdd239d942166f39ed444dd63afca13cdb77c",
+        "previousRevision": "sha256:e938c23ea62db04e30b7957fb74060f789f251479a319624f0310e0b4c215ce6",
+        "scopeKind": "Catalog",
+        "sourceFingerprint": "sha256:9268b1407e6356c270ca89528d4a7181863514788378bc98a74edd5d5717dcaa",
+        "uid": "c5b6ec1f-6078-4d7a-8c67-c2f85d0afc6b"
+      }
+    ],
+    "counts": {
+      "byScope": {
+        "Catalog": 20
+      },
+      "executionSnapshots": 6,
+      "experts": 20,
+      "projects": 0
+    },
+    "fromImage": "srw-registry:5000/srw-agent:tilt-a2242c3a891301a2",
+    "imageBinding": "installed",
+    "invariants": {
+      "executionHistoryUnchanged": true,
+      "noAffectedProjectGeneration": true,
+      "onlyImageAndVersionBookkeeping": true,
+      "priorResourceRevisionsUnchanged": true,
+      "privateSettingsAndAuthorityUnchanged": true,
+      "unrelatedResourcesUnchanged": true
+    },
+    "operation": "apply",
+    "planRevision": "sha256:99ceecabf07b9769c49a219e417d9cc545c686a3d39e20c60e2b81575a48e73d"
+  },
+  "readiness": {
+    "installedImage": "srw-registry:5000/srw-agent:tilt-333bc834fa8c95c4",
+    "readiness": {
+      "activeExperts": 20,
+      "installedBindings": 20,
+      "currentAccepted": 20,
+      "futureImageAccepted": 20
+    },
+    "futureCheck": "read-only validator check; installation not changed"
+  },
+  "pythonVerification": {
+    "broaderRun": {
+      "passed": 427,
+      "failed": 10,
+      "durationSeconds": 229.32,
+      "failures": "8 missing locked Helm dependency in isolated checkout; 2 new Project fixtures omitted admission authority."
+    },
+    "correctedAffectedModules": {
+      "passed": 29,
+      "failed": 0,
+      "durationSeconds": 75.78
+    },
+    "migrationRehearsals": {
+      "passed": 3,
+      "cases": [
+        "versioned update preserves private values and history",
+        "changed Project topology refuses plan",
+        "unrelated mutation rolls transaction back"
+      ]
+    },
+    "result": "All selected checks passed after correcting the test setup; production code was unchanged during those corrections."
+  },
+  "liveSmoke": {
+    "gate": "manifest-srw-adapter-smoke",
+    "context": "k3d-srw",
+    "gateIdentity": "cutover-7b65c3a7fc54-",
+    "startedAt": "2026-09-10T07:37:54.451966+00:00",
+    "status": "passed",
+    "scope": "Real SRW worker Job and stateless Session over HTTP, SSE, sandbox workspace and stored snapshots",
+    "deployment": {
+      "pod": "srw-orchestrator-7bf9c6d4d-bjmfw",
+      "imageID": "srw-registry:5000/srw-orchestrator@sha256:cce70cdb37655d7317e59316b4ee164598b7ca7214bac8bb70a06f1e38479afa",
+      "sourceFilesMatched": 62,
+      "sourceDigest": "104d3a71a63d1198722015f01a8f378f8e3b71eef124a6adb9484498ec8f7542",
+      "nativeHostingEnabled": false,
+      "nativeNamespace": "srw-native"
+    },
+    "agents": [
+      {
+        "pod": "srw-agent-stateless-79fd77cb49-nrx2z",
+        "uid": "e510154c-5813-4977-a05f-44edb433ba90",
+        "image": "srw-registry:5000/srw-agent:tilt-333bc834fa8c95c4",
+        "sourceFilesMatched": 4
+      },
+      {
+        "pod": "srw-agent-stateless-79fd77cb49-vf5b2",
+        "uid": "e602c755-be30-42a4-9dbc-7587386bbbd7",
+        "image": "srw-registry:5000/srw-agent:tilt-333bc834fa8c95c4",
+        "sourceFilesMatched": 4
+      }
+    ],
+    "fixtureImage": "srw-registry:5000/srw-manifest-fixture@sha256:3e0e5e106fe7b03063eb2a13f150ba6ef4d97c1e55ecfcc2541c52e703527f57",
+    "temporaryAdmin": {
+      "username": "srw-manifest-admin-ef1e00da2df6",
+      "oauthClientID": "cb8c51bb-4672-4fdb-b44d-5f812777e945",
+      "keycloakID": "8923b09d-9c80-4898-930d-e247583399c7",
+      "applicationID": "be2513ba-aaba-4a26-9576-92ec2d80646b",
+      "identityRevoked": true,
+      "identityDeleted": true,
+      "applicationUserDeleted": true,
+      "oauthClientDeleted": true,
+      "defaultProjectRemoved": true,
+      "externalProfileResidue": "Normal JIT cloud/Gitea profiles may outlive the application user; no external account deletion API is assumed."
+    },
+    "checks": [
+      "Role-authenticated owned provider/model registration preserves configured and effective defaults",
+      "Native SRW manifest Job completes through the real worker and reapply preserves its execution identity",
+      "Stateless Session first attach, frozen source edit, next-turn PATCH and End/Resume preserve the admitted contract"
+    ],
+    "cleanup": {
+      "complete": true,
+      "stage": "complete",
+      "workloads": [
+        {
+          "kind": "Session",
+          "workID": "59467b98-db01-4060-9494-f09db5e8aea0",
+          "statuses": [
+            {
+              "method": "GET",
+              "status": 200
+            },
+            {
+              "method": "DELETE",
+              "status": 503
+            },
+            {
+              "method": "GET",
+              "status": 200
+            },
+            {
+              "method": "DELETE",
+              "status": 200
+            },
+            {
+              "method": "GET",
+              "status": 404
+            }
+          ],
+          "absent": true
+        },
+        {
+          "kind": "Job",
+          "workID": "52e8740f-f723-4076-85b8-301f61ca9c46",
+          "statuses": [
+            {
+              "method": "GET",
+              "status": 200
+            },
+            {
+              "method": "DELETE",
+              "status": 200
+            },
+            {
+              "method": "GET",
+              "status": 404
+            }
+          ],
+          "absent": true
+        }
+      ],
+      "workloadsAndCatalogRemoved": true
+    },
+    "job": {
+      "workID": "52e8740f-f723-4076-85b8-301f61ca9c46",
+      "snapshot": {
+        "id": "f5ccd1fd-2b63-4304-8587-02da1f995010",
+        "generation": 1,
+        "revision": "sha256:e3e85ba49b89de8e05da3fba43f2ed69b5d731381fcf018479d9267d08822743",
+        "adapter": "srw/v1",
+        "image": "srw-registry:5000/srw-agent:tilt-333bc834fa8c95c4",
+        "model": "zz-srw-manifest-7b65c3a7fc54",
+        "temperature": 0.17,
+        "sourceDigest": "23a9b2ccda3764c3d4eda349ef012dcc33318d6bf5295553c0c2853c7ca6f756"
+      },
+      "provider": {
+        "consumed_required_responses": 0,
+        "worker_job_tool_steps": 12,
+        "unexpected_count": 0,
+        "pending_calls": 0
+      }
+    },
+    "session": {
+      "workID": "59467b98-db01-4060-9494-f09db5e8aea0",
+      "original": {
+        "id": "d74eb37c-212e-40c9-a935-088cede1b5ed",
+        "generation": 1,
+        "revision": "sha256:9e59f0ab487c46a903ba0d3ddf3c0c398d5e0b9cb6a25b0b60792d1d6806f88b",
+        "adapter": "srw/v1",
+        "image": "srw-registry:5000/srw-agent:tilt-333bc834fa8c95c4",
+        "model": "zz-srw-manifest-7b65c3a7fc54",
+        "temperature": 0.17,
+        "sourceDigest": "742f50f0dae87705fc1acd27302b3b5f5f7163a16539455a92fe5ba716010067",
+        "thread": {
+          "execution_lane": "stateless",
+          "status": "active",
+          "generation": "a7ad1bd1-c51d-4280-9ac0-aa84643f0d9e",
+          "total_turns": 1
+        }
+      },
+      "patched": {
+        "id": "d74eb37c-212e-40c9-a935-088cede1b5ed",
+        "generation": 2,
+        "revision": "sha256:413e36c6500edf80652213660a849fa532f1f78f3b1d85715e4881eacdad6806",
+        "adapter": "srw/v1",
+        "image": "srw-registry:5000/srw-agent:tilt-333bc834fa8c95c4",
+        "model": "zz-srw-manifest-7b65c3a7fc54",
+        "temperature": 0.42,
+        "sourceDigest": "742f50f0dae87705fc1acd27302b3b5f5f7163a16539455a92fe5ba716010067",
+        "thread": {
+          "execution_lane": "stateless",
+          "status": "active",
+          "generation": "a7ad1bd1-c51d-4280-9ac0-aa84643f0d9e",
+          "total_turns": 1
+        }
+      },
+      "resumed": {
+        "id": "d74eb37c-212e-40c9-a935-088cede1b5ed",
+        "generation": 2,
+        "revision": "sha256:413e36c6500edf80652213660a849fa532f1f78f3b1d85715e4881eacdad6806",
+        "adapter": "srw/v1",
+        "image": "srw-registry:5000/srw-agent:tilt-333bc834fa8c95c4",
+        "model": "zz-srw-manifest-7b65c3a7fc54",
+        "temperature": 0.42,
+        "sourceDigest": "742f50f0dae87705fc1acd27302b3b5f5f7163a16539455a92fe5ba716010067",
+        "thread": {
+          "execution_lane": "stateless",
+          "status": "active",
+          "generation": "e926bf9d-8511-46c8-ada2-4a4717abfd02",
+          "total_turns": 3
+        }
+      },
+      "provider": {
+        "consumed_required_responses": 3,
+        "worker_job_tool_steps": 0,
+        "unexpected_count": 0,
+        "pending_calls": 0
+      }
+    },
+    "ownedWorkIDs": {
+      "job": "52e8740f-f723-4076-85b8-301f61ca9c46",
+      "session": "59467b98-db01-4060-9494-f09db5e8aea0"
+    },
+    "fixtureNamespace": {
+      "name": "srw-adapter-gate-8b3091a1455c",
+      "uid": "6c732cbe-7076-44b9-abec-8ace620b0009"
+    },
+    "finishedAt": "2026-09-10T07:41:40.658237+00:00"
+  },
+  "liveSmokeSha256": "43863a24301944933f2e3259a4b9e8001e74d61aeb498942105c5e1940e19e4e",
+  "postSmokeExternalProfileCleanup": {
+    "gitea": {
+      "matches": 1,
+      "id": 9,
+      "login": "srw-manifest-admin-ef1e00da2df6",
+      "emailMatches": true,
+      "exactOIDCSubject": true,
+      "createdWithinRun": true,
+      "isAdmin": false,
+      "empty": true,
+      "counts": {
+        "repos": 0,
+        "orgs": 0,
+        "keys": 0
+      },
+      "deleted": true
+    },
+    "cloud": {
+      "backend": "nextcloud",
+      "emailMatches": 0
+    }
+  },
+  "retainedArtifacts": [
+    "immutable execution history",
+    "local image cache"
+  ]
+}

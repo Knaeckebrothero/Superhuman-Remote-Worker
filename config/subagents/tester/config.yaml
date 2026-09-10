@@ -18,7 +18,6 @@ metadata:
   - subagent
 spec:
   runtime:
-    image: srw-agent:latest
     adapter: srw/v1
     config:
       config_name: expert_base

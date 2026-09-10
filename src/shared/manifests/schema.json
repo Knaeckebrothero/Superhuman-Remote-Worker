@@ -317,12 +317,19 @@
     "Runtime": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "image"
+      "anyOf": [
+        {
+          "required": ["image"]
+        },
+        {
+          "required": ["adapter"],
+          "properties": {"adapter": {"const": "srw/v1"}}
+        }
       ],
       "properties": {
         "image": {
-          "$ref": "#/$defs/NonemptyString"
+          "$ref": "#/$defs/NonemptyString",
+          "description": "Required for generic hosting. Omit with adapter srw/v1 to use the installation-managed harness; an explicit image constrains SRW admission to that installed image."
         },
         "pullPolicy": {
           "$ref": "#/$defs/PullPolicy"

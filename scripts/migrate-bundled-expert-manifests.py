@@ -18,22 +18,25 @@ from shared.runtime.core.srw_manifest_config import (
 )
 
 
-def converted(path: Path, *, image: str) -> str | None:
+def converted(path: Path, *, image: str | None) -> str | None:
     text = path.read_text(encoding="utf-8")
     raw = yaml.safe_load(text)
     if not isinstance(raw, dict):
         raise ValueError(f"Expected an object: {path}")
     if raw.get("kind") == "Expert":
         private = srw_private_config(raw)
+        updated = text
+        if image is None and raw["spec"]["runtime"].get("image") == BUNDLED_SRW_IMAGE:
+            updated = updated.replace(f"    image: {BUNDLED_SRW_IMAGE}\n", "", 1)
         if "asset_name" not in private:
             selector = private["config_name"]
             base = private.get("config", {}).get("$extends", "worker_base")
-            return text.replace(
+            updated = updated.replace(
                 f"      config_name: {selector}\n",
                 f"      config_name: {base}\n      asset_name: {selector}\n",
                 1,
             )
-        return None
+        return updated if updated != text else None
     library = path.parent.parent.name == "subagents"
     name = path.parent.name
     role = "session" if raw.get("$extends") == "session_base" else "worker"
@@ -62,7 +65,7 @@ def converted(path: Path, *, image: str) -> str | None:
         "metadata": metadata,
         "spec": {
             "runtime": {
-                "image": image,
+                **({"image": image} if image is not None else {}),
                 "adapter": SRW_HARNESS_ADAPTER,
                 "config": {
                     "config_name": raw.get("$extends", "worker_base"),
@@ -94,7 +97,9 @@ def main() -> int:
         type=Path,
         default=Path(__file__).resolve().parents[1] / "config",
     )
-    parser.add_argument("--image", default=BUNDLED_SRW_IMAGE)
+    parser.add_argument(
+        "--image", help="Constrain newly converted definitions to an explicit image"
+    )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--write", action="store_true")
     mode.add_argument("--check", action="store_true")

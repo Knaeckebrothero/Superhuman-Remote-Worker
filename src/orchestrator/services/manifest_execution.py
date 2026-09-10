@@ -196,6 +196,11 @@ class ManifestExecutionService:
             ] = srw["resolved"]["spec"]["execution"]["expert"]["inline"]["runtime"][
                 "config"
             ]
+            # Keep the authored installation binding, but record the concrete
+            # image selected at admission in the immutable execution snapshot.
+            snapshot["resolved"]["spec"]["execution"]["expert"]["inline"]["runtime"][
+                "image"
+            ] = self.srw_image
         else:
             bindings = await self.bindings(snapshot, user, materialize=False)
             try:

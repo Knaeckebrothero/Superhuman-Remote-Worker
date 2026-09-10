@@ -31,7 +31,6 @@ metadata:
   - session
 spec:
   runtime:
-    image: srw-agent:latest
     adapter: srw/v1
     config:
       config_name: session_base

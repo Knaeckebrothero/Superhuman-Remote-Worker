@@ -167,6 +167,7 @@ def test_generic_projection_never_claims_reference_harness_settings():
     document = module.expert_manifest(row)
     runtime = document["spec"]["runtime"]
     runtime.pop("adapter")
+    runtime["image"] = "custom/worker:1"
     runtime["config"] = {"tools": {"read_file": None}, "arbitrary": [True, None]}
     projected = module.project_expert_resource(row, saved_resource(document))
     assert projected["harness_adapter"] is None
@@ -188,6 +189,7 @@ def test_all_bundled_definitions_are_valid_manifests_with_same_private_leaf():
     documents = []
     for path in paths:
         (document,) = parse_documents(path.read_text())
+        assert "image" not in document["spec"]["runtime"]
         documents.append(document)
         private = srw_private_config(document)
         assert private["config"] == read_srw_config(path)
@@ -277,6 +279,7 @@ async def test_generic_catalog_detail_never_loads_reference_harness_settings():
     row = expert_row()
     document = module.expert_manifest(row)
     document["spec"]["runtime"].pop("adapter")
+    document["spec"]["runtime"]["image"] = "custom/worker:1"
     projected = module.project_expert_resource(row, saved_resource(document))
     deps = SimpleNamespace(
         store=SimpleNamespace(get_expert_by_id=AsyncMock(return_value=projected)),

@@ -14,7 +14,6 @@ from pathlib import Path
 from orchestrator.database.postgres import PostgresDB
 from orchestrator.services.manifest_experts import (
     expert_manifest,
-    installed_srw_image,
     migrate_stored_experts,
     seed_bundled_expert_manifests,
 )
@@ -44,7 +43,10 @@ async def run(args) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--apply", action="store_true")
-    parser.add_argument("--image", default=installed_srw_image())
+    parser.add_argument(
+        "--image",
+        help="Constrain new definitions to this image; omit to follow the installed SRW harness",
+    )
     parser.add_argument(
         "--config-dir",
         type=Path,

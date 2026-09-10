@@ -16,7 +16,6 @@ from orchestrator.services.manifest_experts import (
     bind_bundled_expert_identity,
     hydrate_expert_rows,
     project_expert_resource,
-    installed_srw_image,
 )
 from orchestrator.services.manifest_store import ManifestStore, resource_key
 from shared.manifests import API_VERSION, validate_documents
@@ -477,7 +476,6 @@ def _base_project_expert(resource, project_id, role, config_name, recipe):
         },
         "spec": {
             "runtime": {
-                "image": installed_srw_image(),
                 "adapter": SRW_HARNESS_ADAPTER,
                 "config": {"config_name": config_name, "config": {}},
             }

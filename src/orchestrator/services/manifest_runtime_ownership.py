@@ -55,11 +55,19 @@ def require_srw_expert_configuration(
 def require_srw_launch_configuration(
     runtime: Mapping[str, Any], *, trusted_image: str
 ) -> dict[str, Any]:
-    """Native and existing callers must honor the same reference-host contract."""
-    if runtime.get("image") != trusted_image:
+    """An omitted SRW image follows installation upgrades; explicit ones constrain.
+
+    Only this adapter uses the installation-managed pool. An omitted image must
+    never turn an ordinary container into a trusted SRW harness.
+    """
+    if not isinstance(trusted_image, str) or not trusted_image.strip():
+        raise HTTPException(503, "The installed SRW harness image is unavailable.")
+    if ("image" in runtime and runtime["image"] != trusted_image) or (
+        "image" not in runtime and runtime.get("adapter") != "srw/v1"
+    ):
         raise HTTPException(
             422,
-            "The SRW adapter requires this installation's trusted SRW image; update the Expert image and reapply affected Projects, or use generic hosting for an arbitrary image.",
+            "The explicit SRW image must match the installed harness. Omit image with adapter srw/v1 to follow installation upgrades, or use generic hosting for an arbitrary image.",
         )
     if any(key in runtime for key in ("command", "args", "env", "probes", "resources")):
         raise HTTPException(

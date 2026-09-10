@@ -72,8 +72,8 @@ def expert_manifest(
     """Convert a reference-harness row, preserving private nulls and tool keys.
 
     This is an explicit SRW adapter, not a generic manifest transformation.
-    Image defaults come from installation configuration only for this legacy
-    authoring boundary. Native manifest requests keep their authored image.
+    New legacy-authored Experts follow the installed harness without copying a
+    rollout tag. Existing and explicitly supplied image constraints stay owned.
     """
     if existing is not None:
         private = srw_private_config(existing)
@@ -91,7 +91,6 @@ def expert_manifest(
             "metadata": {"name": expert_resource_name(row), "scope": scope},
             "spec": {
                 "runtime": {
-                    "image": image or installed_srw_image(),
                     "adapter": SRW_HARNESS_ADAPTER,
                 }
             },
@@ -513,7 +512,8 @@ async def seed_bundled_expert_manifests(
             for path in sorted((config_dir / group).glob("*/config.yaml")):
                 document = parse_documents(path.read_text(encoding="utf-8"))[0]
                 srw_private_config(document)
-                document["spec"]["runtime"]["image"] = image or installed_srw_image()
+                if image is not None:
+                    document["spec"]["runtime"]["image"] = image
                 await store.lock_identity(document)
                 metadata = document["metadata"]
                 if await store.by_name("Expert", metadata["scope"], metadata["name"]):

@@ -25,7 +25,6 @@ metadata:
   - safe-default
 spec:
   runtime:
-    image: srw-agent:latest
     adapter: srw/v1
     config:
       config_name: worker_base

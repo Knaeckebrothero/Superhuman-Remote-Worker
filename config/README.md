@@ -15,7 +15,6 @@ metadata:
   scope: {kind: Account, name: personal}
 spec:
   runtime:
-    image: registry.example.com/your-installed-srw-agent:version
     adapter: srw/v1
     config:
       config_name: worker_base
@@ -27,31 +26,26 @@ spec:
         persona: Help implement and verify the assigned change.
 ```
 
-The adapter requires the installation's trusted SRW image. The
-`srw-agent:latest` image in shipped assets is an import placeholder: the bundled
-migration substitutes the configured image. A native manifest's arbitrary image
-is never granted reference-harness integration by using that placeholder or
-selecting an adapter.
+With `adapter: srw/v1`, omit `image` to use the installed SRW harness. Bundled and
+new editor-created Experts use this binding, so Helm/Tilt image upgrades do not
+require editing every Expert or Project. Generic hosting still requires an image.
+An explicit SRW `image` is an admission constraint: it must match the installed
+image, and a mismatch is rejected on Job, Session and roster admission. Choose
+generic hosting to launch an arbitrary image.
 
-Changing the installed SRW image requires an explicit definition update. An
-operator migration must select the exact previous installation image, preserve
-private settings and frozen Project content, and commit resource revisions under
-the catalog transaction lock. Migrated Projects also carry a server-owned recipe
-used by their existing default and override editors. Exporting and reapplying one
-through the public manifest API adopts native Project authoring and does not retain
-that recipe; re-resolution can also incorporate newer referenced definitions.
-An installation image update must preserve this provenance and publish any
-affected Project as a complete new generation. Independent Experts can use normal
-versioned manifest updates. Startup and rerunning the importer with `--image`
-preserve existing authored resources; they do not upgrade image fields. New Job
-and Session admission rejects a stale or custom SRW launch envelope on every
-ingress path. Previously recorded execution generations retain their original
-configuration.
+Earlier imports stored a concrete installation image. Remove that field through
+a versioned resource update to adopt the installed binding. Restarting or rerunning
+the importer preserves existing authored definitions. Active Projects keep frozen
+Expert content and need a complete Project update to adopt the new binding.
+Migrated Projects also retain a server-owned editor recipe; public export/reapply
+adopts native authoring and re-resolves references, so review that transition before
+using it to update a migrated Project. Existing execution generations remain unchanged.
 
 The reference adapter launches the installation-managed worker image, including
-on later stateless attachments. Keeping an older image reference in a historical
-snapshot does not select that old image from the pool. Generic hosting separately
-pins observed image digests for retries and workspace handoffs.
+on later stateless attachments. Each new execution snapshot records the concrete
+image selected at admission. This is provenance: it does not select an old image
+from the pool after a rollout. Generic hosting separately pins observed image
+digests for retries and workspace handoffs.
 
 Within this private contract, `config_name` selects the actual configuration
 base. Optional `asset_name` selects an installed Expert or subagent directory
@@ -84,7 +78,8 @@ payload lives in the resource store; the old `experts.config` and
 `experts.prompts` payloads are emptied during migration. Existing expert editing
 and selection APIs project the SRW private settings from that resource.
 `scripts/migrate-expert-resources.py` previews pending stored conversions;
-`--apply --image <trusted-image>` performs the migration after schema migration.
+`--apply` performs the migration after schema migration, using the installed
+harness binding. Optional `--image <trusted-image>` adds an explicit image constraint.
 It preserves existing resource edits on reruns. Imported bundled resources are
 also preserved on restart; upgrading one uses an explicit resource update.
 

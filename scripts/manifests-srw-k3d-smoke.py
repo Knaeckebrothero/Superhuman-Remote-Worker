@@ -1129,6 +1129,7 @@ def authored_expert(prefix, image, model, *, session=False):
         prefix, "session" if session else "worker", image=image, private=private
     )
     document["spec"]["runtime"]["adapter"] = "srw/v1"
+    document["spec"]["runtime"].pop("image")
     if session:
         document["metadata"]["annotations"]["srw.io/expert-type"] = "session"
         document["metadata"]["tags"] = ["session"]
@@ -1247,7 +1248,10 @@ class Smoke:
     def snapshot(self, kind, work_id):
         result = readonly_evidence(kind=kind, work_id=work_id)
         require(
-            result and result["adapter"] == "srw/v1" and result["model"] == self.model,
+            result
+            and result["adapter"] == "srw/v1"
+            and result["model"] == self.model
+            and result["image"] == self.image,
             "The execution does not contain the admitted SRW adapter/model snapshot.",
         )
         return result
