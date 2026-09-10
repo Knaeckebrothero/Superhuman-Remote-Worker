@@ -822,7 +822,10 @@ class CutoverGate:
                 in self.cleanup_intents
             ]
             for item in sorted(
-                candidates, key=lambda row: row["resource"]["kind"] != "Project"
+                candidates,
+                key=lambda row: {"Job": 0, "Project": 1}.get(
+                    row["resource"]["kind"], 2
+                ),
             ):
                 if (
                     item["resource"]["metadata"].get("annotations", {}).get(OWNER_LABEL)

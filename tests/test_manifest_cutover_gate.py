@@ -317,3 +317,44 @@ async def test_project_gate_against_real_routes_and_full_postgres_schema(
                 assert len(gate.evidence["checks"]) == 2
 
         await asyncio.to_thread(exercise)
+
+
+def test_cleanup_retires_jobs_before_their_referenced_experts(gate_module):
+    expert = gate_module.authored_expert(PREFIX)
+    job = gate_module.authored_job(PREFIX)
+    resources = [
+        {"uid": str(uuid4()), "resource": doc, "resourceVersion": 1}
+        for doc in (expert, job)
+    ]
+    remaining = {item["uid"]: item for item in resources}
+    deleted = []
+
+    def respond(request):
+        if request.url.path == "/api/resources":
+            return httpx.Response(200, json={"resources": list(remaining.values())})
+        uid = request.url.path.rsplit("/", 1)[1]
+        item = remaining.get(uid)
+        if request.method == "DELETE":
+            kind = item["resource"]["kind"]
+            if kind == "Expert" and any(
+                r["resource"]["kind"] == "Job" for r in remaining.values()
+            ):
+                return httpx.Response(409, json={"detail": "Referenced by a Job"})
+            deleted.append(kind)
+            del remaining[uid]
+            return httpx.Response(200, json={"deleted": True})
+        return httpx.Response(200 if item else 404, json=item or {})
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        gate = gate_module.CutoverGate(
+            client,
+            prefix=PREFIX,
+            inspect_db=lambda: counts(activeOwnedResources=len(remaining)),
+            inspect_native=lambda: [],
+        )
+        gate.cleanup_intents = {
+            (doc["kind"], doc["metadata"]["name"]) for doc in (expert, job)
+        }
+        gate.cleanup()
+    assert deleted == ["Job", "Expert"]
+    assert gate.evidence["cleanup"]["complete"] is True
