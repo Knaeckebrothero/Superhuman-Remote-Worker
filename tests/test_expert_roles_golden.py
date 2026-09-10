@@ -105,8 +105,10 @@ _POST_SPLIT_OVERLAY_REMOVALS: dict[str, tuple[str, ...]] = {
     # U3 WP4: a delegation batch runs without the tool-batch watchdog (B.6),
     # so the per-category ceiling for `delegation` left the worker overlay
     # with the light reader it was sized for.
-    "worker": ("limits.tool_category_timeouts.delegation",),
-    "session": (),
+    # Manifest workspace ownership: infrastructure now comes from the
+    # execution resolver, so the shared Expert root no longer selects it.
+    "worker": ("limits.tool_category_timeouts.delegation", "workspace.backend"),
+    "session": ("workspace.backend",),
 }
 #: Tool names later work packages added to a tool CATEGORY on top of the
 #: frozen baseline (role -> category -> names, with the work that added them).

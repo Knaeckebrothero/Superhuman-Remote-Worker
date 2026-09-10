@@ -77,13 +77,11 @@ workspace:
   max_write_words: 10000
   # Git versioning for workspace history
   git_versioning: true
-  # Workspace backend: "sandbox" (SSH workspace container) or "vm"
-  # (KubeVirt VM with sudo gate). The agent never operates on its own
-  # filesystem — every workspace lives in an isolated SSH-accessible
-  # container or VM. The orchestrator injects the connection details at
-  # dispatch time.
-  backend: sandbox
-  # Remote backend settings (injected by orchestrator at dispatch time)
+  # Infrastructure is selected by the execution, independently of Expert
+  # settings. The execution resolver supplies role defaults (worker: sandbox,
+  # session: virtual) before the harness receives its configuration.
+  # Remote connection settings are injected for sandbox/VM workspaces at
+  # dispatch time; virtual/no-workspace selections do not require SSH.
   # remote:
   #   host: ""                                        # VM/container hostname or IP
   #   port: 22

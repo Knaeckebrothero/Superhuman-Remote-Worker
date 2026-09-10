@@ -207,6 +207,10 @@ Selection precedence is explicit execution choice, then the active Project's
 workspace default, then account/role defaults (worker: sandbox, session: virtual).
 An explicit `workspace: null` means no workspace.
 
+The managed role defaults are defined in
+`shared.runtime.core.workspace_selection.execution_workspace_config`.
+`expert_base.yaml` contains harness behavior and does not select infrastructure.
+
 Experts can publish `spec.workspacePreference: {backend: sandbox}`. The creation
 forms show this recommendation and materialize it as an explicit execution choice
 when no Project default or manual selection takes precedence. API callers must

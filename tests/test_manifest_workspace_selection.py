@@ -78,6 +78,23 @@ def test_expert_edits_never_select_or_size_execution_workspace(role, backend):
 
 
 @pytest.mark.parametrize(
+    "role,backend", [("worker", "sandbox"), ("session", "virtual")]
+)
+def test_managed_role_default_is_independent_of_expert_backend(role, backend):
+    blob = resolve_config(
+        base_config_name=f"{role}_base",
+        expert_type=role,
+        expert_row={
+            "config": {
+                "workspace": {"backend": "vm"},
+                "llm": {"model": "admitted-model"},
+            }
+        },
+    )
+    assert blob["agent"]["workspace"]["backend"] == backend
+
+
+@pytest.mark.parametrize(
     "model,required", [(JobCreate, {"description": "Test"}), (ThreadCreateRequest, {})]
 )
 def test_api_workspace_null_is_distinct_from_omission(model, required):
