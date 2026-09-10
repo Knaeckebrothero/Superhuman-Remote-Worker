@@ -110,33 +110,75 @@ def _install_fake_auth(monkeypatch, user_id: str = "u1") -> None:
 
     monkeypatch.setattr(sessions_mod, "require_approved_user", _fake, raising=True)
 
-    # Every connection path now joins protected-reader readiness before lane
-    # or transport discovery. Ordinary fixture rows take the immediate-ready
-    # branch; individual protected tests override this explicitly.
-    import orchestrator.main as main_mod
-
-    monkeypatch.setattr(
-        main_mod,
-        "_await_protected_cloud_runtime_ready",
-        AsyncMock(return_value=True),
-        raising=True,
-    )
+    # Every connection path joins protected-reader readiness before lane or
+    # transport discovery. ``_Ports`` defaults that port to immediately-ready;
+    # individual protected tests override it on their own holder.
 
 
-def _fake_main() -> MagicMock:
-    """Stub for the ``main`` module the router pulls in via late imports.
+class _Ports:
+    """Mutable stand-ins for the sessions router's explicit ports.
 
-    Pre-seeds the coroutine functions those imports resolve to — a bare
-    MagicMock attribute raises ``TypeError: 'MagicMock' object can't be
-    awaited`` at the await site.
+    R1.B06 replaced this router's late ``from orchestrator.main import ...``
+    with a constructed ``SessionsDependencies``. Tests reassign a collaborator
+    after construction, so ``dependencies`` forwards through this holder at
+    call time rather than capturing the callables when it is built.
     """
-    m = MagicMock()
-    # Attach gate: lets in-flight cloud session-folder provisioning land
-    # before an agent binds (knowledge-base/knowledge/issues/
-    # session_resume_cloud_sync_race_late_provision.md).
-    m._await_late_cloud_setup = AsyncMock(return_value=None)
-    m._await_protected_cloud_runtime_ready = AsyncMock(return_value=True)
-    return m
+
+    def __init__(self, store=None):
+        self.store = store if store is not None else AsyncMock()
+        self.agent_provisioner = MagicMock()
+        self.container_provisioner = MagicMock()
+        self.workspace_suspension_service = MagicMock()
+        self.session_router = MagicMock()
+        self.session_tokens = MagicMock()
+        self.ensure_session_workspace = AsyncMock()
+        # Attach gate: lets in-flight cloud session-folder provisioning land
+        # before an agent binds (knowledge-base/knowledge/issues/
+        # session_resume_cloud_sync_race_late_provision.md).
+        self.await_late_cloud_setup = AsyncMock(return_value=None)
+        self.await_protected_cloud_runtime_ready = AsyncMock(return_value=True)
+        self.session_grant_violations = AsyncMock(return_value=[])
+        self.session_endpoint_violations = AsyncMock(return_value=[])
+        self.find_idle_persistent_agent = AsyncMock(return_value=None)
+        self.send_session_attach = AsyncMock(return_value=True)
+
+    @property
+    def dependencies(self):
+        from orchestrator.routers.sessions import SessionsDependencies
+
+        holder = self
+        return SessionsDependencies(
+            store=holder.store,
+            agent_provisioner=holder.agent_provisioner,
+            container_provisioner=holder.container_provisioner,
+            workspace_suspension_service=holder.workspace_suspension_service,
+            session_router=holder.session_router,
+            session_tokens=holder.session_tokens,
+            ensure_session_workspace=(
+                lambda *a, **k: holder.ensure_session_workspace(*a, **k)
+            ),
+            await_late_cloud_setup=(
+                lambda *a, **k: holder.await_late_cloud_setup(*a, **k)
+            ),
+            await_protected_cloud_runtime_ready=(
+                lambda *a, **k: holder.await_protected_cloud_runtime_ready(*a, **k)
+            ),
+            session_grant_violations=(
+                lambda *a, **k: holder.session_grant_violations(*a, **k)
+            ),
+            session_endpoint_violations=(
+                lambda *a, **k: holder.session_endpoint_violations(*a, **k)
+            ),
+            find_idle_persistent_agent=(
+                lambda *a, **k: holder.find_idle_persistent_agent(*a, **k)
+            ),
+            send_session_attach=(lambda *a, **k: holder.send_session_attach(*a, **k)),
+        )
+
+
+def _fake_main(store=None) -> _Ports:
+    """Build the router's ports without standing up the composition root."""
+    return _Ports(store)
 
 
 @pytest.fixture
@@ -180,12 +222,9 @@ def app(monkeypatch):
 
     # The router uses `from main import postgres_db` — patch the symbol on the
     # router module so the late import resolves to our fake.
-    monkeypatch.setattr(
-        "orchestrator.routers.sessions._get_db",
-        lambda: fake_db,
-        raising=False,
-    )
+    fake_main = _fake_main(fake_db)
 
+    app.state.sessions_dependencies_factory = lambda: fake_main.dependencies
     app.include_router(sessions_router)
     return app, fake_db
 
@@ -321,7 +360,6 @@ def test_prepare_refuses_every_non_pinned_lane(app, execution_lane):
 @pytest.mark.asyncio
 async def test_do_prepare_refuses_stateless_lane_before_provisioning(monkeypatch):
     """The background entry re-checks the lane in case it changed after POST."""
-    import sys
 
     from orchestrator.routers import sessions as sessions_mod
 
@@ -334,12 +372,11 @@ async def test_do_prepare_refuses_stateless_lane_before_provisioning(monkeypatch
     lock_cm.__aenter__.return_value = None
     lock_cm.__aexit__.return_value = False
     db.thread_advisory_lock = MagicMock(return_value=lock_cm)
-    monkeypatch.setattr(sessions_mod, "_get_db", lambda: db, raising=False)
+    fake_main = _fake_main(db)
     provision = AsyncMock()
     monkeypatch.setattr(
         sessions_mod, "_provision_agent_for_thread", provision, raising=True
     )
-    monkeypatch.setitem(sys.modules, "orchestrator.main", _fake_main())
     emitted: list[tuple[str, dict]] = []
     monkeypatch.setattr(
         sessions_mod,
@@ -357,6 +394,7 @@ async def test_do_prepare_refuses_stateless_lane_before_provisioning(monkeypatch
             thread_id=CONNECTION_THREAD_ID,
             generation=CONNECTION_GENERATION,
         ),
+        dependencies=fake_main.dependencies,
     )
 
     assert [state for state, _ in emitted] == ["provisioning", "failed"]
@@ -376,13 +414,14 @@ async def test_provision_helper_refuses_stateless_lane(monkeypatch):
         "status": "created",
         "user_id": "u1",
     }
-    monkeypatch.setattr(sessions_mod, "_get_db", lambda: db, raising=False)
+    fake_main = _fake_main(db)
 
     with pytest.raises(RuntimeError, match="pinned provisioning"):
         await sessions_mod._provision_agent_for_thread(
             thread_id="t1",
             config_name="session_base",
             config_override=None,
+            dependencies=fake_main.dependencies,
         )
 
 
@@ -391,7 +430,6 @@ async def test_provision_helper_suppresses_pod_fallback_after_lane_transition(
     monkeypatch,
 ):
     """A failed warm reservation must not use its stale pinned snapshot."""
-    import sys
 
     from orchestrator.routers import sessions as sessions_mod
 
@@ -418,25 +456,24 @@ async def test_provision_helper_suppresses_pod_fallback_after_lane_transition(
             },
         )
     )
-    monkeypatch.setattr(sessions_mod, "_get_db", lambda: db, raising=False)
+    fake_main = _fake_main(db)
 
-    fake_main = _fake_main()
-    fake_main._find_idle_persistent_agent = AsyncMock(
+    fake_main.find_idle_persistent_agent = AsyncMock(
         return_value={
             "id": "a1",
             "pod_ip": "10.0.0.1",
             "pod_port": 8001,
         }
     )
-    fake_main._send_session_attach = AsyncMock(return_value=False)
+    fake_main.send_session_attach = AsyncMock(return_value=False)
     fake_main.agent_provisioner.provision_agent = AsyncMock()
-    monkeypatch.setitem(sys.modules, "orchestrator.main", fake_main)
 
     with pytest.raises(RuntimeError, match="pinned provisioning"):
         await sessions_mod._provision_agent_for_thread(
             thread_id="t1",
             config_name="session_base",
             config_override=None,
+            dependencies=fake_main.dependencies,
         )
 
     fake_main.agent_provisioner.provision_agent.assert_not_awaited()
@@ -465,7 +502,7 @@ async def test_do_prepare_emits_phases_for_warm_thread(monkeypatch, metadata):
     lock_cm.__aenter__.return_value = None
     lock_cm.__aexit__.return_value = False
     db.thread_advisory_lock = MagicMock(return_value=lock_cm)
-    monkeypatch.setattr(sessions_mod, "_get_db", lambda: db, raising=False)
+    fake_main = _fake_main(db)
 
     # Mock the readiness probe to immediately return ready=true.
     observed_ready: dict = {}
@@ -477,12 +514,9 @@ async def test_do_prepare_emits_phases_for_warm_thread(monkeypatch, metadata):
     monkeypatch.setattr(sessions_mod, "wait_for_ready", _ready_ok, raising=True)
 
     # Mock session_router on main.
-    import sys
 
-    fake_main = _fake_main()
     fake_main.session_router = AsyncMock()
     fake_main.session_router.ensure_route = AsyncMock(return_value="/p/t1")
-    monkeypatch.setitem(sys.modules, "orchestrator.main", fake_main)
 
     # Capture lifecycle emits at the call site inside sessions.py — patching
     # the bound `lifecycle_emit` name avoids the dual-module-path problem
@@ -506,6 +540,7 @@ async def test_do_prepare_emits_phases_for_warm_thread(monkeypatch, metadata):
             thread_id=CONNECTION_THREAD_ID,
             generation=CONNECTION_GENERATION,
         ),
+        dependencies=fake_main.dependencies,
     )
 
     # Expected phase sequence: provisioning (up-front) → booting → ready.
@@ -558,8 +593,6 @@ async def test_do_prepare_never_publishes_ready_for_a_changed_binding(
 ):
     """Readiness and routing for A cannot publish B as session-ready."""
 
-    import sys
-
     from orchestrator.routers import sessions as sessions_mod
 
     original = _connection_binding()
@@ -574,7 +607,7 @@ async def test_do_prepare_never_publishes_ready_for_a_changed_binding(
     lock_cm.__aenter__.return_value = None
     lock_cm.__aexit__.return_value = False
     db.thread_advisory_lock = MagicMock(return_value=lock_cm)
-    monkeypatch.setattr(sessions_mod, "_get_db", lambda: db, raising=False)
+    fake_main = _fake_main(db)
     monkeypatch.setattr(
         sessions_mod,
         "wait_for_ready",
@@ -582,11 +615,9 @@ async def test_do_prepare_never_publishes_ready_for_a_changed_binding(
         raising=True,
     )
 
-    fake_main = _fake_main()
     fake_main.session_router = MagicMock()
     fake_main.session_router.ensure_route = AsyncMock(return_value="/p/t1")
     fake_main.session_router.teardown_route = AsyncMock(return_value=True)
-    monkeypatch.setitem(sys.modules, "orchestrator.main", fake_main)
     emitted: list[str] = []
     monkeypatch.setattr(
         sessions_mod,
@@ -604,6 +635,7 @@ async def test_do_prepare_never_publishes_ready_for_a_changed_binding(
             thread_id=CONNECTION_THREAD_ID,
             generation=CONNECTION_GENERATION,
         ),
+        dependencies=fake_main.dependencies,
     )
 
     assert emitted == ["provisioning", "booting"]
@@ -628,8 +660,6 @@ async def test_do_prepare_cleans_partial_route_on_every_exception(
 ):
     """Service-only creation or a failed final reread cannot strand a route."""
 
-    import sys
-
     from orchestrator.routers import sessions as sessions_mod
 
     original = _connection_binding()
@@ -644,7 +674,7 @@ async def test_do_prepare_cleans_partial_route_on_every_exception(
     lock_cm.__aenter__.return_value = None
     lock_cm.__aexit__.return_value = False
     db.thread_advisory_lock = MagicMock(return_value=lock_cm)
-    monkeypatch.setattr(sessions_mod, "_get_db", lambda: db, raising=False)
+    fake_main = _fake_main(db)
     monkeypatch.setattr(
         sessions_mod,
         "wait_for_ready",
@@ -652,7 +682,6 @@ async def test_do_prepare_cleans_partial_route_on_every_exception(
         raising=True,
     )
 
-    fake_main = _fake_main()
     fake_main.session_router = MagicMock()
     fake_main.session_router.ensure_route = AsyncMock(
         side_effect=(
@@ -662,7 +691,6 @@ async def test_do_prepare_cleans_partial_route_on_every_exception(
         )
     )
     fake_main.session_router.teardown_route = AsyncMock(return_value=True)
-    monkeypatch.setitem(sys.modules, "orchestrator.main", fake_main)
     emitted: list[dict] = []
     monkeypatch.setattr(
         sessions_mod,
@@ -680,6 +708,7 @@ async def test_do_prepare_cleans_partial_route_on_every_exception(
             thread_id=CONNECTION_THREAD_ID,
             generation=CONNECTION_GENERATION,
         ),
+        dependencies=fake_main.dependencies,
     )
 
     assert [event["state"] for event in emitted] == [
@@ -699,8 +728,6 @@ async def test_do_prepare_cleans_partial_route_on_every_exception(
 async def test_do_prepare_reports_failed_when_exact_route_cleanup_is_incomplete(
     monkeypatch,
 ):
-    import sys
-
     from orchestrator.routers import sessions as sessions_mod
 
     original = _connection_binding()
@@ -711,17 +738,15 @@ async def test_do_prepare_reports_failed_when_exact_route_cleanup_is_incomplete(
     lock_cm.__aenter__.return_value = None
     lock_cm.__aexit__.return_value = False
     db.thread_advisory_lock = MagicMock(return_value=lock_cm)
-    monkeypatch.setattr(sessions_mod, "_get_db", lambda: db, raising=False)
+    fake_main = _fake_main(db)
     monkeypatch.setattr(
         sessions_mod, "wait_for_ready", AsyncMock(return_value=True), raising=True
     )
-    fake_main = _fake_main()
     fake_main.session_router = MagicMock()
     fake_main.session_router.ensure_route = AsyncMock(
         side_effect=RuntimeError("Ingress create failed")
     )
     fake_main.session_router.teardown_route = AsyncMock(return_value=False)
-    monkeypatch.setitem(sys.modules, "orchestrator.main", fake_main)
     emitted: list[dict] = []
     monkeypatch.setattr(
         sessions_mod,
@@ -739,6 +764,7 @@ async def test_do_prepare_reports_failed_when_exact_route_cleanup_is_incomplete(
             thread_id=CONNECTION_THREAD_ID,
             generation=CONNECTION_GENERATION,
         ),
+        dependencies=fake_main.dependencies,
     )
 
     assert emitted[-1]["state"] == "failed"
@@ -759,7 +785,7 @@ async def test_do_prepare_emits_failed_when_pod_not_ready(monkeypatch):
     lock_cm.__aenter__.return_value = None
     lock_cm.__aexit__.return_value = False
     db.thread_advisory_lock = MagicMock(return_value=lock_cm)
-    monkeypatch.setattr(sessions_mod, "_get_db", lambda: db, raising=False)
+    fake_main = _fake_main(db)
 
     # Readiness times out.
     async def _ready_timeout(pod_ip, pod_port, timeout_s, **_kwargs):
@@ -767,12 +793,8 @@ async def test_do_prepare_emits_failed_when_pod_not_ready(monkeypatch):
 
     monkeypatch.setattr(sessions_mod, "wait_for_ready", _ready_timeout, raising=True)
 
-    import sys
-
-    fake_main = _fake_main()
     fake_main.session_router = AsyncMock()
     fake_main.session_router.ensure_route = AsyncMock()
-    monkeypatch.setitem(sys.modules, "orchestrator.main", fake_main)
 
     emit_calls: list[dict] = []
 
@@ -792,6 +814,7 @@ async def test_do_prepare_emits_failed_when_pod_not_ready(monkeypatch):
             thread_id=CONNECTION_THREAD_ID,
             generation=CONNECTION_GENERATION,
         ),
+        dependencies=fake_main.dependencies,
     )
 
     states = [c["state"] for c in emit_calls]
@@ -828,7 +851,7 @@ async def test_do_prepare_waits_when_agent_pod_marker_in_flight(monkeypatch):
     lock_cm.__aenter__.return_value = None
     lock_cm.__aexit__.return_value = False
     db.thread_advisory_lock = MagicMock(return_value=lock_cm)
-    monkeypatch.setattr(sessions_mod, "_get_db", lambda: db, raising=False)
+    fake_main = _fake_main(db)
 
     provision = AsyncMock()
     monkeypatch.setattr(
@@ -844,15 +867,11 @@ async def test_do_prepare_waits_when_agent_pod_marker_in_flight(monkeypatch):
     monkeypatch.setattr(sessions_mod, "wait_for_binding", _bound, raising=True)
     monkeypatch.setattr(sessions_mod, "wait_for_ready", _ready_ok, raising=True)
 
-    import sys
-
-    fake_main = _fake_main()
     fake_main.session_router = AsyncMock()
     fake_main.session_router.ensure_route = AsyncMock(return_value="/p/t1")
     fake_main.ensure_session_workspace = AsyncMock(return_value=None)
-    fake_main._session_grant_violations = AsyncMock(return_value=[])
-    fake_main._session_endpoint_violations = AsyncMock(return_value=[])
-    monkeypatch.setitem(sys.modules, "orchestrator.main", fake_main)
+    fake_main.session_grant_violations = AsyncMock(return_value=[])
+    fake_main.session_endpoint_violations = AsyncMock(return_value=[])
 
     emit_calls: list[dict] = []
 
@@ -872,6 +891,7 @@ async def test_do_prepare_waits_when_agent_pod_marker_in_flight(monkeypatch):
             thread_id=CONNECTION_THREAD_ID,
             generation=CONNECTION_GENERATION,
         ),
+        dependencies=fake_main.dependencies,
     )
 
     provision.assert_not_awaited()
@@ -911,7 +931,7 @@ async def test_do_prepare_reconciles_workspace_on_cold_start(monkeypatch):
     lock_cm.__aenter__.return_value = None
     lock_cm.__aexit__.return_value = False
     db.thread_advisory_lock = MagicMock(return_value=lock_cm)
-    monkeypatch.setattr(sessions_mod, "_get_db", lambda: db, raising=False)
+    fake_main = _fake_main(db)
 
     monkeypatch.setattr(
         sessions_mod, "_provision_agent_for_thread", AsyncMock(), raising=True
@@ -926,15 +946,11 @@ async def test_do_prepare_reconciles_workspace_on_cold_start(monkeypatch):
     monkeypatch.setattr(sessions_mod, "wait_for_binding", _bound, raising=True)
     monkeypatch.setattr(sessions_mod, "wait_for_ready", _ready_ok, raising=True)
 
-    import sys
-
-    fake_main = _fake_main()
     fake_main.session_router = AsyncMock()
     fake_main.session_router.ensure_route = AsyncMock(return_value="/p/t1")
     fake_main.ensure_session_workspace = AsyncMock(return_value=None)
-    fake_main._session_grant_violations = AsyncMock(return_value=[])
-    fake_main._session_endpoint_violations = AsyncMock(return_value=[])
-    monkeypatch.setitem(sys.modules, "orchestrator.main", fake_main)
+    fake_main.session_grant_violations = AsyncMock(return_value=[])
+    fake_main.session_endpoint_violations = AsyncMock(return_value=[])
 
     monkeypatch.setattr(
         sessions_mod, "lifecycle_emit", lambda *a, **k: None, raising=True
@@ -949,6 +965,7 @@ async def test_do_prepare_reconciles_workspace_on_cold_start(monkeypatch):
             thread_id=CONNECTION_THREAD_ID,
             generation=CONNECTION_GENERATION,
         ),
+        dependencies=fake_main.dependencies,
     )
 
     fake_main.ensure_session_workspace.assert_called_once()
@@ -991,7 +1008,7 @@ async def test_do_prepare_waits_for_cloud_folder_before_binding_an_agent(monkeyp
     lock_cm.__aenter__.side_effect = _enter_lock
     lock_cm.__aexit__.return_value = False
     db.thread_advisory_lock = MagicMock(return_value=lock_cm)
-    monkeypatch.setattr(sessions_mod, "_get_db", lambda: db, raising=False)
+    fake_main = _fake_main(db)
 
     async def _provision(**kwargs):
         calls.append("provision")
@@ -1009,19 +1026,15 @@ async def test_do_prepare_waits_for_cloud_folder_before_binding_an_agent(monkeyp
     monkeypatch.setattr(sessions_mod, "wait_for_binding", _bound, raising=True)
     monkeypatch.setattr(sessions_mod, "wait_for_ready", _ready_ok, raising=True)
 
-    import sys
-
     async def _gate(thread_id):
         calls.append("cloud_gate")
 
-    fake_main = _fake_main()
-    fake_main._await_late_cloud_setup = _gate
+    fake_main.await_late_cloud_setup = _gate
     fake_main.session_router = AsyncMock()
     fake_main.session_router.ensure_route = AsyncMock(return_value="/p/t1")
     fake_main.ensure_session_workspace = AsyncMock(return_value=None)
-    fake_main._session_grant_violations = AsyncMock(return_value=[])
-    fake_main._session_endpoint_violations = AsyncMock(return_value=[])
-    monkeypatch.setitem(sys.modules, "orchestrator.main", fake_main)
+    fake_main.session_grant_violations = AsyncMock(return_value=[])
+    fake_main.session_endpoint_violations = AsyncMock(return_value=[])
 
     monkeypatch.setattr(
         sessions_mod, "lifecycle_emit", lambda *a, **k: None, raising=True
@@ -1036,6 +1049,7 @@ async def test_do_prepare_waits_for_cloud_folder_before_binding_an_agent(monkeyp
             thread_id=CONNECTION_THREAD_ID,
             generation=CONNECTION_GENERATION,
         ),
+        dependencies=fake_main.dependencies,
     )
 
     # Gate first, and OUTSIDE the advisory lock — holding it across the wait
@@ -1060,24 +1074,19 @@ async def test_do_prepare_grant_denied_fails_fast_without_provisioning(monkeypat
     lock_cm.__aenter__.return_value = None
     lock_cm.__aexit__.return_value = False
     db.thread_advisory_lock = MagicMock(return_value=lock_cm)
-    monkeypatch.setattr(sessions_mod, "_get_db", lambda: db, raising=False)
+    fake_main = _fake_main(db)
 
     provision = AsyncMock()
     monkeypatch.setattr(
         sessions_mod, "_provision_agent_for_thread", provision, raising=True
     )
 
-    import sys
-
-    fake_main = _fake_main()
-    fake_main._session_grant_violations = AsyncMock(
+    fake_main.session_grant_violations = AsyncMock(
         return_value=["permission_mode: 'autonomous' exceeds the ceiling"]
     )
-    fake_main._grant_violations_detail = (
-        lambda v: "config exceeds your capability grants: " + "; ".join(v)
-    )
+    # No stub for the detail formatter: the router imports the real one from
+    # ``grant_enforcement`` now, so the assertion below checks the shipped text.
     fake_main.ensure_session_workspace = AsyncMock(return_value=None)
-    monkeypatch.setitem(sys.modules, "orchestrator.main", fake_main)
 
     emit_calls: list[dict] = []
 
@@ -1097,6 +1106,7 @@ async def test_do_prepare_grant_denied_fails_fast_without_provisioning(monkeypat
             thread_id=CONNECTION_THREAD_ID,
             generation=CONNECTION_GENERATION,
         ),
+        dependencies=fake_main.dependencies,
     )
 
     states = [c["state"] for c in emit_calls]
@@ -1128,7 +1138,6 @@ def test_connection_probes_persisted_metadata_with_the_correct_cloud_requirement
     monkeypatch, metadata, expected_status
 ):
     """An ordinary pinned /ready is sufficient only for ordinary stored rows."""
-    import sys
 
     import httpx
     from orchestrator.routers import sessions as sessions_mod
@@ -1144,7 +1153,7 @@ def test_connection_probes_persisted_metadata_with_the_correct_cloud_requirement
     }
     binding = _connection_binding()
     db.get_pinned_session_binding.return_value = binding
-    monkeypatch.setattr(sessions_mod, "_get_db", lambda: db)
+    fake_main = _fake_main(db)
 
     def ready_response(request):
         assert request.url.path == "/ready"
@@ -1170,14 +1179,13 @@ def test_connection_probes_persisted_metadata_with_the_correct_cloud_requirement
         lambda **kwargs: real_client(transport=transport, **kwargs),
     )
     monkeypatch.setattr(sessions_mod, "probe_ready", session_lifecycle.probe_ready)
-    fake_main = _fake_main()
     fake_main.session_router.ensure_route = AsyncMock(return_value="/p/t1")
     fake_main.session_tokens = SessionTokenService(
         secret="test-secret-do-not-use", ttl_seconds=60
     )
-    monkeypatch.setitem(sys.modules, "orchestrator.main", fake_main)
 
     app = FastAPI()
+    app.state.sessions_dependencies_factory = lambda: fake_main.dependencies
     app.include_router(sessions_mod.router)
     response = TestClient(app).get(f"/api/sessions/{CONNECTION_THREAD_ID}/connection")
 
@@ -1208,7 +1216,7 @@ def test_connection_returns_ws_url_and_token_when_ready(monkeypatch):
     fake_db.get_pinned_session_binding.return_value = _connection_binding()
     from orchestrator.routers import sessions as sessions_mod
 
-    monkeypatch.setattr(sessions_mod, "_get_db", lambda: fake_db, raising=False)
+    fake_main = _fake_main(fake_db)
 
     # /connection probes the agent's /ready before minting; stub it to
     # always pass so we exercise the 200 path.
@@ -1222,15 +1230,13 @@ def test_connection_returns_ws_url_and_token_when_ready(monkeypatch):
 
     # Inject a real SessionTokenService and a fake session_router.
     test_tokens = SessionTokenService(secret="test-secret-do-not-use", ttl_seconds=60)
-    import sys
 
-    fake_main = _fake_main()
     fake_main.session_tokens = test_tokens
     fake_main.session_router = MagicMock()
     fake_main.session_router.ensure_route = AsyncMock(return_value="/p/t1")
-    monkeypatch.setitem(sys.modules, "orchestrator.main", fake_main)
     monkeypatch.setenv("SESSION_INGRESS_HOST", "api.test.example")
 
+    app.state.sessions_dependencies_factory = lambda: fake_main.dependencies
     app.include_router(sessions_router)
     client = TestClient(app)
     resp = client.get(f"/api/sessions/{CONNECTION_THREAD_ID}/connection")
@@ -1285,8 +1291,6 @@ def test_connection_refuses_any_changed_physical_binding_after_await(
 ):
     """A ready response/route for A cannot mint a token after DB names B."""
 
-    import sys
-
     from orchestrator.routers import sessions as sessions_mod
 
     fastapi_app = FastAPI()
@@ -1299,7 +1303,7 @@ def test_connection_refuses_any_changed_physical_binding_after_await(
         if mutation_phase == "post_probe"
         else [original, original, changed_binding]
     )
-    monkeypatch.setattr(sessions_mod, "_get_db", lambda: fake_db, raising=False)
+    fake_main = _fake_main(fake_db)
     monkeypatch.setattr(
         sessions_mod,
         "probe_ready",
@@ -1307,12 +1311,11 @@ def test_connection_refuses_any_changed_physical_binding_after_await(
         raising=True,
     )
 
-    fake_main = _fake_main()
     fake_main.session_tokens = MagicMock()
     fake_main.session_router = MagicMock()
     fake_main.session_router.ensure_route = AsyncMock(return_value="/p/t1")
     fake_main.session_router.teardown_route = AsyncMock(return_value=True)
-    monkeypatch.setitem(sys.modules, "orchestrator.main", fake_main)
+    fastapi_app.state.sessions_dependencies_factory = lambda: fake_main.dependencies
     fastapi_app.include_router(sessions_mod.router)
 
     response = TestClient(fastapi_app).get(
@@ -1344,8 +1347,6 @@ def test_connection_cleans_partial_route_on_every_exception(
 ):
     """No exception after route mutation may leave the captured route behind."""
 
-    import sys
-
     from orchestrator.routers import sessions as sessions_mod
 
     fastapi_app = FastAPI()
@@ -1367,11 +1368,10 @@ def test_connection_cleans_partial_route_on_every_exception(
         ]
     else:
         fake_db.get_pinned_session_binding.side_effect = [original, original]
-    monkeypatch.setattr(sessions_mod, "_get_db", lambda: fake_db, raising=False)
+    fake_main = _fake_main(fake_db)
     monkeypatch.setattr(
         sessions_mod, "probe_ready", AsyncMock(return_value=True), raising=True
     )
-    fake_main = _fake_main()
     fake_main.session_tokens = MagicMock()
     if failure_phase == "token_mint":
         fake_main.session_tokens.mint.side_effect = RuntimeError("token mint failed")
@@ -1384,7 +1384,7 @@ def test_connection_cleans_partial_route_on_every_exception(
         )
     )
     fake_main.session_router.teardown_route = AsyncMock(return_value=True)
-    monkeypatch.setitem(sys.modules, "orchestrator.main", fake_main)
+    fastapi_app.state.sessions_dependencies_factory = lambda: fake_main.dependencies
     fastapi_app.include_router(sessions_mod.router)
 
     response = TestClient(fastapi_app, raise_server_exceptions=False).get(
@@ -1417,8 +1417,6 @@ def test_connection_fails_when_exact_partial_route_cleanup_is_incomplete(
     cleanup_failure,
     message,
 ):
-    import sys
-
     from orchestrator.routers import sessions as sessions_mod
 
     fastapi_app = FastAPI()
@@ -1427,11 +1425,10 @@ def test_connection_fails_when_exact_partial_route_cleanup_is_incomplete(
     fake_db = AsyncMock()
     fake_db.get_thread.return_value = _connection_thread()
     fake_db.get_pinned_session_binding.side_effect = [original, original]
-    monkeypatch.setattr(sessions_mod, "_get_db", lambda: fake_db, raising=False)
+    fake_main = _fake_main(fake_db)
     monkeypatch.setattr(
         sessions_mod, "probe_ready", AsyncMock(return_value=True), raising=True
     )
-    fake_main = _fake_main()
     fake_main.session_tokens = MagicMock()
     fake_main.session_router = MagicMock()
     fake_main.session_router.ensure_route = AsyncMock(
@@ -1443,7 +1440,7 @@ def test_connection_fails_when_exact_partial_route_cleanup_is_incomplete(
         fake_main.session_router.teardown_route = AsyncMock(
             return_value=cleanup_failure
         )
-    monkeypatch.setitem(sys.modules, "orchestrator.main", fake_main)
+    fastapi_app.state.sessions_dependencies_factory = lambda: fake_main.dependencies
     fastapi_app.include_router(sessions_mod.router)
 
     with pytest.raises(RuntimeError, match=message):
@@ -1464,8 +1461,6 @@ def test_connection_regates_agent_status_after_readiness(
 ):
     """Mutable heartbeat state is not in target_key, but remains a live gate."""
 
-    import sys
-
     from orchestrator.routers import sessions as sessions_mod
 
     fastapi_app = FastAPI()
@@ -1479,19 +1474,18 @@ def test_connection_regates_agent_status_after_readiness(
         if mutation_phase == "post_probe"
         else [original, original, changed]
     )
-    monkeypatch.setattr(sessions_mod, "_get_db", lambda: fake_db, raising=False)
+    fake_main = _fake_main(fake_db)
     monkeypatch.setattr(
         sessions_mod,
         "probe_ready",
         AsyncMock(return_value=True),
         raising=True,
     )
-    fake_main = _fake_main()
     fake_main.session_tokens = MagicMock()
     fake_main.session_router = MagicMock()
     fake_main.session_router.ensure_route = AsyncMock(return_value="/p/t1")
     fake_main.session_router.teardown_route = AsyncMock(return_value=True)
-    monkeypatch.setitem(sys.modules, "orchestrator.main", fake_main)
+    fastapi_app.state.sessions_dependencies_factory = lambda: fake_main.dependencies
     fastapi_app.include_router(sessions_mod.router)
 
     response = TestClient(fastapi_app).get(
@@ -1523,7 +1517,8 @@ def test_connection_reports_stateless_ready_without_a_socket(monkeypatch):
     fake_db.get_thread.return_value = _connection_thread(
         lane="stateless", agent_id=None
     )
-    monkeypatch.setattr(sessions_mod, "_get_db", lambda: fake_db, raising=False)
+    fake_main = _fake_main(fake_db)
+    fastapi_app.state.sessions_dependencies_factory = lambda: fake_main.dependencies
     fastapi_app.include_router(sessions_mod.router)
 
     resp = TestClient(fastapi_app).get(
@@ -1632,7 +1627,8 @@ def test_connection_fails_closed_for_unsafe_lane_rows(
         lane=execution_lane,
         agent_id=(CONNECTION_AGENT_ID if agent_id else None),
     )
-    monkeypatch.setattr(sessions_mod, "_get_db", lambda: fake_db, raising=False)
+    fake_main = _fake_main(fake_db)
+    fastapi_app.state.sessions_dependencies_factory = lambda: fake_main.dependencies
     fastapi_app.include_router(sessions_mod.router)
 
     resp = TestClient(fastapi_app).get(
@@ -1654,10 +1650,10 @@ def test_connection_returns_425_when_thread_unbound(monkeypatch):
 
     fake_db = AsyncMock()
     fake_db.get_thread.return_value = _connection_thread(agent_id=None)
-    from orchestrator.routers import sessions as sessions_mod
 
-    monkeypatch.setattr(sessions_mod, "_get_db", lambda: fake_db, raising=False)
+    fake_main = _fake_main(fake_db)
 
+    app.state.sessions_dependencies_factory = lambda: fake_main.dependencies
     app.include_router(sessions_router)
     client = TestClient(app)
     resp = client.get(f"/api/sessions/{CONNECTION_THREAD_ID}/connection")
@@ -1673,10 +1669,10 @@ def test_connection_returns_404_for_missing_thread(monkeypatch):
     _install_fake_auth(monkeypatch)
     fake_db = AsyncMock()
     fake_db.get_thread.return_value = None
-    from orchestrator.routers import sessions as sessions_mod
 
-    monkeypatch.setattr(sessions_mod, "_get_db", lambda: fake_db, raising=False)
+    fake_main = _fake_main(fake_db)
 
+    app.state.sessions_dependencies_factory = lambda: fake_main.dependencies
     app.include_router(sessions_router)
     client = TestClient(app)
     resp = client.get("/api/sessions/missing/connection")
@@ -1692,10 +1688,10 @@ def test_connection_returns_403_when_other_user(monkeypatch):
     _install_fake_auth(monkeypatch)
     fake_db = AsyncMock()
     fake_db.get_thread.return_value = _connection_thread(user_id="OTHER")
-    from orchestrator.routers import sessions as sessions_mod
 
-    monkeypatch.setattr(sessions_mod, "_get_db", lambda: fake_db, raising=False)
+    fake_main = _fake_main(fake_db)
 
+    app.state.sessions_dependencies_factory = lambda: fake_main.dependencies
     app.include_router(sessions_router)
     client = TestClient(app)
     resp = client.get(f"/api/sessions/{CONNECTION_THREAD_ID}/connection")
@@ -1713,10 +1709,10 @@ def test_connection_returns_409_when_agent_not_ready(monkeypatch):
     fake_db = AsyncMock()
     fake_db.get_thread.return_value = _connection_thread()
     fake_db.get_pinned_session_binding.return_value = None
-    from orchestrator.routers import sessions as sessions_mod
 
-    monkeypatch.setattr(sessions_mod, "_get_db", lambda: fake_db, raising=False)
+    fake_main = _fake_main(fake_db)
 
+    app.state.sessions_dependencies_factory = lambda: fake_main.dependencies
     app.include_router(sessions_router)
     client = TestClient(app)
     resp = client.get(f"/api/sessions/{CONNECTION_THREAD_ID}/connection")
@@ -1736,10 +1732,10 @@ def test_connection_waits_for_durable_recovery_when_agent_offline(monkeypatch):
     fake_db.get_pinned_session_binding.return_value = _connection_binding(
         status="offline"
     )
-    from orchestrator.routers import sessions as sessions_mod
 
-    monkeypatch.setattr(sessions_mod, "_get_db", lambda: fake_db, raising=False)
+    fake_main = _fake_main(fake_db)
 
+    app.state.sessions_dependencies_factory = lambda: fake_main.dependencies
     app.include_router(sessions_router)
     client = TestClient(app)
     resp = client.get(f"/api/sessions/{CONNECTION_THREAD_ID}/connection")
@@ -1762,10 +1758,10 @@ def test_connection_returns_typed_terminal_refusal_when_agent_row_missing(monkey
     fake_db = AsyncMock()
     fake_db.get_thread.return_value = _connection_thread()
     fake_db.get_pinned_session_binding.return_value = None
-    from orchestrator.routers import sessions as sessions_mod
 
-    monkeypatch.setattr(sessions_mod, "_get_db", lambda: fake_db, raising=False)
+    fake_main = _fake_main(fake_db)
 
+    app.state.sessions_dependencies_factory = lambda: fake_main.dependencies
     app.include_router(sessions_router)
     client = TestClient(app)
     resp = client.get(f"/api/sessions/{CONNECTION_THREAD_ID}/connection")
@@ -1788,10 +1784,10 @@ def test_connection_keeps_409_and_no_unbind_when_agent_booting(monkeypatch):
     fake_db.get_pinned_session_binding.return_value = _connection_binding(
         status="booting"
     )
-    from orchestrator.routers import sessions as sessions_mod
 
-    monkeypatch.setattr(sessions_mod, "_get_db", lambda: fake_db, raising=False)
+    fake_main = _fake_main(fake_db)
 
+    app.state.sessions_dependencies_factory = lambda: fake_main.dependencies
     app.include_router(sessions_router)
     client = TestClient(app)
     resp = client.get(f"/api/sessions/{CONNECTION_THREAD_ID}/connection")
@@ -1815,13 +1811,14 @@ def test_connection_returns_425_when_pod_not_session_ready(monkeypatch):
     fake_db.get_pinned_session_binding.return_value = _connection_binding()
     from orchestrator.routers import sessions as sessions_mod
 
-    monkeypatch.setattr(sessions_mod, "_get_db", lambda: fake_db, raising=False)
+    fake_main = _fake_main(fake_db)
 
     async def _probe_not_ready(pod_ip, pod_port, **_kwargs):
         return False
 
     monkeypatch.setattr(sessions_mod, "probe_ready", _probe_not_ready, raising=True)
 
+    app.state.sessions_dependencies_factory = lambda: fake_main.dependencies
     app.include_router(sessions_router)
     client = TestClient(app)
     resp = client.get(f"/api/sessions/{CONNECTION_THREAD_ID}/connection")

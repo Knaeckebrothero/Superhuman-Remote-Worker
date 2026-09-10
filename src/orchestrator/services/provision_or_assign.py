@@ -1,28 +1,59 @@
 """Bind an agent to a thread for the create-thread fast path.
 
-This is the K8s-mode binding path invoked by
-``main.create_thread`` as a fire-and-forget asyncio task. It owns the
-lifecycle SSE emissions for that path — without these the cockpit's
-startup card never sees ``provisioning``/``booting``/``ready`` because
+This is the K8s-mode binding path invoked by session admission as a
+fire-and-forget asyncio task. It owns the lifecycle SSE emissions for that
+path — without these the cockpit's startup card never sees
+``provisioning``/``booting``/``ready`` because
 ``GET /api/sessions/{tid}/connection`` returns 200 immediately for the
-warm-pool case (the idle-pool attach is synchronous inside
-``create_thread``) and the cockpit's 425 fallback (which drives
-``/prepare``'s lifecycle SSE) never fires.
+warm-pool case (the idle-pool attach is synchronous inside session create)
+and the cockpit's 425 fallback (which drives ``/prepare``'s lifecycle SSE)
+never fires.
 
-Late imports of orchestrator singletons live inside the function body —
-same pattern as ``src/orchestrator/routers/sessions.py::_provision_agent_for_thread`` —
-so this module is unit-testable without dragging in the full ``main.py``
-side-effect chain (license gate, agent provisioner, etc.).
+R1.B06 closed this module's late ``from orchestrator.main import ...``. Every
+collaborator that needs a constructed dependency object now arrives as an
+already-bound operation on :class:`ProvisionOrAssignDependencies`, built once
+by the composition root and handed down by whichever caller schedules the
+task. The genuinely pure helpers — the two violation-detail formatters, the
+readiness budget and the lifecycle admission predicate — are imported from
+their owning services directly, because routing them through a main wrapper
+bought nothing but a second hop.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import logging
 import os
+from typing import Any, Awaitable, Callable
 
+from orchestrator.services.grant_enforcement import grant_violations_detail
+from orchestrator.services.session_config_resolution import (
+    endpoint_violations_detail,
+)
+from orchestrator.services.session_runtime_identity import thread_accepts_runtime
+from orchestrator.services.session_workspace_policy import session_ready_timeout_s
 from shared.pinned_session_identity import PinnedSessionBinding
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class ProvisionOrAssignDependencies:
+    """The collaborators this path needs, already constructed.
+
+    Each callable is the owning service's operation with its own dependency
+    object applied — never a lookup back into the composition root. ``store``
+    and ``agent_provisioner`` are the composition bindings of the application
+    that scheduled the task.
+    """
+
+    store: Any
+    agent_provisioner: Any
+    await_protected_cloud_runtime_ready: Callable[[str], Awaitable[bool]]
+    session_grant_violations: Callable[..., Awaitable[list[str]]]
+    session_endpoint_violations: Callable[..., Awaitable[list[str]]]
+    find_idle_persistent_agent: Callable[[], Awaitable[dict[str, Any] | None]]
+    send_session_attach: Callable[..., Awaitable[bool]]
 
 
 async def provision_or_assign(
@@ -34,6 +65,7 @@ async def provision_or_assign(
     ds_ids: list[str] | None,
     *,
     runtime_generation: str | None = None,
+    dependencies: ProvisionOrAssignDependencies,
 ) -> None:
     """Bind an agent to a thread and emit ``session.lifecycle`` events.
 
@@ -53,19 +85,9 @@ async def provision_or_assign(
     from orchestrator.services.workspace_tier_policy import (
         backend_from_override as _backend_from_override,
     )
-    from orchestrator.main import (  # noqa: E402  (late import — see module docstring)
-        _await_protected_cloud_runtime_ready,
-        _endpoint_violations_detail,
-        _find_idle_persistent_agent,
-        _grant_violations_detail,
-        _send_session_attach,
-        _session_endpoint_violations,
-        _session_grant_violations,
-        _session_ready_timeout_s,
-        _thread_accepts_runtime,
-        agent_provisioner,
-        postgres_db,
-    )
+
+    postgres_db = dependencies.store
+    agent_provisioner = dependencies.agent_provisioner
     from orchestrator.services.session_lifecycle import (
         emit as lifecycle_emit,
         wait_for_binding,
@@ -109,7 +131,7 @@ async def provision_or_assign(
         if expected_runtime is None:
             # Direct mixed-version/test callers retain the historical status
             # gate. The production scheduler always passes a generation.
-            return _thread_accepts_runtime(current)
+            return thread_accepts_runtime(current)
         return same_thread_runtime_authority(current, expected_runtime)
 
     async def _safe_emit(state: str, **extra: str) -> bool:
@@ -129,7 +151,7 @@ async def provision_or_assign(
         # Create-time protected engagement runs concurrently with repository
         # setup.  It must converge before either a warm reservation or a pod
         # spawn; ordinary sessions return immediately.
-        if not await _await_protected_cloud_runtime_ready(tid):
+        if not await dependencies.await_protected_cloud_runtime_ready(tid):
             return
         async with postgres_db.thread_advisory_lock(tid):
             cur = await postgres_db.get_thread(tid)
@@ -189,7 +211,7 @@ async def provision_or_assign(
                 # /connection until its ~5m40s ready timeout. Fail fast with the
                 # real reason instead.
                 # knowledge-base/knowledge/issues/session_permission_mode_grant_denied_ready_timeout.md
-                violations = await _session_grant_violations(cur)
+                violations = await dependencies.session_grant_violations(cur)
                 cur = await postgres_db.get_thread(tid)
                 if not await _same_runtime(cur):
                     return
@@ -201,7 +223,7 @@ async def provision_or_assign(
                     )
                     await _safe_emit(
                         "failed",
-                        reason=_grant_violations_detail(violations),
+                        reason=grant_violations_detail(violations),
                     )
                     return
                 # Pre-flight the model-role transports too: a configured role
@@ -211,7 +233,9 @@ async def provision_or_assign(
                 # workspace, and hangs the cockpit exactly like a grant denial.
                 # Fail fast with the real reason instead of spawning a doomed pod.
                 # knowledge-base/knowledge/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md
-                endpoint_violations = await _session_endpoint_violations(cur)
+                endpoint_violations = await dependencies.session_endpoint_violations(
+                    cur
+                )
                 cur = await postgres_db.get_thread(tid)
                 if not await _same_runtime(cur):
                     return
@@ -223,7 +247,7 @@ async def provision_or_assign(
                     )
                     await _safe_emit(
                         "failed",
-                        reason=_endpoint_violations_detail(endpoint_violations),
+                        reason=endpoint_violations_detail(endpoint_violations),
                     )
                     return
                 # Try to attach an idle dual-mode agent from the warm pool
@@ -231,7 +255,7 @@ async def provision_or_assign(
                 # _send_session_attach writes threads.agent_id via the
                 # orchestrator's own DB connection, so the binding is visible
                 # to other lock-takers immediately on release.
-                idle_agent = await _find_idle_persistent_agent()
+                idle_agent = await dependencies.find_idle_persistent_agent()
                 cur = await postgres_db.get_thread(tid)
                 if not await _same_runtime(cur):
                     return
@@ -245,7 +269,7 @@ async def provision_or_assign(
                         if expected_runtime is not None
                         else {}
                     )
-                    ok = await _send_session_attach(
+                    ok = await dependencies.send_session_attach(
                         idle_agent,
                         tid,
                         co,
@@ -333,7 +357,7 @@ async def provision_or_assign(
         # advisory lock we just dropped).
         if needs_binding_wait:
             bind_timeout_s = int(os.environ.get("AGENT_BIND_TIMEOUT_S", "300"))
-            if not await wait_for_binding(tid, bind_timeout_s):
+            if not await wait_for_binding(tid, bind_timeout_s, store=postgres_db):
                 cur = await postgres_db.get_thread(tid)
                 if await _same_runtime(cur):
                     await _safe_emit("failed", reason="agent failed to register")
@@ -348,7 +372,7 @@ async def provision_or_assign(
         if expected_runtime is None:
             await _safe_emit("failed", reason="session runtime identity is unavailable")
             return
-        ready_timeout_s = _session_ready_timeout_s(_backend_from_override(co))
+        ready_timeout_s = session_ready_timeout_s(_backend_from_override(co))
         cur = await postgres_db.get_thread(tid)
         if not await _same_runtime(cur):
             return

@@ -1505,23 +1505,19 @@ class TestPrepareBoundary:
             return {"id": "u1", "is_approved": True}
 
         monkeypatch.setattr(sessions_mod, "require_approved_user", _fake_auth)
-        monkeypatch.setattr(
-            sessions_mod,
-            "_get_db",
-            lambda: SimpleNamespace(
-                get_thread=AsyncMock(
-                    return_value={
-                        "id": SESSION_THREAD_ID,
-                        "user_id": "u1",
-                        "agent_id": None,
-                        "config_name": "session_base",
-                        "execution_lane": "pinned",
-                        "status": "created",
-                        "runtime_generation": SESSION_RUNTIME_GENERATION,
-                        "runtime_retirement_token": None,
-                    }
-                )
-            ),
+        store = SimpleNamespace(
+            get_thread=AsyncMock(
+                return_value={
+                    "id": SESSION_THREAD_ID,
+                    "user_id": "u1",
+                    "agent_id": None,
+                    "config_name": "session_base",
+                    "execution_lane": "pinned",
+                    "status": "created",
+                    "runtime_generation": SESSION_RUNTIME_GENERATION,
+                    "runtime_retirement_token": None,
+                }
+            )
         )
         do_prepare = MagicMock()
         monkeypatch.setattr(sessions_mod, "_do_prepare", do_prepare)
@@ -1530,6 +1526,9 @@ class TestPrepareBoundary:
         )
 
         app = FastAPI()
+        # The router reads its collaborators off the application answering the
+        # request; only the store matters for this write boundary.
+        app.state.sessions_dependencies_factory = lambda: SimpleNamespace(store=store)
         app.include_router(sessions_mod.router)
         return TestClient(app, raise_server_exceptions=False), do_prepare
 

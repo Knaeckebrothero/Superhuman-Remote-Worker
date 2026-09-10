@@ -251,6 +251,7 @@ class ThreadAdmissionDependencies:
 
     find_idle_persistent_agent: Callable[[], Awaitable[dict[str, Any] | None]]
     send_session_attach: Callable[..., Awaitable[bool]]
+    provision_or_assign: Callable[..., Awaitable[None]]
     redact_thread_metadata: Callable[[dict[str, Any]], dict[str, Any]]
 
     def project_dependencies(self) -> ThreadProjectAuthorizationDependencies:
@@ -1453,10 +1454,8 @@ def schedule_thread_agent(
         # Kubernetes mode: create agent pod on demand, with pool fallback
         effective_config = plan.config_name
 
-        from orchestrator.services.provision_or_assign import provision_or_assign
-
         asyncio.create_task(
-            provision_or_assign(
+            dependencies.provision_or_assign(
                 str(user["id"]),
                 thread_id,
                 effective_config,

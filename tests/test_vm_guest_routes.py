@@ -69,8 +69,10 @@ async def route_env(monkeypatch):
     )
     register = AsyncMock()
     heartbeat = AsyncMock()
+    # The store now reaches the routes through the application handling the
+    # request, not a module singleton — same contract the B04 routers hold.
+    app.state.store = db
     monkeypatch.setattr(vm_guest, "require_vm_guest", auth)
-    monkeypatch.setattr(vm_guest, "_get_db", lambda: db)
     monkeypatch.setattr(vm_guest, "_get_sudo_gate", lambda: gate)
     monkeypatch.setattr(vm_guest, "record_register", register)
     monkeypatch.setattr(vm_guest, "record_heartbeat", heartbeat)

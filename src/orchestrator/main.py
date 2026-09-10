@@ -143,6 +143,7 @@ from orchestrator.routers import project_loops_router  # noqa: E402
 from orchestrator.routers import product_capabilities_router  # noqa: E402
 from orchestrator.routers import shared_browser_router  # noqa: E402
 from orchestrator.routers import vm_guest_router  # noqa: E402
+from orchestrator.routers import sessions as sessions_routes  # noqa: E402
 from orchestrator.routers.sessions import router as sessions_router  # noqa: E402
 from orchestrator.routers.contacts import ContactsDependencies  # noqa: E402
 from orchestrator.routers import job_reads as job_reads_routes  # noqa: E402
@@ -230,6 +231,7 @@ from orchestrator.services import (  # noqa: E402
 from orchestrator.services import (  # noqa: E402
     commissioned_officer_provisioning as commissioned_officer_provisioning_service,
     pinned_session_mutation_target as pinned_session_mutation_target_service,
+    provision_or_assign as provision_or_assign_service,
     session_attach_binding as session_attach_binding_service,
     session_attach_recovery as session_attach_recovery_service,
 )
@@ -10231,6 +10233,119 @@ def _session_attach_binding_dependencies() -> (
     )
 
 
+def _sessions_dependencies() -> sessions_routes.SessionsDependencies:
+    """Compose the two ``/api/sessions`` endpoints' collaborators.
+
+    ``_await_late_cloud_setup`` stays an injected callable: it reads this
+    module's in-process late-setup task registry, which is a composition
+    concern rather than a session-admission one. The rest reach their owning
+    services directly.
+    """
+    return sessions_routes.SessionsDependencies(
+        store=postgres_db,
+        agent_provisioner=agent_provisioner,
+        container_provisioner=container_provisioner,
+        workspace_suspension_service=workspace_suspension_service,
+        session_router=session_router,
+        session_tokens=session_tokens,
+        ensure_session_workspace=ensure_session_workspace,
+        await_late_cloud_setup=_await_late_cloud_setup,
+        await_protected_cloud_runtime_ready=(
+            lambda thread_id, **kwargs: (
+                protected_cloud_engage._await_protected_cloud_runtime_ready(
+                    thread_id,
+                    **kwargs,
+                    dependencies=_protected_cloud_engage_dependencies(),
+                )
+            )
+        ),
+        session_grant_violations=(
+            lambda *args, **kwargs: session_config_resolution.session_grant_violations(
+                *args, **kwargs, dependencies=_session_config_dependencies()
+            )
+        ),
+        session_endpoint_violations=(
+            lambda *args, **kwargs: (
+                session_config_resolution.session_endpoint_violations(
+                    *args, **kwargs, dependencies=_session_config_dependencies()
+                )
+            )
+        ),
+        find_idle_persistent_agent=(
+            lambda: session_attach_binding_service.find_idle_persistent_agent(
+                dependencies=_session_attach_binding_dependencies()
+            )
+        ),
+        send_session_attach=(
+            lambda *args, **kwargs: (
+                session_attach_binding_service.send_session_attach(
+                    *args, **kwargs, dependencies=_session_attach_binding_dependencies()
+                )
+            )
+        ),
+    )
+
+
+def _provision_or_assign_dependencies() -> (
+    provision_or_assign_service.ProvisionOrAssignDependencies
+):
+    """Compose the create-path binder's collaborators.
+
+    Every callable below reaches its owning service directly, carrying that
+    service's own dependency object built at call time. Routing them through
+    this module's compatibility wrappers instead would put a second hop in
+    the path for no decision — the wrappers are there for *inbound* callers
+    of ``main``, not for services calling one another.
+    """
+    return provision_or_assign_service.ProvisionOrAssignDependencies(
+        store=postgres_db,
+        agent_provisioner=agent_provisioner,
+        await_protected_cloud_runtime_ready=(
+            lambda thread_id: (
+                protected_cloud_engage._await_protected_cloud_runtime_ready(
+                    thread_id, dependencies=_protected_cloud_engage_dependencies()
+                )
+            )
+        ),
+        session_grant_violations=(
+            lambda *args, **kwargs: session_config_resolution.session_grant_violations(
+                *args, **kwargs, dependencies=_session_config_dependencies()
+            )
+        ),
+        session_endpoint_violations=(
+            lambda *args, **kwargs: (
+                session_config_resolution.session_endpoint_violations(
+                    *args, **kwargs, dependencies=_session_config_dependencies()
+                )
+            )
+        ),
+        find_idle_persistent_agent=(
+            lambda: session_attach_binding_service.find_idle_persistent_agent(
+                dependencies=_session_attach_binding_dependencies()
+            )
+        ),
+        send_session_attach=(
+            lambda *args, **kwargs: (
+                session_attach_binding_service.send_session_attach(
+                    *args, **kwargs, dependencies=_session_attach_binding_dependencies()
+                )
+            )
+        ),
+    )
+
+
+async def _provision_or_assign(*args: Any, **kwargs: Any) -> None:
+    """Schedule-time entry point for the create-path binder.
+
+    Session admission and attach-abort recovery both hand this to their own
+    dependency object, so neither service has to know how the binder's
+    collaborators are built.
+    """
+    await provision_or_assign_service.provision_or_assign(
+        *args, **kwargs, dependencies=_provision_or_assign_dependencies()
+    )
+
+
 def _session_attach_recovery_dependencies() -> (
     session_attach_recovery_service.SessionAttachRecoveryDependencies
 ):
@@ -10242,6 +10357,7 @@ def _session_attach_recovery_dependencies() -> (
         ensure_session_workspace=ensure_session_workspace,
         thread_project_ids=_thread_project_ids,
         reconcile_attach_abort_successor=_reconcile_attach_abort_successor,
+        provision_or_assign=_provision_or_assign,
         successor_tasks=_attach_abort_successor_tasks,
     )
 
@@ -10635,6 +10751,7 @@ def _thread_admission_dependencies() -> (
         record_protected_error=_record_protected_error,
         find_idle_persistent_agent=_find_idle_persistent_agent,
         send_session_attach=_send_session_attach,
+        provision_or_assign=_provision_or_assign,
         redact_thread_metadata=_redact_thread_metadata,
     )
 
@@ -10887,6 +11004,7 @@ app.state.unit_claim_bundle_dependencies_factory = (
     lambda: _unit_claim_bundle_dependencies()
 )
 app.state.run_queue_admin_dependencies_factory = lambda: _run_queue_admin_dependencies()
+app.state.sessions_dependencies_factory = lambda: _sessions_dependencies()
 app.state.agent_thread_status_dependencies_factory = (
     lambda: _agent_thread_status_dependencies()
 )

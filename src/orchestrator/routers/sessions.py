@@ -15,9 +15,12 @@ live inline in ``src/orchestrator/main.py``'s ``persistent_ws_proxy``.
     socket. Stateless control transport is not implemented in this slice.
 
 Spec: knowledge-base/knowledge/features/direct_session_websockets.md §Component details.
-Pattern: late imports of postgres_db (and other singletons) inside handler
-bodies to avoid circular imports at module load time — same pattern as
-orchestrator/routers/automations.py.
+
+R1.B06 closed this router's late ``from orchestrator.main import ...``.
+Collaborators arrive on :class:`SessionsDependencies`, resolved from the
+application handling the request and threaded explicitly into the background
+tasks the two endpoints schedule — a task outlives its request, so it has to
+carry the ports rather than look them up later.
 """
 
 from __future__ import annotations
@@ -27,6 +30,9 @@ import logging
 import os
 import uuid
 from typing import Annotated, Any, Literal
+
+from dataclasses import dataclass
+from typing import Awaitable, Callable
 
 from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, Field
@@ -50,6 +56,10 @@ from orchestrator.services.session_router import SessionRouteAuthorityError
 # R1.B05 moved these three out of `main`; they are pure, so this router
 # reaches their owners directly instead of going back through the
 # application module.
+from orchestrator.services.grant_enforcement import grant_violations_detail
+from orchestrator.services.session_config_resolution import (
+    endpoint_violations_detail,
+)
 from orchestrator.services import session_tool_policy
 from orchestrator.services import session_workspace_policy
 from orchestrator.services import workspace_tier_policy
@@ -97,16 +107,33 @@ async def _read_queue_block(db: Any, thread: dict[str, Any]) -> dict[str, Any] |
         return None
 
 
-def _get_db() -> Any:
-    """Late-resolve the postgres_db singleton from main.
+@dataclass(frozen=True, slots=True)
+class SessionsDependencies:
+    """Everything the two session endpoints need, already constructed.
 
-    Wrapped in a function so tests can monkeypatch this single symbol
-    instead of having to patch the late `from main import postgres_db`
-    inside the handler body.
+    ``store`` and the four provisioner/router singletons are the composition
+    bindings of the application answering the request. The callables are the
+    owning services' operations with their own dependency objects applied.
     """
-    from orchestrator.main import postgres_db  # type: ignore
 
-    return postgres_db
+    store: Any
+    agent_provisioner: Any
+    container_provisioner: Any
+    workspace_suspension_service: Any
+    session_router: Any
+    session_tokens: Any
+    ensure_session_workspace: Callable[..., Awaitable[Any]]
+    await_late_cloud_setup: Callable[[str], Awaitable[None]]
+    await_protected_cloud_runtime_ready: Callable[..., Awaitable[bool]]
+    session_grant_violations: Callable[..., Awaitable[list[str]]]
+    session_endpoint_violations: Callable[..., Awaitable[list[str]]]
+    find_idle_persistent_agent: Callable[[], Awaitable[dict[str, Any] | None]]
+    send_session_attach: Callable[..., Awaitable[bool]]
+
+
+def get_sessions_dependencies(request: Request) -> SessionsDependencies:
+    """Resolve collaborators only from the application handling this request."""
+    return request.app.state.sessions_dependencies_factory()
 
 
 def _is_expert_uuid(value: str | None) -> bool:
@@ -275,7 +302,8 @@ async def prepare_session(
     feed and waits for ``session.lifecycle`` events with state=ready, then
     calls GET /api/sessions/{tid}/connection for the token.
     """
-    db = _get_db()
+    dependencies = get_sessions_dependencies(request)
+    db = dependencies.store
     user = await require_approved_user(request, db)
 
     thread = await db.get_thread(thread_id)
@@ -346,6 +374,7 @@ async def prepare_session(
             config_name=boot_config_name,
             config_override=validated_override,
             runtime_authority=runtime_authority,
+            dependencies=dependencies,
         )
     )
 
@@ -358,6 +387,8 @@ async def _do_prepare(
     config_name: str | None,
     config_override: dict[str, Any] | None,
     runtime_authority: ThreadRuntimeAuthority,
+    *,
+    dependencies: SessionsDependencies,
 ) -> None:
     """Run the actual provisioning + readiness work asynchronously.
 
@@ -372,7 +403,7 @@ async def _do_prepare(
     so holding it across the wait deadlocks both for the asyncpg query
     timeout (~60s).
     """
-    db = _get_db()
+    db = dependencies.store
 
     def _emit(state: str, **extra: Any) -> None:
         lifecycle_emit(
@@ -404,9 +435,7 @@ async def _do_prepare(
     # progress card covers the wait. Deliberately OUTSIDE the advisory lock —
     # this can take seconds and the fresh pod's /register needs the same lock.
     # knowledge-history/done/session_resume_cloud_sync_race_late_provision.md
-    from orchestrator.main import _await_late_cloud_setup  # late import: avoid circular
-
-    await _await_late_cloud_setup(thread_id)
+    await dependencies.await_late_cloud_setup(thread_id)
     thread = await db.get_thread(thread_id)
     if not same_thread_runtime_authority(thread, runtime_authority):
         return
@@ -414,9 +443,7 @@ async def _do_prepare(
     # A protected thread may not reserve or provision an agent until reader
     # engagement has produced the active mount payload.  The helper is a no-op
     # for ordinary sessions and rechecks terminal lifecycle while waiting.
-    from orchestrator.main import _await_protected_cloud_runtime_ready
-
-    if not await _await_protected_cloud_runtime_ready(thread_id):
+    if not await dependencies.await_protected_cloud_runtime_ready(thread_id):
         current = await db.get_thread(thread_id)
         if same_thread_runtime_authority(current, runtime_authority):
             _emit(
@@ -458,14 +485,7 @@ async def _do_prepare(
                 # cockpit to poll /connection until its ~5m40s ready timeout. Fail
                 # fast with the real reason instead.
                 # knowledge-base/knowledge/issues/session_permission_mode_grant_denied_ready_timeout.md
-                from orchestrator.main import (  # type: ignore
-                    _endpoint_violations_detail,
-                    _grant_violations_detail,
-                    _session_endpoint_violations,
-                    _session_grant_violations,
-                )
-
-                _violations = await _session_grant_violations(thread)
+                _violations = await dependencies.session_grant_violations(thread)
                 thread = await db.get_thread(thread_id)
                 if not same_thread_runtime_authority(thread, runtime_authority):
                     return
@@ -475,14 +495,14 @@ async def _do_prepare(
                         thread_id,
                         "; ".join(_violations),
                     )
-                    _emit("failed", reason=_grant_violations_detail(_violations))
+                    _emit("failed", reason=grant_violations_detail(_violations))
                     return
 
                 # Same fail-fast for unusable model-role transports (e.g. the
                 # memory reranker with no reachable embedding endpoint) — reject
                 # before reconciling a workspace + booting a doomed pod.
                 # knowledge-base/knowledge/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md
-                _ep_violations = await _session_endpoint_violations(thread)
+                _ep_violations = await dependencies.session_endpoint_violations(thread)
                 thread = await db.get_thread(thread_id)
                 if not same_thread_runtime_authority(thread, runtime_authority):
                     return
@@ -494,7 +514,7 @@ async def _do_prepare(
                     )
                     _emit(
                         "failed",
-                        reason=_endpoint_violations_detail(_ep_violations),
+                        reason=endpoint_violations_detail(_ep_violations),
                     )
                     return
 
@@ -506,19 +526,12 @@ async def _do_prepare(
                 # workspace instead of SSH-looping a dead address. Fire-and-forget
                 # (mirrors the resume path in main.py); the agent tolerates a
                 # not-yet-ready workspace.
-                from orchestrator.main import (  # type: ignore
-                    container_provisioner,
-                    ensure_session_workspace,
-                    postgres_db,
-                    workspace_suspension_service,
-                )
-
                 asyncio.create_task(
-                    ensure_session_workspace(
+                    dependencies.ensure_session_workspace(
                         thread_id,
-                        db=postgres_db,
-                        provisioner=container_provisioner,
-                        suspension=workspace_suspension_service,
+                        db=dependencies.store,
+                        provisioner=dependencies.container_provisioner,
+                        suspension=dependencies.workspace_suspension_service,
                         expected_runtime_generation=runtime_authority.generation,
                     )
                 )
@@ -534,6 +547,7 @@ async def _do_prepare(
                         thread_id=thread_id,
                         config_name=config_name or "session_base",
                         config_override=config_override,
+                        dependencies=dependencies,
                     )
                     thread = await db.get_thread(thread_id)
                     if not same_thread_runtime_authority(thread, runtime_authority):
@@ -542,12 +556,12 @@ async def _do_prepare(
 
         # Lock released. For fresh-pod paths, wait for the agent's
         # /register to write threads.agent_id (which needs the lock we
-        # just dropped). For idle-pool paths, _send_session_attach has
+        # just dropped). For idle-pool paths, send_session_attach has
         # already set agent_id via the orchestrator's own DB connection,
         # so wait_for_binding returns immediately.
         if needs_binding_wait:
             bind_timeout_s = int(os.environ.get("AGENT_BIND_TIMEOUT_S", "300"))
-            if not await wait_for_binding(thread_id, bind_timeout_s):
+            if not await wait_for_binding(thread_id, bind_timeout_s, store=db):
                 current = await db.get_thread(thread_id)
                 if same_thread_runtime_authority(current, runtime_authority):
                     _emit("failed", reason="agent failed to register")
@@ -608,11 +622,9 @@ async def _do_prepare(
             return
 
         # Create the route resource.
-        from orchestrator.main import session_router  # type: ignore
-
         route_published = False
         try:
-            await session_router.ensure_route(
+            await dependencies.session_router.ensure_route(
                 thread_id=thread_id,
                 pod_name=binding.agent_hostname,
                 pod_uid=binding.pod_uid,
@@ -639,7 +651,7 @@ async def _do_prepare(
             # reread. A false result means cleanup authority was not proven;
             # surface that failure instead of silently wedging the successor.
             if not route_published:
-                route_removed = await session_router.teardown_route(
+                route_removed = await dependencies.session_router.teardown_route(
                     thread_id,
                     expected_namespace=binding.pod_namespace,
                     expected_runtime_generation=runtime_authority.generation,
@@ -658,6 +670,8 @@ async def _provision_agent_for_thread(
     thread_id: str,
     config_name: str,
     config_override: dict[str, Any] | None,
+    *,
+    dependencies: SessionsDependencies,
 ) -> None:
     """Trigger pool-first then create-pod provisioning.
 
@@ -668,33 +682,25 @@ async def _provision_agent_for_thread(
     # reuse point.  Re-read the authoritative row and whitelist the one lane
     # that is allowed to bind a registered agent; a blacklist of today's
     # stateless name would make the next lane unsafe by default.
-    db = _get_db()
+    db = dependencies.store
     thread = await db.get_thread(thread_id)
     runtime_authority = thread_runtime_authority(thread)
     if runtime_authority is None or thread.get("execution_lane") != LANE_PINNED:
         raise RuntimeError(_PINNED_PROVISIONING_ONLY_DETAIL)
 
-    from orchestrator.main import _await_protected_cloud_runtime_ready
-
-    if not await _await_protected_cloud_runtime_ready(thread_id):
+    if not await dependencies.await_protected_cloud_runtime_ready(thread_id):
         raise RuntimeError("Protected cloud engagement is not ready")
     if not same_thread_runtime_authority(
         await db.get_thread(thread_id), runtime_authority
     ):
         raise RuntimeError("Session lifecycle changed during preparation")
 
-    from orchestrator.main import (
-        _find_idle_persistent_agent,
-        _send_session_attach,
-        agent_provisioner,
-    )
-
-    idle_agent = await _find_idle_persistent_agent()
+    idle_agent = await dependencies.find_idle_persistent_agent()
     thread = await db.get_thread(thread_id)
     if not same_thread_runtime_authority(thread, runtime_authority):
         raise RuntimeError("Session lifecycle changed during preparation")
     if idle_agent:
-        ok = await _send_session_attach(
+        ok = await dependencies.send_session_attach(
             idle_agent, thread_id, config_override or {}, [], datasources=None
         )
         if ok:
@@ -715,7 +721,7 @@ async def _provision_agent_for_thread(
     current = await db.get_thread(thread_id)
     if not same_thread_runtime_authority(current, runtime_authority):
         raise RuntimeError("Session lifecycle changed during preparation")
-    await agent_provisioner.provision_agent(
+    await dependencies.agent_provisioner.provision_agent(
         purpose="session", thread_id=thread_id, config_name=config_name
     )
     if not same_thread_runtime_authority(
@@ -825,7 +831,8 @@ async def get_connection(
     topology remains an internal server concern. This does not claim a
     replacement control transport exists. Unknown lanes fail closed.
     """
-    db = _get_db()
+    dependencies = get_sessions_dependencies(request)
+    db = dependencies.store
     user = await require_approved_user(request, db)
 
     thread = await db.get_thread(thread_id)
@@ -838,9 +845,9 @@ async def get_connection(
     if runtime_authority is None:
         raise HTTPException(status_code=409, detail="Session runtime is unavailable")
 
-    from orchestrator.main import _await_protected_cloud_runtime_ready
-
-    if not await _await_protected_cloud_runtime_ready(thread_id, timeout_s=0):
+    if not await dependencies.await_protected_cloud_runtime_ready(
+        thread_id, timeout_s=0
+    ):
         _require_preparable_thread(await db.get_thread(thread_id))
         raise HTTPException(
             status_code=425,
@@ -952,11 +959,9 @@ async def get_connection(
     # tolerates concurrent-create races, so calling it here guarantees the
     # Service + Ingress exist by the time the cockpit opens the WS — no matter
     # which path bound the agent.
-    from orchestrator.main import session_router, session_tokens  # type: ignore
-
     route_committed = False
     try:
-        await session_router.ensure_route(
+        await dependencies.session_router.ensure_route(
             thread_id=runtime_authority.thread_id,
             pod_name=binding.agent_hostname,
             pod_uid=binding.pod_uid,
@@ -973,7 +978,7 @@ async def get_connection(
             raise AssertionError("unreachable")
         _require_live_agent(current_binding)
 
-        token, expires_at = session_tokens.mint(
+        token, expires_at = dependencies.session_tokens.mint(
             user_id=str(user["id"]),
             thread_id=runtime_authority.thread_id,
             session_identity_fingerprint=identity_fingerprint,
@@ -998,7 +1003,7 @@ async def get_connection(
         # DB read, a status/identity race, and token construction failure.  It
         # is deliberately armed only when route mutation begins.
         if not route_committed:
-            route_removed = await session_router.teardown_route(
+            route_removed = await dependencies.session_router.teardown_route(
                 runtime_authority.thread_id,
                 expected_namespace=binding.pod_namespace,
                 expected_runtime_generation=runtime_authority.generation,

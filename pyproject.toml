@@ -234,7 +234,6 @@ forbidden_modules = ["orchestrator.main"]
 # point these entries can come off.
 ignore_imports = [
     "orchestrator.services.session_wake -> orchestrator.main",
-    "orchestrator.services.session_lifecycle -> orchestrator.main",
     "orchestrator.services.sitrep -> orchestrator.main",
     "orchestrator.services.project_backlog -> orchestrator.main",
 ]
@@ -276,9 +275,6 @@ ignore_imports = [
     # datasource and knowledge services through kb_datasources -> kb_reindex ->
     # kb_materialize.
     "orchestrator.services.project_backlog -> orchestrator.main",
-    # B06 owns this one (services/session_lifecycle.py:48). Reached the same way
-    # as session_wake, through security.access -> sudo_gate -> session_wake.
-    "orchestrator.services.session_lifecycle -> orchestrator.main",
     # B07 owns this one (services/sitrep.py:115,128).
     "orchestrator.services.sitrep -> orchestrator.main",
 ]
@@ -325,8 +321,6 @@ forbidden_modules = ["orchestrator.main"]
 ignore_imports = [
     # B10 owns this one (services/session_wake.py, a lazy import in a function).
     "orchestrator.services.session_wake -> orchestrator.main",
-    # B06 owns this one (services/session_lifecycle.py).
-    "orchestrator.services.session_lifecycle -> orchestrator.main",
     # B07 owns these two.
     "orchestrator.services.project_backlog -> orchestrator.main",
     "orchestrator.services.sitrep -> orchestrator.main",
@@ -368,8 +362,6 @@ forbidden_modules = ["orchestrator.main"]
 ignore_imports = [
     # B10 owns this one (services/session_wake.py, a lazy import in a function).
     "orchestrator.services.session_wake -> orchestrator.main",
-    # B06 owns this one (services/session_lifecycle.py).
-    "orchestrator.services.session_lifecycle -> orchestrator.main",
     # B07 owns these two.
     "orchestrator.services.project_backlog -> orchestrator.main",
     "orchestrator.services.sitrep -> orchestrator.main",
@@ -416,19 +408,27 @@ forbidden_modules = ["orchestrator.main"]
 # ones B02-B05 recorded, reached through orchestrator.security.access ->
 # services.sudo_gate. Each exact edge is ignored rather than setting
 # `allow_indirect_imports`, so a NEW transitive path to main still breaks this.
+# B06's own two edges are now closed: session_lifecycle takes the caller's
+# store and provision_or_assign takes a constructed
+# ProvisionOrAssignDependencies, so neither reaches main any more.
+#
+# One indirect edge remains, and it is B10's: every module here imports
+# orchestrator.security.access, which reaches main through
+# services.sudo_gate -> services.session_wake. B02-B05 all ledger that same
+# edge; this contract was written without it and so was BROKEN against the
+# real tree from the day it landed (tests/test_import_boundaries.py lints a
+# synthetic tree, which is why it stayed green there). Ignoring the exact
+# edge rather than setting `allow_indirect_imports` keeps a NEW path to main
+# breaking the contract.
 ignore_imports = [
-    # B06's own remaining debt: services/session_lifecycle.py still resolves
-    # postgres_db on main. Closed with the rest of that file's migration.
-    "orchestrator.services.session_lifecycle -> orchestrator.main",
-    # B06's other remaining debt, reached from services.thread_admission.
-    # provision_or_assign.py still late-imports eleven names from main. Eight
-    # now have real service homes, but three do not yet: the two
-    # `_session_*_violations` wrappers are B05 varargs bridges that need a
-    # main-built dependency object, and `_await_protected_cloud_runtime_ready`
-    # is a B04 function that has not left main. Closing this edge means moving
-    # one of those, so it is named here rather than hidden behind
-    # `allow_indirect_imports` — a NEW path to main still breaks the contract.
-    "orchestrator.services.provision_or_assign -> orchestrator.main",
+    # B10 owns this one (services/session_wake.py:919, a lazy import in a
+    # function). Comes off when B10 closes its caller.
+    "orchestrator.services.session_wake -> orchestrator.main",
+    # B07 owns these two, reached from the registration and child-thread
+    # services through managed_repository_authority -> security.access ->
+    # sudo_gate -> session_wake -> sitrep -> officer_backlog.
+    "orchestrator.services.sitrep -> orchestrator.main",
+    "orchestrator.services.project_backlog -> orchestrator.main",
 ]
 unmatched_ignore_imports_alerting = "warn"
 

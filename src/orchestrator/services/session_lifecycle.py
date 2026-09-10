@@ -10,7 +10,8 @@ renders identically regardless of which path bound the agent.
 Single source of truth for:
   - ``emit``: broadcasting ``session.lifecycle`` events on the user's
     notification channel
-  - ``wait_for_binding``: polling the DB until ``threads.agent_id`` is set
+  - ``wait_for_binding``: polling the caller's store until
+    ``threads.agent_id`` is set
   - ``wait_for_ready``: polling the agent pod's ``/ready`` endpoint until
     the pod reports session-ready (gated by the agent-side
     ``_session_ready()`` 3-way check)
@@ -43,14 +44,17 @@ def emit(user_id: str, thread_id: str, state: str, **extra: Any) -> None:
     )
 
 
-async def wait_for_binding(thread_id: str, timeout_s: int) -> bool:
-    """Poll the DB until ``threads.agent_id`` is set, or wall-clock timeout."""
-    from orchestrator.main import postgres_db  # type: ignore
+async def wait_for_binding(thread_id: str, timeout_s: int, *, store: Any) -> bool:
+    """Poll the DB until ``threads.agent_id`` is set, or wall-clock timeout.
 
+    *store* is the caller's own database handle. Both session-start paths
+    already hold one, so resolving a module singleton out of ``main`` here
+    only made this helper untestable and tied it to a single application.
+    """
     deadline = asyncio.get_event_loop().time() + timeout_s
     interval = 2
     while asyncio.get_event_loop().time() < deadline:
-        thread = await postgres_db.get_thread(thread_id)
+        thread = await store.get_thread(thread_id)
         if not thread_runtime_is_preparable(thread):
             return False
         if thread and thread.get("agent_id"):

@@ -299,21 +299,26 @@ class TestSessionPrepareWriteBoundary:
         db.get_thread = AsyncMock(return_value=thread)
         scheduled: list = []
 
-        with patch.object(sessions_router, "_get_db", lambda: db):
+        # The router reads its store off the application answering the request.
+        request = MagicMock()
+        request.app.state.sessions_dependencies_factory = lambda: SimpleNamespace(
+            store=db
+        )
+
+        with patch.object(
+            sessions_router, "require_approved_user", AsyncMock(return_value=user_a)
+        ):
             with patch.object(
-                sessions_router, "require_approved_user", AsyncMock(return_value=user_a)
+                sessions_router,
+                "_schedule_prepare_task",
+                lambda coro: (coro.close(), scheduled.append(coro))[0],
             ):
-                with patch.object(
-                    sessions_router,
-                    "_schedule_prepare_task",
-                    lambda coro: (coro.close(), scheduled.append(coro))[0],
-                ):
-                    with pytest.raises(HTTPException) as exc:
-                        await sessions_router.prepare_session(
-                            str(thread["id"]),
-                            MagicMock(),
-                            sessions_router.PrepareRequest(config_name="a b"),
-                        )
+                with pytest.raises(HTTPException) as exc:
+                    await sessions_router.prepare_session(
+                        request,
+                        str(thread["id"]),
+                        sessions_router.PrepareRequest(config_name="a b"),
+                    )
 
         assert exc.value.status_code == 422
         assert scheduled == []

@@ -106,6 +106,7 @@ class SessionAttachRecoveryDependencies:
     ensure_session_workspace: Callable[..., Awaitable[Any]]
     thread_project_ids: Callable[[str], Awaitable[list[str]]]
     reconcile_attach_abort_successor: Callable[..., Awaitable[bool]]
+    provision_or_assign: Callable[..., Awaitable[None]]
     successor_tasks: dict[AttachAbortSuccessorTaskKey, "asyncio.Task[None]"]
 
 
@@ -444,9 +445,7 @@ async def reconcile_attach_abort_successor(
         successor_generation=successor_generation,
     ):
         return False
-    from orchestrator.services.provision_or_assign import provision_or_assign
-
-    await provision_or_assign(
+    await dependencies.provision_or_assign(
         current_user_id,
         thread_id,
         current_config_name,

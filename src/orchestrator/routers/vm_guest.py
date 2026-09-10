@@ -19,10 +19,15 @@ from orchestrator.services.vm_guest_events import record_heartbeat, record_regis
 router = APIRouter(prefix="/api/internal/vm", include_in_schema=False)
 
 
-def _get_db() -> Any:
-    from orchestrator.main import postgres_db  # type: ignore
+def _get_db(request: Request) -> Any:
+    """The store of the application handling *this* request.
 
-    return postgres_db
+    R1.B04 established ``request.app.state.store`` as the router's reading of
+    the database (tests/test_b04_router_store_isolation.py). Resolving the
+    module-level singleton from ``orchestrator.main`` instead would make two
+    applications in one process share one store regardless of which answered.
+    """
+    return request.app.state.store
 
 
 def _get_sudo_gate() -> Any:
@@ -110,7 +115,7 @@ def _expires_at(value: object) -> str:
 async def register_guest(
     entity_id: str, request: Request, body: RegisterBody
 ) -> dict[str, bool]:
-    db = _get_db()
+    db = _get_db(request)
     identity = await require_vm_guest(request, db, entity_id)
     await record_register(
         db, identity, body.model_dump(mode="json"), authoritative=False
@@ -122,7 +127,7 @@ async def register_guest(
 async def heartbeat_guest(
     entity_id: str, request: Request, body: HeartbeatBody
 ) -> dict[str, bool]:
-    db = _get_db()
+    db = _get_db(request)
     identity = await require_vm_guest(request, db, entity_id)
     if not _rate_limits.allow("heartbeat", identity.entity_type, entity_id, 12):
         raise _limited(5)
@@ -137,7 +142,7 @@ async def create_sudo_request(
     response: Response,
     body: SudoCreateBody,
 ) -> dict[str, Any]:
-    db = _get_db()
+    db = _get_db(request)
     identity = await require_vm_guest(request, db, entity_id)
     if not _rate_limits.allow("sudo_create", identity.entity_type, entity_id, 6):
         raise _limited()
@@ -171,7 +176,7 @@ async def wait_for_sudo_decision(
     request: Request,
     wait: Annotated[float, Query(ge=0)] = 0,
 ) -> dict[str, Any]:
-    db = _get_db()
+    db = _get_db(request)
     identity = await require_vm_guest(request, db, entity_id)
     if not _rate_limits.allow("sudo_wait", identity.entity_type, entity_id, 30):
         raise _limited(2)
