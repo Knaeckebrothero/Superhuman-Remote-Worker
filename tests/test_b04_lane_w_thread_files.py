@@ -728,6 +728,7 @@ class TestPreparePinnedVmThreadOperation:
             username="agent-host",
             key_path="/k",
             workspace_path="/w",
+            host_key_fingerprint="SHA256:" + "a" * 43,
         )
         lease = SimpleNamespace(
             identity=SimpleNamespace(ssh_host="10.0.0.1", ssh_port=2222),
@@ -777,7 +778,12 @@ class TestPreparePinnedVmThreadOperation:
                 THREAD,
                 {"execution_lane": "pinned"},
                 _SshTarget(
-                    host="h", port=1, username="u", key_path="/k", workspace_path="/w"
+                    host="h",
+                    port=1,
+                    username="u",
+                    key_path="/k",
+                    workspace_path="/w",
+                    host_key_fingerprint="SHA256:" + "a" * 43,
                 ),
                 operation_kind="thread_upload",
                 store=SimpleNamespace(),
@@ -853,6 +859,7 @@ class TestPreparePinnedK8sThreadUpload:
             username="agent-host",
             key_path="/k",
             workspace_path="/w",
+            host_key_fingerprint="SHA256:" + "a" * 43,
         )
         monkeypatch.setattr(
             "orchestrator.services.thread_uploads."
@@ -887,6 +894,7 @@ class TestPreparePinnedK8sThreadUpload:
             username="agent-host",
             key_path="/k",
             workspace_path="/w",
+            host_key_fingerprint="SHA256:" + "a" * 43,
         )
         thread = self._thread()
         monkeypatch.setattr(
