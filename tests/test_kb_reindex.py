@@ -2732,29 +2732,32 @@ class TestPostJobReindexTriggerResolvesItsOwnRepo:
     source. Coarse, but it fails the moment someone re-pins the repo.
     """
 
-    def _main_src(self) -> str:
+    def _src(self, *parts: str) -> str:
         import pathlib
 
         return (
-            pathlib.Path(__file__).resolve().parents[1]
-            / "src"
-            / "orchestrator"
-            / "main.py"
+            pathlib.Path(__file__).resolve().parents[1].joinpath("src", *parts)
         ).read_text(encoding="utf-8")
 
+    def _main_src(self) -> str:
+        return self._src("orchestrator", "main.py")
+
     def test_trigger_does_not_pin_repo_name(self):
-        src = self._main_src()
-        assert "async def _record_loop_job_outcome" in src, (
+        # R1.B03 moved the callee into orchestrator.services.knowledge_index;
+        # R1.B07 then moved this caller out of `main` into the loop engine and
+        # turned the call into a port. The guard follows the caller, as its own
+        # docstring instructs — and now checks BOTH halves, because the project
+        # id and the absent repo_name are decided in two places.
+        hook = self._src("orchestrator", "services", "project_loop_spawn.py")
+        assert "async def record_loop_job_outcome" in hook, (
             "post-job outcome hook not found — if it was renamed, move this "
             "guard with it rather than deleting it (see §10a)."
         )
-        body = _function_body(src, "async def _record_loop_job_outcome")
-        # R1.B03 moved the callee to orchestrator.services.knowledge_index and
-        # dropped its leading underscore; the caller is still here, so the guard
-        # stays here too. Compare whitespace-insensitively — the call is wrapped
-        # across lines now, and formatting is not the thing under test.
+        body = _function_body(hook, "async def record_loop_job_outcome")
+        # Compare whitespace-insensitively — the call is wrapped across lines,
+        # and formatting is not the thing under test.
         compact = re.sub(r"\s+", "", body)
-        assert "reindex_project_kb(pid,dependencies=" in compact, (
+        assert "dependencies.reindex_project_kb(pid)" in compact, (
             "The post-job KB trigger must call reindex_project_kb with the "
             "project id and no repo_name so it resolves the vault repo itself. "
             "Passing the job's repo_name pins it to an execution repo and wipes "
@@ -2763,6 +2766,18 @@ class TestPostJobReindexTriggerResolvesItsOwnRepo:
         assert "repo_name=" not in body, (
             "repo_name= reappeared in the post-job KB trigger — this is the "
             "exact §10a regression: silent chunk-index wipe."
+        )
+        # The other half: the application binds that port, and a repo_name
+        # smuggled into the binding would be just as silent.
+        binding = _function_body(self._main_src(), "def _project_loop_dependencies")
+        compact_binding = re.sub(r"\s+", "", binding)
+        assert "reindex_project_kb=(lambdaproject_id:" in compact_binding, (
+            "The loop engine's KB port must be bound to a one-argument "
+            "project-id call. See §10a."
+        )
+        assert "repo_name" not in binding, (
+            "repo_name reappeared in the loop engine's KB port binding — the "
+            "§10a regression, moved one hop out. "
         )
 
     def test_no_caller_pins_repo_name_to_the_jobs_repo(self):

@@ -49,9 +49,15 @@ def test_wake_service_has_no_direct_pod_ip_injection() -> None:
 
     repository = Path(__file__).resolve().parents[1]
     calls: list[tuple[str, int]] = []
+    # R1.B07 moved both sanctioned callers out of `main`: the conference hold
+    # stand-by notice and the Legate one-liner. The guard follows them rather
+    # than narrowing — the property is "exactly these two, each with the exact
+    # DB recheck, and none inside the wake service itself".
     for relative in (
         "src/orchestrator/services/session_wake.py",
         "src/orchestrator/main.py",
+        "src/orchestrator/services/officer_conference.py",
+        "src/orchestrator/services/officer_notices.py",
     ):
         tree = ast.parse((repository / relative).read_text())
         for node in ast.walk(tree):

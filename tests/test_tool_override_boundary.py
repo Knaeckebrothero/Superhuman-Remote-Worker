@@ -1596,8 +1596,10 @@ class TestAutomationBoundary:
             create_automation=AsyncMock(return_value={"id": "a1"}),
             update_automation=AsyncMock(return_value={"id": "a1"}),
         )
-        # The router late-imports `from main import postgres_db`, which
-        # resolves sys.modules["main"] — patching orchestrator.main misses it.
+        # R1.B07 closed this router's late `from main import postgres_db`.
+        # The store now arrives on `AutomationsDependencies`, which the cases
+        # below hand in explicitly — calling a declaration directly never
+        # resolves its `Depends(...)` default.
         monkeypatch.setattr("orchestrator.main.postgres_db", db)
         monkeypatch.setattr(
             mod, "require_approved_user", AsyncMock(return_value=caller)
@@ -1624,6 +1626,18 @@ class TestAutomationBoundary:
         )
         return mod, db
 
+    @staticmethod
+    def _deps(mod, db):
+        """What `main._automations_dependencies()` binds, with this suite's
+        store. The forge/cloud clients and the dispatch nudge are inert here:
+        the boundary under test refuses before any job is created."""
+        return mod.AutomationsDependencies(
+            store=db,
+            gitea_client=MagicMock(),
+            main_cloud_router=MagicMock(),
+            trigger_dispatch=MagicMock(),
+        )
+
     def _create_body(self, mod, config_override):
         return mod.AutomationCreate(
             name="a",
@@ -1643,6 +1657,7 @@ class TestAutomationBoundary:
             await mod.create_automation(
                 MagicMock(),
                 self._create_body(mod, {"tools": {"canvas": ["run_command"]}}),
+                dependencies=self._deps(mod, db),
             )
         assert exc.value.status_code == 400
         db.create_automation.assert_not_awaited()
@@ -1652,7 +1667,9 @@ class TestAutomationBoundary:
         mod, db = automations_env
 
         await mod.create_automation(
-            MagicMock(), self._create_body(mod, {"tools": {"research": []}})
+            MagicMock(),
+            self._create_body(mod, {"tools": {"research": []}}),
+            dependencies=self._deps(mod, db),
         )
 
         stored = db.create_automation.await_args.kwargs["config_override"]
@@ -1673,6 +1690,7 @@ class TestAutomationBoundary:
                 mod.AutomationUpdate(
                     config_override={"tools": {"citation": ["shell_execute"]}}
                 ),
+                dependencies=self._deps(mod, db),
             )
         assert exc.value.status_code == 400
         db.update_automation.assert_not_awaited()
