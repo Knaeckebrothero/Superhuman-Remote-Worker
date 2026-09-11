@@ -29032,7 +29032,10 @@ class PostgresDB:
                        j.execution_lane, j.branch_name, j.context, j.created_at,
                        -- The managed repository authority keys on repo_name;
                        -- a row without it dispatches a credential-less remote.
-                       j.repo_name
+                       j.repo_name,
+                       (SELECT execution.harness_adapter FROM srw_execution_specs execution
+                        WHERE execution.work_kind='Job' AND execution.work_id=j.id)
+                       AS execution_harness_adapter
                 FROM jobs j
                 -- These three terms are the partial index idx_jobs_dispatchable
                 -- (0046). Statuses MUST stay literal (see docstring); the
@@ -29122,7 +29125,10 @@ class PostgresDB:
                        j.project_id, j.parent_job_id, j.priority, j.runner_kind,
                        j.execution_lane, j.branch_name, j.context, j.created_at,
                        j.expert_id, j.document_path, j.worktree_path,
-                       j.delegation_context
+                       j.delegation_context,
+                       (SELECT execution.harness_adapter FROM srw_execution_specs execution
+                        WHERE execution.work_kind='Job' AND execution.work_id=j.id)
+                       AS execution_harness_adapter
                 FROM jobs j
                 WHERE j.status IN ('created', 'paused')
                   AND NOT EXISTS (SELECT 1 FROM srw_execution_specs execution WHERE execution.work_kind='Job' AND execution.work_id=j.id AND execution.harness_adapter='generic')

@@ -42,6 +42,7 @@ from orchestrator.services.vm_provisioner import (
     vm_persistent_rootdisk_enabled,
 )
 from orchestrator.services.workspace_binding import CANVAS_WORKSPACE_GENERATION_KEY
+from orchestrator.services.vm_workspace_config import vm_provisioning_options
 from orchestrator.services.workspace_lifecycle import WorkspaceOwner
 
 logger = logging.getLogger(__name__)
@@ -2251,8 +2252,15 @@ class WorkspaceSuspensionService:
                 raw_vm = metadata.get("vm")
                 if raw_vm is not None and not isinstance(raw_vm, dict):
                     return False
+                options = await vm_provisioning_options(
+                    self._db,
+                    "Session",
+                    thread,
+                    fallback=metadata.get("config_override"),
+                )
                 ok = await self._vm_provisioner.create_thread_vm(
                     thread_id,
+                    **options,
                     expected_runtime_generation=generation,
                     expected_agent_id=(
                         str(thread["agent_id"])

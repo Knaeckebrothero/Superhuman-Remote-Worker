@@ -771,6 +771,7 @@ from shared.runtime.core.tool_report import (  # noqa: E402
 from shared.tool_catalog import TOOL_REGISTRY  # noqa: E402
 from orchestrator.services.nats_bridge import nats_bridge  # noqa: E402
 from orchestrator.services.vm_provisioner import vm_provisioner  # noqa: E402
+from orchestrator.services.vm_workspace_config import vm_provisioning_options  # noqa: E402
 from orchestrator.services.vm_readiness import vm_readiness_prober  # noqa: E402
 from orchestrator.services.container_provisioner import (  # noqa: E402
     WORKSPACE_RUNTIME_INCARNATION_KEY,
@@ -7604,16 +7605,15 @@ async def _try_dispatch_pending_jobs() -> None:
                         config_override = job.get("config_override") or {}
                         if isinstance(config_override, str):
                             config_override = json.loads(config_override)
-                        vm_cfg = config_override.get("workspace", {}).get("vm", {})
+                        vm_options = await vm_provisioning_options(
+                            postgres_db, "Job", job, fallback=config_override
+                        )
                         ok = await vm_provisioner.create_vm(
                             job_id=job_id,
                             agent_config=canonical_config_name(
                                 job.get("config_name", "worker_base")
                             ),
-                            vm_image=vm_cfg.get("image"),
-                            cpu_cores=vm_cfg.get("cpu_cores", 8),
-                            memory=vm_cfg.get("memory", "16Gi"),
-                            disk_size=vm_cfg.get("disk_size"),
+                            **vm_options,
                             description=job.get("description", ""),
                         )
                         if ok:
@@ -7678,16 +7678,15 @@ async def _try_dispatch_pending_jobs() -> None:
                         config_override = job.get("config_override") or {}
                         if isinstance(config_override, str):
                             config_override = json.loads(config_override)
-                        vm_cfg = config_override.get("workspace", {}).get("vm", {})
+                        vm_options = await vm_provisioning_options(
+                            postgres_db, "Job", job, fallback=config_override
+                        )
                         await vm_provisioner.create_vm(
                             job_id=job_id,
                             agent_config=canonical_config_name(
                                 job.get("config_name", "worker_base")
                             ),
-                            vm_image=vm_cfg.get("image"),
-                            cpu_cores=vm_cfg.get("cpu_cores", 8),
-                            memory=vm_cfg.get("memory", "16Gi"),
-                            disk_size=vm_cfg.get("disk_size"),
+                            **vm_options,
                             description=job.get("description", ""),
                             fresh=False,
                         )
@@ -7771,16 +7770,15 @@ async def _try_dispatch_pending_jobs() -> None:
                         config_override = job.get("config_override") or {}
                         if isinstance(config_override, str):
                             config_override = json.loads(config_override)
-                        vm_cfg = config_override.get("workspace", {}).get("vm", {})
+                        vm_options = await vm_provisioning_options(
+                            postgres_db, "Job", job, fallback=config_override
+                        )
                         await vm_provisioner.create_vm(
                             job_id=job_id,
                             agent_config=canonical_config_name(
                                 job.get("config_name", "worker_base")
                             ),
-                            vm_image=vm_cfg.get("image"),
-                            cpu_cores=vm_cfg.get("cpu_cores", 8),
-                            memory=vm_cfg.get("memory", "16Gi"),
-                            disk_size=vm_cfg.get("disk_size"),
+                            **vm_options,
                             description=job.get("description", ""),
                             fresh=False,
                         )

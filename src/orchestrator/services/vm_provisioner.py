@@ -726,6 +726,7 @@ class VMProvisioner:
                 entity_type="job",
                 set_provisioning=fresh,
                 provision_generation=generation,
+                **({"disk_size": disk_size} if disk_size is not None else {}),
             )
 
         if self._http_available:
@@ -2210,6 +2211,7 @@ class VMProvisioner:
                 entity_type="thread",
                 set_provisioning=False,
                 provision_generation=generation,
+                **({"disk_size": disk_size} if disk_size is not None else {}),
             )
         elif self._http_available:
             result = await self._create_http(

@@ -75,9 +75,48 @@ workspace revisions are frozen in execution snapshots, including across Session
 configuration edits and End/Resume. Unattended Project loops, automations and
 Officer dispatch also resolve the Project workspace before connector selection.
 
-The current SRW provisioner accepts backend-only templates with `Delete`
-retention. It rejects template resources, custom workspace images, initialization,
-preparation, retained instances and `instanceRef` instead of discarding them.
+The SRW provisioner accepts backend-only templates and prebuilt VM templates
+with `Delete` retention. VM templates can select `environment.image` and
+`resources.cpu`, `memory`, and `storage`. CPUs must be whole cores; the disk
+request is raised to the controller's rootdisk minimum when necessary.
+`IfNotPresent`/`Reuse` uses the controller's existing disk import/clone behavior.
+Use immutable image digests: an existing cached golden disk is keyed by the full
+image reference, so changing the contents behind a tag does not invalidate it.
+Other pull/cache policies, preparation, initialization, retained instances and
+`instanceRef` remain unsupported. Image/resource settings on the SRW sandbox
+and virtual backends are also rejected instead of discarded.
+
+[srw-development-vm.yaml](srw-development-vm.yaml) selects a published VM image
+with Docker Engine, Compose, Buildx, kubectl, Helm, k3d, Tilt, mkcert, Python,
+Node and Git already installed. It is a bootable VM disk implementing SRW's
+guest/SSH contract. An application container image cannot be used as a VM disk.
+Applying this template alone creates no VM. An authorized VM Job or Session
+selects it independently of its Expert; the installation must enable the VM tier.
+
+For an MCP-created manifest Job, first use `manifest_apply` on the template,
+then on a Job containing this execution selection:
+
+```yaml
+execution:
+  expert:
+    ref:
+      name: engineer
+      scope: {kind: Catalog, name: shared}
+  workspace:
+    template:
+      ref:
+        name: srw-development
+        scope: {kind: Account, name: me}
+  connectors: {}
+```
+
+Set the Job task to the source revision and work to perform, and attach the
+repository and other required Connectors. Project defaults can select the same
+template for team Jobs. The existing MCP manifest API preserves omitted
+selections and explicit `workspace: null` without an additional selection syntax.
+VM allocation is captured at admission and survives dispatch, Session settings
+edits and resume. Changing a template affects new executions; changing VM image
+or resources through a Session settings PATCH requires a new Session.
 These fields are part of the manifest schema and are supported only where the
 selected provisioner implements them. This change does not add a general
 auto-upgrade policy or preparation cache.

@@ -396,6 +396,32 @@ class TestRequestVmCreate:
     """Tests for NatsBridge.request_vm_create()."""
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("entity_type", ["job", "thread"])
+    async def test_create_signs_requested_disk_size(
+        self, bridge_with_db, mock_nc, entity_type
+    ):
+        from orchestrator.services.vm_lifecycle_auth import verify_payload
+
+        secret = b"development-vm-test-lifecycle-secret-32-bytes"
+        bridge_with_db._lifecycle_hmac_secret = secret
+        await bridge_with_db.request_vm_create(
+            job_id="test-job",
+            entity_type=entity_type,
+            vm_image="registry.example/dev-vm:v1",
+            disk_size="120Gi",
+            provision_generation=PROVISION_GENERATION,
+        )
+        payload = json.loads(mock_nc.publish.call_args.args[1])
+        assert payload["disk_size"] == "120Gi"
+        assert verify_payload(
+            payload, direction="request", operation="create", secret=secret
+        )
+        payload["disk_size"] = "240Gi"
+        assert not verify_payload(
+            payload, direction="request", operation="create", secret=secret
+        )
+
+    @pytest.mark.asyncio
     async def test_create_publishes_correct_payload(
         self, bridge_with_db, mock_nc, mock_db
     ):

@@ -242,6 +242,18 @@ Selected template and Project revisions are captured at admission; source edits
 do not change existing execution snapshots. Children keep their existing
 workspace inheritance.
 
+VM WorkspaceTemplates support prebuilt `environment.image` references and
+`resources: {cpu: 12, memory: 24Gi, storage: 120Gi}`. CPU is a whole core count;
+memory/storage use `Mi`, `Gi`, or `Ti`. The controller applies its rootdisk
+minimum to storage requests. Pin images by digest for reproducible selection.
+Only the existing `IfNotPresent`/`Reuse` disk import/clone behavior is supported;
+preparation, initialization and retained-template instances remain separate work.
+Images must implement the SRW VM guest/SSH contract. See the
+[development VM template](../examples/manifests/srw-development-vm.yaml) and
+[selection examples](../examples/manifests/README.md#execution-owned-workspace-selection).
+The selected VM image/resources are captured with execution policy, independently
+of the typed harness settings, and reused for Job dispatch and Session resume.
+
 Bundled Experts now declare advisory preferences. For stored SRW Experts, run
 `scripts/migrate-workspace-preferences.py` to preview versioned changes, then
 `--apply --plan-revision <returned-revision>` against the intended database.

@@ -145,7 +145,8 @@ COPY --from=builder /usr/local/bin /usr/local/bin
 # Bake tokenizer assets before source changes. Runtime counting must not block
 # the event loop on lazy downloads or fall back because an asset is missing.
 ENV TIKTOKEN_CACHE_DIR=/opt/tiktoken-cache
-COPY docker/prepare-tokenizer-cache.py /usr/local/bin/prepare-tokenizer-cache.py
+# Private workspace checkouts can be mode 0600; the final srw user must read it.
+COPY --chmod=0644 docker/prepare-tokenizer-cache.py /usr/local/bin/prepare-tokenizer-cache.py
 RUN python /usr/local/bin/prepare-tokenizer-cache.py prepare
 
 # No browser in the agent image — Chromium lives on the workspace image only

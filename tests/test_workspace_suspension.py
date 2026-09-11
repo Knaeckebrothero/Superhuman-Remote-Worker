@@ -2374,6 +2374,27 @@ class TestVmRestoreEndsAtTheCreate:
         return thread
 
     @pytest.mark.asyncio
+    async def test_resume_preserves_custom_image_and_resources(self, monkeypatch):
+        monkeypatch.setenv("VM_PERSISTENT_ROOTDISK", "true")
+        svc, vm_prov = make_vm_service()
+        before = self._kept_thread()
+        before["metadata"]["config_override"]["workspace"]["vm"] = {
+            "image": "registry.example/dev-vm:v1",
+            "cpu_cores": 12,
+            "memory": "24Gi",
+            "disk_size": "120Gi",
+        }
+        svc._db.get_thread = AsyncMock(return_value=before)
+        svc._extract_snapshot = AsyncMock()
+        assert await svc.restore_thread_workspace("tid-vm") is True
+        options = vm_prov.create_thread_vm.await_args.kwargs
+        assert options["vm_image"] == "registry.example/dev-vm:v1"
+        assert options["cpu_cores"] == 12
+        assert options["memory"] == "24Gi"
+        assert options["disk_size"] == "120Gi"
+        svc._extract_snapshot.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_kept_disk_restore_succeeds_without_ssh_host(self, monkeypatch):
         monkeypatch.setenv("VM_PERSISTENT_ROOTDISK", "true")
         svc, vm_prov = make_vm_service()
