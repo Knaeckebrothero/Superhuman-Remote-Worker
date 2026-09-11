@@ -281,8 +281,12 @@ def strip_loader_owned_keys(override: Any) -> Any:
     if isinstance(nested_extra, dict):
         cleaned["extra"] = strip_loader_owned_keys(nested_extra)
     if dropped:
+        # Name the keys, never the mapping: an override layer's VALUES are
+        # caller-supplied and routinely hold credentials.
         logger.warning(
-            "Dropped loader-owned keys from a config override layer: %s", dropped
+            "Dropped %d loader-owned key(s) from a config override layer: %s",
+            len(dropped),
+            ", ".join(dropped),
         )
     return cleaned
 

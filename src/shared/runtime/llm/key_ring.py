@@ -30,9 +30,13 @@ logger = logging.getLogger(__name__)
 
 
 def _mask_key(key: str) -> str:
-    """Mask an API key for safe logging. Shows first 8 chars only."""
+    """Mask an API key for safe logging. Shows first 8 chars only.
+
+    A short key discloses nothing: half of an 8-character secret is most of
+    it, so only full-length keys keep an identifying prefix.
+    """
     if len(key) <= 8:
-        return key[:4] + "..."
+        return "..."
     return key[:8] + "..."
 
 
@@ -98,14 +102,21 @@ class KeyRing:
         # Maps key index -> timestamp when cooldown expires (0 = not on cooldown)
         self._cooldown_until: Dict[int, float] = {}
 
-        if len(keys) > 1:
+        active_prefix = _mask_key(self._keys[0])
+        if len(self._keys) > 1:
             logger.info(
-                f"KeyRing[{provider}]: initialized with {len(keys)} keys "
-                f"(cooldown={cooldown_seconds}s). "
-                f"Active: {_mask_key(keys[0])}"
+                "KeyRing[%s]: initialized with %d keys (cooldown=%ss). Active: %s",
+                provider,
+                len(self._keys),
+                cooldown_seconds,
+                active_prefix,
             )
         else:
-            logger.debug(f"KeyRing[{provider}]: single key mode ({_mask_key(keys[0])})")
+            logger.debug(
+                "KeyRing[%s]: single key mode (%s)",
+                provider,
+                active_prefix,
+            )
 
     @property
     def current_key(self) -> str:

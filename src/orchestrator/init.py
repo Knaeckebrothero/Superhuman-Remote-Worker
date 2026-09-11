@@ -107,6 +107,17 @@ def _parse_connection_string(connection_string: str) -> dict:
     }
 
 
+def _safe_connection_parts(connection_string: Optional[str]) -> dict:
+    """Host/port/database only — never the password. Log from this.
+
+    ``_parse_connection_string`` above deliberately returns the password for
+    ``PGPASSWORD``, so nothing read out of it may reach a log record.
+    """
+    from shared.db_url import describe_postgres_dsn  # local import: src/*
+
+    return describe_postgres_dsn(connection_string)
+
+
 async def init_postgres(force_reset: bool = False) -> bool:
     """Initialize PostgreSQL database.
 
@@ -129,8 +140,8 @@ async def init_postgres(force_reset: bool = False) -> bool:
         return False
 
     connection_string = get_postgres_connection_string()
-    db_name = connection_string.split("/")[-1].split("?")[0]
-    logger.info(f"  Database: {db_name}")
+    db_name = _safe_connection_parts(connection_string)["database"]
+    logger.info("  Database: %s", db_name)
 
     db = PostgresDB(connection_string)
 
@@ -305,8 +316,8 @@ async def init_vector_db(force_reset: bool = False) -> bool:
         logger.error(f"  Could not import PostgresDB: {e}")
         return False
 
-    db_name = vector_url.split("/")[-1].split("?")[0]
-    logger.info(f"  Database: {db_name}")
+    db_name = _safe_connection_parts(vector_url)["database"]
+    logger.info("  Database: %s", db_name)
 
     db = PostgresDB(vector_url, migrations_dir=MIGRATIONS_VECTOR_DIR)
 
@@ -437,7 +448,10 @@ def backup_vector_db(backup_file: Path) -> bool:
     env = os.environ.copy()
     env["PGPASSWORD"] = params["password"]
 
-    logger.info(f"  Running pg_dump for vector database: {params['database']}")
+    logger.info(
+        "  Running pg_dump for vector database: %s",
+        _safe_connection_parts(vector_url)["database"],
+    )
 
     try:
         subprocess.run(cmd, env=env, capture_output=True, text=True, check=True)
@@ -489,7 +503,10 @@ def restore_vector_db(backup_file: Path) -> bool:
         str(backup_file),
     ]
 
-    logger.info(f"  Running pg_restore for vector database: {params['database']}")
+    logger.info(
+        "  Running pg_restore for vector database: %s",
+        _safe_connection_parts(vector_url)["database"],
+    )
 
     try:
         result = subprocess.run(cmd, env=env, capture_output=True, text=True)
@@ -562,7 +579,10 @@ def backup_postgres(backup_file: Path) -> bool:
     env = os.environ.copy()
     env["PGPASSWORD"] = params["password"]
 
-    logger.info(f"  Running pg_dump for database: {params['database']}")
+    logger.info(
+        "  Running pg_dump for database: %s",
+        _safe_connection_parts(connection_string)["database"],
+    )
 
     try:
         subprocess.run(cmd, env=env, capture_output=True, text=True, check=True)
@@ -596,7 +616,10 @@ def restore_postgres(backup_file: Path) -> bool:
     env["PGPASSWORD"] = params["password"]
 
     # Clear database first
-    logger.info(f"  Clearing database: {params['database']}")
+    logger.info(
+        "  Clearing database: %s",
+        _safe_connection_parts(connection_string)["database"],
+    )
     try:
         asyncio.run(_reset_postgres_schema())
     except Exception as e:
@@ -617,7 +640,10 @@ def restore_postgres(backup_file: Path) -> bool:
         str(backup_file),
     ]
 
-    logger.info(f"  Running pg_restore for database: {params['database']}")
+    logger.info(
+        "  Running pg_restore for database: %s",
+        _safe_connection_parts(connection_string)["database"],
+    )
 
     try:
         result = subprocess.run(cmd, env=env, capture_output=True, text=True)
@@ -830,11 +856,16 @@ async def _seed_llm_keys_from_env(db) -> None:
         return
 
     report = await llm_seed(db, {"systemApiKeys": entries})
-    if report.api_keys_seeded:
-        logger.info(f"  Seeded system_api_keys: {', '.join(report.api_keys_seeded)}")
-    if report.api_keys_skipped:
+    # Report the providers via the literal tuple this function seeds from, so
+    # no string that passed through the seeder's key handling reaches the log.
+    seeded = [p for p in _SEEDABLE_PROVIDERS if p in set(report.api_keys_seeded)]
+    skipped = [p for p in _SEEDABLE_PROVIDERS if p in set(report.api_keys_skipped)]
+    if seeded:
+        logger.info("  Seeded system_api_keys: %s", ", ".join(seeded))
+    if skipped:
         logger.info(
-            f"  Skipped existing system_api_keys: {', '.join(report.api_keys_skipped)}"
+            "  Skipped existing system_api_keys: %s",
+            ", ".join(skipped),
         )
 
 

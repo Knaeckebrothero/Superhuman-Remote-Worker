@@ -9199,12 +9199,22 @@ async def lifespan(app: FastAPI):
         _active_id = main_cloud_router.active.backend_id
         _missing_secrets = missing_secret_envs(_active_id, _persisted_overlay)
         if _missing_secrets:
+            # Name only variables confirmed absent from the environment: a
+            # variable with no value cannot disclose one, which is exactly
+            # what this warning reports.
+            _unset_names = sorted(
+                {
+                    str(_m["env_var"])
+                    for _m in _missing_secrets
+                    if not os.getenv(str(_m["env_var"]))
+                }
+            )
             logger.warning(
                 "Main cloud backend %r is active but required secret env var(s) "
                 "are unset: %s — it is running on built-in DEV credentials and "
                 "will fail at the first cloud call. Set them via Helm/Vault.",
                 _active_id,
-                ", ".join(sorted({m["env_var"] for m in _missing_secrets})),
+                ", ".join(_unset_names),
             )
     except Exception as _e:
         logger.debug("Main cloud secret presence check skipped at startup: %s", _e)

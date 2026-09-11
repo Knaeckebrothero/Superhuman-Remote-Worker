@@ -1200,7 +1200,11 @@ class VMController:
         manifest = self.render_template(job_config, tailscale_auth_key)
         cloud_init_user_data = manifest.pop("_srwCloudInitUserData", None)
         ssh_host_key_fingerprint = manifest.pop("_srwSSHHostKeyFingerprint", None)
-        vm_name = manifest["metadata"]["name"]
+        # Derive the name from the job id rather than reading it back out of
+        # the rendered manifest: the manifest carries the Tailscale auth key,
+        # the SSH key and the VM auth token, so nothing lifted out of it may
+        # reach a log record. This is the same name the template renders.
+        vm_name = f"agent-vm-{job_id}"
         if golden_name:
             self._apply_clone_source(manifest, golden_name)
 
@@ -2142,6 +2146,10 @@ class VMController:
             )
         dvt = dvts[0]
         name = (dvt.get("metadata") or {}).get("name") or _rootdisk_name(job_id)
+        # The manifest carries the Tailscale auth key, the SSH key and the VM
+        # auth token, so nothing read back out of it may reach a log record.
+        # The template renders exactly this name, so it is the same string.
+        log_name = _rootdisk_name(job_id)
 
         # A templated DataVolume may omit spec.source.pvc.namespace — CDI
         # defaults it from the owning VM. A standalone one may not: the webhook
@@ -2159,16 +2167,16 @@ class VMController:
         if dv and phase == "Succeeded":
             # The recovery path: files are already there, and the ~3m27s clone
             # is skipped entirely — recovery is faster than a fresh start.
-            log.info("rootdisk reattach: %s (job %s)", name, job_id)
+            log.info("rootdisk reattach: %s (job %s)", log_name, job_id)
             return name
         if dv and phase == "Failed":
-            log.warning("rootdisk %s is Failed — recreating", name)
+            log.warning("rootdisk %s is Failed — recreating", log_name)
             await self._delete_dv(name)
             dv = None
         if dv is not None:
             # Importing / Pending / CloneScheduled — a racing create is already
             # building it, and KubeVirt gates VMI start on DV readiness anyway.
-            log.info("rootdisk %s in progress (%s) — adopting", name, phase or "?")
+            log.info("rootdisk %s in progress (%s) — adopting", log_name, phase or "?")
             return name
 
         template_labels = (dvt.get("metadata") or {}).get("labels") or {}
@@ -2208,11 +2216,11 @@ class VMController:
                 plural=CDI_PLURAL,
                 body=body,
             )
-            log.info("rootdisk created: %s (job %s)", name, job_id)
+            log.info("rootdisk created: %s (job %s)", log_name, job_id)
         except ApiException as e:
             if e.status != 409:
                 raise
-            log.info("rootdisk %s already exists — adopting", name)
+            log.info("rootdisk %s already exists — adopting", log_name)
         return name
 
     async def _gc_rootdisks_safe(self) -> None:
