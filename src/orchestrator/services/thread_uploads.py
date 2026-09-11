@@ -41,6 +41,7 @@ landed. That path's whole security burden sits in ``_safe_upload_relpath``.
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import logging
 import mimetypes
@@ -72,6 +73,7 @@ from orchestrator.services.canvas_ssh import (
     PinnedSFTPPool,
     asyncssh,
 )
+from orchestrator.services.ssh_helpers import _fingerprint_host_key
 from orchestrator.services.stateless_workspace_gate import (
     stateless_session_workspace_check,
 )
@@ -140,6 +142,11 @@ class _SshTarget:
     username: str
     key_path: str
     workspace_path: str
+    # The control-plane-attested SSH host key this endpoint must present. It has
+    # no default on purpose: a caller that cannot name the key it expects has no
+    # way to tell the workspace apart from anything else answering on that
+    # address, and must be refused rather than silently trusting the peer.
+    host_key_fingerprint: str
 
 
 @dataclass
@@ -177,6 +184,112 @@ class ThreadUploadError(Exception):
         super().__init__(detail)
         self.status_code = status_code
         self.detail = detail
+
+
+class _HostKeyMismatch(Exception):
+    """The peer's SSH host key is not the attested one. Never caught as I/O."""
+
+
+if paramiko is not None:
+
+    class _PinnedHostKeyPolicy(paramiko.MissingHostKeyPolicy):
+        """Accept exactly the control-plane-attested host key, nothing else.
+
+        Paramiko consults this hook once the key exchange has produced the
+        server's host key but *before* it authenticates, so raising here means
+        the workspace private key is never offered to a peer that failed to
+        prove its identity. The digest covers the whole key blob, including its
+        type, so matching an ed25519 pin is itself proof the peer presented the
+        attested ed25519 key.
+        """
+
+        def __init__(self, expected_fingerprint: str):
+            self._expected = expected_fingerprint
+
+        def missing_host_key(self, client, hostname, key) -> None:
+            presented = _fingerprint_host_key(
+                base64.b64encode(key.asbytes()).decode("ascii")
+            )
+            if not secrets.compare_digest(presented, self._expected):
+                raise _HostKeyMismatch(
+                    f"host key for {hostname} does not match the attested key"
+                )
+
+
+def _pinned_ssh_client(target: _SshTarget) -> Any:
+    """Build an SSHClient that will only complete against ``target``'s key."""
+
+    if paramiko is None:  # pragma: no cover - import guard
+        raise ThreadUploadError(
+            status_code=503, detail="paramiko is not installed on the orchestrator"
+        )
+    if not _valid_ssh_fingerprint(target.host_key_fingerprint):
+        # No usable pin means the peer's identity cannot be established at all.
+        # Trusting it anyway is precisely the man-in-the-middle exposure this
+        # refusal exists to close, so there is no fallback policy here.
+        logger.warning(
+            "Refusing SFTP to %s:%d — no attested SSH host key fingerprint",
+            target.host,
+            target.port,
+        )
+        raise ThreadUploadError(
+            status_code=409,
+            detail="Workspace SSH host key attestation is unavailable",
+        )
+
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(
+        _PinnedHostKeyPolicy(target.host_key_fingerprint)
+    )
+    return client
+
+
+def _connect_pinned_sftp(client: Any, target: _SshTarget) -> None:
+    """Connect ``client`` to ``target``, enforcing its pinned host key."""
+
+    try:
+        client.connect(
+            hostname=target.host,
+            port=target.port,
+            username=target.username,
+            key_filename=target.key_path,
+            timeout=15,
+            banner_timeout=15,
+            auth_timeout=15,
+            allow_agent=False,
+            look_for_keys=False,
+        )
+    except _HostKeyMismatch as e:
+        # An identity verdict, not a reachability one: the host answered and
+        # presented the wrong key. Reporting it as "could not reach" would hide
+        # an active man-in-the-middle behind a retryable-looking message.
+        logger.error(
+            "SSH host key mismatch for %s@%s:%d — refusing SFTP",
+            target.username,
+            target.host,
+            target.port,
+        )
+        client.close()
+        raise ThreadUploadError(
+            status_code=502,
+            detail=(
+                f"Workspace SSH host key verification failed "
+                f"({target.host}:{target.port})"
+            ),
+        ) from e
+    except Exception as e:
+        logger.warning(
+            "SSH connect failed for %s@%s:%d (%s)",
+            target.username,
+            target.host,
+            target.port,
+            e,
+        )
+        client.close()
+        raise ThreadUploadError(
+            status_code=502,
+            detail=f"Could not reach workspace ({target.host}:{target.port})",
+        ) from e
 
 
 def _sanitize_filename(filename: str) -> str:
@@ -734,19 +847,28 @@ def resolve_thread_upload_destination(
 
     vm_ctx = metadata.get("vm") or {}
     ws_ctx = metadata.get("workspace_container") or {}
+    binding = metadata.get("_workspace_binding") or {}
 
     host: str | None = None
     port = 22
     workspace_path = DEFAULT_WORKSPACE_PATH
+    host_key_fingerprint = ""
 
     if backend == "vm" and vm_ctx.get("status") == "ready":
         host = vm_ctx.get("ssh_host") or vm_ctx.get("pod_ip")
         port = int(vm_ctx.get("ssh_port") or 22)
         workspace_path = vm_ctx.get("workspace_path") or DEFAULT_WORKSPACE_PATH
+        host_key_fingerprint = vm_ctx.get("ssh_host_key_fingerprint") or ""
     elif backend in {None, "sandbox"} and ws_ctx.get("status") == "ready":
         host = ws_ctx.get("host") or ws_ctx.get("pod_ip")
         port = int(ws_ctx.get("port") or 22)
         workspace_path = ws_ctx.get("workspace_path") or DEFAULT_WORKSPACE_PATH
+        host_key_fingerprint = ws_ctx.get("ssh_host_key_fingerprint") or ""
+
+    # The binding is the control plane's own record of which key this workspace
+    # was provisioned with, so it wins over whatever the endpoint context echoes.
+    if isinstance(binding, dict) and binding.get("ssh_host_key_fingerprint"):
+        host_key_fingerprint = str(binding["ssh_host_key_fingerprint"])
 
     if not host:
         # Genuinely transient now: this branch is only reachable for tiers that
@@ -769,6 +891,7 @@ def resolve_thread_upload_destination(
         username=DEFAULT_USERNAME,
         key_path=key_path,
         workspace_path=workspace_path,
+        host_key_fingerprint=host_key_fingerprint,
     )
 
 
@@ -1129,37 +1252,8 @@ def _sftp_write_files(
     ``_expand_payloads_for_extraction``; a corrupt/unsafe zip falls back to
     being written verbatim like any other file.
     """
-    if paramiko is None:  # pragma: no cover - import guard
-        raise ThreadUploadError(
-            status_code=503, detail="paramiko is not installed on the orchestrator"
-        )
-
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    try:
-        client.connect(
-            hostname=target.host,
-            port=target.port,
-            username=target.username,
-            key_filename=target.key_path,
-            timeout=15,
-            banner_timeout=15,
-            auth_timeout=15,
-            allow_agent=False,
-            look_for_keys=False,
-        )
-    except Exception as e:
-        logger.warning(
-            "SSH connect failed for %s@%s:%d (%s)",
-            target.username,
-            target.host,
-            target.port,
-            e,
-        )
-        raise ThreadUploadError(
-            status_code=502,
-            detail=f"Could not reach workspace ({target.host}:{target.port})",
-        ) from e
+    client = _pinned_ssh_client(target)
+    _connect_pinned_sftp(client, target)
 
     try:
         sftp = client.open_sftp()
@@ -1843,37 +1937,8 @@ def _sftp_delete_file(target: _SshTarget, relpath: str) -> bool:
     Returns:
         True when something was removed, False when there was nothing there.
     """
-    if paramiko is None:  # pragma: no cover - import guard
-        raise ThreadUploadError(
-            status_code=503, detail="paramiko is not installed on the orchestrator"
-        )
-
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    try:
-        client.connect(
-            hostname=target.host,
-            port=target.port,
-            username=target.username,
-            key_filename=target.key_path,
-            timeout=15,
-            banner_timeout=15,
-            auth_timeout=15,
-            allow_agent=False,
-            look_for_keys=False,
-        )
-    except Exception as e:
-        logger.warning(
-            "SSH connect failed for %s@%s:%d (%s)",
-            target.username,
-            target.host,
-            target.port,
-            e,
-        )
-        raise ThreadUploadError(
-            status_code=502,
-            detail=f"Could not reach workspace ({target.host}:{target.port})",
-        ) from e
+    client = _pinned_ssh_client(target)
+    _connect_pinned_sftp(client, target)
 
     try:
         sftp = client.open_sftp()

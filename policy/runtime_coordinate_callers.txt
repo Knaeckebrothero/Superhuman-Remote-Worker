@@ -98,7 +98,7 @@ src/orchestrator/services/ssh_helpers.py  stream_extract_snapshot  ssh  build_ag
 src/orchestrator/services/ssh_helpers.py  wait_for_agent_ssh  remote-effect  create_owned_subprocess_exec  48e3950913b3  #1  pinned-host-key
 src/orchestrator/services/ssh_helpers.py  wait_for_agent_ssh  ssh  build_agent_ssh_cmd  03995d101f31  #1  pinned-host-key
 src/orchestrator/services/thread_cloud_diff.py  _reset_thread_overlay  http  client.post  92db99489add  #1  exact-runtime-recipient
-src/orchestrator/services/thread_uploads.py  resolve_thread_upload_destination  ssh  _SshTarget  edfd95d5f2d1  #1  pinned-host-key
+src/orchestrator/services/thread_uploads.py  resolve_thread_upload_destination  ssh  _SshTarget  4b9010b50487  #1  pinned-host-key
 src/orchestrator/services/thread_workspace_delivery.py  agent_get_thread_workspace_locked  remote-effect  remote_canvas_presentation_available  f40229a0ebf2  #1  fresh-k8s-attestation
 src/orchestrator/services/thread_workspace_delivery.py  agent_get_thread_workspace_locked  remote-effect  remote_canvas_presentation_available  f40229a0ebf2  #2  fresh-k8s-attestation
 src/orchestrator/services/vm_provisioner.py  VMProvisioner.release_vm_captured  remote-effect  self._snapshot_service.capture_vm_snapshot  22b821d81a7c  #1  vm-authority
