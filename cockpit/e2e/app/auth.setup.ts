@@ -113,11 +113,12 @@ async function bootstrapCatalogAndReadiness(
     'fixture model catalog',
   );
   const enabledModels = models.filter(({ enabled }) => enabled);
-  // Migration 0242 materialises one enabled `rerank` row per enabled embedding
-  // provider, so the implicit reranker transport that predated the rerank
-  // catalog slot stays green across an upgrade. That row is expected here and
-  // is still checked: it must carry the rerank capability and nothing else,
-  // and every OTHER enabled row must still be exactly the two fixture models.
+  // `rerank` is a required capability with its own catalog slot, so an enabled
+  // rerank row is expected: this profile seeds one through `llm.seed`, and an
+  // upgraded deployment gets one from migration 0242 instead. Either way the
+  // row is still checked — it must carry the rerank capability and nothing
+  // else, and every OTHER enabled row must still be exactly the two fixture
+  // models, so a stray enabled chat model would still fail here.
   const autoRerankRows = enabledModels.filter(({ capabilities }) =>
     capabilities.includes('rerank'),
   );
