@@ -169,6 +169,18 @@ CRAWL4AI_MODEL_ID = "crawl4ai"
 _DEFAULT_CODEX_PROXY_URL = "http://localhost:8317"
 
 
+def _entry_field_names(entry: Any) -> str:
+    """Name a malformed entry's fields without printing their values.
+
+    A seed entry carries an inline ``apiKey``, so logging the mapping itself
+    puts the credential in the record. The field names alone identify what the
+    operator got wrong.
+    """
+    if not isinstance(entry, dict):
+        return type(entry).__name__
+    return ", ".join(sorted(str(key) for key in entry)) or "none"
+
+
 def _resolve_secret_value(entry: dict[str, Any], *, context: str) -> str | None:
     """Resolve an ``apiKey`` from an inline string or an ``apiKeyEnv`` reference.
 
@@ -334,7 +346,10 @@ async def _seed_api_keys(
     for entry in entries:
         provider = entry.get("provider")
         if not provider:
-            logger.warning("skipping systemApiKeys entry without provider: %r", entry)
+            logger.warning(
+                "skipping systemApiKeys entry without provider (fields: %s)",
+                _entry_field_names(entry),
+            )
             continue
         api_key = _resolve_secret_value(entry, context=f"systemApiKeys[{provider}]")
         if not api_key:
@@ -387,7 +402,9 @@ async def _seed_endpoints(
         base_url = entry.get("baseUrl") or entry.get("base_url")
         if not label or not base_url:
             logger.warning(
-                "skipping systemEndpoints entry — label or baseUrl missing: %r", entry
+                "skipping systemEndpoints entry — label or baseUrl missing "
+                "(fields: %s)",
+                _entry_field_names(entry),
             )
             continue
         transport_kind = entry.get("transportKind") or entry.get("transport_kind")

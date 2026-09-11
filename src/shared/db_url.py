@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import os
 from typing import Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 
 def build_postgres_url(
@@ -69,6 +69,38 @@ def build_postgres_url(
     if fallback_env:
         return os.getenv(fallback_env)
     return None
+
+
+def describe_postgres_dsn(dsn: Optional[str]) -> dict:
+    """Return only the parts of a DSN that are safe to log.
+
+    ``{"host": ..., "port": ..., "database": ...}`` and nothing else — the
+    userinfo component carrying the password is never read, so the result
+    cannot carry a credential no matter what the DSN contains. Log this
+    instead of slicing the DSN: ``dsn.split("/")[-1]`` yields a password
+    fragment when a fallback ``DATABASE_URL`` has no trailing database path,
+    because the slice then lands inside the credentials.
+
+    Unparseable input yields the same keys with empty values, so callers can
+    format the result unconditionally.
+    """
+    _, _, authority = (dsn or "").rpartition("://")
+    # Drop the userinfo before parsing. A fallback DSN is not URL-quoted, so a
+    # password may itself contain "/", ":" or "@" — which is exactly what
+    # truncates the netloc under ``urlsplit``. Everything up to and including
+    # the LAST "@" is credentials, so this is the only slice that cannot
+    # return part of one.
+    _, _, remainder = authority.rpartition("@")
+    parts = urlsplit(f"//{remainder}")
+    try:
+        port = parts.port
+    except ValueError:  # non-numeric port in a hand-written DSN
+        port = None
+    return {
+        "host": parts.hostname or "",
+        "port": str(port) if port else "",
+        "database": parts.path.lstrip("/").split("?")[0],
+    }
 
 
 def checkpointer_backend() -> str:

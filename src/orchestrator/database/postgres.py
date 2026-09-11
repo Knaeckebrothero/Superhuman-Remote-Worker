@@ -67,7 +67,7 @@ from orchestrator.security.crypto import (
     is_encrypted,
 )
 
-from shared.db_url import build_postgres_url
+from shared.db_url import build_postgres_url, describe_postgres_dsn
 from shared.job_freeze_types import AUTO_REDISPATCH_FREEZE_TYPES
 from shared.job_steering import context_delivery_key, queued_reply_key
 from shared.pinned_session_identity import PinnedSessionBinding
@@ -51476,9 +51476,10 @@ class PostgresDB:
         Raises:
             RuntimeError: If database name cannot be extracted from connection string.
         """
-        # Extract database name from connection string
-        # Format: postgresql://user:pass@host:port/dbname
-        db_name = self._connection_string.rsplit("/", 1)[-1].split("?")[0]
+        # Parse the database name out of the DSN rather than slicing it: a
+        # fallback DATABASE_URL is not URL-quoted, so a "/" in the password
+        # makes rsplit land inside the credentials.
+        db_name = describe_postgres_dsn(self._connection_string)["database"]
         if not db_name:
             raise RuntimeError("Could not extract database name from connection string")
 
