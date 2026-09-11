@@ -377,7 +377,7 @@ APP_INPUT_DELIVERY_CONSTRAINTS_NOT_VALID = (
 )
 APP_CURRENT_MIGRATION_HEAD = (
     ROOT
-    / "src/orchestrator/database/migrations/app/0239_validate_manifest_deferred_constraints.sql"
+    / "src/orchestrator/database/migrations/app/0242_rerank_rows_from_embedding_rows.sql"
 )
 AUDIT_EXPANSION = (
     ROOT
