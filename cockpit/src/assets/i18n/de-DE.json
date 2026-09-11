@@ -869,6 +869,8 @@
       "scopeLabel": "Verbrauchsbereich",
       "scopeNoSubjobs": "Dieser Job hat keine Teil-Jobs, beide Werte sind daher identisch.",
       "scopeSubtree": "Inkl. Teil-Jobs",
+      "showLess": "Weniger anzeigen",
+      "showMore": "Mehr anzeigen",
       "showSubjobRows": "{{count}} ausgeblendete als Zeilen anzeigen",
       "showSubjobRowsHint": "Fügt Unteraufträge zum Herkunftsfilter hinzu, damit sie in der Liste erscheinen.",
       "subjobs": "Unteraufträge ({{count}})",

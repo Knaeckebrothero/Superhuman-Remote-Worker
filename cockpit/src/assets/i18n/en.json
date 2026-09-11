@@ -869,6 +869,8 @@
       "scopeLabel": "Usage scope",
       "scopeNoSubjobs": "This job has no sub-jobs, so both figures are the same.",
       "scopeSubtree": "Incl. sub-jobs",
+      "showLess": "Show less",
+      "showMore": "Show more",
       "showSubjobRows": "Show {{count}} hidden as rows",
       "showSubjobRowsHint": "Adds sub-jobs to the origin filter, so they appear in the list.",
       "subjobs": "Sub-jobs ({{count}})",
