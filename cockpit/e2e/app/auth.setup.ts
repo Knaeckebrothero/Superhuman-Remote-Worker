@@ -113,9 +113,25 @@ async function bootstrapCatalogAndReadiness(
     'fixture model catalog',
   );
   const enabledModels = models.filter(({ enabled }) => enabled);
-  expect(enabledModels.map(({ model_id }) => model_id).sort()).toEqual(
-    [environment.chatModel, environment.embeddingModel].sort(),
+  // Migration 0242 materialises one enabled `rerank` row per enabled embedding
+  // provider, so the implicit reranker transport that predated the rerank
+  // catalog slot stays green across an upgrade. That row is expected here and
+  // is still checked: it must carry the rerank capability and nothing else,
+  // and every OTHER enabled row must still be exactly the two fixture models.
+  const autoRerankRows = enabledModels.filter(({ capabilities }) =>
+    capabilities.includes('rerank'),
   );
+  for (const row of autoRerankRows) {
+    expect(row.capabilities, 'the auto-seeded rerank row carries only rerank').toEqual([
+      'rerank',
+    ]);
+  }
+  expect(
+    enabledModels
+      .filter(({ capabilities }) => !capabilities.includes('rerank'))
+      .map(({ model_id }) => model_id)
+      .sort(),
+  ).toEqual([environment.chatModel, environment.embeddingModel].sort());
 
   const chatRows = enabledModels.filter(({ model_id }) => model_id === environment.chatModel);
   const embeddingRows = enabledModels.filter(
