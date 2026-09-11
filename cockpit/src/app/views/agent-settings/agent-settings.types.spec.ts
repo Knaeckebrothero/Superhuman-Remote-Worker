@@ -15,6 +15,21 @@ describe('detectModelFamily — GLM', () => {
   });
 });
 
+describe('detectModelFamily — Claude Opus 5', () => {
+  it('maps Opus 5 IDs to the claude-opus-5 family across transports', () => {
+    expect(detectModelFamily('claude-opus-5')).toBe('claude-opus-5');
+    expect(detectModelFamily('claude-opus-5-20260401')).toBe('claude-opus-5');
+    expect(detectModelFamily('openrouter/anthropic/claude-opus-5')).toBe(
+      'claude-opus-5',
+    );
+  });
+
+  it('leaves older Opus rows on the generic family', () => {
+    expect(detectModelFamily('claude-opus-4-8')).toBe('claude-opus');
+    expect(detectModelFamily('claude-opus-4-5')).toBe('claude-opus');
+  });
+});
+
 describe('detectModelFamily — GPT-5.6', () => {
   it('maps GPT-5.6 tiers to the gpt-5.6 family, ahead of gpt-5', () => {
     expect(detectModelFamily('gpt-5.6-sol')).toBe('gpt-5.6');

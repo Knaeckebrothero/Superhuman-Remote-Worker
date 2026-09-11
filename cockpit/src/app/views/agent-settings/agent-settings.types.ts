@@ -183,6 +183,10 @@ export function detectModelFamily(model: string): string {
   }
   if (name.startsWith('openai/')) name = name.slice('openai/'.length);
 
+  // Opus 5 before the generic Opus rule — mirrors family_of() in
+  // src/shared/runtime/core/model_registry.py (Opus 5 is the only Opus with
+  // the full xhigh/max effort ladder, so it has its own matrix family).
+  if (name.startsWith('claude-opus-5')) return 'claude-opus-5';
   if (name.startsWith('claude-opus')) return 'claude-opus';
   if (name.startsWith('claude-sonnet')) return 'claude-sonnet';
   if (name.startsWith('claude-haiku')) return 'claude-haiku';

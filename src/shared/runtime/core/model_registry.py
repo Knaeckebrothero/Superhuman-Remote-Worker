@@ -319,6 +319,11 @@ def family_of(model_id: str, default: str = "default") -> str:
     if name.startswith("openai/"):
         name = name[len("openai/") :]
 
+    # Opus 5 before the generic Opus rule: it is the only Opus that takes the
+    # full effort ladder (xhigh/max), so it carries its own matrix family.
+    # family_matcher.detect_family orders its rules the same way.
+    if name.startswith("claude-opus-5"):
+        return "claude-opus-5"
     if name.startswith("claude-opus"):
         return "claude-opus"
     if name.startswith("claude-sonnet"):

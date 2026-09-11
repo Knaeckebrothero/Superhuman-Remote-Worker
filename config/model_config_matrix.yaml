@@ -283,6 +283,34 @@ claude-opus:
     # 28px patches, Opus 4.7+/Fable5 high-res cap (2576px edge / 4784 tok max).
     image_tokens: { mode: anthropic_patches, patch_px: 28, max_edge: 2576, max_tokens: 4784, flat: 4784 }
 
+claude-opus-5:
+  # Split off `claude-opus` for one reason: Opus 5 accepts the FULL effort
+  # ladder. Anthropic grew it per generation — 4.5 and older take
+  # low|medium|high, 4.6 added `max`, 4.7 added `xhigh` — and Opus 5 takes all
+  # five. The generic `claude-opus` family still has to serve those older rows,
+  # so widening it there would offer every 4.x Opus a level its wire rejects.
+  #
+  # Everything else mirrors `claude-opus` on purpose: a family block falls
+  # through to `default`, NEVER to a sibling family, so the settings have to be
+  # repeated here or Opus 5 would silently inherit `default` (multimodal:false,
+  # 128k window) — the same trap the claude-sonnet note below records.
+  #
+  # Delivery is unchanged: effort rides `reasoning_effort` on the OpenAI-shaped
+  # wire (subscription proxy / OpenRouter), which CLIProxyAPI maps onto
+  # Anthropic `thinking` + `output_config.effort`. The native Anthropic factory
+  # injects no reasoning control, so a row served by a direct Anthropic key
+  # ignores this block — see the claude-opus note above.
+  reasoning: { method: effort_enum, delivery: native, default: high, options: [low, medium, high, xhigh, max] }
+  settings:
+    shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
+    temperature: 1.0  # Anthropic: just use temperature, leave top_p/top_k at defaults
+    multimodal: true
+    parallel_tool_calls: true
+    model_max_context_tokens: 1000000  # Opus 5: 1M context, 128K max output
+    max_output_tokens: 65536  # reasoning headroom (resolver clamps to ctx backstop)
+    # 28px patches, Opus 4.7+/Fable5 high-res cap (2576px edge / 4784 tok max).
+    image_tokens: { mode: anthropic_patches, patch_px: 28, max_edge: 2576, max_tokens: 4784, flat: 4784 }
+
 # Claude Sonnet / Haiku — NEW rows. Without them family_of('claude-sonnet')
 # falls through to `default` (multimodal:false!), so the homelab interactive
 # main model never counted images and compacted at the 128k default window.

@@ -512,6 +512,77 @@ class TestGpt6Reasoning:
         assert plan["value"] is None
 
 
+class TestClaudeOpus5Reasoning:
+    """claude-opus-5 is its own matrix family: it is the only Opus that accepts
+    the full effort ladder, and both OpenAI-shaped factories must carry xhigh /
+    max through un-clamped while the generic `claude-opus` family stays at
+    low/medium/high for the 4.x rows it still serves."""
+
+    def test_capability_lists_xhigh_and_max(self):
+        cap = reasoning_capability("claude-opus-5")
+        assert cap["method"] == "effort_enum"
+        assert cap["default"] == "high"
+        assert cap["options"] == ["low", "medium", "high", "xhigh", "max"]
+
+    def test_older_opus_rows_stay_on_the_narrow_ladder(self):
+        # Regression guard: widening the shared family instead of splitting it
+        # would offer 4.x Opus rows a level their wire rejects.
+        assert reasoning_capability("claude-opus-4-8")["options"] == [
+            "low",
+            "medium",
+            "high",
+        ]
+
+    def test_settings_match_the_generic_opus_family(self):
+        # A family block falls through to `default`, never to a sibling — if the
+        # settings were dropped here Opus 5 would silently become non-multimodal
+        # with a 128k window.
+        from shared.runtime.core.loader import _apply_settings_matrix
+
+        five = {"llm": {"model": "claude-opus-5"}}
+        four = {"llm": {"model": "claude-opus-4-8"}}
+        _apply_settings_matrix(five, expert_llm_keys=set())
+        _apply_settings_matrix(four, expert_llm_keys=set())
+        five["llm"].pop("model")
+        four["llm"].pop("model")
+        assert five == four
+
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
+    def test_xhigh_survives_the_chat_completions_factory(self, mock_chat):
+        # Subscription-proxy Claude rows speak openai-chat; CLIProxyAPI maps
+        # `reasoning_effort` onto Anthropic thinking + output_config.effort.
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model="claude-opus-5", reasoning_level="xhigh")
+
+        _create_openai_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["model_kwargs"]["reasoning_effort"] == "xhigh"
+
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
+    def test_max_survives_the_codex_factory_as_a_flat_effort(self, mock_chat):
+        # A proxy row left on openai-responses still routes here. Claude is not
+        # a reasoning-summary model, so the flat Chat-Completions field is the
+        # correct shape — what matters is that `max` is not clamped away.
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model="claude-opus-5", reasoning_level="max")
+
+        _create_codex_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["model_kwargs"]["reasoning_effort"] == "max"
+
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
+    def test_xhigh_on_an_older_opus_still_clamps(self, mock_chat):
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model="claude-opus-4-8", reasoning_level="xhigh")
+
+        _create_openai_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["model_kwargs"]["reasoning_effort"] == "high"
+
+
 class TestOpenAIReasoningClamping:
     """Integration tests verifying clamping reaches ReasoningChatOpenAI for OpenAI."""
 

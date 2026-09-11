@@ -295,6 +295,17 @@ class TestFamilyOf:
     def test_claude_opus(self):
         assert family_of("claude-opus-4-7") == "claude-opus"
 
+    def test_claude_opus_5_has_its_own_family(self):
+        # Opus 5 is the only Opus that takes the full effort ladder, so it gets
+        # a dedicated matrix family; the rule must beat the generic prefix.
+        assert family_of("claude-opus-5") == "claude-opus-5"
+        assert family_of("claude-opus-5-20260401") == "claude-opus-5"
+        assert family_of("openrouter/anthropic/claude-opus-5") == "claude-opus-5"
+
+    def test_older_opus_ids_stay_on_the_generic_family(self):
+        assert family_of("claude-opus-4-5") == "claude-opus"
+        assert family_of("claude-opus-4-8") == "claude-opus"
+
     def test_gpt_4o_uses_legacy_family(self):
         # `family_of`'s heuristic predates the family-matcher service and
         # still returns "gpt-4o" for native gpt-4o; the matcher service
