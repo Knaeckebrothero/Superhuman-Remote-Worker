@@ -9713,7 +9713,15 @@ async def lifespan(app: FastAPI):
                 release_enabled=OFFICER_AUTO_PULL_RELEASE_ENABLED,
                 provision_repo=_provision_officer_ticket_repo,
                 trigger_dispatch=_trigger_dispatch,
-                enforce_grants=_enforce_officer_ticket_grants,
+                enforce_grants=(
+                    lambda *args, **kwargs: (
+                        project_loop_spawn_service.enforce_officer_ticket_grants(
+                            *args,
+                            **kwargs,
+                            dependencies=_project_loop_dependencies(),
+                        )
+                    )
+                ),
                 usage_ledger=usage_ledger,
                 notify=notify_officer,
             ),
@@ -10747,9 +10755,15 @@ def _thread_admission_dependencies() -> (
             )
         ),
         enforce_officer_auto_pull_release=_enforce_officer_auto_pull_release,
-        can_manage_project_officer=_can_manage_project_officer,
+        can_manage_project_officer=(
+            lambda *args, **kwargs: (
+                officer_post_view_service.can_manage_project_officer(
+                    *args, **kwargs, dependencies=_officer_post_view_dependencies()
+                )
+            )
+        ),
         find_open_conference_thread=_find_open_conference_thread,
-        inherit_conference_brain=_inherit_conference_brain,
+        inherit_conference_brain=officer_conference_service.inherit_conference_brain,
         hold_officer_for_conference=_hold_officer_for_conference,
         provision_commissioned_officer=_provision_commissioned_officer,
         end_thread_flow=_end_thread_flow,
@@ -10900,9 +10914,9 @@ async def _thread_has_knowledge_scope(
 async def create_thread(
     request_body: ThreadCreateRequest, request: Request
 ) -> dict[str, Any]:
-    """Kept on main because ``commission_project_officer`` and the bench
-    review path call it directly; the route itself lives in
-    ``routers/thread_admission``."""
+    """Kept on main because the bench review path calls it directly and B07's
+    ``officer_post_lifecycle`` takes it as its ``create_thread`` port; the route
+    itself lives in ``routers/thread_admission``."""
     return await thread_admission_service.create_thread(
         request_body,
         request,
@@ -11053,14 +11067,6 @@ def _loop_plan_filing_dependencies() -> (
     )
 
 
-async def _enforce_officer_ticket_grants(*args: Any, **kwargs: Any) -> Any:
-    """Compatibility wrapper: the officer backlog tick takes this as its
-    create-time grant PEP (``enforce_grants``)."""
-    return await project_loop_spawn_service.enforce_officer_ticket_grants(
-        *args, **kwargs, dependencies=_project_loop_dependencies()
-    )
-
-
 async def _provision_officer_ticket_repo(*args: Any, **kwargs: Any) -> Any:
     """Compatibility wrapper: the officer backlog tick and the job-admission
     officer path both take this as their repo/cloud provisioning adapter."""
@@ -11204,6 +11210,12 @@ def _notification_action_dependencies() -> (
 
 
 # --- R1.B07 lane O: the Officer Post ---------------------------------------
+# Four wrappers below survive on purpose. Each has TWO composition sites —
+# a dependency factory and a task-wiring site, or two factories — so the
+# name is what those sites share rather than a hop they go through.
+# Inlining would duplicate the same dependency expression twice, which is
+# the trade B06 already declined. The ones that fed exactly one consumer
+# are gone: that consumer binds the owning service directly.
 def _officer_post_policy_dependencies() -> (
     officer_post_policy_service.OfficerPostPolicyDependencies
 ):
@@ -11316,22 +11328,6 @@ async def _conclude_conference_if_any(thread: dict[str, Any]) -> None:
     )
 
 
-def _inherit_conference_brain(
-    config_override: dict[str, Any], officer: dict[str, Any] | None
-) -> list[str]:
-    """Compatibility wrapper: B06's create funnel fills the conference brain
-    through this name."""
-    return officer_conference_service.inherit_conference_brain(config_override, officer)
-
-
-async def _can_manage_project_officer(user: dict[str, Any], project_id: str) -> bool:
-    """Compatibility wrapper: B06's create funnel asks this before admitting a
-    conference."""
-    return await officer_post_view_service.can_manage_project_officer(
-        user, project_id, dependencies=_officer_post_view_dependencies()
-    )
-
-
 def _enforce_officer_auto_pull_release(desired: Any) -> None:
     """Compatibility wrapper: B06's create funnel fences unattended enablement
     through this name."""
@@ -11357,13 +11353,6 @@ async def _decommission_officer_post(*args: Any, **kwargs: Any) -> Any:
     )
 
 
-async def _inject_officer_notice(officer_thread: dict[str, Any], text: str) -> bool:
-    """Compatibility wrapper: two suites drive the Legate one-liner here."""
-    return await officer_notice_service.inject_officer_notice(
-        officer_thread, text, dependencies=_officer_notice_dependencies()
-    )
-
-
 async def _dispatch_officer_page(*args: Any, **kwargs: Any) -> Any:
     """Compatibility wrapper: the persistent recycler's respawn-failure alert
     and the watchdog's runtime-authorization incident both page through this
@@ -11374,9 +11363,12 @@ async def _dispatch_officer_page(*args: Any, **kwargs: Any) -> Any:
 
 
 # --- R1.B07 lane M: message routing, guidance and pending actions ---------
-# The cache belongs to this application, not to the module: the key is the
-# caller's user id (or "__admin__"), so two applications sharing one dict would
-# serve one process's counts to the other's caller.
+# The application owns the 5 s count cache and hands it to the operation, which
+# keeps nothing between calls. It is deliberately still one dict per module,
+# not per `app.state`: the store is resolved through the factory below so a
+# suite rebinding `postgres_db` here still steers the read, and the same
+# reasoning keeps the cache reachable at `main._pending_actions_cache` for the
+# suites that clear it.
 _pending_actions_cache: dict[str, dict[str, Any]] = {}
 
 

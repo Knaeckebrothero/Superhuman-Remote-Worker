@@ -563,7 +563,8 @@ async def test_later_recovery_allows_exactly_the_later_turn_to_spend():
 
 @pytest.mark.asyncio
 async def test_watchdog_pages_only_the_claimed_project_incident(monkeypatch):
-    from orchestrator import main
+    from orchestrator.services import officer_watchdog
+    from orchestrator.services.officer_watchdog import OfficerWatchdogDependencies
     from orchestrator.services.runtime_actor import OfficerRuntimeMaintenance
 
     outcome = OfficerRuntimeMaintenance(
@@ -580,18 +581,32 @@ async def test_watchdog_pages_only_the_claimed_project_incident(monkeypatch):
     maintain = AsyncMock(return_value=outcome)
     page = AsyncMock(return_value=True)
     settle = AsyncMock(return_value=True)
-    monkeypatch.setattr(main, "maintain_current_officer_runtime", maintain)
-    monkeypatch.setattr(main, "_dispatch_officer_page", page)
-    monkeypatch.setattr(main, "settle_officer_runtime_incident_notification", settle)
+    # The watchdog imports both runtime-actor helpers directly, so a rebind on
+    # ``orchestrator.main`` would no longer reach the code under test.
+    monkeypatch.setattr(officer_watchdog, "maintain_current_officer_runtime", maintain)
+    monkeypatch.setattr(
+        officer_watchdog, "settle_officer_runtime_incident_notification", settle
+    )
+    store = MagicMock(name="postgres_db")
+    dependencies = OfficerWatchdogDependencies(
+        store=store,
+        persistent_provisioner=MagicMock(),
+        persistent_thread_recycler=lambda: None,
+        kick_officer_event_drain=MagicMock(),
+        dispatch_officer_page=page,
+        conclude_conference_if_any=AsyncMock(),
+        officer_runtime_verification_enabled=lambda: False,
+        persistent_agent_reconciliation_enabled=lambda: False,
+    )
 
-    result = await main._maintain_officer_runtime_authorization(
-        {"id": THREAD_ID, "project_id": PROJECT_ID}
+    result = await officer_watchdog.maintain_officer_runtime_authorization(
+        {"id": THREAD_ID, "project_id": PROJECT_ID}, dependencies=dependencies
     )
 
     assert result is outcome
     page.assert_awaited_once()
     settle.assert_awaited_once_with(
-        main.postgres_db,
+        store,
         project_id=PROJECT_ID,
         thread_id=THREAD_ID,
         officer_incarnation=3,
@@ -602,9 +617,11 @@ async def test_watchdog_pages_only_the_claimed_project_incident(monkeypatch):
 
 
 def test_officer_summary_projects_only_safe_incident_fields():
-    from orchestrator import main
+    from orchestrator.services.officer_post_views import (
+        officer_runtime_authorization_view,
+    )
 
-    view = main._officer_runtime_authorization_view(
+    view = officer_runtime_authorization_view(
         {
             "runtime_actor_incident": {
                 "status": "open",

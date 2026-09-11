@@ -5,11 +5,20 @@ Extracted verbatim from ``orchestrator.main`` (R1.B07 lane M, census group
 counts AND the most-urgent sudo's command string; the caller must now be
 approved and a non-admin sees only their own / project-member jobs.
 
-The cache is **application-owned**, not a module global: two applications in
-one process must not share one cache, and the cache key is the caller's user id
-(or ``"__admin__"`` for the unfiltered admin path), so a shared slot would leak
-one user's counts to another. The application constructs the dict and hands it
-over on :class:`PendingActionsDependencies`.
+The cache is a parameter, not module state of this operation: the application
+constructs the dict and hands it over on :class:`PendingActionsDependencies`,
+so a test supplies its own instead of reaching for a global, and the operation
+itself keeps nothing between calls. The key is the caller's user id (or
+``"__admin__"`` for the unfiltered admin path), which is what keeps one user's
+counts out of another's slot.
+
+Stated precisely so it is not read as more than it is: `orchestrator.main`
+still holds the one dict its application uses, exactly as it did before. Making
+two applications in one process hold two caches would mean resolving it from
+``request.app.state`` in the router, which this batch did not do — the store is
+resolved through the application's factory for the same reason every other B07
+router is, so that a suite rebinding ``postgres_db`` on ``main`` still steers
+the read.
 """
 
 from __future__ import annotations

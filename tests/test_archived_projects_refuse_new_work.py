@@ -50,6 +50,37 @@ PROJECT_ID = "68137e29-6b1f-4f1b-a0c1-4e6dc2be3f9a"  # the pre-split archive
 OFFICER_THREAD_ID = "a3333333-3333-4333-8333-333333333333"
 
 
+def _officer_post_request(request, db):
+    """Wire the Post's dependencies onto the request the route reads them from.
+
+    The commission declaration resolves its store through
+    ``request.app.state`` now, so patching ``orchestrator.main.postgres_db``
+    alone would leave the archived-project gate reading the real one.
+    """
+    from orchestrator.services.officer_post_lifecycle import (
+        OfficerPostLifecycleDependencies,
+    )
+    from orchestrator.services.officer_post_policy import (
+        OfficerPostPolicyDependencies,
+    )
+
+    request.app.state.officer_post_lifecycle_dependencies_factory = (
+        lambda: OfficerPostLifecycleDependencies(
+            store=db,
+            persistent_provisioner=MagicMock(),
+            persistent_thread_recycler=None,
+            policy=OfficerPostPolicyDependencies(
+                auto_pull_release_enabled=lambda: False
+            ),
+            kick_officer_event_drain=MagicMock(),
+            deliver_officer_note=AsyncMock(),
+            create_thread=AsyncMock(),
+            end_thread_flow=AsyncMock(),
+        )
+    )
+    return request
+
+
 def _patch_caller_and_db(user: dict, db):
     """Stack the patches every endpoint test needs (see test_project_access)."""
     stack = ExitStack()
@@ -83,8 +114,9 @@ class TestOfficerCannotBeCommissionedOntoAnArchive:
 
     @pytest.mark.asyncio
     async def test_commission_is_refused(self, user_a, archived, fake_db, fake_request):
-        from orchestrator.main import commission_project_officer
+        from orchestrator.routers.officers import commission_project_officer
 
+        fake_request = _officer_post_request(fake_request, fake_db)
         with _patch_caller_and_db(user_a, fake_db):
             with pytest.raises(HTTPException) as exc:
                 await commission_project_officer(
@@ -103,8 +135,9 @@ class TestOfficerCannotBeCommissionedOntoAnArchive:
         self, user_a, project_a, fake_db, fake_request
     ):
         """The refusal must be about the archive, not about the endpoint."""
-        from orchestrator.main import commission_project_officer
+        from orchestrator.routers.officers import commission_project_officer
 
+        fake_request = _officer_post_request(fake_request, fake_db)
         fake_db.user_can_run_unattended_operations = AsyncMock(return_value=False)
         with _patch_caller_and_db(user_a, fake_db):
             with pytest.raises(HTTPException) as exc:
@@ -344,13 +377,24 @@ class TestAutomationFireOnAnArchivedProject:
         """The service can't raise (its other caller is a cron tick with
         nobody to answer), but an owner clicking a button that silently does
         nothing is worse than a 409 naming the one lever that fixes it."""
-        from orchestrator.routers.automations import run_now
+        from orchestrator.routers.automations import (
+            AutomationsDependencies,
+            run_now,
+        )
 
         db = MagicMock()
         db.get_project = AsyncMock(
             return_value={"id": PROJECT_ID, "status": "archived"}
         )
         request = MagicMock()
+        # The route takes its store on a dependency object; a ``sys.modules``
+        # stub of ``orchestrator.main`` no longer reaches it.
+        dependencies = AutomationsDependencies(
+            store=db,
+            gitea_client=MagicMock(),
+            main_cloud_router=MagicMock(),
+            trigger_dispatch=MagicMock(),
+        )
 
         with (
             patch(
@@ -364,13 +408,13 @@ class TestAutomationFireOnAnArchivedProject:
                 "orchestrator.routers.automations.create_job_from_automation",
                 AsyncMock(return_value=None),
             ),
-            patch.dict(
-                "sys.modules",
-                {"orchestrator.main": MagicMock(postgres_db=db)},
-            ),
             pytest.raises(HTTPException) as exc,
         ):
-            await run_now(request, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+            await run_now(
+                request,
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                dependencies=dependencies,
+            )
 
         assert exc.value.status_code == 409
         assert exc.value.detail == access_module.PROJECT_ARCHIVED_DETAIL

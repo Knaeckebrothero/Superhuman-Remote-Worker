@@ -1673,6 +1673,7 @@ async def test_blocking_message_status_is_exact_worker_fenced(
     status_cas_wins,
 ):
     from orchestrator import main
+    from orchestrator.services import agent_messaging
 
     # OC-01: the stateless fence used to be inline SQL in send_agent_message.
     # It now lives inside create_routed_blocking_freeze, which commits the
@@ -1693,7 +1694,6 @@ async def test_blocking_message_status_is_exact_worker_fenced(
     async def acquire():
         yield MagicMock()
 
-    monkeypatch.setattr(main, "require_internal", AsyncMock())
     monkeypatch.setattr(
         main.postgres_db,
         "get_job",
@@ -1768,12 +1768,24 @@ async def test_blocking_message_status_is_exact_worker_fenced(
         lease_token=9,
     )
 
+    # The send funnel moved to ``services.agent_messaging``; its collaborators
+    # come from ``main._agent_messaging_dependencies()``, which binds
+    # ``main.postgres_db`` and ``main.notification_service`` — the very objects
+    # monkeypatched above — so those patches still steer the code under test.
+    def _send():
+        return agent_messaging.send_agent_message(
+            MagicMock(),
+            JOB_ID,
+            body,
+            dependencies=main._agent_messaging_dependencies(),
+        )
+
     if status_cas_wins:
-        result = await main.send_agent_message(MagicMock(), JOB_ID, body)
+        result = await _send()
         assert result["status"] == "sent"
     else:
         with pytest.raises(HTTPException) as lost:
-            await main.send_agent_message(MagicMock(), JOB_ID, body)
+            await _send()
         assert lost.value.status_code == 409
         assert lost.value.detail == "Job changed before blocking message was committed"
 

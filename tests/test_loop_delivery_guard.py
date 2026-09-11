@@ -20,9 +20,14 @@ that keeps the shape but drops the behaviour still fails.
 from __future__ import annotations
 
 import uuid
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+
+from orchestrator.services.project_loop_spawn import (
+    ProjectLoopDependencies,
+    record_loop_job_outcome,
+)
 
 LOOP_ID = "105a6f98-134c-4077-b7e1-6d08916650d7"
 
@@ -52,26 +57,40 @@ def _ctx(role: str = "developer") -> dict:
     return {"loop_id": LOOP_ID, "loop_role": role, "loop_iteration": 3}
 
 
-async def _run(job: dict, *, role: str = "developer") -> list[str]:
-    """Invoke the real hook and return the loop-visible action lines."""
-    from orchestrator.main import _record_loop_job_outcome
-
+def _deps(**over) -> ProjectLoopDependencies:
+    """The loop engine's one dependency object, built from mocks."""
     db = MagicMock()
     db.create_job_change_record = AsyncMock(return_value=True)
+    fields = dict(
+        store=db,
+        vector_store=None,
+        notifier=AsyncMock(),
+        gitea_client=MagicMock(),
+        main_cloud_router=MagicMock(),
+        trigger_dispatch=MagicMock(),
+        kick_officer_event_drain=MagicMock(),
+        enforce_dispatch_grants=AsyncMock(),
+        reindex_project_kb=AsyncMock(),
+        completion_commands_enabled=lambda: False,
+        completion_sweep_router=MagicMock(),
+    )
+    fields.update(over)
+    return ProjectLoopDependencies(**fields)
+
+
+async def _run(job: dict, *, role: str = "developer") -> list[str]:
+    """Invoke the real hook and return the loop-visible action lines."""
     actions: list[str] = []
-    with (
-        patch("orchestrator.main.postgres_db", db),
-        patch("orchestrator.main.vector_db", None),
-    ):
-        await _record_loop_job_outcome(
-            job,
-            ctx=_ctx(role),
-            loop={"id": LOOP_ID, "project_id": None},
-            loop_id=LOOP_ID,
-            actions=actions,
-            failed=False,
-            last_error=None,
-        )
+    await record_loop_job_outcome(
+        job,
+        ctx=_ctx(role),
+        loop={"id": LOOP_ID, "project_id": None},
+        loop_id=LOOP_ID,
+        actions=actions,
+        failed=False,
+        last_error=None,
+        dependencies=_deps(),
+    )
     return actions
 
 

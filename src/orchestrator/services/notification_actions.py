@@ -402,8 +402,8 @@ def register_notification_actions(
     @register_action("ssh_key_added", "open")
     async def _open_ssh_keys(ctx: ActionContext) -> ActionResult:
         # ssh_key_added rows DO carry source_kind="ssh_key" and source_id
-        # (see the notification call this action's rows come from, further
-        # down in this file) — but no register_source_loader/
+        # (see the notification call this action's rows come from, in
+        # ``services/ssh_access.py``) — but no register_source_loader/
         # register_source_probe is ever registered for "ssh_key", so nothing
         # can compute source_resolved for it (M-2: this comment used to say
         # "carries no source_kind", which is wrong — the row has one, it's

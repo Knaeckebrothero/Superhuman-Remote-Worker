@@ -33,6 +33,7 @@ import pytest
 
 # R1.B06: the heartbeat moved to services/agent_registration.
 from orchestrator.services import agent_registration  # noqa: E402
+from orchestrator.services import inbound_reply, job_guidance  # noqa: E402
 from fastapi import HTTPException
 from langchain_core.messages import AIMessage, HumanMessage
 
@@ -105,6 +106,27 @@ def _routing_db(job):
     return db
 
 
+def _route_inbound_reply(om, *args, **kwargs):
+    """Drive the extracted reply funnel with the application's collaborators.
+
+    ``main._inbound_reply_dependencies()`` binds ``main.postgres_db``,
+    ``main.notification_service``, ``main._guard_completion_control``,
+    ``main._completion_dispatch_guard_kwargs`` and ``main._internal_resume_job``
+    at call time, so building it inside the patch scope keeps every patch below
+    steering the code under test.
+    """
+    return inbound_reply.route_inbound_reply(
+        *args, **kwargs, dependencies=om._inbound_reply_dependencies()
+    )
+
+
+def _ack_job_guidance(om, request, job_id, body):
+    """Same, for the guidance ack behind ``POST /api/jobs/{id}/guidance/ack``."""
+    return job_guidance.ack_job_guidance(
+        request, job_id, body, dependencies=om._job_guidance_dependencies()
+    )
+
+
 # =============================================================================
 # Orchestrator routing: urgent ≠ resume anymore
 # =============================================================================
@@ -124,8 +146,8 @@ class TestUrgentReplyRoutesToGuidance:
             patch.object(om, "_guard_completion_control", guard),
             pytest.raises(HTTPException) as exc,
         ):
-            await om._route_inbound_reply(
-                JOB_ID, "officer", "do not race completion", urgent=True
+            await _route_inbound_reply(
+                om, JOB_ID, "officer", "do not race completion", urgent=True
             )
 
         assert exc.value.status_code == 409
@@ -149,8 +171,8 @@ class TestUrgentReplyRoutesToGuidance:
             patch.object(om, "_internal_resume_job", resume),
             pytest.raises(HTTPException) as exc,
         ):
-            await om._route_inbound_reply(
-                JOB_ID, "officer", "wake only if fenced", urgent=True
+            await _route_inbound_reply(
+                om, JOB_ID, "officer", "wake only if fenced", urgent=True
             )
 
         assert exc.value.status_code == 409
@@ -171,8 +193,8 @@ class TestUrgentReplyRoutesToGuidance:
             patch.object(om, "_guard_completion_control", guard),
             pytest.raises(HTTPException) as exc,
         ):
-            await om._route_inbound_reply(
-                JOB_ID, "officer", "queue only if I win", urgent=False
+            await _route_inbound_reply(
+                om, JOB_ID, "officer", "queue only if I win", urgent=False
             )
 
         assert exc.value.status_code == 409
@@ -194,8 +216,8 @@ class TestUrgentReplyRoutesToGuidance:
             patch.object(om, "postgres_db", db),
             patch.object(om, "_internal_resume_job", resume),
         ):
-            strategy, sequence = await om._route_inbound_reply(
-                JOB_ID, "officer", "stop retrying X, read file Z", urgent=True
+            strategy, sequence = await _route_inbound_reply(
+                om, JOB_ID, "officer", "stop retrying X, read file Z", urgent=True
             )
 
         assert strategy == "guidance_next_turn"
@@ -221,14 +243,14 @@ class TestUrgentReplyRoutesToGuidance:
             patch.object(om, "postgres_db", db),
             patch.object(om, "_internal_resume_job", resume),
         ):
-            strategy, _ = await om._route_inbound_reply(
-                JOB_ID, "officer", "wake up and do Y", urgent=True
+            strategy, _ = await _route_inbound_reply(
+                om, JOB_ID, "officer", "wake up and do Y", urgent=True
             )
 
         assert strategy == "immediate_interrupt"
         db.append_pending_guidance.assert_not_awaited()
         resume.assert_awaited_once()
-        assert resume.await_args.kwargs["reason"] == om._URGENT_RESUME_REASON
+        assert resume.await_args.kwargs["reason"] == inbound_reply.URGENT_RESUME_REASON
 
     @pytest.mark.asyncio
     async def test_blocking_reply_still_resumes_with_honest_reason(self):
@@ -244,7 +266,7 @@ class TestUrgentReplyRoutesToGuidance:
             patch.object(om, "postgres_db", db),
             patch.object(om, "_internal_resume_job", resume),
         ):
-            strategy, _ = await om._route_inbound_reply(JOB_ID, "t1", "the answer")
+            strategy, _ = await _route_inbound_reply(om, JOB_ID, "t1", "the answer")
 
         assert strategy == "immediate_resume"
         resume.assert_awaited_once()
@@ -267,8 +289,8 @@ class TestUrgentReplyRoutesToGuidance:
             patch.object(om, "postgres_db", db),
             patch.object(om, "_internal_resume_job", resume),
         ):
-            strategy, _ = await om._route_inbound_reply(
-                JOB_ID, "officer", "adjust course", urgent=False
+            strategy, _ = await _route_inbound_reply(
+                om, JOB_ID, "officer", "adjust course", urgent=False
             )
 
         assert strategy == "guidance_next_turn"
@@ -286,8 +308,8 @@ class TestUrgentReplyRoutesToGuidance:
             patch.object(om, "postgres_db", db),
             patch.object(om, "_internal_resume_job", resume),
         ):
-            strategy, _ = await om._route_inbound_reply(
-                JOB_ID, "officer", "for the next boundary", urgent=False
+            strategy, _ = await _route_inbound_reply(
+                om, JOB_ID, "officer", "for the next boundary", urgent=False
             )
 
         assert strategy == "next_strategic_phase"
@@ -315,9 +337,8 @@ class TestCheckpointCoupledAckEndpoint:
         )
         with (
             patch.object(om, "postgres_db", db),
-            patch.object(om, "require_internal", AsyncMock()),
         ):
-            result = await om.ack_job_guidance(MagicMock(), JOB_ID, body)
+            result = await _ack_job_guidance(om, MagicMock(), JOB_ID, body)
 
         assert result == {"status": "ok", "consumed": 4}
         db.consume_job_guidance.assert_awaited_once_with(
@@ -338,10 +359,10 @@ class TestCheckpointCoupledAckEndpoint:
         db.consume_job_guidance.side_effect = ValueError("checkpoint missing")
         with (
             patch.object(om, "postgres_db", db),
-            patch.object(om, "require_internal", AsyncMock()),
             pytest.raises(HTTPException) as exc,
         ):
-            await om.ack_job_guidance(
+            await _ack_job_guidance(
+                om,
                 MagicMock(),
                 JOB_ID,
                 om.GuidanceAckRequest(guidance_ids=["g1"]),

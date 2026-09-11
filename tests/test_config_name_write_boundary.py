@@ -39,6 +39,7 @@ import pytest
 from fastapi import HTTPException
 
 import orchestrator.main as orch_main
+from orchestrator.routers import officers as officers_router
 from orchestrator.services.agent_pod_entrypoint import (
     InvalidConfigNameError,
     validate_config_name,
@@ -747,6 +748,32 @@ class TestMagicLinkWakeProvisioningFailsLoudly:
         assert "config_name" in recorder.failures[0]["reason"]
 
 
+def _officer_recycle_request(db, recycler):
+    """The Post's recycle route resolves its store, provisioner and recycler
+    from ``request.app.state`` now — rebinding the three ``orchestrator.main``
+    globals no longer reaches it."""
+    from orchestrator.services.officer_post_lifecycle import (
+        OfficerPostLifecycleDependencies,
+    )
+    from orchestrator.services.officer_post_policy import (
+        OfficerPostPolicyDependencies,
+    )
+
+    dependencies = OfficerPostLifecycleDependencies(
+        store=db,
+        persistent_provisioner=MagicMock(is_available=True, expected_build_sha="sha"),
+        persistent_thread_recycler=recycler,
+        policy=OfficerPostPolicyDependencies(auto_pull_release_enabled=lambda: False),
+        kick_officer_event_drain=MagicMock(),
+        deliver_officer_note=AsyncMock(),
+        create_thread=AsyncMock(),
+        end_thread_flow=AsyncMock(),
+    )
+    request = MagicMock()
+    request.app.state.officer_post_lifecycle_dependencies_factory = lambda: dependencies
+    return request
+
+
 class TestOfficerRecycleRouteAnswers4xx:
     """A row poisoned before the write boundary existed must fail its
     provisioning attempt with something an operator can act on."""
@@ -757,9 +784,10 @@ class TestOfficerRecycleRouteAnswers4xx:
         db.get_officer_thread_for_project = AsyncMock(
             return_value={"id": THREAD_ID, "project_id": "p"}
         )
-        monkeypatch.setattr(orch_main, "postgres_db", db)
         monkeypatch.setattr(
-            orch_main, "require_project_owner", AsyncMock(return_value=(None, None))
+            officers_router,
+            "require_project_owner",
+            AsyncMock(return_value=(None, None)),
         )
         recycler = MagicMock()
         recycler.observe = AsyncMock(return_value=None)
@@ -768,15 +796,10 @@ class TestOfficerRecycleRouteAnswers4xx:
                 "config_name must not contain a '..' segment: '../../x'"
             )
         )
-        monkeypatch.setattr(orch_main, "_persistent_thread_recycler", recycler)
-        monkeypatch.setattr(
-            orch_main,
-            "persistent_provisioner",
-            MagicMock(is_available=True, expected_build_sha="sha"),
-        )
+        request = _officer_recycle_request(db, recycler)
 
         with pytest.raises(HTTPException) as exc:
-            await orch_main.recycle_project_officer(MagicMock(), "p")
+            await officers_router.recycle_project_officer(request, "p")
 
         assert exc.value.status_code == 422
         assert "'..' segment" in str(exc.value.detail)
@@ -789,19 +812,15 @@ class TestOfficerRecycleRouteAnswers4xx:
         db.get_officer_thread_for_project = AsyncMock(
             return_value={"id": THREAD_ID, "project_id": "p"}
         )
-        monkeypatch.setattr(orch_main, "postgres_db", db)
         monkeypatch.setattr(
-            orch_main, "require_project_owner", AsyncMock(return_value=(None, None))
+            officers_router,
+            "require_project_owner",
+            AsyncMock(return_value=(None, None)),
         )
         recycler = MagicMock()
         recycler.observe = AsyncMock(return_value=None)
         recycler.request_and_reconcile = AsyncMock(side_effect=RuntimeError("boom"))
-        monkeypatch.setattr(orch_main, "_persistent_thread_recycler", recycler)
-        monkeypatch.setattr(
-            orch_main,
-            "persistent_provisioner",
-            MagicMock(is_available=True, expected_build_sha="sha"),
-        )
+        request = _officer_recycle_request(db, recycler)
 
         with pytest.raises(RuntimeError):
-            await orch_main.recycle_project_officer(MagicMock(), "p")
+            await officers_router.recycle_project_officer(request, "p")

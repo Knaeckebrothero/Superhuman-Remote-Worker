@@ -50,8 +50,8 @@ _NOTIFICATION_REGISTRIES = (
 def _isolate_notification_registries():
     """Keep the notification catalog's process-global registries per-test.
 
-    ``main._register_notification_actions()`` installs the live action
-    handlers, source loaders and source probes into module-level dicts. A
+    ``notification_actions.register_notification_actions()`` installs the live
+    action handlers, source loaders and source probes into module-level dicts. A
     test that calls it leaves them installed for every later test in the
     same xdist worker, and under ``--dist loadfile`` which files share a
     worker is a scheduling detail — so the damage lands as an intermittent,

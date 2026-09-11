@@ -178,9 +178,11 @@ async def notification_sse_events(
     )
 
 
-# Registered AFTER /api/notifications/events on purpose: FastAPI matches in
-# declaration order, and a `{notification_id}` segment would otherwise
-# swallow the SSE path.
+# The declaration-order rule this operation depends on lives with the routes
+# that enforce it: `routers/notifications.py` registers
+# `GET /api/notifications/events` BEFORE `GET /api/notifications/{notification_id}`,
+# because FastAPI matches in declaration order and the path parameter would
+# otherwise swallow the SSE path.
 async def get_notification_detail(
     request: Request,
     notification_id: str,

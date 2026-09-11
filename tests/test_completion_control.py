@@ -18,6 +18,23 @@ from unittest.mock import MagicMock, patch
 
 import orchestrator.main as main
 from orchestrator.routers import job_diff as job_diff_routes
+from orchestrator.services import agent_messaging
+
+
+def _send_agent_message(job_id, body):
+    """Drive the extracted send funnel with the application's own collaborators.
+
+    ``main._agent_messaging_dependencies()`` reads ``main.postgres_db``,
+    ``main.notification_service`` and ``main.COMPLETION_COMMANDS_ENABLED`` at
+    call time, so building it inside the patch scope is what keeps the patches
+    below steering the code under test.
+    """
+    return agent_messaging.send_agent_message(
+        MagicMock(),
+        job_id,
+        body,
+        dependencies=main._agent_messaging_dependencies(),
+    )
 
 
 def test_control_marker_expiry_and_malformed_fail_closed():
@@ -404,12 +421,11 @@ async def test_blocking_message_loser_has_zero_notification_side_effects():
     )
     with (
         patch.object(main, "COMPLETION_COMMANDS_ENABLED", True),
-        patch.object(main, "require_internal", AsyncMock()),
         patch.object(main, "postgres_db", db),
         patch.object(main, "notification_service", notifier),
     ):
         with pytest.raises(HTTPException) as exc:
-            await main.send_agent_message(MagicMock(), job_id, body)
+            await _send_agent_message(job_id, body)
 
     assert exc.value.status_code == 409
     notifier.record_agent_message.assert_not_awaited()
