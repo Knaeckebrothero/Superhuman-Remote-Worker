@@ -2,13 +2,15 @@
 self-improvement loop.
 
 One active loop per project. **Start** spawns the first job (``role_sequence[0]``,
-normally the scholar); the orchestrator's ``_advance_project_loop`` completion
-hook drives the Scholar→Critic→Execution rotation from there, one job at a time,
-until the iteration / deadline / consecutive-failure budget stops it.
+normally the scholar); the completion hook drives the
+Scholar→Critic→Execution rotation from there, one job at a time, until the
+iteration / deadline / consecutive-failure budget stops it.
 
-Mirrors ``routers/automations.py`` conventions: handlers reach ``postgres_db``
-(and the loop spawn helpers) via late ``from main import ...`` to dodge the
-circular import at module load; ACL via ``require_project_member``.
+R1.B07 closed this router's nine late ``from orchestrator.main import ...``
+sites. The two stores, the three loop operations and the VM permission check
+now arrive on :class:`ProjectLoopsDependencies`, resolved from the application
+handling the request. ACL stays where it was: ``require_project_member`` in
+each declaration body.
 
 Spec: knowledge-base/knowledge/features/project_self_improvement_loop.md.
 """
@@ -16,10 +18,11 @@ Spec: knowledge-base/knowledge/features/project_self_improvement_loop.md.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Awaitable, Callable
 
-from fastapi import APIRouter, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 
 from orchestrator.security.access import require_project_member
@@ -30,6 +33,29 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/projects", tags=["Project Loops"])
 
+
+@dataclass
+class ProjectLoopsDependencies:
+    """Collaborators for one loop-control request, resolved per invocation.
+
+    The three loop operations arrive as constructed ports rather than imports
+    so this router shares one reading of the engine with the completion hook,
+    and ``check_vm_permission`` is B05's policy, consumed and never re-derived.
+    """
+
+    store: Any
+    vector_store: Any
+    spawn_loop_stage: Callable[..., Awaitable[tuple[list[dict[str, Any]], int]]]
+    writeback_loop_stage: Callable[..., Awaitable[dict[str, Any] | None]]
+    resume_project_loop: Callable[[str], Awaitable[dict[str, Any] | None]]
+    check_vm_permission: Callable[..., Awaitable[Any]]
+
+
+def get_project_loops_dependencies(request: Request) -> ProjectLoopsDependencies:
+    """Resolve collaborators only from the application handling this request."""
+    return request.app.state.project_loops_dependencies_factory()
+
+
 # Workspace tiers a loop may pin for every spawned job. Mirrors the validated
 # set in migration 0041 and the backends the dispatcher understands. `vm` is the
 # headline case; lite tiers are accepted but conflict with a repository
@@ -38,7 +64,7 @@ _LOOP_WORKSPACE_BACKENDS = frozenset({"sandbox", "vm", "virtual", "none"})
 
 
 async def _require_unattended_operations(
-    postgres_db, caller: dict[str, Any], project_id: str
+    store, caller: dict[str, Any], project_id: str
 ) -> None:
     """403 unless the caller holds ``unattended_operations`` on this project.
 
@@ -48,12 +74,13 @@ async def _require_unattended_operations(
     was revoked while it ran; the fail-closed direction here is "no new work",
     not "no control". Admins bypass inside the DB helper.
 
-    The spawn choke point (``main._spawn_loop_stage``) re-reads the same grant,
+    The spawn choke point (``services.project_loop_spawn.spawn_loop_stage``)
+    re-reads the same grant,
     so this is the loud, synchronous half of a gate that also holds against a
     revocation landing mid-run. Spec:
     knowledge-history/done/unattended_operations_grant.md.
     """
-    if await postgres_db.user_can_run_unattended_operations(caller, project_id):
+    if await store.user_can_run_unattended_operations(caller, project_id):
         return
     raise HTTPException(
         status_code=403,
@@ -105,7 +132,11 @@ class ProjectLoopStart(BaseModel):
 
 @router.post("/{project_id}/loop", status_code=status.HTTP_201_CREATED)
 async def start_project_loop(
-    request: Request, project_id: str, body: ProjectLoopStart
+    request: Request,
+    project_id: str,
+    body: ProjectLoopStart,
+    *,
+    dependencies: ProjectLoopsDependencies = Depends(get_project_loops_dependencies),
 ) -> dict[str, Any]:
     """Start a self-improvement loop on a project and spawn its first job.
 
@@ -113,18 +144,13 @@ async def start_project_loop(
     (running|paused) loop. The first job is the first role in ``role_sequence``;
     everything after is driven by the completion hook.
     """
-    from orchestrator.main import (  # late import: avoid circular
-        _spawn_loop_stage,
-        _writeback_loop_stage,
-        postgres_db,
-    )
     from orchestrator.services.project_loops import validate_role_sequence
 
-    caller = await require_approved_user(request, postgres_db)
+    caller = await require_approved_user(request, dependencies.store)
     await require_project_member(
-        request, postgres_db, project_id, min_role="editor", allow_archived=False
+        request, dependencies.store, project_id, min_role="editor", allow_archived=False
     )
-    await _require_unattended_operations(postgres_db, caller, project_id)
+    await _require_unattended_operations(dependencies.store, caller, project_id)
 
     # Budget: at least one stop axis must be set (hard floor under runaway) —
     # except officer scheduling, which is naturally unbounded: the centurion
@@ -197,18 +223,14 @@ async def start_project_loop(
             f"{sorted(_LOOP_WORKSPACE_BACKENDS)}.",
         )
     if workspace_backend == "vm":
-        from orchestrator.main import (
-            _check_vm_permission,
-        )  # late import: avoid circular
-
-        await _check_vm_permission(caller, job_needs_vm=True)
+        await dependencies.check_vm_permission(caller, job_needs_vm=True)
 
     # Officer scheduling needs someone to wake: a commissioned post
     # (officer_post.md §4 — the lookup reads project_officers.thread_id, and
     # requires the linked thread live). Fail loud at start — an officer loop
     # with a vacant post would conclude turns into a void.
     if body.scheduling == "officer":
-        officer = await postgres_db.get_officer_thread_for_project(project_id)
+        officer = await dependencies.store.get_officer_thread_for_project(project_id)
         if not officer:
             raise HTTPException(
                 status_code=400,
@@ -216,13 +238,13 @@ async def start_project_loop(
                 "on this project's post — provision one first.",
             )
 
-    if await postgres_db.get_active_project_loop(project_id):
+    if await dependencies.store.get_active_project_loop(project_id):
         raise HTTPException(
             status_code=409,
             detail="Project already has an active loop. Stop it before starting another.",
         )
 
-    project = await postgres_db.get_project(project_id)
+    project = await dependencies.store.get_project(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     if not project.get("main_cloud_folder_handle") or not project.get(
@@ -237,7 +259,7 @@ async def start_project_loop(
         )
     goal = body.goal_override if body.goal_override is not None else project.get("goal")
 
-    loop = await postgres_db.create_project_loop(
+    loop = await dependencies.store.create_project_loop(
         project_id=project_id,
         owner_id=str(caller["id"]),
         goal=goal,
@@ -260,7 +282,7 @@ async def start_project_loop(
         from orchestrator.services.session_wake import kick_event_drain, notify_officer
 
         await notify_officer(
-            postgres_db,
+            dependencies.store,
             project_id,
             source="loop",
             dedup_key=f"started:{str(loop['id'])[:8]}",
@@ -272,7 +294,7 @@ async def start_project_loop(
                 ),
             },
         )
-        kick_event_drain(postgres_db)
+        kick_event_drain(dependencies.store)
         return loop
 
     # Spawn the first stage (1 job for a single-role entry, N concurrent jobs
@@ -280,7 +302,7 @@ async def start_project_loop(
     # failed and surface a 502 — don't leave a running loop with no in-flight
     # job/stage (the advance hook would never fire).
     try:
-        jobs, new_total = await _spawn_loop_stage(
+        jobs, new_total = await dependencies.spawn_loop_stage(
             loop,
             stage=roles[0],
             seq_index=0,
@@ -289,7 +311,7 @@ async def start_project_loop(
         )
     except Exception as e:
         logger.exception("Failed to spawn first stage for loop %s", loop["id"])
-        await postgres_db.update_project_loop(
+        await dependencies.store.update_project_loop(
             str(loop["id"]),
             status="failed",
             last_error=f"first spawn failed: {e}",
@@ -299,7 +321,7 @@ async def start_project_loop(
             status_code=502, detail=f"Loop created but first job failed to start: {e}"
         ) from e
 
-    updated = await _writeback_loop_stage(
+    updated = await dependencies.writeback_loop_stage(
         str(loop["id"]),
         jobs=jobs,
         seq_index=0,
@@ -312,20 +334,25 @@ async def start_project_loop(
 
 
 @router.get("/{project_id}/loop")
-async def get_project_loop(request: Request, project_id: str) -> dict[str, Any]:
+async def get_project_loop(
+    request: Request,
+    project_id: str,
+    *,
+    dependencies: ProjectLoopsDependencies = Depends(get_project_loops_dependencies),
+) -> dict[str, Any]:
     """Return the project's current loop.
 
     Prefers the active (running|paused) loop; falls back to the most recent
     terminal one so the cockpit can show the outcome (status + stop_reason)
     after an unattended run finished. 404 only if the project never had a loop.
     """
-    from orchestrator.main import postgres_db  # late import: avoid circular
-
-    await require_approved_user(request, postgres_db)
-    await require_project_member(request, postgres_db, project_id, min_role="viewer")
-    loop = await postgres_db.get_active_project_loop(project_id)
+    await require_approved_user(request, dependencies.store)
+    await require_project_member(
+        request, dependencies.store, project_id, min_role="viewer"
+    )
+    loop = await dependencies.store.get_active_project_loop(project_id)
     if not loop:
-        recent = await postgres_db.list_project_loops(project_id=project_id)
+        recent = await dependencies.store.list_project_loops(project_id=project_id)
         loop = recent[0] if recent else None
     if not loop:
         raise HTTPException(status_code=404, detail="No loop for this project")
@@ -333,40 +360,47 @@ async def get_project_loop(request: Request, project_id: str) -> dict[str, Any]:
 
 
 @router.post("/{project_id}/loop/pause")
-async def pause_project_loop(request: Request, project_id: str) -> dict[str, Any]:
+async def pause_project_loop(
+    request: Request,
+    project_id: str,
+    *,
+    dependencies: ProjectLoopsDependencies = Depends(get_project_loops_dependencies),
+) -> dict[str, Any]:
     """Pause the loop: the in-flight job finishes, but no next job is spawned."""
-    from orchestrator.main import postgres_db  # late import: avoid circular
-
-    await require_approved_user(request, postgres_db)
-    await require_project_member(request, postgres_db, project_id, min_role="editor")
-    loop = await postgres_db.get_active_project_loop(project_id)
+    await require_approved_user(request, dependencies.store)
+    await require_project_member(
+        request, dependencies.store, project_id, min_role="editor"
+    )
+    loop = await dependencies.store.get_active_project_loop(project_id)
     if not loop:
         raise HTTPException(status_code=404, detail="No active loop for this project")
     if loop["status"] != "running":
         return loop
-    return await postgres_db.update_project_loop(str(loop["id"]), status="paused")
+    return await dependencies.store.update_project_loop(
+        str(loop["id"]), status="paused"
+    )
 
 
 @router.post("/{project_id}/loop/resume")
-async def resume_project_loop(request: Request, project_id: str) -> dict[str, Any]:
+async def resume_project_loop(
+    request: Request,
+    project_id: str,
+    *,
+    dependencies: ProjectLoopsDependencies = Depends(get_project_loops_dependencies),
+) -> dict[str, Any]:
     """Resume a paused loop, re-kicking the rotation if its job already finished."""
-    from orchestrator.main import (
-        _resume_project_loop,
-        postgres_db,
-    )  # late import: avoid circular
-
-    caller = await require_approved_user(request, postgres_db)
+    caller = await require_approved_user(request, dependencies.store)
     await require_project_member(
-        request, postgres_db, project_id, min_role="editor", allow_archived=False
+        request, dependencies.store, project_id, min_role="editor", allow_archived=False
     )
     # Resume re-kicks the rotation, so it is a start, not a control action.
-    await _require_unattended_operations(postgres_db, caller, project_id)
-    loop = await postgres_db.get_active_project_loop(project_id)
+    await _require_unattended_operations(dependencies.store, caller, project_id)
+    loop = await dependencies.store.get_active_project_loop(project_id)
     if not loop:
         raise HTTPException(status_code=404, detail="No active loop for this project")
     if loop["status"] != "paused":
         return loop
-    resumed = await _resume_project_loop(str(loop["id"]))
+    resumed = await dependencies.resume_project_loop(str(loop["id"]))
     return resumed or loop
 
 
@@ -378,7 +412,11 @@ class ProjectLoopScheduling(BaseModel):
 
 @router.post("/{project_id}/loop/scheduling")
 async def convert_project_loop_scheduling(
-    request: Request, project_id: str, body: ProjectLoopScheduling
+    request: Request,
+    project_id: str,
+    body: ProjectLoopScheduling,
+    *,
+    dependencies: ProjectLoopsDependencies = Depends(get_project_loops_dependencies),
 ) -> dict[str, Any]:
     """Convert the live loop to officer scheduling (centurion.md §7/S8).
 
@@ -391,18 +429,17 @@ async def convert_project_loop_scheduling(
     officer; plus an enabled centurion on the project. An in-flight TURN is
     fine — its completion hits the officer branch and wakes him.
     """
-    from orchestrator.main import postgres_db  # late import: avoid circular
     from orchestrator.services.session_wake import kick_event_drain, notify_officer
 
-    caller = await require_approved_user(request, postgres_db)
+    caller = await require_approved_user(request, dependencies.store)
     await require_project_member(
-        request, postgres_db, project_id, min_role="editor", allow_archived=False
+        request, dependencies.store, project_id, min_role="editor", allow_archived=False
     )
-    await _require_unattended_operations(postgres_db, caller, project_id)
+    await _require_unattended_operations(dependencies.store, caller, project_id)
 
     # Post commissioned? (officer_post.md §4 — row-backed via the flipped
     # lookup, which also requires the linked thread live.)
-    officer = await postgres_db.get_officer_thread_for_project(project_id)
+    officer = await dependencies.store.get_officer_thread_for_project(project_id)
     if not officer:
         raise HTTPException(
             status_code=400,
@@ -410,14 +447,14 @@ async def convert_project_loop_scheduling(
             "on this project's post — provision one first.",
         )
 
-    loop = await postgres_db.get_active_project_loop(project_id)
+    loop = await dependencies.store.get_active_project_loop(project_id)
     if not loop:
         raise HTTPException(status_code=404, detail="No active loop for this project")
 
-    updated = await postgres_db.convert_project_loop_to_officer(str(loop["id"]))
+    updated = await dependencies.store.convert_project_loop_to_officer(str(loop["id"]))
     if not updated:
         # The guarded UPDATE matched nothing — re-read for a specific reason.
-        current = await postgres_db.get_project_loop(str(loop["id"])) or loop
+        current = await dependencies.store.get_project_loop(str(loop["id"])) or loop
         if (current.get("scheduling") or "standard") == "officer":
             return current  # idempotent: already converted
         if current.get("campaign"):
@@ -432,7 +469,7 @@ async def convert_project_loop_scheduling(
         )
 
     await notify_officer(
-        postgres_db,
+        dependencies.store,
         project_id,
         source="loop",
         dedup_key=f"converted:{str(loop['id'])[:8]}",
@@ -444,23 +481,28 @@ async def convert_project_loop_scheduling(
             ),
         },
     )
-    kick_event_drain(postgres_db)
+    kick_event_drain(dependencies.store)
     return updated
 
 
 @router.post("/{project_id}/loop/stop")
-async def stop_project_loop(request: Request, project_id: str) -> dict[str, Any]:
+async def stop_project_loop(
+    request: Request,
+    project_id: str,
+    *,
+    dependencies: ProjectLoopsDependencies = Depends(get_project_loops_dependencies),
+) -> dict[str, Any]:
     """Stop the loop permanently. The in-flight job finishes on its own; the
     advance hook is a no-op once status is terminal.
     """
-    from orchestrator.main import postgres_db  # late import: avoid circular
-
-    await require_approved_user(request, postgres_db)
-    await require_project_member(request, postgres_db, project_id, min_role="editor")
-    loop = await postgres_db.get_active_project_loop(project_id)
+    await require_approved_user(request, dependencies.store)
+    await require_project_member(
+        request, dependencies.store, project_id, min_role="editor"
+    )
+    loop = await dependencies.store.get_active_project_loop(project_id)
     if not loop:
         raise HTTPException(status_code=404, detail="No active loop for this project")
-    return await postgres_db.update_project_loop(
+    return await dependencies.store.update_project_loop(
         str(loop["id"]),
         status="stopped",
         stop_reason="user",
@@ -474,6 +516,8 @@ async def list_project_loop_jobs(
     request: Request,
     project_id: str,
     limit: int = Query(100, ge=1, le=500),
+    *,
+    dependencies: ProjectLoopsDependencies = Depends(get_project_loops_dependencies),
 ) -> list[dict[str, Any]]:
     """List the loop's spawned jobs, newest first.
 
@@ -484,21 +528,26 @@ async def list_project_loop_jobs(
     active-or-most-recent fallback in ``get_project_loop``. 404 only if the
     project never had a loop.
     """
-    from orchestrator.main import postgres_db  # late import: avoid circular
-
-    await require_approved_user(request, postgres_db)
-    await require_project_member(request, postgres_db, project_id, min_role="viewer")
-    loop = await postgres_db.get_active_project_loop(project_id)
+    await require_approved_user(request, dependencies.store)
+    await require_project_member(
+        request, dependencies.store, project_id, min_role="viewer"
+    )
+    loop = await dependencies.store.get_active_project_loop(project_id)
     if not loop:
-        recent = await postgres_db.list_project_loops(project_id=project_id)
+        recent = await dependencies.store.list_project_loops(project_id=project_id)
         loop = recent[0] if recent else None
     if not loop:
         raise HTTPException(status_code=404, detail="No loop for this project")
-    return await postgres_db.list_project_loop_jobs(str(loop["id"]), limit=limit)
+    return await dependencies.store.list_project_loop_jobs(str(loop["id"]), limit=limit)
 
 
 @router.get("/{project_id}/backlog")
-async def get_project_backlog(request: Request, project_id: str) -> dict[str, Any]:
+async def get_project_backlog(
+    request: Request,
+    project_id: str,
+    *,
+    dependencies: ProjectLoopsDependencies = Depends(get_project_loops_dependencies),
+) -> dict[str, Any]:
     """The project's ticket pool -- what the loop's overseer is shown.
 
     Priority goes out as a word (``high``/``normal``/``low``); the 0/1/2
@@ -517,17 +566,17 @@ async def get_project_backlog(request: Request, project_id: str) -> dict[str, An
 
     Viewer or higher required (a read, like the other GETs on this router).
     """
-    from orchestrator.main import postgres_db, vector_db  # late import: avoid circular
+    await require_approved_user(request, dependencies.store)
+    await require_project_member(
+        request, dependencies.store, project_id, min_role="viewer"
+    )
 
-    await require_approved_user(request, postgres_db)
-    await require_project_member(request, postgres_db, project_id, min_role="viewer")
-
-    loop = await postgres_db.get_active_project_loop(project_id)
+    loop = await dependencies.store.get_active_project_loop(project_id)
     campaign = (loop or {}).get("campaign") or {}
     in_progress_id = campaign.get("initiative_note_id")
 
     rows, counts = await fetch_backlog(
-        vector_db, project_id, exclude_note_id=in_progress_id, limit=200
+        dependencies.vector_store, project_id, exclude_note_id=in_progress_id, limit=200
     )
     return {
         "total": sum(counts.values()),
