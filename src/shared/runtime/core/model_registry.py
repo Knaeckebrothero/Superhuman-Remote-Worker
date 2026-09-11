@@ -330,6 +330,10 @@ def family_of(model_id: str, default: str = "default") -> str:
         return "claude-sonnet"
     if name.startswith("claude-haiku"):
         return "claude-haiku"
+    # Fable 5 and 5.1 share one family — same context, output cap, vision and
+    # effort ladder; nothing this matrix carries differs between them.
+    if name.startswith("claude-fable"):
+        return "claude-fable"
     if "codex-spark" in name:
         return "codex-spark"
     if "codex" in name and name.startswith(("gpt-5", "gpt-6")):

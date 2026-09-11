@@ -49,6 +49,8 @@ _FAMILY_RULES: list[tuple[re.Pattern, str | Callable[[re.Match], FamilyDetection
     (re.compile(r"claude-opus", re.IGNORECASE), "claude-opus"),
     (re.compile(r"claude-sonnet", re.IGNORECASE), "claude-sonnet"),
     (re.compile(r"claude-haiku", re.IGNORECASE), "claude-haiku"),
+    # Fable 5 and 5.1 share one family (identical matrix knobs).
+    (re.compile(r"claude-fable", re.IGNORECASE), "claude-fable"),
     # codex variants — must beat both gpt-5 and codex itself, since real
     # codex IDs (e.g. `gpt-5.3-codex`, `gpt-5.3-codex-spark`) contain both
     # the `gpt-5` prefix and the `codex` substring.

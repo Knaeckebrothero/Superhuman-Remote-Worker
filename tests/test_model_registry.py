@@ -302,6 +302,11 @@ class TestFamilyOf:
         assert family_of("claude-opus-5-20260401") == "claude-opus-5"
         assert family_of("openrouter/anthropic/claude-opus-5") == "claude-opus-5"
 
+    def test_claude_fable_is_one_family_for_5_and_5_1(self):
+        assert family_of("claude-fable-5") == "claude-fable"
+        assert family_of("claude-fable-5-1") == "claude-fable"
+        assert family_of("openrouter/anthropic/claude-fable-5-1") == "claude-fable"
+
     def test_older_opus_ids_stay_on_the_generic_family(self):
         assert family_of("claude-opus-4-5") == "claude-opus"
         assert family_of("claude-opus-4-8") == "claude-opus"

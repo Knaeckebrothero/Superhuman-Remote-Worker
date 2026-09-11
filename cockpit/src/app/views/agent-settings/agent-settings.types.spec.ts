@@ -30,6 +30,16 @@ describe('detectModelFamily — Claude Opus 5', () => {
   });
 });
 
+describe('detectModelFamily — Claude Fable', () => {
+  it('maps Fable 5 and 5.1 to one family', () => {
+    expect(detectModelFamily('claude-fable-5')).toBe('claude-fable');
+    expect(detectModelFamily('claude-fable-5-1')).toBe('claude-fable');
+    expect(detectModelFamily('openrouter/anthropic/claude-fable-5-1')).toBe(
+      'claude-fable',
+    );
+  });
+});
+
 describe('detectModelFamily — GPT-5.6', () => {
   it('maps GPT-5.6 tiers to the gpt-5.6 family, ahead of gpt-5', () => {
     expect(detectModelFamily('gpt-5.6-sol')).toBe('gpt-5.6');

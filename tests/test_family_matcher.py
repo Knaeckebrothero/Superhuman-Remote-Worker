@@ -27,6 +27,10 @@ from orchestrator.services.family_matcher import detect_family
         ("claude-opus-4-5", "claude-opus"),
         ("claude-sonnet-4-6", "claude-sonnet"),
         ("claude-haiku-4-5", "claude-haiku"),
+        # Fable 5 and 5.1 share one family.
+        ("claude-fable-5", "claude-fable"),
+        ("claude-fable-5-1", "claude-fable"),
+        ("openrouter/anthropic/claude-fable-5-1", "claude-fable"),
         # OpenAI gpt-5 + o-series (split families post chunk 1)
         ("gpt-5", "gpt-5"),
         ("gpt-5.2", "gpt-5"),

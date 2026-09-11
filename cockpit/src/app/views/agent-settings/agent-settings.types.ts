@@ -190,6 +190,8 @@ export function detectModelFamily(model: string): string {
   if (name.startsWith('claude-opus')) return 'claude-opus';
   if (name.startsWith('claude-sonnet')) return 'claude-sonnet';
   if (name.startsWith('claude-haiku')) return 'claude-haiku';
+  // Fable 5 and 5.1 share one family — mirrors family_of() on the server.
+  if (name.startsWith('claude-fable')) return 'claude-fable';
   if (name.includes('codex-spark')) return 'codex-spark';
   if (name.includes('codex') && (name.startsWith('gpt-5') || name.startsWith('gpt-6'))) return 'codex';
   // GPT-6 (Astra). Mirrors family_of() in src/shared/runtime/core/model_registry.py:

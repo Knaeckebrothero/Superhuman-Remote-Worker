@@ -31,7 +31,18 @@
 default:
   # Reasoning control per family (see knowledge-base/knowledge/features/family_centered_reasoning.md).
   # method: effort_enum | binary_toggle | token_budget | always_on | none
-  reasoning: { method: effort_enum, delivery: native, default: high, options: [low, medium, high] }
+  #
+  # `xhigh` sits in the FALL-THROUGH list on purpose (2026-09-11): every
+  # frontier family that shipped an effort control in the last year takes it, so
+  # a model SRW has no family block for is likelier to support it than not, and
+  # clamping it down to `high` silently spent the human's choice. The trade is
+  # explicit — an unknown model whose provider does NOT know `xhigh` now gets a
+  # 400 instead of a quiet degrade, and on the subscription proxy a 400 is
+  # charged to the CREDENTIAL, benching the whole lane for ~60s. So give a model
+  # its own family block as soon as its real ladder is known. `max` stays out:
+  # it is rarer, and the clamp walks max -> xhigh, so asking for `max` on an
+  # unknown model still lands on the strongest level this list declares.
+  reasoning: { method: effort_enum, delivery: native, default: high, options: [low, medium, high, xhigh] }
   prompts:
     systemprompt: systemprompt.txt
     systemprompt_interactive: systemprompt_interactive.txt
@@ -343,6 +354,34 @@ claude-haiku:
     model_max_context_tokens: 200000  # Haiku 4.5: 200K context
     image_tokens: { mode: anthropic_patches, patch_px: 28, max_edge: 1568, max_tokens: 1568, flat: 1568 }
     pdf_render_dpi: 130  # legacy 1568px cap — see claude-sonnet note
+
+# Claude Fable 5 / 5.1 — Anthropic's tier above Opus. ONE family for both:
+# they share every knob this matrix carries (1M context, 128K output, the full
+# effort ladder, native vision). Thinking is always on and cannot be disabled,
+# and `budget_tokens` is rejected outright — neither is something we send:
+# effort is the only reasoning control SRW drives on this path.
+#
+# NOTE (2026-09-11, proxy v7.2.110): `claude-fable-5-1` is LISTED by CLIProxyAPI
+# but Anthropic rejects it — the proxy identifies itself as Claude Code 2.1.63
+# and 5.1 requires >= 2.1.251. `claude-fable-5` works today (verified 200 at
+# low/xhigh/max, with reasoning text scaling by level). The family is right
+# either way; 5.1 needs the proxy pin to move, not a matrix change.
+claude-fable:
+  reasoning: { method: effort_enum, delivery: native, default: high, options: [low, medium, high, xhigh, max] }
+  settings:
+    shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
+    # 1.0 mirrors the other Claude families and is accepted on the proxy path
+    # (verified 2026-09-11). Anthropic's native API rejects sampling params on
+    # Fable and on Opus 4.7+, so a direct-key row would need them dropped in the
+    # factory — out of scope here: that route injects no reasoning control
+    # either (see the claude-opus note above).
+    temperature: 1.0
+    multimodal: true
+    parallel_tool_calls: true
+    model_max_context_tokens: 1000000  # Fable 5/5.1: 1M context, 128K max output
+    max_output_tokens: 65536  # reasoning headroom (resolver clamps to ctx backstop)
+    # 28px patches, Opus 4.7+/Fable5 high-res cap (2576px edge / 4784 tok max).
+    image_tokens: { mode: anthropic_patches, patch_px: 28, max_edge: 2576, max_tokens: 4784, flat: 4784 }
 
 gpt-5:
   # minimal (GPT-5 family) is the deferred correctness pass — clamped to low today.

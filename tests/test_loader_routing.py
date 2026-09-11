@@ -583,6 +583,87 @@ class TestClaudeOpus5Reasoning:
         assert call_kwargs["model_kwargs"]["reasoning_effort"] == "high"
 
 
+class TestClaudeFableReasoning:
+    """claude-fable covers Fable 5 and 5.1 in one family: identical matrix
+    knobs, and the full effort ladder on both."""
+
+    def test_capability_lists_the_full_ladder(self):
+        cap = reasoning_capability("claude-fable-5")
+        assert cap["method"] == "effort_enum"
+        assert cap["default"] == "high"
+        assert cap["options"] == ["low", "medium", "high", "xhigh", "max"]
+
+    def test_five_and_five_one_share_the_family(self):
+        assert reasoning_capability("claude-fable-5-1") == reasoning_capability(
+            "claude-fable-5"
+        )
+
+    def test_settings_are_declared_not_inherited(self):
+        # Falling through to `default` would make Fable non-multimodal on a
+        # 128k window — the trap every Claude family block here exists to avoid.
+        from shared.runtime.core.loader import _apply_settings_matrix
+
+        data = {"llm": {"model": "claude-fable-5-1"}}
+        _apply_settings_matrix(data, expert_llm_keys=set())
+        assert data["llm"]["multimodal"] is True
+        assert data["llm"]["model_max_context_tokens"] == 1_000_000
+        assert data["limits"]["image_tokens"]["mode"] == "anthropic_patches"
+
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
+    def test_max_survives_the_chat_completions_factory(self, mock_chat):
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model="claude-fable-5", reasoning_level="max")
+
+        _create_openai_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["model_kwargs"]["reasoning_effort"] == "max"
+
+
+class TestFallThroughLadderIncludesXhigh:
+    """The `default` family declares xhigh (2026-09-11), so a model with no
+    family block of its own can be run at xhigh instead of being clamped down
+    to high. `max` is deliberately still out — it clamps to xhigh, not high."""
+
+    def test_unknown_model_offers_xhigh(self):
+        cap = reasoning_capability("some-unknown-model")
+        assert cap["options"] == ["low", "medium", "high", "xhigh"]
+
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
+    def test_xhigh_reaches_the_wire_unclamped(self, mock_chat):
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model="some-unknown-model", reasoning_level="xhigh")
+
+        _create_openai_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["model_kwargs"]["reasoning_effort"] == "xhigh"
+
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
+    def test_max_clamps_to_xhigh_not_high(self, mock_chat):
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model="some-unknown-model", reasoning_level="max")
+
+        _create_openai_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["model_kwargs"]["reasoning_effort"] == "xhigh"
+
+    def test_narrow_families_are_unaffected(self):
+        # Widening the fall-through must not leak into a family that declares
+        # its own (narrower) ladder.
+        assert reasoning_capability("gpt-5.2-pro")["options"] == [
+            "low",
+            "medium",
+            "high",
+        ]
+        assert reasoning_capability("claude-opus-4-8")["options"] == [
+            "low",
+            "medium",
+            "high",
+        ]
+
+
 class TestOpenAIReasoningClamping:
     """Integration tests verifying clamping reaches ReasoningChatOpenAI for OpenAI."""
 
