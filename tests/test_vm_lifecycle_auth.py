@@ -384,7 +384,11 @@ def _controller_source_copies():
 
 def test_controller_shared_inputs_trigger_tilt_and_ci_rebuilds():
     sources = {source for source, _ in _controller_source_copies()}
-    shared_inputs = {"src/shared/__init__.py", "src/shared/vm_lifecycle_auth.py"}
+    shared_inputs = {
+        "src/shared/__init__.py",
+        "src/shared/vm_lifecycle_auth.py",
+        "src/shared/workspace_initialization.py",
+    }
     assert {
         source for source in sources if source.startswith("src/shared/")
     } == shared_inputs
@@ -442,6 +446,7 @@ def test_controller_copied_protocol_imports_without_other_packages(tmp_path):
     assert sorted(path.name for path in (tmp_path / "src/shared").iterdir()) == [
         "__init__.py",
         "vm_lifecycle_auth.py",
+        "workspace_initialization.py",
     ]
     script = """
 import json
@@ -450,6 +455,8 @@ import sys
 
 before = set(sys.modules)
 from vm_controller import lifecycle_auth
+from shared.workspace_initialization import initialization_request
+assert initialization_request([{"command": ["true"]}])["version"] == 1
 assert Path(lifecycle_auth.__file__).is_relative_to(Path.cwd())
 assert lifecycle_auth.verify_payload(
     json.loads(sys.argv[1]),

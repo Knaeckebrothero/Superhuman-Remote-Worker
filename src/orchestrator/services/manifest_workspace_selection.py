@@ -26,21 +26,23 @@ def srw_workspace_config(workspace: dict | None) -> dict:
     recipe = workspace.get("template", {}).get("inline")
     if (
         not isinstance(recipe, dict)
-        or set(recipe) - {"backend", "retention", "resources", "environment"}
+        or set(recipe)
+        - {"backend", "retention", "resources", "environment", "initialize"}
         or recipe.get("retention", "Delete") != "Delete"
     ):
         raise HTTPException(
             422,
             "The SRW workspace provisioner supports backend-only templates and "
-            "prebuilt VM images/resources with Delete retention. Initialized recipes, retained instances "
+            "prebuilt VM images/resources and initialization with Delete retention. "
+            "Retained instances "
             "and instanceRef require a supported workspace provisioner.",
         )
     result = {"backend": recipe["backend"]}
-    if not set(recipe) & {"resources", "environment"}:
+    if not set(recipe) & {"resources", "environment", "initialize"}:
         return result
     if recipe["backend"] != "vm":
         raise HTTPException(
-            422, "SRW template images and resources require backend vm."
+            422, "SRW template images, resources and initialization require backend vm."
         )
     environment = recipe.get("environment", {})
     if (
@@ -54,6 +56,15 @@ def srw_workspace_config(workspace: dict | None) -> dict:
             "preparation and other pull/cache policies are not supported.",
         )
     vm = {}
+    if "initialize" in recipe:
+        from shared.workspace_initialization import initialization_request
+
+        try:
+            initialization = initialization_request(recipe["initialize"])
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        if initialization["steps"]:
+            vm["initialization"] = initialization
     if "image" in environment:
         image = environment["image"]
         # The VM controller embeds this registry reference in its disk manifest.

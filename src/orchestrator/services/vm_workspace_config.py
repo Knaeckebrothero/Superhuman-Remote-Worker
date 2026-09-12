@@ -34,6 +34,7 @@ async def vm_provisioning_options(store, work_kind: str, work: dict, *, fallback
             ("cpu_cores", "cpu_cores"),
             ("memory", "memory"),
             ("disk_size", "disk_size"),
+            ("initialization", "initialization"),
         )
         if vm.get(source) is not None
     }

@@ -339,6 +339,7 @@ docker_build(
         'src/vm_controller/',
         'src/shared/__init__.py',
         'src/shared/vm_lifecycle_auth.py',
+        'src/shared/workspace_initialization.py',
         'pyproject.toml',
         '.dockerignore',
         'docker/Dockerfile.vm-controller',

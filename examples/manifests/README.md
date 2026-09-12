@@ -82,9 +82,45 @@ request is raised to the controller's rootdisk minimum when necessary.
 `IfNotPresent`/`Reuse` uses the controller's existing disk import/clone behavior.
 Use immutable image digests: an existing cached golden disk is keyed by the full
 image reference, so changing the contents behind a tag does not invalidate it.
-Other pull/cache policies, preparation, initialization, retained instances and
+Other pull/cache policies, preparation builds, retained instances and
 `instanceRef` remain unsupported. Image/resource settings on the SRW sandbox
 and virtual backends are also rejected instead of discarded.
+
+Same-cluster SRW VM templates also accept ordered `initialize` commands. See
+[srw-initialized-development-vm.yaml](srw-initialized-development-vm.yaml).
+Admission freezes the commands with the image and resources; editing the template
+affects new executions. Applying or previewing a template runs no commands.
+
+Initialization runs inside the VM as `agent-host`, with
+`/home/agent-host/workspace` as its working directory and `/home/agent-host` as
+`HOME`. Arguments are literal; use an explicit shell command when shell expansion
+is needed. The VM image must provide Python 3.10+, systemd 254+, cloud-init and
+the SRW guest/SSH contract. The shipped Ubuntu 24.04 VM image supplies these.
+Commands cannot elevate privileges. Put OS packages in the base image; use
+initialization for user-owned environments, caches and project directories.
+
+The agent is released only after all steps exit successfully. This VM stage runs
+before the SRW harness attaches execution connectors or clones its repositories;
+it cannot use those credentials or depend on those checkouts. Generic sandbox
+initialization has its own connector delivery path, described below.
+
+Initialization has a 15-minute total command budget, independent of image import
+and boot budgets, with at most 32 steps and 64 KiB of command input. A failure
+blocks readiness and reports the step and exit code. Command output stays in the
+root-readable guest file `/var/log/srw-workspace-initialization.log`.
+The receipt at `/var/lib/srw-workspace-initialization/status.json` contains only
+recipe/owner identity, phase, step and exit code.
+
+Successful setup is skipped when the same Job or Session resumes on the same
+persistent rootdisk. Enable the installation's existing persistent-rootdisk
+support for that guarantee across VM replacement. A fresh disk runs setup again.
+Interrupted steps may replay on restart, so commands must be idempotent. This
+does not implement `Retain` or reuse of one instance across separate Jobs.
+
+The [2026-09-12 k3d verification](verification/k3d-vm-initialization-2026-09-12.json)
+exercised real VM initialization, failed setup and disk-preserving recreation
+through production admission, provisioning, retirement and readiness services.
+It did not execute an LLM job or deploy the full SRW stack inside that workspace.
 
 [srw-development-vm.yaml](srw-development-vm.yaml) selects a published VM image
 with Docker Engine, Compose, Buildx, kubectl, Helm, k3d, Tilt, mkcert, Python,
@@ -390,8 +426,9 @@ startup-isolation verification requirement.
 
 Workspace preparation/cache builds, authored network profiles and native VM/virtual
 hosting currently fail admission explicitly. The reference SRW adapter keeps its
-existing workspace provisioner (simple backend selection, Reported completion,
-one attempt). Custom initialized/retained recipes use generic hosting. Existing
+existing workspace provisioner (backend selection, prebuilt VM images/resources,
+same-cluster VM initialization, Reported completion, one attempt). Its retained-instance
+bindings remain unsupported. Custom initialized/retained sandbox recipes use generic hosting. Existing
 Officer kit/policy updates publish an atomic Project revision; automatic team
 commissioning and new generic team controllers remain future capabilities.
 

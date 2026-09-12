@@ -58,6 +58,50 @@ def test_resolved_prebuilt_vm_preserves_allocation_without_changing_the_source()
     assert document == before
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane", ["pinned", "stateless"])
+async def test_initialization_uses_the_frozen_template_after_source_edits(
+    database, actor, lane
+):
+    from shared.workspace_initialization import initialization_request
+
+    service = ManifestResourceService(database)
+    document = template()
+    steps = [{"command": ["sh", "-c", "mkdir -p toolchain && touch toolchain/ready"]}]
+    document["spec"]["initialize"] = steps
+    await service.apply(json.dumps(document), actor, format="json")
+    job = full_schema.assignment(adapter="srw/v1", mode="Reported")
+    job["spec"]["execution"]["workspace"] = {
+        "template": {"ref": {"name": "development"}}
+    }
+    _, _, _, _, work_id, snapshot = await full_schema.admit(database, actor, job)
+    await database.execute(
+        "UPDATE jobs SET execution_lane=$2 WHERE id=$1::uuid", work_id, lane
+    )
+    row = await ManifestStore(database).by_name(
+        "WorkspaceTemplate",
+        {"kind": "Account", "name": str(actor["id"])},
+        "development",
+    )
+    document["spec"]["initialize"] = [{"command": ["false"]}]
+    await service.apply(
+        json.dumps(document),
+        actor,
+        format="json",
+        expected_versions={
+            f"WorkspaceTemplate/Account/{actor['id']}/development": row[
+                "resource_version"
+            ],
+        },
+    )
+    options = await vm_provisioning_options(
+        database, "Job", await database.get_job(work_id)
+    )
+    assert options == {**OPTIONS, "initialization": initialization_request(steps)}
+    reread = await read_execution(database, "Job", work_id)
+    assert reread["resolved"] == snapshot["resolved"]
+
+
 @pytest.mark.parametrize(
     "changes",
     [
@@ -69,7 +113,6 @@ def test_resolved_prebuilt_vm_preserves_allocation_without_changing_the_source()
         {"environment": {"image": IMAGE, "pullPolicy": "Always"}},
         {"environment": {"image": IMAGE, "pullPolicy": "Never"}},
         {"environment": {"image": IMAGE, "cache": "Rebuild"}},
-        {"initialize": []},
         {"retention": "Retain"},
     ],
 )
@@ -135,16 +178,26 @@ async def test_job_dispatch_keeps_selected_image_and_size_after_template_edit(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("initialize", [False, True])
 async def test_session_snapshot_keeps_vm_allocation_across_unrelated_patch(
-    database, actor
+    database, actor, initialize
 ):
+    from shared.workspace_initialization import initialization_request
+
+    spec = template()["spec"]
+    expected_vm, expected_options = deepcopy(VM), deepcopy(OPTIONS)
+    if initialize:
+        spec["initialize"] = [{"command": ["mkdir", "-p", "project"]}]
+        request = initialization_request(spec["initialize"])
+        expected_vm["initialization"] = request
+        expected_options["initialization"] = request
     workspace, receipt = await select_execution_workspace(
         database,
         actor,
         role="session",
         project_id=None,
         supplied=True,
-        workspace={"template": {"inline": template()["spec"]}},
+        workspace={"template": {"inline": spec}},
     )
     thread_id = await database.create_thread(
         user_id=str(actor["id"]),
@@ -164,9 +217,11 @@ async def test_session_snapshot_keeps_vm_allocation_across_unrelated_patch(
         {"llm": {"temperature": 0.2}},
     )
     _, policy = srw_snapshot_config(prepared)
-    assert policy["workspace"]["vm"] == VM
+    assert policy["workspace"]["vm"] == expected_vm
     assert prepared["resolved"]["spec"]["execution"]["workspace"] == receipt["resolved"]
-    assert await vm_provisioning_options(database, "Session", thread) == OPTIONS
+    assert (
+        await vm_provisioning_options(database, "Session", thread) == expected_options
+    )
     with pytest.raises(HTTPException) as denied:
         await prepare_srw_session_patch(
             database,

@@ -1,0 +1,139 @@
+{
+  "date": "2026-09-12",
+  "baseCommit": "1f9ff7e8b26c7576b9fb32beeb47371ec5d31f6b",
+  "branch": "feat/workspace-preparation",
+  "environment": "isolated namespace on local k3d-srw; real KubeVirt VMs and isolated PostgreSQL 15",
+  "sourceDelivery": "candidate application packages mounted into an isolated gate driver; production VM-controller image also built and smoke-tested",
+  "checks": [
+    {
+      "event": "isolated_golden_clone_requested"
+    },
+    {
+      "event": "manifest_admitted_and_frozen",
+      "case": "initialization-success",
+      "job_id": "695cd2bd-9be9-492d-bf32-5bd00417cfb6"
+    },
+    {
+      "event": "readiness",
+      "job_id": "695cd2bd-9be9-492d-bf32-5bd00417cfb6",
+      "status": "ssh_pending",
+      "initialization_phase": null
+    },
+    {
+      "event": "readiness",
+      "job_id": "695cd2bd-9be9-492d-bf32-5bd00417cfb6",
+      "status": "ssh_pending",
+      "initialization_phase": "Running"
+    },
+    {
+      "event": "readiness",
+      "job_id": "695cd2bd-9be9-492d-bf32-5bd00417cfb6",
+      "status": "ready",
+      "initialization_phase": "Succeeded"
+    },
+    {
+      "event": "initialization_succeeded_before_ready",
+      "job_id": "695cd2bd-9be9-492d-bf32-5bd00417cfb6",
+      "steps": 2,
+      "literal_arguments": true,
+      "unprivileged": true
+    },
+    {
+      "event": "readiness",
+      "job_id": "695cd2bd-9be9-492d-bf32-5bd00417cfb6",
+      "status": "ssh_pending",
+      "initialization_phase": null
+    },
+    {
+      "event": "readiness",
+      "job_id": "695cd2bd-9be9-492d-bf32-5bd00417cfb6",
+      "status": "ready",
+      "initialization_phase": "Succeeded"
+    },
+    {
+      "event": "same_disk_recreation_skips_completed_setup",
+      "job_id": "695cd2bd-9be9-492d-bf32-5bd00417cfb6",
+      "new_vm_uid": true,
+      "new_host_key": true,
+      "same_disk": true
+    },
+    {
+      "event": "manifest_admitted_and_frozen",
+      "case": "initialization-failure",
+      "job_id": "ffc7ed21-641f-45df-b404-ab290319ecb1"
+    },
+    {
+      "event": "readiness",
+      "job_id": "ffc7ed21-641f-45df-b404-ab290319ecb1",
+      "status": "ssh_pending",
+      "initialization_phase": null
+    },
+    {
+      "event": "readiness",
+      "job_id": "ffc7ed21-641f-45df-b404-ab290319ecb1",
+      "status": "failed",
+      "initialization_phase": "Failed"
+    },
+    {
+      "event": "failure_blocks_readiness_and_later_steps",
+      "job_id": "ffc7ed21-641f-45df-b404-ab290319ecb1",
+      "exit_code": 9
+    },
+    {
+      "event": "gate_passed"
+    }
+  ],
+  "verification": {
+    "broadRun": {
+      "passed": 4081,
+      "failed": 65,
+      "errors": 27,
+      "cause": "90 Helm cases lacked the worktree chart dependency; 2 controller source-closure/rebuild-input cases needed the new shared module registered"
+    },
+    "resolvedFailureRerun": {
+      "passed": 92,
+      "failed": 0
+    },
+    "finalChangedAreaRerun": {
+      "passed": 330,
+      "failed": 0
+    },
+    "importContractsKept": 22,
+    "helmLintConfigurations": [
+      "test-values",
+      "customer-external-values"
+    ],
+    "ruff": "passed",
+    "vmControllerImageBuildAndPayloadSmoke": "passed"
+  },
+  "limits": [
+    "No LLM execution or full nested SRW/Tilt deployment in this gate.",
+    "Live execution lifecycle covered Jobs; Session snapshot/patch and readiness parity covered by PostgreSQL and regression tests.",
+    "No cached environment.prepare builds, cross-Job retention/instanceRef, or execution-connector-dependent VM initialization.",
+    "No main-dev deployment or timeout change."
+  ],
+  "sourceSHA256": {
+    ".github/workflows/develop.yml": "1a08681da5a6628fca1508a48621cce906b5a44a5bbd7531d676365314085a87",
+    "Tiltfile": "6b3850ceae8b5ecc1ddea11c71a8b67d06fd12aedaf4e401452f34ee269734b5",
+    "docker/Dockerfile.vm-controller": "1b4e1df38d8d509fa482747c1b7de235021a6f472fb310469608711b22a638ce",
+    "src/orchestrator/main.py": "660cce4a1f5f91961eaef71c27f53cb597bdfa84dd7b598eb4bba080d677cf00",
+    "src/orchestrator/services/dispatch_guards.py": "b4d3831f086e10acb633e8af04bfa30892bec0fdc91b42f68b8e97b9e62bdcd2",
+    "src/orchestrator/services/manifest_workspace_selection.py": "0fe4ab4ad31a35b14186d01e31318a8a0fca0b7cc558fc24be3769d2e5c1e324",
+    "src/orchestrator/services/nats_bridge.py": "ba7b316d0e9424fa53980b95fa01a5ac69a1d983cc68ff9ec5ff83c896ff72b3",
+    "src/orchestrator/services/vm_initialization.py": "3f2a68793c6bc2223ea0638389bf9f4a1950c13570c5325d051b80f297b920b2",
+    "src/orchestrator/services/vm_provisioner.py": "eb022b0094c5654ebf717f223e4b4a55c6e5b6f700c75674f997efa5a7956eed",
+    "src/orchestrator/services/vm_readiness.py": "eceae39dbaabb267ecc116d799adfe8c436b7d8917e771d2413d7bc36e030295",
+    "src/orchestrator/services/vm_workspace_config.py": "bef9de7a4eeafb1733b9a39de790ac811111500b49cc237968f29ffa14d2340e",
+    "src/shared/workspace_initialization.py": "979465af25fd45c3de9bba7b9bf290c643efab746162fd07499b7657d60a992c",
+    "src/vm_controller/controller.py": "f6e907de4cc300e3eec8ece159ba79e6e2269efcaf5d9b9e59d06519aac1aca9",
+    "src/vm_controller/guest_initialization.py": "eae68e5b23daa738be8206dce9d6cb4a5b06f00c5724aa646f375412ea7f8703",
+    "src/vm_controller/workspace_initialization.py": "1683722c4c85ed4a43b48a6d035b938a30b52ff49bc00fcb5f9932f60a1ae895",
+    "tests/test_manifest_vm_workspaces.py": "ff4594ffc31d2e977b27bf863b053d3ce6f243e767f9bb2a7e820ab3e08cf460",
+    "tests/test_nats_bridge.py": "57f8d4558814bc51d0fdd56bdd62c4e99f54e7e63758bc47aa29c838457bf999",
+    "tests/test_vm_lifecycle_auth.py": "28787e277a111f2ed39da5db9d9e88834630537a7aecba8a5b205072ff5bcb61",
+    "tests/test_vm_provisioner.py": "1cca5d3c697dae891c5201a80fa5df7204d86588b8468766085be9453c82dc2c",
+    "tests/test_vm_readiness.py": "348cb9cfa81f83cafa6d9d503863b017c8cd182101f2850aa606445aebfa2269",
+    "tests/test_workspace_initialization.py": "f60d362fce25709f5154617a3c1bbcdb66b5faf80a342d8e0b5da0ea9a2d0666"
+  },
+  "cleanup": "Owned namespace, VMs, rootdisks, cloned golden, test controller and database containers removed. Original srw namespace golden remains Succeeded."
+}

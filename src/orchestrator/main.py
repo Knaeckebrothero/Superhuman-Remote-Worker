@@ -674,6 +674,7 @@ from orchestrator.services.dispatch_guards import (  # noqa: E402
     VM_PARK_CAPACITY,
     VM_PARK_EXHAUSTED,
     VM_PARK_GOLDEN,
+    VM_PARK_INITIALIZATION,
     VM_PARK_HEADSCALE,
     VM_PARKED,
     VM_PROVISION,
@@ -7850,6 +7851,13 @@ async def _try_dispatch_pending_jobs() -> None:
                         await postgres_db.merge_vm_context(
                             job_id,
                             {"status": "failed", "error": park_error},
+                        )
+                        await _fail_vm_parked_job(job_id, park_error)
+                        continue
+                    if vm_decision == VM_PARK_INITIALIZATION:
+                        park_error = "Workspace initialization did not complete within its deadline"
+                        await postgres_db.merge_vm_context(
+                            job_id, {"status": "failed", "error": park_error}
                         )
                         await _fail_vm_parked_job(job_id, park_error)
                         continue

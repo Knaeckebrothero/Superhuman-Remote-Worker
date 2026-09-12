@@ -827,6 +827,15 @@ class VMController:
             ORCHESTRATOR_URL or str(job_config.get("orchestrator_url") or "").strip()
         )
         generation = _provision_generation(job_config.get("provision_generation"))
+        initialization = job_config.get("initialization")
+        if initialization is not None:
+            from shared.workspace_initialization import validate_initialization_request
+
+            initialization = validate_initialization_request(initialization)
+            if not getattr(self, "cloud_init_text", ""):
+                raise ValueError(
+                    "VM initialization requires the same-cluster cloud-init template."
+                )
         vm_auth_token = (
             guest_token(
                 LIFECYCLE_HMAC_SECRET,
@@ -886,6 +895,14 @@ class VMController:
             rendered_cloud_init = cloud_init_text
             for placeholder, value in replacements.items():
                 rendered_cloud_init = rendered_cloud_init.replace(placeholder, value)
+            if initialization is not None:
+                from vm_controller.workspace_initialization import (
+                    inject_workspace_initialization,
+                )
+
+                rendered_cloud_init = inject_workspace_initialization(
+                    rendered_cloud_init, owner_id=owner_id, request=initialization
+                )
             # Only the same-cluster chart mounts this Secret-backed template.
             # The parked external/direct template remains inline and therefore
             # keeps its existing guest-generated host-key behavior for now.
@@ -1105,6 +1122,14 @@ class VMController:
         from kubernetes.client.exceptions import ApiException
 
         job_id = job_config.get("job_id", "unknown")
+        if job_config.get("initialization") is not None:
+            from shared.workspace_initialization import validate_initialization_request
+
+            validate_initialization_request(job_config["initialization"])
+            if not getattr(self, "cloud_init_text", ""):
+                raise ValueError(
+                    "VM initialization requires the same-cluster cloud-init template."
+                )
         owner_kind, _ = _owner_identity(job_config)
         generation = _provision_generation(job_config.get("provision_generation"))
         if LIFECYCLE_HMAC_SECRET is not None and generation is None:

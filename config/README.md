@@ -247,7 +247,11 @@ VM WorkspaceTemplates support prebuilt `environment.image` references and
 memory/storage use `Mi`, `Gi`, or `Ti`. The controller applies its rootdisk
 minimum to storage requests. Pin images by digest for reproducible selection.
 Only the existing `IfNotPresent`/`Reuse` disk import/clone behavior is supported;
-preparation, initialization and retained-template instances remain separate work.
+cached preparation builds and retained-template instances remain separate work.
+Same-cluster VM templates support ordered, unprivileged `initialize` commands
+before agent dispatch. Completed setup survives resume on the same persistent
+rootdisk. See the [initialized VM example](../examples/manifests/srw-initialized-development-vm.yaml)
+and its [runtime limits](../examples/manifests/README.md#execution-owned-workspace-selection).
 Images must implement the SRW VM guest/SSH contract. See the
 [development VM template](../examples/manifests/srw-development-vm.yaml) and
 [selection examples](../examples/manifests/README.md#execution-owned-workspace-selection).

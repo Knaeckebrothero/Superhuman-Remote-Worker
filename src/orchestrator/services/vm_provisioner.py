@@ -668,6 +668,7 @@ class VMProvisioner:
         description: str = "",
         fresh: bool = True,
         disk_size: Optional[str] = None,
+        initialization: dict | None = None,
     ) -> bool | dict[str, Any]:
         """Create a VM for a job.
 
@@ -695,6 +696,14 @@ class VMProvisioner:
             The controller response when HTTP accepted the request, otherwise
             the transport's boolean acknowledgement.
         """
+        if initialization is not None:
+            from shared.workspace_initialization import validate_initialization_request
+
+            initialization = validate_initialization_request(initialization)
+            if self.mode != "same-cluster":
+                raise ValueError(
+                    "Workspace initialization requires same-cluster VM hosting."
+                )
         if self.mode == "external":
             # Refuse before generating/storing a provision generation.  A
             # false availability probe followed by a direct create call must
@@ -710,6 +719,11 @@ class VMProvisioner:
         # timeout. Runs before backend dispatch so every transport inherits it.
         if fresh:
             fresh_context = self._fresh_provision_ctx()
+            fresh_context.update(
+                initialization=initialization,
+                initialization_receipt=None,
+                initialization_started_at=None,
+            )
             generation = fresh_context["provision_generation"]
             await self._set_vm_context(job_id, fresh_context)
         else:
@@ -727,6 +741,11 @@ class VMProvisioner:
                 set_provisioning=fresh,
                 provision_generation=generation,
                 **({"disk_size": disk_size} if disk_size is not None else {}),
+                **(
+                    {"initialization": initialization}
+                    if initialization is not None
+                    else {}
+                ),
             )
 
         if self._http_available:
@@ -737,6 +756,11 @@ class VMProvisioner:
                 cpu_cores=cpu_cores,
                 memory=memory,
                 disk_size=disk_size,
+                **(
+                    {"initialization": initialization}
+                    if initialization is not None
+                    else {}
+                ),
                 description=description,
                 entity_type="job",
                 set_provisioning=fresh,
@@ -1618,6 +1642,7 @@ class VMProvisioner:
         set_provisioning: bool = True,
         provision_generation: str | None = None,
         disk_size: Optional[str] = None,
+        initialization: dict | None = None,
     ) -> bool | dict[str, Any]:
         """Create a VM by POSTing to the co-located VM controller.
 
@@ -1657,6 +1682,10 @@ class VMProvisioner:
             payload["orchestrator_url"] = orchestrator_url
         if disk_size:
             payload["disk_size"] = disk_size
+        if initialization is not None:
+            from shared.workspace_initialization import validate_initialization_request
+
+            payload["initialization"] = validate_initialization_request(initialization)
         generation = _provision_generation(provision_generation)
         if self._lifecycle_hmac_secret is not None and generation is None:
             logger.error(
@@ -2152,6 +2181,7 @@ class VMProvisioner:
         description: str = "",
         *,
         disk_size: Optional[str] = None,
+        initialization: dict | None = None,
         expected_runtime_generation: str | None = None,
         expected_agent_id: str | None = None,
         expected_attach_token: str | None = None,
@@ -2165,6 +2195,14 @@ class VMProvisioner:
         Returns:
             True if the request was accepted, False otherwise.
         """
+        if initialization is not None:
+            from shared.workspace_initialization import validate_initialization_request
+
+            initialization = validate_initialization_request(initialization)
+            if self.mode != "same-cluster":
+                raise ValueError(
+                    "Workspace initialization requires same-cluster VM hosting."
+                )
         if self.mode == "external":
             logger.warning("Thread VM create refused: %s", self.unavailable_reason)
             return False
@@ -2174,6 +2212,11 @@ class VMProvisioner:
         # request.  A stale route read, End, Resume, rebind, or DB failure is a
         # hard refusal with zero external calls.
         fresh_context = self._fresh_provision_ctx()
+        fresh_context.update(
+            initialization=initialization,
+            initialization_receipt=None,
+            initialization_started_at=None,
+        )
         fresh_context["status"] = "provisioning"
         generation = fresh_context["provision_generation"]
         if self._db is None or expected_runtime_generation is None:
@@ -2212,6 +2255,11 @@ class VMProvisioner:
                 set_provisioning=False,
                 provision_generation=generation,
                 **({"disk_size": disk_size} if disk_size is not None else {}),
+                **(
+                    {"initialization": initialization}
+                    if initialization is not None
+                    else {}
+                ),
             )
         elif self._http_available:
             result = await self._create_http(
@@ -2221,6 +2269,11 @@ class VMProvisioner:
                 cpu_cores=cpu_cores,
                 memory=memory,
                 disk_size=disk_size,
+                **(
+                    {"initialization": initialization}
+                    if initialization is not None
+                    else {}
+                ),
                 description=description,
                 entity_type="thread",
                 set_provisioning=False,
