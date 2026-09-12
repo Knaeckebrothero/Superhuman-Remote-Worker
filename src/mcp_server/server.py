@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import platform
 from typing import Any, Literal
+from uuid import UUID
 
 from fastmcp import FastMCP
 from starlette.responses import JSONResponse
@@ -28,6 +29,7 @@ from shared.expert_reference import (
 from shared.orch_surface import formatters as fmt
 from shared.orch_surface.client import AsyncCockpitClient, MutationOutcomeUnknown
 from shared.orch_surface.jobs import AUTH_CONTEXT_FAILURE_NOTICE, CallerCtx
+from shared.sudo_command_line import render_sudo_command_line
 
 DatasourceType = Literal[
     "generic",
@@ -2153,11 +2155,9 @@ async def list_sudo_requests(
 
     lines = [f"Found {len(requests)} sudo request(s):\n"]
     for req in requests:
-        rid = req.get("id", "?")[:8]
+        rid = req.get("id", "?")
         jid = req.get("job_id", "?")[:8]
-        cmd = req.get("command", "?")
-        argv = req.get("arguments", [])
-        cmd_str = " ".join(argv) if argv else cmd
+        cmd_str = render_sudo_command_line(req.get("command"), req.get("arguments"))
         st = req.get("status", "?")
         user = req.get("requesting_user", "?")
         target = req.get("target_user", "root")
@@ -2170,10 +2170,12 @@ async def list_sudo_requests(
             "denied": "❌",
             "expired": "⏰",
         }.get(st, "•")
-        lines.append(f"{status_icon} [{rid}] {st.upper()}")
+        lines.append(f"{status_icon} [{rid[:8]}] {st.upper()} — id: {rid}")
         lines.append(f"  Command: {cmd_str}")
         lines.append(f"  User: {user} → {target} | VM: {vm} | Job: {jid}")
         lines.append(f"  Requested: {ts}")
+        if req.get("expires_at"):
+            lines.append(f"  Expires: {req['expires_at']}")
         if req.get("decided_by"):
             lines.append(
                 f"  Decided by: {req['decided_by']} — {req.get('decision_reason', '')}"
@@ -2181,6 +2183,45 @@ async def list_sudo_requests(
         lines.append("")
 
     return "\n".join(lines)
+
+
+class _SudoIdError(ValueError):
+    """The caller's id matched no request, or more than one."""
+
+
+async def _resolve_sudo_request_id(client: Any, request_id: str) -> str:
+    """Accept the short id the listing prints as well as the full UUID.
+
+    ``list_sudo_requests`` shows 8-character ids, so an approver who reads the
+    listing has a prefix and not a UUID. A full UUID is used as-is; anything
+    shorter is matched against the ids of recent requests and must identify
+    exactly one.
+    """
+    candidate = (request_id or "").strip()
+    try:
+        return str(UUID(candidate))
+    except (AttributeError, TypeError, ValueError):
+        pass
+
+    requests = await client.list_sudo_requests(limit=100)
+    matches = sorted(
+        {
+            str(req["id"])
+            for req in requests
+            if str(req.get("id", "")).startswith(candidate)
+        }
+    )
+    if not matches:
+        raise _SudoIdError(
+            f"no sudo request id starts with '{candidate}' — "
+            "run list_sudo_requests to see the current ids"
+        )
+    if len(matches) > 1:
+        raise _SudoIdError(
+            f"'{candidate}' is ambiguous, it matches {len(matches)} requests: "
+            + ", ".join(matches)
+        )
+    return matches[0]
 
 
 @mcp_tool
@@ -2202,8 +2243,12 @@ async def approve_sudo_request(
     """
     client = _get_client()
     try:
-        result = await client.approve_sudo_request(request_id, reason=reason)
-        return f"Approved sudo request {request_id}: {result.get('status', 'ok')}"
+        resolved = await _resolve_sudo_request_id(client, request_id)
+    except _SudoIdError as e:
+        return f"Failed to approve: {e}"
+    try:
+        result = await client.approve_sudo_request(resolved, reason=reason)
+        return f"Approved sudo request {resolved}: {result.get('status', 'ok')}"
     except Exception as e:
         return f"Failed to approve: {e}"
 
@@ -2227,8 +2272,12 @@ async def deny_sudo_request(
     """
     client = _get_client()
     try:
-        result = await client.deny_sudo_request(request_id, reason=reason)
-        return f"Denied sudo request {request_id}: {result.get('status', 'ok')}"
+        resolved = await _resolve_sudo_request_id(client, request_id)
+    except _SudoIdError as e:
+        return f"Failed to deny: {e}"
+    try:
+        result = await client.deny_sudo_request(resolved, reason=reason)
+        return f"Denied sudo request {resolved}: {result.get('status', 'ok')}"
     except Exception as e:
         return f"Failed to deny: {e}"
 

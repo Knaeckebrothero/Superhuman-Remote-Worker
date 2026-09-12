@@ -4101,6 +4101,8 @@
       "error": "Fehler",
       "summary": "Zusammenfassung",
       "requestType": "Anfrage",
+      "requestId": "Anfrage-ID",
+      "expiresAt": "Läuft ab",
       "vm": "VM",
       "user": "Benutzer",
       "cwd": "CWD",

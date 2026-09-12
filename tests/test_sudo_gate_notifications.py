@@ -35,7 +35,17 @@ EVENT = {
     "target_user": "root",
     "working_directory": "/workspace",
     "requested_at": "2026-08-27T00:00:00+00:00",
+    "expires_at": "2026-08-27T00:30:00+00:00",
     "request_type": "sudo_command",
+}
+
+# The shape that hid the real command from approvers: `command` is the resolved
+# binary, the content the gate judged lives in `arguments`.
+LOGIN_SHELL_EVENT = {
+    **EVENT,
+    "command": "/bin/bash",
+    "arguments": ["bash", "--login", "-c", "id && docker version"],
+    "target_user": "agent-host",
 }
 
 
@@ -66,10 +76,45 @@ class TestOwnerNotification:
             "job_id": "j-1",
             "thread_id": None,
         }
-        assert kw["subject"] == "Sudo approval needed: apt-get"
+        assert kw["subject"] == "Sudo approval needed: apt-get install -y jq"
         assert "`apt-get install -y jq`" in kw["body"]
-        assert "vm-7" in kw["body"] and "5 minutes" in kw["body"]
+        assert "vm-7" in kw["body"]
         assert kw["payload"]["command"] == "apt-get"
+
+    @pytest.mark.asyncio
+    async def test_body_shows_the_command_line_the_gate_evaluated(self, record):
+        """Fix 1: a login-shell wrapper must not read as a bare `/bin/bash`."""
+        gate = _gate(job={"id": "j-1", "user_id": "owner-1"})
+        await gate._record_owner_notification(
+            "r-1", job_id="j-1", thread_id=None, event=LOGIN_SHELL_EVENT
+        )
+        body = record.await_args.kwargs["body"]
+        assert "`/bin/bash --login -c 'id && docker version'`" in body
+        assert record.await_args.kwargs["subject"] == (
+            "Sudo approval needed: /bin/bash --login -c 'id && docker version'"
+        )
+
+    @pytest.mark.asyncio
+    async def test_body_states_the_real_expiry(self, record):
+        """Fix 2: the TTL is configurable, so the copy quotes the row."""
+        gate = _gate(job={"id": "j-1", "user_id": "owner-1"})
+        await gate._record_owner_notification(
+            "r-1", job_id="j-1", thread_id=None, event=EVENT
+        )
+        body = record.await_args.kwargs["body"]
+        assert "5 minutes" not in body
+        assert "2026-08-27T00:30:00+00:00" in body
+
+    @pytest.mark.asyncio
+    async def test_body_without_an_expiry_says_so(self, record):
+        gate = _gate(job={"id": "j-1", "user_id": "owner-1"})
+        await gate._record_owner_notification(
+            "r-1",
+            job_id="j-1",
+            thread_id=None,
+            event={k: v for k, v in EVENT.items() if k != "expires_at"},
+        )
+        assert "Expires" not in record.await_args.kwargs["body"]
 
     @pytest.mark.asyncio
     async def test_thread_request_goes_to_the_thread_owner(self, record):

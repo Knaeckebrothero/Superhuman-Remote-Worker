@@ -4101,6 +4101,8 @@
       "error": "Error",
       "summary": "Summary",
       "requestType": "Request",
+      "requestId": "Request ID",
+      "expiresAt": "Expires",
       "vm": "VM",
       "user": "User",
       "cwd": "CWD",

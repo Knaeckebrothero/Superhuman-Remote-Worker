@@ -48,6 +48,7 @@ async def gate(pg_dsn):
                 target_user        varchar(255) NOT NULL DEFAULT 'root',
                 status             text NOT NULL DEFAULT 'pending',
                 requested_at       timestamptz NOT NULL DEFAULT now(),
+                ttl_seconds        integer NOT NULL DEFAULT 300,
                 expires_at         timestamptz NOT NULL DEFAULT (now() + interval '300 seconds'),
                 nats_reply_subject text,
                 metadata           jsonb DEFAULT '{}',
