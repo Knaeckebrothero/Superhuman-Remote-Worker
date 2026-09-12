@@ -16,17 +16,37 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 import json
 import logging
+import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from fnmatch import fnmatch
 from typing import Any, Optional
 from uuid import UUID
+
+from shared.sudo_command_line import render_sudo_command_line
 
 logger = logging.getLogger(__name__)
 
 # Shell metacharacters that prevent auto-approval.
 # Commands containing these are always forwarded to human review.
 _SHELL_META_RE = re.compile(r"[|;&`$><]|\$\(|\|\||&&")
+
+
+def _ttl_seconds_from_env(name: str, default: int) -> int:
+    """Read a positive TTL from the environment, falling back to ``default``."""
+    try:
+        value = int(os.environ[name])
+    except (KeyError, TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+# How long a pending sudo command request stays decidable. At 300 s every
+# request an unattended VM job raised expired before an operator could look at
+# it, and the agent simply re-issued the command; VM-tier work waits for a
+# human, so the default is 30 minutes. Other request types carry their own TTL
+# (vm_upgrade: 24 h).
+SUDO_COMMAND_TTL_SECONDS = _ttl_seconds_from_env("SUDO_COMMAND_TTL_SECONDS", 1800)
 
 
 class SudoRequestConflict(ValueError):
@@ -51,6 +71,16 @@ def _public_status(value: object) -> str:
         "auto_approved": "approved",
         "auto_denied": "denied",
     }.get(str(value), str(value))
+
+
+def _expires_at(ttl_seconds: int) -> str:
+    """The expiry an approver is shown for a request just inserted.
+
+    The row's authoritative ``expires_at`` is ``NOW() + ttl`` in the database;
+    this mirrors it for the event payload without a second round trip (the
+    insert and this call are milliseconds apart).
+    """
+    return (datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)).isoformat()
 
 
 def _object(value: object) -> dict[str, Any]:
@@ -155,7 +185,11 @@ class SudoGateService:
         command_string = (
             " ".join(payload["argv"]) if payload["argv"] else payload["command"]
         )
-        auto_result = await self._evaluate_auto_rules(command_string)
+        auto_result = await self._evaluate_auto_rules(
+            command_string,
+            requesting_user=payload["user"],
+            target_user=payload["runas_user"],
+        )
         decided_status: str | None = None
         reason: str | None = None
         if auto_result in {"approve", "deny"}:
@@ -180,6 +214,7 @@ class SudoGateService:
                 "target_user": payload["runas_user"],
                 "working_directory": payload["cwd"],
                 "requested_at": datetime.now(timezone.utc).isoformat(),
+                "expires_at": _expires_at(SUDO_COMMAND_TTL_SECONDS),
                 "request_type": "sudo_command",
             }
             await self._broadcast_sse("new_request", event)
@@ -370,7 +405,9 @@ class SudoGateService:
 
         # Evaluate auto-approval rules.
         cmd_string = " ".join(argv) if argv else command
-        auto_result = await self._evaluate_auto_rules(cmd_string)
+        auto_result = await self._evaluate_auto_rules(
+            cmd_string, requesting_user=user, target_user=runas_user
+        )
 
         if auto_result == "approve":
             logger.info("Auto-approved: %s (request %s)", cmd_string, request_id)
@@ -426,12 +463,13 @@ class SudoGateService:
             "target_user": runas_user,
             "working_directory": cwd,
             "requested_at": datetime.now(timezone.utc).isoformat(),
+            "expires_at": _expires_at(SUDO_COMMAND_TTL_SECONDS),
         }
         await self._broadcast_sse("new_request", event)
         await self._notify_project_officer(
             str(request_id),
             job_id,
-            command,
+            render_sudo_command_line(command, argv),
             "sudo_command",
             thread_id=thread_id,
         )
@@ -611,7 +649,13 @@ class SudoGateService:
     # Auto-approval rules
     # =========================================================================
 
-    async def _evaluate_auto_rules(self, command: str) -> Optional[str]:
+    async def _evaluate_auto_rules(
+        self,
+        command: str,
+        *,
+        requesting_user: Optional[str] = None,
+        target_user: Optional[str] = None,
+    ) -> Optional[str]:
         """Evaluate auto-approval rules against a command string.
 
         Returns "approve", "deny", "review", or None (no match).
@@ -619,8 +663,13 @@ class SudoGateService:
         if not self._db:
             return None
 
-        # Shell metacharacter check — always require human review.
-        if _SHELL_META_RE.search(command):
+        # Shell metacharacter check — require human review, except when the
+        # target user IS the requesting user: `sudo -u <self>` grants nothing
+        # the caller does not already have, so there is no escalation for a
+        # human to judge (an agent re-entering a login shell to pick up a group
+        # it was just added to). The rules table still decides.
+        self_targeted = bool(requesting_user) and requesting_user == target_user
+        if not self_targeted and _SHELL_META_RE.search(command):
             logger.debug(
                 "Shell metacharacters in '%s' — skipping auto-approval", command
             )
@@ -868,6 +917,7 @@ class SudoGateService:
         *,
         thread_id: Optional[str] = None,
         request_id: Optional[str] = None,
+        ttl_seconds: Optional[int] = None,
     ) -> Optional[str]:
         """Claim-and-insert a sudo approval request.
 
@@ -886,10 +936,10 @@ class SudoGateService:
                 INSERT INTO sudo_approval_requests
                     (id, job_id, thread_id, vm_name, command, arguments, working_directory,
                      requesting_user, target_user, nats_reply_subject, metadata,
-                     expires_at)
+                     ttl_seconds, expires_at)
                 VALUES (COALESCE($1::uuid, gen_random_uuid()), $2, $3, $4, $5,
-                        $6, $7, $8, $9, $10, $11,
-                        NOW() + INTERVAL '300 seconds')
+                        $6, $7, $8, $9, $10, $11, $12::integer,
+                        NOW() + ($12::integer * INTERVAL '1 second'))
                 ON CONFLICT DO NOTHING
                 RETURNING id
                 """,
@@ -904,6 +954,7 @@ class SudoGateService:
                 target_user,
                 nats_reply_subject,
                 json.dumps(metadata),
+                int(ttl_seconds or SUDO_COMMAND_TTL_SECONDS),
             )
         return str(row["id"]) if row else None
 
@@ -1027,20 +1078,21 @@ class SudoGateService:
                 owner = (thread or {}).get("user_id")
             if not owner:
                 return
-            command = str(event.get("command") or "")
-            args = " ".join(str(a) for a in (event.get("arguments") or []))
-            full = f"{command} {args}".strip()
+            full = render_sudo_command_line(
+                event.get("command"), event.get("arguments")
+            )
+            expires_at = event.get("expires_at")
             await notification_service.record(
                 recipient_id=str(owner),
                 category="sudo_request",
                 dedup_key=f"sudo_request:{request_id}",
-                subject=f"Sudo approval needed: {command[:60]}",
+                subject=f"Sudo approval needed: {full[:60]}",
                 body=(
                     f"`{full}` on **{event.get('vm_name') or 'vm'}** as "
                     f"`{event.get('target_user') or 'root'}` (requested by "
                     f"`{event.get('requesting_user') or 'agent'}` in "
-                    f"`{event.get('working_directory') or '/'}`). "
-                    "The request expires in 5 minutes."
+                    f"`{event.get('working_directory') or '/'}`)."
+                    + (f" Expires {expires_at}." if expires_at else "")
                 ),
                 source_kind="sudo_request",
                 source_id=str(request_id),
