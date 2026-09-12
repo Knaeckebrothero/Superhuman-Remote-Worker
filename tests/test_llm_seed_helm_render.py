@@ -359,3 +359,70 @@ def test_inline_and_ref_on_the_same_entry_is_refused(tmp_path: Path) -> None:
     )
     assert result.returncode != 0
     assert "not both" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# reconcile flags
+# ---------------------------------------------------------------------------
+
+
+def test_reconcile_flags_render_through(tmp_path: Path) -> None:
+    payload = _render_seed_payload(
+        tmp_path,
+        {
+            "systemApiKeys": {
+                "openai": {
+                    "secretName": "s",
+                    "key": "k",
+                    "label": "Main",
+                    "reconcile": True,
+                },
+                "anthropic": {"secretName": "s", "key": "a"},
+            },
+            "systemEndpoints": [
+                {
+                    "label": "Gemma",
+                    "baseUrl": "http://g/v1",
+                    "reconcile": True,
+                    "models": [
+                        {"id": "gemma", "capability": "chat", "reconcile": True},
+                        {"id": "gemma-emb", "capability": "embedding"},
+                    ],
+                }
+            ],
+            "systemModels": [
+                {
+                    "provider": "openai",
+                    "id": "gpt-5-mini",
+                    "capability": "chat",
+                    "reconcile": False,
+                }
+            ],
+            "defaults": {
+                "chat": {"model": "gemma", "reconcile": True},
+                "embedding": {"model": "gemma-emb"},
+                "vision": "gemma",
+            },
+        },
+    )
+    keys = {k["provider"]: k for k in payload["systemApiKeys"]}
+    assert keys["openai"]["reconcile"] is True
+    assert keys["openai"]["label"] == "Main"
+    assert "reconcile" not in keys["anthropic"]
+    ep = payload["systemEndpoints"][0]
+    assert ep["reconcile"] is True
+    assert ep["models"][0]["reconcile"] is True
+    assert "reconcile" not in ep["models"][1]
+    assert payload["systemModels"][0]["reconcile"] is False
+    assert payload["defaults"] == {
+        "chat": {"model": "gemma", "reconcile": True},
+        "embedding": {"model": "gemma-emb"},
+        "vision": "gemma",
+    }
+
+
+def test_defaults_mapping_form_without_model_is_dropped(tmp_path: Path) -> None:
+    payload = _render_seed_payload(
+        tmp_path, {"defaults": {"chat": {"reconcile": True}, "vision": {"model": ""}}}
+    )
+    assert payload.get("defaults") in (None, {})

@@ -22,6 +22,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from orchestrator import init as init_mod
+from shared.helm_provenance import value_hash
 
 
 _TEST_HELM_VALUES = dedent(
@@ -315,7 +316,9 @@ async def test_defaults_block_pins_only_catalog_models(tmp_path):
     }
     assert pinned == {"chat": "gpt-4o", "auxiliary": "gpt-4o"}
     for call in db.set_default_llm_model.await_args_list:
-        assert call.kwargs == {"updated_by": "helm:llm.seed"}
+        assert call.kwargs["updated_by"] == "helm:llm.seed"
+        assert call.kwargs["source"] == "helm"
+        assert call.kwargs["helm_value_hash"] == value_hash("gpt-4o")
 
 
 @pytest.mark.asyncio
@@ -334,5 +337,9 @@ async def test_defaults_only_values_still_run_the_seed(tmp_path):
 
     db.create_model.assert_not_awaited()
     db.set_default_llm_model.assert_awaited_once_with(
-        "chat", "gpt-4o", updated_by="helm:llm.seed"
+        "chat",
+        "gpt-4o",
+        updated_by="helm:llm.seed",
+        source="helm",
+        helm_value_hash=value_hash("gpt-4o"),
     )

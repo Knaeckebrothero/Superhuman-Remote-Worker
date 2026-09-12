@@ -3128,6 +3128,31 @@ llm:
     #   rerank: "qwen3-reranker-8b"
     defaults: {}
 
+    # -- Reconcile: Helm as the source of truth, opted into PER ENTRY. Every
+    # section above is insert-only by default — an existing row or pin is
+    # never touched, so Cockpit edits survive upgrades. Add `reconcile: true`
+    # to an entry (a provider key, an endpoint, a catalog model, or a default
+    # pin in its mapping form) and the seed Job re-applies that entry on
+    # EVERY helm upgrade: a row that differs from the declared value is
+    # rewritten, and an admin's edit is reverted (logged as such in the Job).
+    # The Job records the reconciled entries in the system_settings row
+    # `helm.reconcile`; Admin → Models shows a "Helm" badge on those rows and
+    # warns before an edit. Remove the flag and upgrade to release a row back
+    # to the UI. An endpoint whose declared credential does not resolve keeps
+    # its stored key and only has its URL re-applied.
+    #
+    #   systemApiKeys:
+    #     openai: {secretName: "srw-llm-seed", key: "openai_api_key", reconcile: true}
+    #   systemEndpoints:
+    #     - label: "Local Gemma"
+    #       baseUrl: "http://vllm.ai.svc.cluster.local:8000/v1"
+    #       reconcile: true                 # the transport: URL + credential
+    #       models:
+    #         - id: "RedHatAI/gemma-4-31B-it-FP8-Dynamic"
+    #           reconcile: true             # this catalog row's fields
+    #   defaults:
+    #     chat: {model: "RedHatAI/gemma-4-31B-it-FP8-Dynamic", reconcile: true}
+
     # -- Resource requests for the short-lived seed Job pod.
     resources:
       requests:
