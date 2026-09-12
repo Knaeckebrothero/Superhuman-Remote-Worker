@@ -246,8 +246,10 @@ VM WorkspaceTemplates support prebuilt `environment.image` references and
 `resources: {cpu: 12, memory: 24Gi, storage: 120Gi}`. CPU is a whole core count;
 memory/storage use `Mi`, `Gi`, or `Ti`. The controller applies its rootdisk
 minimum to storage requests. Pin images by digest for reproducible selection.
-Only the existing `IfNotPresent`/`Reuse` disk import/clone behavior is supported;
-cached preparation builds remain separate work.
+Same-cluster VM hosting can enable `environment.prepare`, digest-aware pull
+policies and scoped `Reuse`/`Rebuild` caching. Each workspace clones the prepared
+disk before its own initialization. See [workspace preparation](../examples/manifests/workspace-preparation.md)
+for operator prerequisites, cache behavior and the prepared-template example.
 Same-cluster VM templates support ordered, unprivileged `initialize` commands
 before agent dispatch. Completed setup survives resume on the same persistent
 rootdisk. See the [initialized VM example](../examples/manifests/srw-initialized-development-vm.yaml)

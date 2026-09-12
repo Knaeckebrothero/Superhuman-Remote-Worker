@@ -83,7 +83,9 @@ request is raised to the controller's rootdisk minimum when necessary.
 `IfNotPresent`/`Reuse` uses the controller's existing disk import/clone behavior.
 Use immutable image digests: an existing cached golden disk is keyed by the full
 image reference, so changing the contents behind a tag does not invalidate it.
-Other pull/cache policies and preparation builds remain unsupported. Image/resource settings on the SRW sandbox
+Enabled same-cluster VM preparation supports `prepare`, all three pull policies
+and `Reuse`/`Rebuild` caching. See [prepared VM workspaces](workspace-preparation.md)
+and [the example](srw-prepared-development-vm.yaml). Image/resource settings on the SRW sandbox
 and virtual backends are also rejected instead of discarded.
 
 Same-cluster SRW VM templates also accept ordered `initialize` commands. See
@@ -200,7 +202,7 @@ edits and resume. Changing a template affects new executions; changing VM image
 or resources through a Session settings PATCH requires a new Session.
 These fields are part of the manifest schema and are supported only where the
 selected provisioner implements them. This change does not add a general
-auto-upgrade policy or preparation cache.
+auto-upgrade policy. Preparation has its own [operator capability gate](workspace-preparation.md).
 
 ## Local use
 
@@ -469,10 +471,11 @@ explicit `{}` rule allows all egress. CIDR exclusions must be strictly contained
 subnets. Configuring egress does not enable generic hosting or waive the separate
 startup-isolation verification requirement.
 
-Workspace preparation/cache builds, authored network profiles and VM/virtual
-workspaces for generic harnesses currently fail admission explicitly. The reference SRW adapter keeps its
+Authored network profiles and VM/virtual workspaces for generic harnesses
+currently fail admission explicitly. Preparation/cache builds are supported by
+the same-cluster SRW VM adapter when enabled; generic builders remain unsupported. The reference SRW adapter keeps its
 existing workspace provisioner (backend selection, prebuilt VM images/resources,
-same-cluster VM initialization and retained Job instances, Reported completion,
+same-cluster VM preparation, initialization and retained Job instances, Reported completion,
 one attempt). Custom initialized/retained sandbox recipes use generic hosting. Existing
 Officer kit/policy updates publish an atomic Project revision; automatic team
 commissioning and new generic team controllers remain future capabilities.
@@ -558,8 +561,8 @@ The orchestrator marks initialization complete after every initializer exits zer
 then omits them on later attachments. Partial failures may repeat earlier steps, so
 initializers must tolerate repetition. This follows [Kubernetes init-container
 sequencing](https://kubernetes.io/docs/concepts/workloads/pods/init-containers/).
-Image preparation/cache builds and custom VM providers remain execution capability
-gates. System packages belong in the workspace image; initialization can populate
+For generic sandbox hosting, image preparation/cache builds and custom VM providers
+remain execution capability gates. System packages belong in the workspace image; initialization can populate
 repositories, files and user-space tool installations in the retained home.
 
 The harness receives a workspace descriptor, its scoped private key and pinned
@@ -829,3 +832,27 @@ evidence and changed namespaces remain refused; independently verified operator
 recovery is required. The earlier test fixtures were recovered and removed, and
 their failed artifacts remain separate from the accepted invocation. Cached
 fixture image layers remain in the local registry.
+
+## Prepared VM cache verification
+
+The preparation backend was exercised on `k3d-srw` with real KubeVirt/CDI VMs,
+production manifest admission and PostgreSQL, signed controller transport,
+host-key-pinned SSH, initialization, retained handoff and cleanup. Two fresh VMs
+shared a prepared toolchain while keeping separate files, writable disks and
+machine identities. Rebuild, controller service restart recovery, failed builds,
+cancellation, cache eviction and Session End during preparation also passed.
+
+The ordinary K3s profile exposed a NetworkPolicy startup window. A separate
+Cilium 1.18.13 cluster with `policyEnforcementMode=always` passed the offline and
+online policy checks, including positive public/DNS reachability and denied
+private traffic, then was removed. Test namespaces, VMs, PVCs, PostgreSQL and
+temporary credentials were cleaned up. No LLM or harness completion was used in
+this gate. See the [recorded evidence](workspace-preparation-k3d-evidence.json)
+and [operator setup](workspace-preparation.md).
+
+The full backend regression run with `PYTHONSAFEPATH=1` finished with 30,815
+passes, 179 skips and one source-inspection failure caused by expanding a
+database docstring after the module had already been imported. The affected
+module passed all 10 tests in a fresh process with no runtime changes. Both
+production images built and passed Python 3.12 import checks; Helm lint,
+Ruff, SQL lint and endpoint/runtime-coordinate inventories also passed.
