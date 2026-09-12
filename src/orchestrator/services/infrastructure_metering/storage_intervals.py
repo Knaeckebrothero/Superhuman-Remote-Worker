@@ -354,6 +354,9 @@ def _classify_pvc(
                 True,
             )
         expected_name = f"{_VM_ROOTDISK_PREFIX}{owner_id}{_VM_ROOTDISK_SUFFIX}"
+        workspace_uid = _canonical_uuid(labels.get("srw.io/workspace-instance"))
+        if "srw.io/workspace-instance" in labels:
+            expected_name = f"srw-ws-{workspace_uid.hex}" if workspace_uid else None
         if name != expected_name:
             return (
                 "vm_rootdisk_claim",
@@ -833,6 +836,38 @@ class StorageIntervalReconciler:
         hint = projection.owner_hint
         if hint is None:
             return _unknown(projection.classification_reason)
+        if projection.name and projection.name.startswith("srw-ws-"):
+            workspace_id = UUID(projection.name.removeprefix("srw-ws-"))
+            row = await conn.fetchrow(
+                "SELECT owner_id,project_id,pvc_name,pvc_uid,backend_state FROM srw_workspace_instances WHERE id=$1 AND recipe->>'backend'='vm'",
+                workspace_id,
+            )
+            if row is None:
+                return _unknown("retained-workspace-row-missing")
+            state = _json_details(row.get("backend_state"))
+            storage = _json_details(state.get("storage"))
+            if (
+                row["pvc_name"] != projection.name
+                or row["pvc_uid"] != projection.source_uid
+                or state.get("namespace") != projection.namespace
+                or storage.get("uid") != str(workspace_id)
+                or storage.get("owner_id") != str(hint.id)
+                or storage.get("owner_kind") != hint.kind
+            ):
+                return _unknown("retained-workspace-identity-mismatch")
+            user_id = _uuid_value(row["owner_id"])
+            if user_id is None:
+                return _unknown("owner-user-missing")
+            return StorageAttribution(
+                scope="customer",
+                owner_kind=hint.kind,
+                owner_id=hint.id,
+                user_id=user_id,
+                project_id=_uuid_value(row["project_id"]),
+                source="app-db-vm-rootdisk-owner-identity",
+                quality="exact",
+                reason_code="retained-vm-rootdisk-identity",
+            )
         sql = (
             _VM_ROOTDISK_JOB_OWNER_SQL
             if hint.kind == "job"

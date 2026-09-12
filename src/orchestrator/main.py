@@ -30036,6 +30036,7 @@ def _manifest_execution_service():
         default_image=container_provisioner._workspace_image,
         storage_class_name=container_provisioner._storage_class,
         harness_namespace=namespace,
+        vm_provisioner=vm_provisioner,
     )
     return ManifestExecutionService(
         postgres_db,

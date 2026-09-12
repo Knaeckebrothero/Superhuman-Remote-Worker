@@ -18402,6 +18402,7 @@ CREATE TABLE public.srw_workspace_instances (
     status text DEFAULT 'Reserved'::text NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    backend_state jsonb DEFAULT '{}'::jsonb NOT NULL,
     CONSTRAINT srw_workspace_instances_retired_owner_check CHECK (((owner_id IS NOT NULL) OR ((status = 'Released'::text) AND (execution_id IS NULL) AND (pod_uid IS NULL))))
 );
 

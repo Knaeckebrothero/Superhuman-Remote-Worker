@@ -3714,6 +3714,7 @@ class PostgresDB:
                 SELECT j.id, j.status, j.completion_outcome_kind,
                        j.config_name, j.expert_id, j.config_override,
                        execution.harness_adapter AS execution_harness_adapter,
+                       workspace_binding.instance_id AS workspace_instance_id,
                        COALESCE(
                            CASE WHEN execution.harness_adapter = 'srw/v1' THEN
                                execution.resolved #> '{spec,execution,expert,inline,runtime,config,resolved}'
@@ -3736,6 +3737,8 @@ class PostgresDB:
                 LEFT JOIN projects p ON p.id = j.project_id
                 LEFT JOIN srw_execution_specs execution
                     ON execution.work_kind='Job' AND execution.work_id=j.id
+                LEFT JOIN srw_execution_workspace_bindings workspace_binding
+                    ON workspace_binding.execution_id=execution.id
                 WHERE j.id = $1
                 """,
                 uuid_val,

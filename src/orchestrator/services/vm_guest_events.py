@@ -58,6 +58,16 @@ async def resolve_vm_entity(db: Any, entity_id: str) -> VmGuestIdentity | None:
             )
         job = await db.get_job(entity_id)
         if job:
+            vm = _object(_object(job.get("context")).get("vm"))
+            if vm.get("workspace_storage") is not None:
+                from orchestrator.services.retained_vm_workspaces import (
+                    guest_attachment_is_current,
+                )
+
+                if not await guest_attachment_is_current(
+                    db, entity_id, vm["workspace_storage"]
+                ):
+                    return None
             generation = _object(_object(job.get("context")).get("vm")).get(
                 "provision_generation"
             )

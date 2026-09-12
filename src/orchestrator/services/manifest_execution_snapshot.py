@@ -385,7 +385,10 @@ async def prepare_srw_snapshot(
             srw_workspace_config,
         )
 
-        expected = srw_workspace_config(workspace_selection["resolved"])
+        expected = srw_workspace_config(
+            workspace_selection["resolved"],
+            instance_recipe=workspace_selection.get("instance_recipe"),
+        )
         actual = policy.get("workspace") or {}
         if any(actual.get(key) != value for key, value in expected.items()):
             raise HTTPException(409, "Workspace assignment changed during admission.")
@@ -621,7 +624,7 @@ async def capture_execution(
                 conn=conn,
                 **prepared,
             )
-        return await store.freeze_execution(
+        snapshot = await store.freeze_execution(
             work_kind=work_kind,
             work_id=work_id,
             owner_id=owner_id,
@@ -629,3 +632,8 @@ async def capture_execution(
             conn=conn,
             **prepared,
         )
+
+        from orchestrator.services.retained_vm_workspaces import reserve
+
+        await reserve(db, snapshot)
+        return snapshot

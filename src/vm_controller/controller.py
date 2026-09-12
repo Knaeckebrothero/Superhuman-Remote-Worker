@@ -901,7 +901,11 @@ class VMController:
                 )
 
                 rendered_cloud_init = inject_workspace_initialization(
-                    rendered_cloud_init, owner_id=owner_id, request=initialization
+                    rendered_cloud_init,
+                    owner_id=(job_config.get("workspace_storage") or {}).get(
+                        "uid", owner_id
+                    ),
+                    request=initialization,
                 )
             # Only the same-cluster chart mounts this Secret-backed template.
             # The parked external/direct template remains inline and therefore
@@ -1105,6 +1109,13 @@ class VMController:
             if exc.status != 404:
                 raise
 
+    def _retained_storage(self):
+        from vm_controller.retained_storage import RetainedStorage
+
+        if not hasattr(self, "_retained_storage_service"):
+            self._retained_storage_service = RetainedStorage(self, VM_NAMESPACE)
+        return self._retained_storage_service
+
     async def _do_create(self, job_config: dict) -> dict:
         """Create a KubeVirt VirtualMachine for a job."""
         job_id = job_config.get("job_id", "unknown")
@@ -1115,6 +1126,21 @@ class VMController:
                 capacity_lock = asyncio.Lock()
                 self._capacity_lock = capacity_lock
             async with capacity_lock:
+                binding = job_config.get("workspace_storage")
+                if binding is not None:
+                    from shared.vm_workspace_storage import storage_binding
+
+                    storage_binding(binding)
+                    if (
+                        not VM_PERSISTENT_ROOTDISK
+                        or LIFECYCLE_HMAC_SECRET is None
+                        or not getattr(self, "cloud_init_text", "")
+                    ):
+                        raise ValueError(
+                            "Retained VM workspaces require persistent disks and authenticated lifecycle hosting."
+                        )
+                    async with self._retained_storage().lock:
+                        return await self._do_create_serialized(job_config)
                 return await self._do_create_serialized(job_config)
 
     async def _do_create_serialized(self, job_config: dict) -> dict:
@@ -1165,7 +1191,9 @@ class VMController:
         # legacy behaviour + fallback).
         image = job_config.get("vm_image") or DEFAULT_VM_IMAGE
         golden_name = None
-        if VM_GOLDEN_IMAGE_ENABLED:
+        if VM_GOLDEN_IMAGE_ENABLED and not (
+            job_config.get("workspace_storage") or {}
+        ).get("pvc_uid"):
             waiting = None
             try:
                 golden_name, waiting = await self._golden_state_nowait(image)
@@ -1232,7 +1260,10 @@ class VMController:
         # Detach the rootdisk from the VM object so it outlives it. Must run
         # AFTER the clone mutation above — it lifts the template's dataVolume
         # spec as-is, clone source included.
-        if VM_PERSISTENT_ROOTDISK:
+        workspace_storage = job_config.get("workspace_storage")
+        if workspace_storage is not None:
+            await self._retained_storage().ensure(manifest, workspace_storage, job_id)
+        elif VM_PERSISTENT_ROOTDISK:
             await self._ensure_rootdisk(manifest, job_id, owner_kind=owner_kind)
 
         cloud_init_secret_created = False
@@ -1347,6 +1378,8 @@ class VMController:
                 "Kubernetes admitted VM response has another provision generation"
             )
 
+        if workspace_storage is not None:
+            self._retained_storage().verify_vm(admitted_vm, workspace_storage, job_id)
         if cloud_init_user_data is not None:
             await self._patch_cloud_init_secret_owner(
                 job_id=job_id,
@@ -1354,12 +1387,23 @@ class VMController:
                 vm_uid=vm_uid,
             )
 
-        rootdisk_pvc_uid = await self._rootdisk_pvc_uid(
-            _rootdisk_name(job_id),
-            owner_id=job_id,
-            owner_kind=owner_kind,
-            wait=True,
-        )
+        if workspace_storage is not None:
+            from shared.vm_workspace_storage import storage_name
+
+            rootdisk_pvc_uid = await self._rootdisk_pvc_uid(
+                storage_name(workspace_storage),
+                owner_id=workspace_storage["owner_id"],
+                owner_kind=workspace_storage["owner_kind"],
+                wait=True,
+            )
+            await self._retained_storage().probe(workspace_storage)
+        else:
+            rootdisk_pvc_uid = await self._rootdisk_pvc_uid(
+                _rootdisk_name(job_id),
+                owner_id=job_id,
+                owner_kind=owner_kind,
+                wait=True,
+            )
 
         log.info("VM created: %s (job %s)", vm_name, job_id)
 
@@ -1392,6 +1436,11 @@ class VMController:
             result["ssh_host_key_fingerprint"] = ssh_host_key_fingerprint
         if rootdisk_pvc_uid is not None:
             result["rootdisk_pvc_uid"] = rootdisk_pvc_uid
+        if workspace_storage is not None:
+            result["workspace_storage"] = {
+                **workspace_storage,
+                "pvc_uid": rootdisk_pvc_uid,
+            }
         return result
 
     async def _do_delete(
@@ -1401,6 +1450,7 @@ class VMController:
         provision_generation: str | None = None,
         expected_vm_uid: str | None = None,
         expected_rootdisk_pvc_uid: str | None = None,
+        workspace_storage: dict | None = None,
     ) -> dict:
         """Delete a KubeVirt VirtualMachine for a job.
 
@@ -1415,6 +1465,11 @@ class VMController:
                 provision_generation=provision_generation,
                 expected_vm_uid=expected_vm_uid,
                 expected_rootdisk_pvc_uid=expected_rootdisk_pvc_uid,
+                **(
+                    {"workspace_storage": workspace_storage}
+                    if workspace_storage is not None
+                    else {}
+                ),
             )
 
     async def _do_delete_serialized(
@@ -1424,6 +1479,7 @@ class VMController:
         provision_generation: str | None = None,
         expected_vm_uid: str | None = None,
         expected_rootdisk_pvc_uid: str | None = None,
+        workspace_storage: dict | None = None,
     ) -> dict:
         """Delete while holding the reusable entity-name lifecycle lock.
 
@@ -1491,11 +1547,29 @@ class VMController:
                     raise RuntimeError("refusing to delete a superseded VM UID")
 
         rootdisk = _rootdisk_name(job_id)
+        rootdisk_owner = job_id
+        if workspace_storage is not None:
+            from shared.vm_workspace_storage import storage_binding, storage_name
+
+            workspace_storage = storage_binding(workspace_storage)
+            if not vm_already_absent:
+                self._retained_storage().verify_vm(
+                    current_vm, workspace_storage, job_id
+                )
+            await self._retained_storage().probe(workspace_storage)
+            rootdisk = storage_name(workspace_storage)
+            rootdisk_owner = workspace_storage["owner_id"]
+            purge_disk = False
+        elif not vm_already_absent and generation is not None:
+            from shared.vm_workspace_storage import WORKSPACE_LABEL
+
+            if current_vm.get("metadata", {}).get("labels", {}).get(WORKSPACE_LABEL):
+                raise RuntimeError("Retained VM deletion requires its storage binding.")
         captured_rootdisk_absent = False
         if expected_rootdisk_pvc_uid is not None:
             rootdisk_known, observed_rootdisk_uid = await self._rootdisk_pvc_probe(
                 rootdisk,
-                owner_id=job_id,
+                owner_id=rootdisk_owner,
                 owner_kind=None,
                 wait=False,
             )
@@ -1559,7 +1633,7 @@ class VMController:
                 ):
                     await self._delete_captured_rootdisk(
                         rootdisk,
-                        owner_id=job_id,
+                        owner_id=rootdisk_owner,
                         expected_pvc_uid=expected_rootdisk_pvc_uid,
                     )
                 elif not captured_rootdisk_absent:
@@ -1650,11 +1724,22 @@ class VMController:
         provision_generation: str | None = None,
         *,
         exact_absence: bool = False,
+        workspace_storage: dict | None = None,
     ) -> dict:
         """Query KubeVirt for a VM's current status."""
         from kubernetes.client.exceptions import ApiException
 
         vm_name = f"agent-vm-{job_id}"
+        rootdisk, rootdisk_owner = _rootdisk_name(job_id), job_id
+        if workspace_storage is not None:
+            from shared.vm_workspace_storage import storage_binding, storage_name
+
+            workspace_storage = storage_binding(workspace_storage)
+            await self._retained_storage().probe(workspace_storage)
+            rootdisk, rootdisk_owner = (
+                storage_name(workspace_storage),
+                workspace_storage["owner_id"],
+            )
         try:
             vm = await asyncio.to_thread(
                 self.k8s_client.get_namespaced_custom_object,
@@ -1668,11 +1753,16 @@ class VMController:
             if exc.status != 404 or not exact_absence:
                 raise
             rootdisk_known, rootdisk_uid = await self._rootdisk_pvc_probe(
-                _rootdisk_name(job_id),
-                owner_id=job_id,
+                rootdisk,
+                owner_id=rootdisk_owner,
                 owner_kind=None,
                 wait=False,
             )
+            if (
+                workspace_storage is not None
+                and not await self._retained_storage().unused(workspace_storage)
+            ):
+                rootdisk_known = False
             return {
                 "job_id": job_id,
                 "status": "not_found",
@@ -1684,6 +1774,8 @@ class VMController:
                     else {}
                 ),
             }
+        if workspace_storage is not None:
+            self._retained_storage().verify_vm(vm, workspace_storage, job_id)
         status = vm.get("status", {})
         metadata = vm.get("metadata", {})
         labels = metadata.get("labels", {}) if isinstance(metadata, Mapping) else {}
@@ -1727,6 +1819,7 @@ class VMController:
         else:
             vmi_observed = True
             vmi_status = vmi.get("status", {})
+            result["vmi_phase"] = vmi_status.get("phase")
             interfaces = vmi_status.get("interfaces") or []
             pod_ip = interfaces[0].get("ipAddress") if interfaces else None
             active_pods = vmi_status.get("activePods") or {}
@@ -1751,8 +1844,8 @@ class VMController:
         )
         if exact_absence:
             rootdisk_known, rootdisk_pvc_uid = await self._rootdisk_pvc_probe(
-                _rootdisk_name(job_id),
-                owner_id=job_id,
+                rootdisk,
+                owner_id=rootdisk_owner,
                 owner_kind=None,
                 wait=False,
             )
@@ -1761,8 +1854,8 @@ class VMController:
             # Preserve the ordinary status response/call shape.  Only the
             # explicit teardown probe may publish an authenticated absence bit.
             rootdisk_pvc_uid = await self._rootdisk_pvc_uid(
-                _rootdisk_name(job_id),
-                owner_id=job_id,
+                rootdisk,
+                owner_id=rootdisk_owner,
                 owner_kind=None,
                 wait=False,
             )
@@ -2296,6 +2389,12 @@ class VMController:
         max_age_minutes = VM_ROOTDISK_ORPHAN_HOURS * 60
         for dv in disks:
             name = (dv.get("metadata") or {}).get("name", "")
+            if (
+                (dv.get("metadata") or {})
+                .get("labels", {})
+                .get("srw.io/workspace-instance")
+            ):
+                continue
             if not name.endswith("-rootdisk"):
                 continue
             if name[: -len("-rootdisk")] in live:
@@ -2674,6 +2773,11 @@ class VMController:
                 "purge_disk": purge_disk,
                 "provision_generation": request.query.get("provision_generation"),
                 **(
+                    {"workspace_storage": request.query["workspace_storage"]}
+                    if "workspace_storage" in request.query
+                    else {}
+                ),
+                **(
                     {"expected_vm_uid": request.query.get("expected_vm_uid")}
                     if request.query.get("expected_vm_uid") is not None
                     else {}
@@ -2708,6 +2812,10 @@ class VMController:
                 delete_kwargs["expected_rootdisk_pvc_uid"] = request_payload[
                     "expected_rootdisk_pvc_uid"
                 ]
+            if request_payload.get("workspace_storage") is not None:
+                delete_kwargs["workspace_storage"] = json.loads(
+                    request_payload["workspace_storage"]
+                )
             result = await self._do_delete(job_id, **delete_kwargs)
             return web.json_response(
                 sign_payload(
@@ -2756,6 +2864,11 @@ class VMController:
             {
                 "job_id": job_id,
                 "provision_generation": request.query.get("provision_generation"),
+                **(
+                    {"workspace_storage": request.query["workspace_storage"]}
+                    if "workspace_storage" in request.query
+                    else {}
+                ),
                 **({"exact_absence": True} if exact_absence else {}),
             },
             operation="status",
@@ -2771,6 +2884,15 @@ class VMController:
                 job_id,
                 provision_generation=request_payload.get("provision_generation"),
                 exact_absence=request_payload.get("exact_absence") is True,
+                **(
+                    {
+                        "workspace_storage": json.loads(
+                            request_payload["workspace_storage"]
+                        )
+                    }
+                    if request_payload.get("workspace_storage") is not None
+                    else {}
+                ),
             )
             return web.json_response(
                 sign_payload(
@@ -2870,6 +2992,43 @@ class VMController:
                 status=500,
             )
 
+    async def http_release_workspace(self, request):
+        return await self._http_workspace_storage_action(request, "release-workspace")
+
+    async def http_detach_workspace(self, request):
+        return await self._http_workspace_storage_action(request, "detach-workspace")
+
+    async def _http_workspace_storage_action(self, request, operation):
+        from aiohttp import web
+        from kubernetes.client.exceptions import ApiException
+
+        payload = await request.json()
+        if LIFECYCLE_HMAC_SECRET is None or not await self._verify_lifecycle_request(
+            payload, operation, mutating=True
+        ):
+            return web.json_response({"error": "authentication failed"}, status=401)
+        request_id = _lifecycle_request_id(payload)
+        try:
+            action = (
+                self._retained_storage().delete
+                if operation == "release-workspace"
+                else self._retained_storage().detach
+            )
+            complete = await action(payload.get("workspace_storage"))
+            result, status = {"deleted": complete}, 200
+        except (ValueError, RuntimeError, ApiException) as exc:
+            result, status = {"error": str(exc)}, 409
+        return web.json_response(
+            sign_payload(
+                result,
+                direction="response",
+                operation=operation,
+                secret=LIFECYCLE_HMAC_SECRET,
+                correlation_id=request_id,
+            ),
+            status=status,
+        )
+
     async def http_health(self, _request):
         """GET /healthz — liveness probe target."""
         from aiohttp import web
@@ -2910,6 +3069,8 @@ class VMController:
 
         app = web.Application()
         app.router.add_post("/vms", self.http_create)
+        app.router.add_post("/workspace-disks/release", self.http_release_workspace)
+        app.router.add_post("/workspace-disks/detach", self.http_detach_workspace)
         app.router.add_get("/vms", self.http_list)
         app.router.add_delete("/vms/{job_id}", self.http_delete)
         app.router.add_get("/vms/{job_id}", self.http_status)

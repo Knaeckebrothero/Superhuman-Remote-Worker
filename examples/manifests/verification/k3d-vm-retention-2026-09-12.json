@@ -1,0 +1,117 @@
+{
+  "date": "2026-09-12",
+  "result": "passed",
+  "branch": "feat/workspace-preparation",
+  "baseCommit": "ba40cecda",
+  "scope": {
+    "cluster": "k3d-srw",
+    "namespace": "srw-retained-gate-0912",
+    "backend": "KubeVirt VM",
+    "controllerTransport": "authenticated HTTP with durable nonce claims",
+    "database": "isolated PostgreSQL 15",
+    "guestImage": "srw-registry:5000/srw-agent-vm-base:sha-7d3ec47",
+    "jobCompletion": "test-driven terminal Job status followed by production process retirement and VM teardown",
+    "manualReadinessRearm": false
+  },
+  "events": [
+    {
+      "event": "isolated_golden_clone_requested"
+    },
+    {
+      "event": "manifest_admitted_and_frozen",
+      "case": "retained-first",
+      "job_id": "13d2bbfb-1cee-428b-9170-3fd9042120af"
+    },
+    {
+      "event": "readiness",
+      "job_id": "13d2bbfb-1cee-428b-9170-3fd9042120af",
+      "status": "created",
+      "initialization_phase": null
+    },
+    {
+      "event": "readiness",
+      "job_id": "13d2bbfb-1cee-428b-9170-3fd9042120af",
+      "status": "ready",
+      "initialization_phase": "Succeeded"
+    },
+    {
+      "event": "concurrent_job_attachment_refused",
+      "workspace_id": "8fc2f55d-5045-4979-918c-32052b0b8ad5"
+    },
+    {
+      "event": "first_job_retired_and_disk_detached",
+      "same_pvc": true,
+      "guest_authority_revoked": true
+    },
+    {
+      "event": "readiness",
+      "job_id": "c5af0017-098e-428a-a358-6fcfd73f0080",
+      "status": "created",
+      "initialization_phase": null
+    },
+    {
+      "event": "readiness",
+      "job_id": "c5af0017-098e-428a-a358-6fcfd73f0080",
+      "status": "ready",
+      "initialization_phase": "Succeeded"
+    },
+    {
+      "event": "second_job_reuses_disk_and_completed_initialization",
+      "different_job": true,
+      "same_pvc": true,
+      "new_vm_uid": true,
+      "new_ssh_host_key": true,
+      "setup_count": 1,
+      "files_preserved": true
+    },
+    {
+      "event": "stale_recreate_stale_delete_and_attached_delete_refused"
+    },
+    {
+      "event": "explicit_exact_generation_deletion_completed"
+    },
+    {
+      "event": "manifest_admitted_and_frozen",
+      "case": "cancelled-before-allocation",
+      "job_id": "88f828b3-1aba-4bc9-b6b1-dba098001326"
+    },
+    {
+      "event": "cancel_before_allocation_closes_late_create"
+    },
+    {
+      "event": "gate_passed"
+    }
+  ],
+  "additionalVerification": {
+    "finalTransportProvenance": "Both real gate Job records matched their durable reservations and PVC/namespace identity; both guest authorities were closed.",
+    "postgresql": "Atomic reservation, concurrent admission, rollback, scope checks, stale selections, Session rejection, deletion-response loss and forged-context rejection passed.",
+    "regressions": "47-file run: 1356 passed; two packaging assertions updated for the added shared module and passed on rerun.",
+    "focusedSuites": {
+      "workspaceAuthReadinessAndStorage": 280,
+      "deletionAndProvisioning": 121,
+      "controllerAndStorage": 211,
+      "finalAuthority": 112,
+      "finalRetainedPostgres": 12
+    },
+    "imports": "22 contracts kept",
+    "ruff": "passed",
+    "helm": "test-values and customer-external-values lint passed",
+    "migration": "Squawk: zero findings; migration replay and generated app schema freshness check passed",
+    "controllerImage": "Production Python 3.12.14 image build and retained-storage imports passed",
+    "examples": "Both new YAML examples passed packaged manifest preview validation"
+  },
+  "limits": [
+    "No LLM execution or full nested SRW/k3d/Tilt deployment in this gate.",
+    "Headscale was disabled in the local fixture.",
+    "Retained VM instances are available to SRW Jobs; cross-execution Session instance selection is rejected.",
+    "General environment.prepare builds and preparation cache publication remain unsupported.",
+    "The earlier main-dev large-image timeout report is not diagnosed by this gate."
+  ],
+  "cleanup": {
+    "ownedNamespaceRemoved": true,
+    "ownedDatabaseAndDriverRemoved": true,
+    "originalSharedGoldenPreserved": true,
+    "privateCredentialsAndKubeconfigCopyRemoved": true
+  },
+  "deployment": "No feature push, main-dev rollout, or primary Tilt changes performed."
+}

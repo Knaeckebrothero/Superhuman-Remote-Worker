@@ -370,12 +370,26 @@ class VMProvisioner:
             updates["ssh_host_key_fingerprint"] = fingerprint
         if type(data.get("credential_runtime_started")) is bool:
             updates["credential_runtime_started"] = data["credential_runtime_started"]
-        return await self._set_context_if_generation(
+        merged = await self._set_context_if_generation(
             entity_type,
             entity_id,
             generation,
             updates,
         )
+
+        if merged and entity_type == "job" and root_uid is not None:
+            binding = await self._storage_context(entity_id)
+            if binding is not None:
+                from orchestrator.services.retained_vm_workspaces import record_created
+
+                await record_created(
+                    self._db,
+                    entity_id,
+                    binding,
+                    root_uid,
+                    namespace=data.get("namespace"),
+                )
+        return merged
 
     # =========================================================================
     # Lifecycle
@@ -658,6 +672,107 @@ class VMProvisioner:
             launcher_pod_uid=launcher_uid,
         )
 
+    async def _storage_context(self, job_id):
+        if self._db is None or not callable(getattr(self._db, "get_job", None)):
+            return None
+        job = await self._db.get_job(job_id)
+        if not isinstance(job, Mapping):
+            return None
+        value = _extract_vm_context(job).get("workspace_storage")
+        if value is None:
+            return None
+        from shared.vm_workspace_storage import storage_binding
+
+        binding = storage_binding(value)
+        # Context carries transport data, not the right to select a disk. Prove
+        # this Job's durable reservation before signing any storage reference.
+        row = await self._db.fetchrow(
+            """SELECT i.generation,i.pvc_uid,i.backend_state FROM srw_execution_specs s
+            JOIN srw_execution_workspace_bindings b ON b.execution_id=s.id
+            JOIN srw_workspace_instances i ON i.id=b.instance_id
+            WHERE s.work_kind='Job' AND s.work_id=$1 AND i.id=$2 AND i.recipe->>'backend'='vm'""",
+            UUID(str(job_id)),
+            UUID(binding["uid"]),
+        )
+        from orchestrator.services.retained_vm_workspaces import object_value
+
+        recorded = object_value(row["backend_state"]).get("storage", {}) if row else {}
+        if (
+            not row
+            or binding["generation"] > row["generation"]
+            or any(
+                binding[key] != recorded.get(key)
+                for key in ("uid", "owner_id", "owner_kind")
+            )
+        ):
+            raise ValueError(
+                "VM context lacks retained workspace reservation authority."
+            )
+        # The authenticated response pins the PVC after its first allocation.
+        uid = _extract_vm_context(job).get("rootdisk_pvc_uid")
+        if uid:
+            binding["pvc_uid"] = uid
+        if (
+            row["pvc_uid"]
+            and binding["pvc_uid"]
+            and row["pvc_uid"] != binding["pvc_uid"]
+        ):
+            raise ValueError(
+                "Retained VM context has a different captured PVC identity."
+            )
+        binding["pvc_uid"] = row["pvc_uid"] or binding["pvc_uid"]
+        return storage_binding(binding)
+
+    async def release_workspace_storage(self, binding):
+        return await self._workspace_storage_action(binding, "release-workspace")
+
+    async def _workspace_storage_action(self, binding, operation):
+        from shared.vm_workspace_storage import storage_binding
+
+        if not self._http_available or self._lifecycle_hmac_secret is None:
+            return False
+        payload = sign_payload(
+            {"workspace_storage": storage_binding(binding)},
+            direction="request",
+            operation=operation,
+            secret=self._lifecycle_hmac_secret,
+        )
+        response = await self._http_client.post(
+            "/workspace-disks/"
+            + ("release" if operation == "release-workspace" else "detach"),
+            json=payload,
+        )
+        data = response.json()
+        if not isinstance(data, Mapping) or not verify_payload(
+            data,
+            direction="response",
+            operation=operation,
+            secret=self._lifecycle_hmac_secret,
+            expected_correlation_id=payload[AUTH_FIELD]["request_id"],
+        ):
+            return False
+        response.raise_for_status()
+        return data.get("deleted") is True
+
+    async def _record_retained_detach(self, job_id, binding):
+        if binding is not None:
+            job = await self._db.get_job(job_id)
+            if not job or job["status"] not in {"completed", "failed", "cancelled"}:
+                return
+            pending = await self._db.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM srw_workspace_instances i JOIN srw_execution_specs s ON s.id=i.execution_id WHERE i.id=$1 AND i.generation=$2 AND i.status IN ('Reserved','Attached') AND s.work_kind='Job' AND s.work_id=$3)",
+                UUID(binding["uid"]),
+                binding["generation"],
+                UUID(str(job_id)),
+            )
+            if not pending or not await self._workspace_storage_action(
+                binding, "detach-workspace"
+            ):
+                return
+            from orchestrator.services.retained_vm_workspaces import record_detached
+
+            await record_detached(self._db, job_id, binding)
+
     async def create_vm(
         self,
         job_id: str,
@@ -669,6 +784,7 @@ class VMProvisioner:
         fresh: bool = True,
         disk_size: Optional[str] = None,
         initialization: dict | None = None,
+        workspace_storage: dict | None = None,
     ) -> bool | dict[str, Any]:
         """Create a VM for a job.
 
@@ -696,6 +812,17 @@ class VMProvisioner:
             The controller response when HTTP accepted the request, otherwise
             the transport's boolean acknowledgement.
         """
+        if workspace_storage is not None:
+            from orchestrator.services.retained_vm_workspaces import provision_binding
+            from shared.vm_workspace_storage import storage_binding
+
+            workspace_storage = storage_binding(workspace_storage)
+            if self.mode != "same-cluster" or self._lifecycle_hmac_secret is None:
+                raise ValueError(
+                    "Retained workspaces require authenticated same-cluster VM hosting."
+                )
+            if await provision_binding(self._db, job_id) != workspace_storage:
+                raise ValueError("Retained workspace attachment authority changed.")
         if initialization is not None:
             from shared.workspace_initialization import validate_initialization_request
 
@@ -721,6 +848,7 @@ class VMProvisioner:
             fresh_context = self._fresh_provision_ctx()
             fresh_context.update(
                 initialization=initialization,
+                workspace_storage=workspace_storage,
                 initialization_receipt=None,
                 initialization_started_at=None,
             )
@@ -756,6 +884,11 @@ class VMProvisioner:
                 cpu_cores=cpu_cores,
                 memory=memory,
                 disk_size=disk_size,
+                **(
+                    {"workspace_storage": workspace_storage}
+                    if workspace_storage is not None
+                    else {}
+                ),
                 **(
                     {"initialization": initialization}
                     if initialization is not None
@@ -1007,6 +1140,9 @@ class VMProvisioner:
     ) -> VMTeardownResult:
         """Delete only the VM/rootdisk incarnation captured in an intent."""
 
+        binding = await self._storage_context(job_id) if entity_type == "job" else None
+        if binding is not None:
+            purge_disk = False
         generation = _provision_generation(identity.provision_generation)
         if generation is None:
             return VMTeardownResult("identity_invalid", False)
@@ -1035,6 +1171,7 @@ class VMProvisioner:
         if classification == "superseded":
             return VMTeardownResult("identity_superseded", False)
         if classification == "completed":
+            await self._record_retained_detach(job_id, binding)
             return VMTeardownResult("completed", True)
         if classification != "matched":
             return VMTeardownResult("identity_unknown", False)
@@ -1051,6 +1188,7 @@ class VMProvisioner:
             reprobe, identity, purge_disk=purge_disk
         )
         if reclassification == "completed":
+            await self._record_retained_detach(job_id, binding)
             return VMTeardownResult("completed", True)
         if reclassification == "superseded":
             return VMTeardownResult("identity_superseded", False)
@@ -1133,6 +1271,9 @@ class VMProvisioner:
     ) -> VMTeardownResult:
         """Best-effort archive, then release only the captured VM incarnation."""
 
+        binding = await self._storage_context(job_id) if entity_type == "job" else None
+        if binding is not None:
+            purge_disk = False
         generation = _provision_generation(identity.provision_generation)
         if generation is None:
             return VMTeardownResult("identity_invalid", False)
@@ -1173,6 +1314,8 @@ class VMProvisioner:
                     runtime_incarnation=generation,
                 )
             )
+            if contained:
+                await self._record_retained_detach(job_id, binding)
             return VMTeardownResult(
                 "completed" if contained else "process_zero_unproven",
                 contained,
@@ -1643,6 +1786,7 @@ class VMProvisioner:
         provision_generation: str | None = None,
         disk_size: Optional[str] = None,
         initialization: dict | None = None,
+        workspace_storage: dict | None = None,
     ) -> bool | dict[str, Any]:
         """Create a VM by POSTing to the co-located VM controller.
 
@@ -1680,6 +1824,8 @@ class VMProvisioner:
         }
         if orchestrator_url := os.getenv("ORCHESTRATOR_URL"):
             payload["orchestrator_url"] = orchestrator_url
+        if workspace_storage is not None:
+            payload["workspace_storage"] = workspace_storage
         if disk_size:
             payload["disk_size"] = disk_size
         if initialization is not None:
@@ -1739,6 +1885,15 @@ class VMProvisioner:
                 )
             resp.raise_for_status()
             data = unsigned_payload(data)
+            if workspace_storage is not None and data.get("status") == "created":
+                expected_storage = {
+                    **workspace_storage,
+                    "pvc_uid": data.get("rootdisk_pvc_uid"),
+                }
+                if data.get("workspace_storage") != expected_storage:
+                    raise RuntimeError(
+                        "VM controller did not attest the retained workspace binding."
+                    )
 
             updates = {
                 "status": data.get("status", "created"),
@@ -1802,6 +1957,22 @@ class VMProvisioner:
                     response_generation,
                     {**updates, **identity_updates},
                 )
+                if (
+                    merged
+                    and workspace_storage is not None
+                    and identity_updates.get("rootdisk_pvc_uid")
+                ):
+                    from orchestrator.services.retained_vm_workspaces import (
+                        record_created,
+                    )
+
+                    await record_created(
+                        self._db,
+                        job_id,
+                        workspace_storage,
+                        identity_updates["rootdisk_pvc_uid"],
+                        namespace=data.get("namespace"),
+                    )
                 if not merged:
                     if self._lifecycle_hmac_secret is not None:
                         logger.warning(
@@ -1926,6 +2097,12 @@ class VMProvisioner:
             params["expected_vm_uid"] = expected_vm_uid
         if expected_rootdisk_pvc_uid is not None:
             params["expected_rootdisk_pvc_uid"] = expected_rootdisk_pvc_uid
+        binding = await self._storage_context(job_id)
+        if binding is not None:
+            signed_payload["workspace_storage"] = json.dumps(
+                binding, sort_keys=True, separators=(",", ":")
+            )
+            params["workspace_storage"] = signed_payload["workspace_storage"]
         params.update(
             _http_lifecycle_query(
                 signed_payload,
@@ -2006,6 +2183,12 @@ class VMProvisioner:
         if exact_absence:
             signed_payload["exact_absence"] = True
             params["exact_absence"] = "true"
+        binding = await self._storage_context(job_id)
+        if binding is not None:
+            signed_payload["workspace_storage"] = json.dumps(
+                binding, sort_keys=True, separators=(",", ":")
+            )
+            params["workspace_storage"] = signed_payload["workspace_storage"]
         params.update(
             _http_lifecycle_query(
                 signed_payload,

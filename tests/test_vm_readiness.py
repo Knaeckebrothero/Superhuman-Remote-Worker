@@ -811,14 +811,17 @@ async def test_scan_presented_wrong_key_is_identity_mismatch(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("vmi", [None, "Pending", "Scheduling", "Scheduled"])
 async def test_initial_stopped_vm_keeps_probing_while_its_disk_is_allocating(
     successful_ssh,
+    vmi,
 ):
     provisioner = FakeProvisioner(
         {
             "ready": False,
             "phase": "Stopped",
-            "credential_runtime_started": False,
+            "credential_runtime_started": vmi is not None,
+            "vmi_phase": vmi,
         }
     )
     await VMReadinessService(

@@ -113,7 +113,6 @@ async def test_initialization_uses_the_frozen_template_after_source_edits(
         {"environment": {"image": IMAGE, "pullPolicy": "Always"}},
         {"environment": {"image": IMAGE, "pullPolicy": "Never"}},
         {"environment": {"image": IMAGE, "cache": "Rebuild"}},
-        {"retention": "Retain"},
     ],
 )
 def test_unsupported_vm_recipes_are_refused_instead_of_partially_applied(changes):

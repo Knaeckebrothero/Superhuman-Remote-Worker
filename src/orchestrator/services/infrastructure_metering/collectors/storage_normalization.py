@@ -53,6 +53,7 @@ ALLOWED_STORAGE_LABELS = frozenset(
         "srw.io/owner-kind",
         "srw.io/owner-id",
         "srw.io/rootdisk",
+        "srw.io/workspace-instance",
         "srw.io/golden-image",
         "srw.io/vm-image",
         "topology.kubernetes.io/region",

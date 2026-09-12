@@ -76,14 +76,14 @@ configuration edits and End/Resume. Unattended Project loops, automations and
 Officer dispatch also resolve the Project workspace before connector selection.
 
 The SRW provisioner accepts backend-only templates and prebuilt VM templates
-with `Delete` retention. VM templates can select `environment.image` and
+with `Delete` retention, plus retained same-cluster VM instances for Jobs.
+VM templates can select `environment.image` and
 `resources.cpu`, `memory`, and `storage`. CPUs must be whole cores; the disk
 request is raised to the controller's rootdisk minimum when necessary.
 `IfNotPresent`/`Reuse` uses the controller's existing disk import/clone behavior.
 Use immutable image digests: an existing cached golden disk is keyed by the full
 image reference, so changing the contents behind a tag does not invalidate it.
-Other pull/cache policies, preparation builds, retained instances and
-`instanceRef` remain unsupported. Image/resource settings on the SRW sandbox
+Other pull/cache policies and preparation builds remain unsupported. Image/resource settings on the SRW sandbox
 and virtual backends are also rejected instead of discarded.
 
 Same-cluster SRW VM templates also accept ordered `initialize` commands. See
@@ -116,13 +116,56 @@ recipe/owner identity, phase, step and exit code.
 Successful setup is skipped when the same Job or Session resumes on the same
 persistent rootdisk. Enable the installation's existing persistent-rootdisk
 support for that guarantee across VM replacement. A fresh disk runs setup again.
-Interrupted steps may replay on restart, so commands must be idempotent. This
-does not implement `Retain` or reuse of one instance across separate Jobs.
+Interrupted steps may replay on restart, so commands must be idempotent.
 
-The [2026-09-12 k3d verification](verification/k3d-vm-initialization-2026-09-12.json)
+For reuse by separate SRW Jobs, select `retention: Retain`. The
+[first assignment example](srw-retained-development-vm.yaml) creates a VM instance;
+the [next assignment example](srw-retained-job.yaml) selects its `instanceRef`.
+Read `workspace_instance_id` from `GET /api/jobs/{id}`, or `status.workspace.uid`
+from the canonical Job resource. Wait for `GET /api/workspace-instances/{uid}`
+to report `Detached` before submitting a different Job with that UID.
+Reapplying a completed Job does not replay it.
+
+Each template allocation gets a fresh instance. Only an explicit `instanceRef`
+reuses one, within its original Account or Project scope and after current access
+checks. The reservation is exclusive and part of Job admission. The instance's
+recipe stays frozen: changing its source template does not rebuild an existing
+disk. Jobs using this SRW adapter still have Reported completion and one attempt.
+
+A completed Job releases its disk only after managed process retirement and proof
+that its VM, VMI and launcher no longer reference the disk. A durable attachment
+fence rejects delayed requests from the prior Job. The next Job gets a fresh VM,
+SSH host key and guest token, with current connector/grant resolution. The PVC
+and successful initialization receipt remain the same. Retained files can include
+previously saved credentials; `connectors: {}` does not erase filesystem contents.
+
+Normal VM teardown and orphan sweeps preserve retained disks. Delete one explicitly
+with `DELETE /api/workspace-instances/{uid}?expected_generation=N`, using the
+current generation returned by GET. A response with `deleted: false` requires a
+retry; `Deleting` remains reserved even if a controller response is lost.
+Deletion verifies the captured PVC identity and refuses active attachments.
+A cancelled Job that never allocated a disk can also release its reservation
+through this endpoint. Storage remains attributed to the workspace's Account or
+Project after the original Job is deleted.
+
+Retained VM hosting requires `VM_MODE=same-cluster`, persistent rootdisks, signed
+lifecycle transport and the Secret-backed cloud-init template. Keep the chart's
+single VM controller and `Recreate` rollout strategy. Apply the database migration
+and updated controller/RBAC before admitting retained recipes. The controller
+keeps a small Lease tombstone for released workspace identities to reject delayed
+creates. VM instances are supported by the installed SRW harness adapter; generic
+harnesses continue to use the separate sandbox workspace provider. Sessions retain
+their own disk through suspend/resume; selecting a retained VM instance for a
+Session is explicitly rejected in this increment.
+
+The [initialization verification](verification/k3d-vm-initialization-2026-09-12.json)
 exercised real VM initialization, failed setup and disk-preserving recreation
 through production admission, provisioning, retirement and readiness services.
-It did not execute an LLM job or deploy the full SRW stack inside that workspace.
+The [retention verification](verification/k3d-vm-retention-2026-09-12.json) also
+passed on real k3d VMs: two separate Jobs reused the same PVC and initialized once,
+with new VM/SSH host identities, stale-operation rejection and explicit deletion.
+Both gates drove terminal Job status through a test fixture; neither executed an
+LLM job or deployed the full SRW stack inside that workspace.
 
 [srw-development-vm.yaml](srw-development-vm.yaml) selects a published VM image
 with Docker Engine, Compose, Buildx, kubectl, Helm, k3d, Tilt, mkcert, Python,
@@ -426,11 +469,11 @@ explicit `{}` rule allows all egress. CIDR exclusions must be strictly contained
 subnets. Configuring egress does not enable generic hosting or waive the separate
 startup-isolation verification requirement.
 
-Workspace preparation/cache builds, authored network profiles and native VM/virtual
-hosting currently fail admission explicitly. The reference SRW adapter keeps its
+Workspace preparation/cache builds, authored network profiles and VM/virtual
+workspaces for generic harnesses currently fail admission explicitly. The reference SRW adapter keeps its
 existing workspace provisioner (backend selection, prebuilt VM images/resources,
-same-cluster VM initialization, Reported completion, one attempt). Its retained-instance
-bindings remain unsupported. Custom initialized/retained sandbox recipes use generic hosting. Existing
+same-cluster VM initialization and retained Job instances, Reported completion,
+one attempt). Custom initialized/retained sandbox recipes use generic hosting. Existing
 Officer kit/policy updates publish an atomic Project revision; automatic team
 commissioning and new generic team controllers remain future capabilities.
 

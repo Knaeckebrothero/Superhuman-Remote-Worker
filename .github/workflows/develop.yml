@@ -841,7 +841,7 @@ jobs:
           MCP_PATHS=(src/mcp_server/ src/shared/ pyproject.toml
             .dockerignore docker/Dockerfile.mcp)
           VM_CONTROLLER_PATHS=(src/vm_controller/ src/shared/__init__.py
-            src/shared/vm_lifecycle_auth.py src/shared/workspace_initialization.py pyproject.toml
+            src/shared/vm_lifecycle_auth.py src/shared/workspace_initialization.py src/shared/vm_workspace_storage.py pyproject.toml
             .dockerignore docker/Dockerfile.vm-controller
             scripts/check_kubernetes_sdk_auth.py requirements/ scripts/lock_dependencies.py)
           # docker/browser-exec is COPY'd into the workspace image at build time

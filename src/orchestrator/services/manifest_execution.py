@@ -116,11 +116,25 @@ class ManifestExecutionService:
                         422, "Datasource connectors require config.datasourceId."
                     ) from None
         workspace = execution["workspace"]
+        instance_recipe = None
+        if adapter == "srw/v1" and workspace and "instanceRef" in workspace:
+            from orchestrator.services.retained_vm_workspaces import read_instance
+
+            instance = await read_instance(
+                self.db,
+                workspace["instanceRef"]["uid"],
+                user,
+                project_id=project_id,
+                request=request,
+            )
+            instance_recipe = instance["recipe"]
         backend = (
             workspace.get("template", {}).get("inline", {}).get("backend")
             if workspace
             else "none"
         )
+        if instance_recipe is not None:
+            backend = instance_recipe["backend"]
         if adapter == "srw/v1" and backend == "vm":
             from orchestrator.services.vm_workspace_policy import (
                 VmPermissionDependencies,
@@ -166,7 +180,11 @@ class ManifestExecutionService:
                 srw_workspace_config,
             )
 
-            config_override = {"workspace": srw_workspace_config(workspace)}
+            config_override = {
+                "workspace": srw_workspace_config(
+                    workspace, instance_recipe=instance_recipe
+                )
+            }
             if (
                 spec["completion"]["mode"] != "Reported"
                 or spec["retry"]["maxAttempts"] != 1
@@ -346,6 +364,8 @@ class ManifestExecutionService:
         )
 
     async def reconcile(self):
+        if self.workspace:
+            await self.workspace.reconcile_vm_detach()
         if self.cancel_srw:
             overdue = await self.db.fetch("""SELECT j.id FROM srw_execution_specs s JOIN jobs j ON s.work_kind='Job' AND s.work_id=j.id
                 WHERE s.harness_adapter='srw/v1' AND s.resource_id IS NOT NULL AND j.status IN ('created','processing')

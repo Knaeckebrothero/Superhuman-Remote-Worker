@@ -228,10 +228,13 @@ class VMReadinessService:
         if (
             phase.lower() == "stopped"
             and not reprobe
-            and status.get("credential_runtime_started") is False
+            and (
+                status.get("credential_runtime_started") is False
+                or status.get("vmi_phase") in {"Pending", "Scheduling", "Scheduled"}
+            )
         ):
-            # KubeVirt briefly reports Stopped before the first VMI exists,
-            # including while CDI is allocating its disk. Keep this initial
+            # KubeVirt briefly reports Stopped before the first VMI runs,
+            # including with a Pending VMI while CDI allocates its disk. Keep this initial
             # allocation in the bounded boot loop, not outside the candidate
             # query as an unreachable formerly-running guest.
             await self._transient_failure(
@@ -333,7 +336,7 @@ class VMReadinessService:
                 request = validate_initialization_request(vm["initialization"])
                 previous = initialization_receipt(
                     vm.get("initialization_receipt"),
-                    owner_id=entity_id,
+                    owner_id=(vm.get("workspace_storage") or {}).get("uid", entity_id),
                     revision=request["revision"],
                 )
             except ValueError:
@@ -421,7 +424,7 @@ class VMReadinessService:
             try:
                 receipt = await read_vm_initialization(
                     initial_attestation,
-                    owner_id=entity_id,
+                    owner_id=(vm.get("workspace_storage") or {}).get("uid", entity_id),
                     request=vm["initialization"],
                 )
             except Exception:
