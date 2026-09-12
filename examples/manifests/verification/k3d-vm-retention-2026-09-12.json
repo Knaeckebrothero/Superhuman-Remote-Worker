@@ -98,7 +98,8 @@
     "helm": "test-values and customer-external-values lint passed",
     "migration": "Squawk: zero findings; migration replay and generated app schema freshness check passed",
     "controllerImage": "Production Python 3.12.14 image build and retained-storage imports passed",
-    "examples": "Both new YAML examples passed packaged manifest preview validation"
+    "examples": "Both new YAML examples passed packaged manifest preview validation",
+    "prePushMigrationSuite": "49 passed with PYTHONSAFEPATH=1 after advancing the migration-head test from 0242 to 0243; includes historical schema upgrade replay."
   },
   "limits": [
     "No LLM execution or full nested SRW/k3d/Tilt deployment in this gate.",

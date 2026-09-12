@@ -377,7 +377,7 @@ APP_INPUT_DELIVERY_CONSTRAINTS_NOT_VALID = (
 )
 APP_CURRENT_MIGRATION_HEAD = (
     ROOT
-    / "src/orchestrator/database/migrations/app/0242_rerank_rows_from_embedding_rows.sql"
+    / "src/orchestrator/database/migrations/app/0243_retained_vm_workspace_state.sql"
 )
 AUDIT_EXPANSION = (
     ROOT
