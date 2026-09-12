@@ -30,6 +30,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
+from uuid import uuid4
 
 from fastapi import HTTPException
 
@@ -268,9 +269,18 @@ async def accept_job_diff(
     try:
         backend = dependencies.cloud_router.for_project(project)
     except Exception as e:
+        error_ref = uuid4().hex[:12]
+        logger.exception(
+            "Mode A: job %s — cloud backend %r unavailable (error_ref=%s)",
+            job_id,
+            backend_id,
+            error_ref,
+        )
         raise HTTPException(
             status_code=503,
-            detail=f"Cloud backend '{backend_id}' unavailable: {e}",
+            detail=(
+                f"Cloud backend '{backend_id}' unavailable (error_ref={error_ref})"
+            ),
         ) from e
     if not backend.is_initialized:
         raise HTTPException(status_code=503, detail="Cloud backend not initialized.")
