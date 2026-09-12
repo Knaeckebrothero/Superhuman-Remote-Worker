@@ -110,7 +110,7 @@ async def reserve(db, snapshot):
         )
 
         _, policy = srw_snapshot_config(snapshot)
-        expected = srw_workspace_config({"template": {"inline": recipe}})
+        expected = srw_workspace_config(workspace, instance_recipe=recipe)
         if any(
             (policy.get("workspace") or {}).get(key) != value
             for key, value in expected.items()

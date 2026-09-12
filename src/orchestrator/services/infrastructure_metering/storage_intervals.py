@@ -326,6 +326,7 @@ def _classify_pvc(
             rootdisk_marker not in {None, "true"}
             or labels.get("srw.io/golden-image")
             or labels.get("srw.io/vm-image")
+            or labels.get("srw.io/preparation-disk")
         ):
             return (
                 "vm_rootdisk_claim",
@@ -387,6 +388,14 @@ def _classify_pvc(
             False,
         )
 
+    if labels.get("srw.io/preparation-disk"):
+        return (
+            "golden_image_pvc",
+            None,
+            _shared("workspace-preparation-cache"),
+            "workspace-preparation-cache",
+            False,
+        )
     if labels.get("srw.io/golden-image") or labels.get("srw.io/vm-image"):
         return (
             "golden_image_pvc",

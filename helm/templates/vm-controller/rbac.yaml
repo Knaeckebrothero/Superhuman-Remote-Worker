@@ -20,7 +20,11 @@ rules:
     verbs: ["get", "list", "create", "delete"]
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get", "list"]
+    # Keep reconciliation/retirement authority when new builds are disabled.
+    verbs: ["get", "list", "create", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "create", "update", "delete"]
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["create", "get", "delete", "patch"]

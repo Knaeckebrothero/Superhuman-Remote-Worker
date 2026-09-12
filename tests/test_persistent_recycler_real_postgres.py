@@ -9128,3 +9128,79 @@ async def test_two_desired_image_changes_chain_without_releasing_hold(db):
         "example.test/agent:sha-build-two",
         "example.test/agent:sha-build-three",
     ]
+
+
+@pytest.mark.asyncio
+async def test_preparation_stage_preserves_deadline_and_allows_session_end(db):
+    from orchestrator.services.vm_provisioner import VMProvisioner
+    from shared.workspace_preparation import preparation_request
+
+    ids = await _seed(db, bind_agent=False, publish_agent_pod=False)
+    before = await db.get_thread(ids["thread"])
+    runtime = str(before["runtime_generation"])
+    preparation = preparation_request(
+        {"image": "registry.example/base:v1", "prepare": []},
+        scope_kind="Account",
+        scope_uid=str(before["user_id"]),
+        allocation_id=ids["thread"],
+        owner_kind="session",
+        runtime_generation=runtime,
+    )
+    context = VMProvisioner._fresh_provision_ctx()
+    context.update(
+        status="provisioning",
+        preparation_request=preparation,
+        preparation_wait_started_at=123.0,
+    )
+    kwargs = dict(
+        expected_runtime_generation=runtime,
+        expected_agent_id=None,
+        expected_attach_token=None,
+    )
+    stage = await db.begin_pinned_thread_vm_provisioning(
+        ids["thread"],
+        expected_vm_context=None,
+        provision_context=context,
+        preparation_only=True,
+        **kwargs,
+    )
+    assert stage["preparation_only"] is True
+    metadata = _json((await db.get_thread(ids["thread"]))["metadata"])
+    assert not metadata.get("vm")
+    assert any(
+        r["entity_id"] == ids["thread"]
+        for r in await db.list_thread_vm_readiness_candidates()
+    )
+    assert (
+        await db.begin_pinned_thread_vm_provisioning(
+            ids["thread"],
+            expected_vm_context=None,
+            provision_context=context,
+            preparation_only=True,
+            **kwargs,
+        )
+        == stage
+    )
+    assert stage["preparation_wait_started_at"] == 123.0
+    assert await db.merge_thread_preparation_if_current(
+        ids["thread"], runtime, stage, {"preparation": {"phase": "Building"}}
+    )
+    retired = await db.begin_pinned_thread_retirement(ids["thread"], permanent=True)
+    assert retired["state"] == "pending"
+    assert not await db.begin_pinned_thread_vm_provisioning(
+        ids["thread"],
+        expected_vm_context=None,
+        provision_context=context,
+        preparation_only=True,
+        **kwargs,
+    )
+    assert not await db.merge_thread_preparation_if_current(
+        ids["thread"], runtime, stage, {"status": "ready"}
+    )
+    cancellations = await db.list_vm_preparation_cancellations()
+    assert any(r["entity_id"] == ids["thread"] for r in cancellations)
+    await db.acknowledge_vm_preparation_cancelled("thread", ids["thread"], preparation)
+    assert not any(
+        r["entity_id"] == ids["thread"]
+        for r in await db.list_vm_preparation_cancellations()
+    )

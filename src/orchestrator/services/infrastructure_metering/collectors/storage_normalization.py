@@ -56,6 +56,7 @@ ALLOWED_STORAGE_LABELS = frozenset(
         "srw.io/workspace-instance",
         "srw.io/golden-image",
         "srw.io/vm-image",
+        "srw.io/preparation-disk",
         "topology.kubernetes.io/region",
         "topology.kubernetes.io/zone",
         "failure-domain.beta.kubernetes.io/region",

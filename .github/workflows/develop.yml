@@ -585,6 +585,7 @@ jobs:
       vm-base: ${{ steps.check.outputs.vm-base }}
       vm-base-stage1: ${{ steps.check.outputs.vm-base-stage1 }}
       vm-controller: ${{ steps.check.outputs.vm-controller }}
+      vm-preparer: ${{ steps.check.outputs.vm-preparer }}
       workspace: ${{ steps.check.outputs.workspace }}
       # Per-component image identity: full sha of the newest commit that
       # touched the component's build inputs. Consumed by the build jobs
@@ -596,6 +597,7 @@ jobs:
       mcp-sha: ${{ steps.check.outputs.mcp-sha }}
       workspace-sha: ${{ steps.check.outputs.workspace-sha }}
       vm-controller-sha: ${{ steps.check.outputs.vm-controller-sha }}
+      vm-preparer-sha: ${{ steps.check.outputs.vm-preparer-sha }}
       vm-base-sha: ${{ steps.check.outputs.vm-base-sha }}
       vm-base-stage1-sha: ${{ steps.check.outputs.vm-base-stage1-sha }}
       chart: ${{ steps.check.outputs.chart }}
@@ -841,7 +843,8 @@ jobs:
           MCP_PATHS=(src/mcp_server/ src/shared/ pyproject.toml
             .dockerignore docker/Dockerfile.mcp)
           VM_CONTROLLER_PATHS=(src/vm_controller/ src/shared/__init__.py
-            src/shared/vm_lifecycle_auth.py src/shared/workspace_initialization.py src/shared/vm_workspace_storage.py pyproject.toml
+            src/shared/vm_lifecycle_auth.py src/shared/workspace_initialization.py src/shared/vm_workspace_storage.py src/shared/workspace_preparation.py
+            src/shared/workspace_preparation_settings.py pyproject.toml
             .dockerignore docker/Dockerfile.vm-controller
             scripts/check_kubernetes_sdk_auth.py requirements/ scripts/lock_dependencies.py)
           # docker/browser-exec is COPY'd into the workspace image at build time
@@ -854,6 +857,12 @@ jobs:
             docker/browser-exec docker/check-browser-stream.py
             docker/assert-browser-stack.sh
             .playwright-version .dockerignore)
+
+          VM_PREPARER_PATHS=(src/vm_controller/__init__.py src/vm_controller/preparation_builder.py
+            src/shared/__init__.py src/shared/workspace_initialization.py src/shared/workspace_preparation.py
+            pyproject.toml .dockerignore docker/Dockerfile.vm-preparer)
+          VM_PREPARER_SHA=$(last_input_sha "${VM_PREPARER_PATHS[@]}")
+          VM_PREPARER=$(image_missing vm-preparer "$VM_PREPARER_SHA")
 
           AGENT_SHA=$(last_input_sha "${AGENT_PATHS[@]}")
           AGENT=$(image_missing agent "$AGENT_SHA")
@@ -963,6 +972,8 @@ jobs:
             echo "workspace-sha=$WORKSPACE_SHA"
             echo "vm-controller=$VM_CONTROLLER"
             echo "vm-controller-sha=$VM_CONTROLLER_SHA"
+            echo "vm-preparer=$VM_PREPARER"
+            echo "vm-preparer-sha=$VM_PREPARER_SHA"
             echo "vm-base=$VM_BASE"
             echo "vm-base-sha=$VM_BASE_SHA"
             echo "vm-base-stage1=$VM_BASE_STAGE1"
@@ -1906,6 +1917,78 @@ jobs:
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-vm-controller:buildcache-develop
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-vm-controller:buildcache-develop,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
 
+  build-vm-preparer:
+    needs: [architecture, changes, dependency-audit, test-python, test-cockpit]
+    if: >-
+      needs.architecture.result == 'success' &&
+      always() && !cancelled() &&
+      (needs.changes.outputs.vm-preparer == 'true' || github.event_name == 'workflow_dispatch') &&
+      needs.dependency-audit.result == 'success' &&
+      needs.test-python.result != 'failure' && needs.test-python.result != 'cancelled' &&
+      needs.test-cockpit.result != 'failure' && needs.test-cockpit.result != 'cancelled'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: docker/setup-buildx-action@v3
+        with:
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+      - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Image identity = newest input commit, not push HEAD (see build-agent).
+      - name: Resolve component identity
+        id: ident
+        run: |
+          FULL="${{ needs.changes.outputs.vm-preparer-sha }}"
+          : "${FULL:?component identity is required}"
+          {
+            echo "full=$FULL"
+            echo "short=${FULL::7}"
+            echo "version=0.0.0-dev.sha-${FULL}"
+          } >> "$GITHUB_OUTPUT"
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-vm-preparer
+          tags: |
+            type=raw,value=sha-${{ steps.ident.outputs.short }}
+            type=raw,value=experimental,enable=${{ github.event_name != 'pull_request' }}
+      - name: Build${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.vm-preparer
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.source=${{ env.SRW_SOURCE_URL }}
+            org.opencontainers.image.revision=${{ steps.ident.outputs.full }}
+            org.opencontainers.image.version=${{ steps.ident.outputs.version }}
+            org.opencontainers.image.documentation=${{ env.SRW_DOCUMENTATION_URL }}
+            io.srw.component=vm-preparer
+          provenance: false
+          build-args: |
+            SRW_SOURCE_REVISION=${{ steps.ident.outputs.full }}
+            SRW_SOURCE_URL=${{ env.SRW_SOURCE_URL }}
+            SRW_RELEASE_VERSION=${{ steps.ident.outputs.version }}
+            SRW_DOCUMENTATION_URL=${{ env.SRW_DOCUMENTATION_URL }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-vm-preparer:buildcache-develop
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-vm-preparer:buildcache-develop,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
+
+
   # ---------------------------------------------------------------------------
   # Publish the dev Helm chart. The chart version (monotonic 0.0.<run_number>)
   # plus the baked image tags fully determine what the dev cluster runs — the
@@ -1925,6 +2008,7 @@ jobs:
       - build-mcp
       - build-workspace
       - build-vm-controller
+      - build-vm-preparer
       - chart-test
       - chart-schema-negative
     if: >-
@@ -2007,7 +2091,8 @@ jobs:
           needs.build-cockpit.result == 'success' ||
           needs.build-mcp.result == 'success' ||
           needs.build-workspace.result == 'success' ||
-          needs.build-vm-controller.result == 'success'
+          needs.build-vm-controller.result == 'success' ||
+          needs.build-vm-preparer.result == 'success'
         env:
           SHA_ORCHESTRATOR: ${{ needs.changes.outputs.orchestrator-sha }}
           SHA_AGENT: ${{ needs.changes.outputs.agent-sha }}
@@ -2015,6 +2100,7 @@ jobs:
           SHA_MCP: ${{ needs.changes.outputs.mcp-sha }}
           SHA_WORKSPACE: ${{ needs.changes.outputs.workspace-sha }}
           SHA_VMCONTROLLER: ${{ needs.changes.outputs.vm-controller-sha }}
+          SHA_VMPREPARER: ${{ needs.changes.outputs.vm-preparer-sha }}
         run: |
           helm repo add collabora https://collaboraonline.github.io/online --force-update
           helm dependency build helm/
@@ -2046,6 +2132,8 @@ jobs:
           export TAG_MCP="sha-${SHA_MCP::7}"
           export TAG_WORKSPACE="sha-${SHA_WORKSPACE::7}"
           export TAG_VMCONTROLLER="sha-${SHA_VMCONTROLLER::7}"
+          : "${SHA_VMPREPARER:?verified component identity is required}"
+          export TAG_VMPREPARER="sha-${SHA_VMPREPARER::7}"
           export REV_ORCHESTRATOR="$SHA_ORCHESTRATOR"
           export REV_AGENT="$SHA_AGENT"
           export REV_COCKPIT="$SHA_COCKPIT"
@@ -2065,6 +2153,8 @@ jobs:
             .image.mcp.digest       = strenv(MCP_DIGEST) |
             .image.workspace.tag    = strenv(TAG_WORKSPACE) |
             .vmController.image.tag = strenv(TAG_VMCONTROLLER) |
+            .vmController.preparation.image.tag = strenv(TAG_VMPREPARER) |
+            .vmController.preparation.image.digest = strenv(VM_PREPARER_DIGEST) |
             .provenance.releaseVersion = strenv(CHART_VERSION) |
             .provenance.components.orchestrator.sourceRevision = strenv(REV_ORCHESTRATOR) |
             .provenance.components.agent.sourceRevision        = strenv(REV_AGENT) |

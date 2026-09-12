@@ -40,6 +40,19 @@ async def vm_provisioning_options(store, work_kind: str, work: dict, *, fallback
         if vm.get(source) is not None
     }
 
+    if vm.get("preparation") is not None:
+        if snapshot is None:
+            raise HTTPException(
+                422, "Workspace preparation requires an admitted manifest execution."
+            )
+        from orchestrator.services.vm_preparation import execution_request
+
+        options["preparation"] = execution_request(
+            snapshot,
+            vm["preparation"],
+            runtime_generation=work.get("runtime_generation"),
+        )
+
     if work_kind == "Job" and snapshot is not None:
         selection = snapshot["resolved"]["spec"]["execution"]["workspace"] or {}
         if (

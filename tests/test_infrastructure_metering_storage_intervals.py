@@ -354,6 +354,13 @@ def test_untrusted_or_noncanonical_claim_owner_hints_remain_unknown(
             "golden-image-claim",
         ),
         (
+            "srw-prepared-11111111222233334444555555555555",
+            {"srw.io/preparation-disk": "11111111-2222-3333-4444-555555555555"},
+            "golden_image_pvc",
+            "shared-platform",
+            "workspace-preparation-cache",
+        ),
+        (
             "postgres-data",
             {"app.kubernetes.io/managed-by": "Helm"},
             "platform_pvc",

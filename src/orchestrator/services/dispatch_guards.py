@@ -74,6 +74,8 @@ VM_CAPACITY_POLL = "capacity_poll"  # controller at capacity → re-poll create
 VM_PARK_CAPACITY = "park_capacity"  # capacity never became available → fail
 VM_HEADSCALE_POLL = "headscale_poll"  # mesh VPN down → re-poll create, free
 VM_PARK_HEADSCALE = "park_headscale"  # mesh VPN never recovered → fail + park
+VM_PREPARATION_POLL = "preparation_poll"
+VM_PARK_PREPARATION = "park_preparation"
 
 # Teardown states the controller reports when a delete does not complete. Both
 # used to match no branch and fall through to the generic not-ready arm, which
@@ -207,6 +209,19 @@ def vm_provisioning_decision(
         if started and (now - float(started)) > golden_timeout_s:
             return VM_PARK_GOLDEN
         return VM_GOLDEN_POLL
+    if status == "waiting_preparation":
+        from shared.workspace_preparation_settings import PreparationSettings
+
+        settings = PreparationSettings.from_environment()
+        budget = settings.wait_budget
+        started = vm_ctx.get("preparation_wait_started_at")
+        if (
+            type(started) not in (int, float)
+            or not 0 < started <= now
+            or now - started > budget
+        ):
+            return VM_PARK_PREPARATION
+        return VM_PREPARATION_POLL
     if status == "waiting_capacity":
         started = vm_ctx.get("capacity_wait_started_at")
         if started and (now - float(started)) > capacity_timeout_s:

@@ -183,6 +183,21 @@ class VMReadinessService:
         reprobe: bool,
     ) -> None:
         key = (entity_type, entity_id, generation)
+        if entity_type == "thread" and (
+            vm.get("status")
+            in {
+                "waiting_preparation",
+                "waiting_golden",
+                "waiting_capacity",
+                "waiting_headscale",
+            }
+            or vm.get("status") == "provisioning"
+            and vm.get("preparation_request") is not None
+            and vm.get("identity_authenticated") is False
+        ):
+            await self._provisioner.poll_thread_vm(entity_id, generation)
+            self._retry_after[key] = time.monotonic() + 5.0
+            return
         status = await self._provisioner.query_status(
             entity_id, entity_type=entity_type
         )
@@ -213,6 +228,23 @@ class VMReadinessService:
                 entity_id,
             )
             return
+
+        if vm.get("preparation_request") is not None:
+            prepared = status.get("preparation") or vm.get("preparation") or {}
+            if not isinstance(prepared, Mapping) or prepared.get("phase") not in {
+                "Succeeded",
+                "ExistingWorkspace",
+            }:
+                await self._transient_failure(
+                    key,
+                    entity_type,
+                    entity_id,
+                    generation,
+                    vm,
+                    "prepared workspace artifact is not attested",
+                    reprobe=False,
+                )
+                return
 
         if status.get("status") == "not_found":
             await self._provisioner._set_context_if_generation(
@@ -594,6 +626,11 @@ async def vm_readiness_prober(
 ) -> None:
     if os.getenv("VM_MODE", "off").strip().lower() != "same-cluster":
         return
-    await VMReadinessService(db, provisioner, trigger_dispatch=trigger_dispatch).run(
-        shutdown_event
+    from orchestrator.services.vm_preparation import cancellation_loop
+
+    await asyncio.gather(
+        VMReadinessService(db, provisioner, trigger_dispatch=trigger_dispatch).run(
+            shutdown_event
+        ),
+        cancellation_loop(shutdown_event, db=db, provisioner=provisioner),
     )

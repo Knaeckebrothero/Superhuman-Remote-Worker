@@ -53,17 +53,18 @@ def srw_workspace_config(
             422, "SRW template images, resources and initialization require backend vm."
         )
     environment = recipe.get("environment", {})
+    vm = {}
     if (
-        set(environment) - {"image", "pullPolicy", "cache"}
+        "prepare" in environment
         or environment.get("pullPolicy", "IfNotPresent") != "IfNotPresent"
         or environment.get("cache", "Reuse") != "Reuse"
     ):
-        raise HTTPException(
-            422,
-            "VM templates support prebuilt images with IfNotPresent/Reuse only; "
-            "preparation and other pull/cache policies are not supported.",
-        )
-    vm = {}
+        from orchestrator.services.vm_preparation import validate_environment
+
+        if instance_recipe is None:
+            settings = validate_environment(environment, recipe.get("resources", {}))
+            vm["preparation"] = deepcopy(environment)
+            vm["disk_size"] = settings.disk_size
     if "initialize" in recipe:
         from shared.workspace_initialization import initialization_request
 

@@ -3426,6 +3426,45 @@ vmController:
     gc:
       enabled: false
       orphanHours: 72
+  # Offline libguestfs preparation of an immutable, scoped CDI cache disk.
+  # Requires same-cluster mode, lifecycle authentication and persistentRootdisk.
+  preparation:
+    enabled: false
+    image:
+      repository: ghcr.io/knaeckebrothero/superhuman-remote-worker-vm-preparer
+      tag: latest
+      digest: ""
+    diskSize: 30Gi
+    maxConcurrent: 2
+    # Bounds the combined number of cached bases and prepared artifacts.
+    maxCacheEntries: 128
+    timeoutSeconds: 3600
+    importTimeoutSeconds: 2700
+    # Idle artifact/base expiry; 0 disables automatic eviction.
+    cacheTtlSeconds: 604800
+    # Public OCI registries only. No Job/Connector credentials reach builders.
+    registryHosts: [ghcr.io, docker.io, quay.io]
+    insecureRegistryHosts: []
+    tokenHosts: [ghcr.io, auth.docker.io, quay.io]
+    network:
+      # Off = libguestfs --no-network plus Pod egress denial.
+      enabled: false
+      # Operator assertion after testing the cluster's NetworkPolicy enforcement.
+      enforcementVerified: false
+      # Public IPv4 HTTP(S); private/cluster/metadata ranges are excluded below.
+      blockedCidrs:
+        - 0.0.0.0/8
+        - 10.0.0.0/8
+        - 100.64.0.0/10
+        - 127.0.0.0/8
+        - 169.254.0.0/16
+        - 172.16.0.0/12
+        - 192.168.0.0/16
+        - 198.18.0.0/15
+        - 224.0.0.0/4
+        - 240.0.0.0/4
+      # Operator-owned NetworkPolicy egress rules, e.g. a package mirror.
+      additionalEgress: []
   resources:
     requests:
       memory: "64Mi"

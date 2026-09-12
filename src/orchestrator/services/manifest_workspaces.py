@@ -75,6 +75,48 @@ class ManifestWorkspaceService:
         self.storage_class_name = storage_class_name
         self.harness_namespace = harness_namespace or namespace
 
+    async def preparation_cache(self, user, scope, *, uid=None, request=None):
+        """Inspect/evict scoped immutable artifacts through authenticated hosting."""
+        from orchestrator.services.manifest_authority import ManifestAuthority
+        import httpx
+
+        if scope["kind"] not in {"Account", "Project"}:
+            raise HTTPException(
+                422, "Preparation caches belong to an Account or Project."
+            )
+        if scope["kind"] != "Account" or scope.get("name") not in {"me", "personal"}:
+            try:
+                UUID(str(scope.get("name")))
+            except ValueError:
+                raise HTTPException(
+                    422, "Preparation scope requires a UUID or me."
+                ) from None
+        scope = await ManifestAuthority(self.db, user, request=request).scope(
+            scope, write=uid is not None
+        )
+        if self.vm_provisioner is None:
+            raise HTTPException(503, "VM preparation hosting is unavailable.")
+        values = {"scope": {"kind": scope["kind"], "uid": str(UUID(scope["name"]))}}
+        if uid is not None:
+            values["uid"] = str(uid)
+        try:
+            return await self.vm_provisioner.preparation_operation(
+                "delete" if uid else "list", values
+            )
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 409:
+                raise HTTPException(
+                    409,
+                    "The artifact is still in use, building, or awaiting verified cleanup.",
+                ) from None
+            raise HTTPException(
+                503, "Preparation cache operation is unavailable."
+            ) from None
+        except (ValueError, httpx.RequestError):
+            raise HTTPException(
+                503, "Authenticated preparation hosting is unavailable."
+            ) from None
+
     async def read(self, instance_id, user, *, write=False, request=None):
         row = await self.db.fetchrow(
             "SELECT * FROM srw_workspace_instances WHERE id=$1", UUID(str(instance_id))

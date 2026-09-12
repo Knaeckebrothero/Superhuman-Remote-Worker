@@ -513,10 +513,10 @@ def test_image_workflows_pass_full_source_revision_separately_from_short_sha():
         encoding="utf-8"
     )
 
-    assert _count_full_revision(main, "SRW_SOURCE_REVISION") >= 6
-    assert _count_full_revision(develop, "SRW_SOURCE_REVISION") >= 6
-    assert _count_full_revision(main, "org.opencontainers.image.revision") == 6
-    assert _count_full_revision(develop, "org.opencontainers.image.revision") == 6
+    assert _count_full_revision(main, "SRW_SOURCE_REVISION") >= 7
+    assert _count_full_revision(develop, "SRW_SOURCE_REVISION") >= 7
+    assert _count_full_revision(main, "org.opencontainers.image.revision") == 7
+    assert _count_full_revision(develop, "org.opencontainers.image.revision") == 7
     for component in (
         "agent",
         "orchestrator",
@@ -524,6 +524,7 @@ def test_image_workflows_pass_full_source_revision_separately_from_short_sha():
         "mcp",
         "workspace",
         "vm-controller",
+        "vm-preparer",
     ):
         assert f"io.srw.component={component}" in main
         assert f"io.srw.component={component}" in develop
@@ -543,12 +544,12 @@ def test_image_workflows_pass_full_source_revision_separately_from_short_sha():
 
     # ...and it must stay *derived* from the full sha, so the two cannot drift
     # apart into an image tagged with one commit and labeled with another.
-    # Six ident steps: the five service components plus vm-controller.
-    assert develop.count("short=${FULL::7}") == 6
+    # Seven build identities: the five services, controller and disk builder.
+    assert develop.count("short=${FULL::7}") == 7
     # The chart-stamping step derives every baked tag from the same identity
     # sha whose full form ships as that component's provenance revision —
-    # six of them since the VM controller stopped being left at "latest".
-    assert len(re.findall(r'="sha-\$\{SHA_[A-Z]+::7\}"', develop)) == 6
+    # seven including the ephemeral preparation builder.
+    assert len(re.findall(r'="sha-\$\{SHA_[A-Z]+::7\}"', develop)) == 7
 
     assert (
         ".provenance.components[strenv(component)].sourceRevision = strenv(GITHUB_SHA)"

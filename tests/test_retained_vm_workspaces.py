@@ -338,3 +338,33 @@ async def test_transport_uses_the_reserved_pvc_pin_when_context_lags(database, a
     provisioner.connect(database)
     assert await provisioner._storage_context(job_id) == {**binding, "pvc_uid": pvc_uid}
     await provisioner.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_prepared_retained_instance_can_be_readmitted_with_preparation_disabled(
+    database, actor, monkeypatch
+):
+    monkeypatch.setenv(
+        "VM_LIFECYCLE_HMAC_SECRET", "test-preparation-only-long-auth-secret"
+    )
+    monkeypatch.setenv("VM_PREPARATION_ENABLED", "true")
+    monkeypatch.setenv(
+        "VM_PREPARATION_IMAGE", "registry.example/builder@sha256:" + "b" * 64
+    )
+    monkeypatch.setenv("VM_PREPARATION_REGISTRY_HOSTS", '["registry.example"]')
+    manifest = assignment()
+    manifest["spec"]["execution"]["workspace"]["template"]["inline"]["environment"][
+        "prepare"
+    ] = [{"command": ["true"]}]
+    *_, job_id, _ = await full_schema.admit(database, actor, manifest)
+    binding = await provision_binding(database, job_id)
+    uid = await finished(database, job_id, binding)
+    monkeypatch.setenv("VM_PREPARATION_ENABLED", "false")
+    *_, next_job, _ = await full_schema.admit(
+        database, actor, assignment({"instanceRef": {"uid": binding["uid"]}})
+    )
+    options = await vm_provisioning_options(
+        database, "Job", await database.get_job(next_job)
+    )
+    assert "preparation" not in options
+    assert options["workspace_storage"]["pvc_uid"] == uid

@@ -1116,6 +1116,30 @@ class VMController:
             self._retained_storage_service = RetainedStorage(self, VM_NAMESPACE)
         return self._retained_storage_service
 
+    def _workspace_preparation(self):
+        from shared.workspace_preparation_settings import PreparationSettings
+        from vm_controller.workspace_preparation import VMWorkspacePreparation
+
+        if not hasattr(self, "_workspace_preparation_service"):
+            self._workspace_preparation_service = VMWorkspacePreparation(
+                self,
+                namespace=VM_NAMESPACE,
+                storage_class=VM_STORAGE_CLASS,
+                settings=PreparationSettings.from_environment(),
+            )
+        return self._workspace_preparation_service
+
+    async def _preparation_loop(self):
+        while not self._shutdown.is_set():
+            try:
+                await self._workspace_preparation().reconcile()
+            except Exception:
+                log.exception("Workspace preparation reconciliation failed")
+            try:
+                await asyncio.wait_for(self._shutdown.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                pass
+
     async def _do_create(self, job_config: dict) -> dict:
         """Create a KubeVirt VirtualMachine for a job."""
         job_id = job_config.get("job_id", "unknown")
@@ -1191,9 +1215,51 @@ class VMController:
         # legacy behaviour + fallback).
         image = job_config.get("vm_image") or DEFAULT_VM_IMAGE
         golden_name = None
-        if VM_GOLDEN_IMAGE_ENABLED and not (
-            job_config.get("workspace_storage") or {}
-        ).get("pvc_uid"):
+        prepared = None
+        preparation = job_config.get("preparation")
+        if preparation is not None:
+            from shared.workspace_preparation import validate_request
+
+            preparation = validate_request(preparation)
+            if (
+                preparation["allocationId"] != job_id
+                or preparation["ownerKind"]
+                != ("session" if owner_kind == "thread" else "job")
+                or LIFECYCLE_HMAC_SECRET is None
+                or not VM_PERSISTENT_ROOTDISK
+                or not getattr(self, "cloud_init_text", "")
+            ):
+                raise ValueError(
+                    "VM preparation requires authenticated, persistent same-cluster allocation."
+                )
+            binding = job_config.get("workspace_storage")
+            from shared.vm_workspace_storage import storage_name
+
+            root_name = storage_name(binding) if binding else _rootdisk_name(job_id)
+            known, existing_root = await self._rootdisk_pvc_probe(
+                root_name,
+                owner_id=binding["owner_id"] if binding else job_id,
+                owner_kind=binding["owner_kind"] if binding else owner_kind,
+                wait=False,
+            )
+            if not known:
+                raise RuntimeError("Existing workspace disk identity is unknown.")
+            if existing_root is None:
+                prepared, waiting = await self._workspace_preparation().prepare(
+                    preparation
+                )
+                if waiting is not None:
+                    return {
+                        "job_id": job_id,
+                        "provision_generation": generation,
+                        **waiting,
+                    }
+                golden_name = prepared["name"]
+        if (
+            preparation is None
+            and VM_GOLDEN_IMAGE_ENABLED
+            and not (job_config.get("workspace_storage") or {}).get("pvc_uid")
+        ):
             waiting = None
             try:
                 golden_name, waiting = await self._golden_state_nowait(image)
@@ -1254,6 +1320,15 @@ class VMController:
         cloud_init_user_data = manifest.pop("_srwCloudInitUserData", None)
         ssh_host_key_fingerprint = manifest.pop("_srwSSHHostKeyFingerprint", None)
         vm_name = manifest["metadata"]["name"]
+        if prepared is not None:
+            from shared.workspace_preparation import PREPARATION_LABEL, canonical
+
+            manifest["metadata"].setdefault("labels", {})[PREPARATION_LABEL] = prepared[
+                "preparation"
+            ]["uid"]
+            manifest["metadata"].setdefault("annotations", {})[
+                "srw.io/prepared-artifact"
+            ] = canonical(prepared["preparation"])
         if golden_name:
             self._apply_clone_source(manifest, golden_name)
 
@@ -1380,6 +1455,12 @@ class VMController:
 
         if workspace_storage is not None:
             self._retained_storage().verify_vm(admitted_vm, workspace_storage, job_id)
+        if prepared is not None:
+            from shared.workspace_preparation import PREPARATION_LABEL
+
+            labels = admitted_vm.get("metadata", {}).get("labels", {})
+            if labels.get(PREPARATION_LABEL) != prepared["preparation"]["uid"]:
+                raise RuntimeError("Existing VM did not select the prepared artifact.")
         if cloud_init_user_data is not None:
             await self._patch_cloud_init_secret_owner(
                 job_id=job_id,
@@ -1407,6 +1488,13 @@ class VMController:
 
         log.info("VM created: %s (job %s)", vm_name, job_id)
 
+        if preparation is not None and rootdisk_pvc_uid is not None:
+            await self._workspace_preparation().mark_allocated(
+                preparation,
+                rootdisk=root_name,
+                pvc_uid=rootdisk_pvc_uid,
+            )
+
         # Best-effort GC of stale goldens from previous image digests. Never the
         # current image's golden, one a live VM references (in-flight clone), or
         # one younger than the min age. Fire-and-forget so it can't delay create.
@@ -1426,6 +1514,13 @@ class VMController:
             "namespace": VM_NAMESPACE,
             "entity_type": owner_kind,
         }
+        if prepared is not None:
+            result["preparation"] = prepared["preparation"]
+        elif preparation is not None:
+            result["preparation"] = {
+                "phase": "ExistingWorkspace",
+                "allocationId": job_id,
+            }
         if admitted_generation is not None:
             result["provision_generation"] = admitted_generation
         if ssh_host_key_fingerprint is not None:
@@ -1861,6 +1956,20 @@ class VMController:
             )
         if rootdisk_pvc_uid is not None:
             result["rootdisk_pvc_uid"] = rootdisk_pvc_uid
+        prepared_annotation = (
+            vm.get("metadata", {})
+            .get("annotations", {})
+            .get("srw.io/prepared-artifact")
+        )
+        if prepared_annotation and not exact_absence:
+            result["preparation"] = json.loads(prepared_annotation)
+            if rootdisk_pvc_uid is not None:
+                await self._workspace_preparation().observe_workspace(
+                    "session" if entity_type == "thread" else "job",
+                    job_id,
+                    rootdisk=rootdisk,
+                    pvc_uid=rootdisk_pvc_uid,
+                )
         return result
 
     # =========================================================================
@@ -3035,6 +3144,68 @@ class VMController:
 
         return web.json_response({"status": "ok"})
 
+    async def http_preparation(self, request):
+        from aiohttp import web
+
+        action = request.match_info["action"]
+        if action not in {"list", "delete", "cancel", "prepare"}:
+            return web.json_response(
+                {"error": "Unknown preparation operation"}, status=404
+            )
+        operation = "preparation-" + action
+        payload = await request.json()
+        if LIFECYCLE_HMAC_SECRET is None or not await self._verify_lifecycle_request(
+            payload, operation, mutating=action != "list"
+        ):
+            return web.json_response({"error": "authentication failed"}, status=401)
+        request_id = _lifecycle_request_id(payload)
+        status = 200
+        try:
+            service = self._workspace_preparation()
+            if action == "prepare":
+                source, waiting = await service.prepare(payload["preparation"])
+                result = {"source": source, "waiting": waiting}
+            elif action == "cancel":
+                result = {"cancelled": await service.cancel(payload["preparation"])}
+            else:
+                scope = payload["scope"]
+                if (
+                    not isinstance(scope, dict)
+                    or set(scope) != {"kind", "uid"}
+                    or scope["kind"] not in {"Account", "Project"}
+                    or str(UUID(scope["uid"])) != scope["uid"]
+                ):
+                    raise ValueError("Invalid preparation scope")
+                result = (
+                    {"artifacts": await service.artifacts(scope)}
+                    if action == "list"
+                    else {
+                        "deleted": await service.delete_artifact(payload["uid"], scope)
+                    }
+                )
+                if action == "delete" and result["deleted"] is not True:
+                    status = 409
+        except (ValueError, KeyError, TypeError):
+            result, status = {"error": "Invalid preparation operation"}, 400
+        except Exception:
+            log.exception("Workspace preparation %s failed", action)
+            result, status = (
+                {
+                    "error": "Preparation operation could not establish current ownership"
+                },
+                409,
+            )
+        return web.json_response(
+            sign_payload(
+                result,
+                direction="response",
+                operation=operation,
+                secret=LIFECYCLE_HMAC_SECRET,
+                correlation_id=request_id,
+            ),
+            status=status,
+        )
+
     async def _publish_status(
         self,
         job_id: str,
@@ -3071,6 +3242,7 @@ class VMController:
         app.router.add_post("/vms", self.http_create)
         app.router.add_post("/workspace-disks/release", self.http_release_workspace)
         app.router.add_post("/workspace-disks/detach", self.http_detach_workspace)
+        app.router.add_post("/workspace-preparations/{action}", self.http_preparation)
         app.router.add_get("/vms", self.http_list)
         app.router.add_delete("/vms/{job_id}", self.http_delete)
         app.router.add_get("/vms/{job_id}", self.http_status)
@@ -3094,6 +3266,7 @@ class VMController:
         self.load_template()
         self.init_k8s()
         await self.headscale.init()
+        preparation_task = asyncio.create_task(self._preparation_loop())
 
         # Pre-warm the default image's golden so the first job doesn't pay the
         # one-time import on its critical path (best-effort, non-blocking).
@@ -3129,6 +3302,7 @@ class VMController:
 
         # Wait for shutdown signal
         await self._shutdown.wait()
+        await preparation_task
 
         log.info("Shutting down...")
         if self.nc and self.nc.is_connected:

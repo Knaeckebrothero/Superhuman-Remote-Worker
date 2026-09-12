@@ -388,6 +388,8 @@ def test_controller_shared_inputs_trigger_tilt_and_ci_rebuilds():
         "src/shared/__init__.py",
         "src/shared/vm_lifecycle_auth.py",
         "src/shared/workspace_initialization.py",
+        "src/shared/workspace_preparation.py",
+        "src/shared/workspace_preparation_settings.py",
         "src/shared/vm_workspace_storage.py",
     }
     assert {
@@ -449,6 +451,8 @@ def test_controller_copied_protocol_imports_without_other_packages(tmp_path):
         "vm_lifecycle_auth.py",
         "vm_workspace_storage.py",
         "workspace_initialization.py",
+        "workspace_preparation.py",
+        "workspace_preparation_settings.py",
     ]
     script = """
 import json
@@ -459,6 +463,10 @@ before = set(sys.modules)
 from vm_controller import lifecycle_auth
 from shared.workspace_initialization import initialization_request
 from shared.vm_workspace_storage import storage_binding
+from shared.workspace_preparation import preparation_request
+from shared.workspace_preparation_settings import PreparationSettings
+assert PreparationSettings().enabled is False
+assert callable(preparation_request)
 assert callable(storage_binding)
 assert initialization_request([{"command": ["true"]}])["version"] == 1
 assert Path(lifecycle_auth.__file__).is_relative_to(Path.cwd())
