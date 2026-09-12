@@ -96,8 +96,10 @@ Initialization runs inside the VM as `agent-host`, with
 `HOME`. Arguments are literal; use an explicit shell command when shell expansion
 is needed. The VM image must provide Python 3.10+, systemd 254+, cloud-init and
 the SRW guest/SSH contract. The shipped Ubuntu 24.04 VM image supplies these.
-Commands cannot elevate privileges. Put OS packages in the base image; use
-initialization for user-owned environments, caches and project directories.
+The runner sets `NoNewPrivileges` and adds no privileges beyond the image's
+`agent-host` account. That account's existing access to services such as Docker
+remains available. Put OS packages in the base image; use initialization for
+user-owned environments, caches and project directories.
 
 The agent is released only after all steps exit successfully. This VM stage runs
 before the SRW harness attaches execution connectors or clones its repositories;
