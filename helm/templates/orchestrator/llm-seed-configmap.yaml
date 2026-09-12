@@ -31,7 +31,9 @@ data:
       {{- range $i, $ep := .Values.llm.seed.systemEndpoints }}
       - label: {{ required "llm.seed.systemEndpoints[].label is required" $ep.label | quote }}
         baseUrl: {{ required "llm.seed.systemEndpoints[].baseUrl is required" $ep.baseUrl | quote }}
-        {{- if $ep.apiKeyRef }}
+        {{- /* apiKeyRef (any mode) or an inline apiKey (dev mode, see
+             llm-seed-inline-secret.yaml) both surface as the same env var. */}}
+        {{- if or $ep.apiKeyRef (hasKey $ep "apiKey") }}
         apiKeyEnv: {{ printf "SEED_ENDPOINT_%d_API_KEY" $i | quote }}
         {{- end }}
         models:
@@ -57,6 +59,13 @@ data:
             {{- end }}
             {{- if hasKey . "multimodal" }}
             multimodal: {{ .multimodal }}
+            {{- end }}
+            {{- if hasKey . "params" }}
+            {{- if not (kindIs "map" .params) }}
+            {{- fail (printf "llm.seed.systemEndpoints[%d].models[%s].params must be a mapping" $i .id) }}
+            {{- end }}
+            params:
+              {{- toYaml .params | nindent 14 }}
             {{- end }}
             enabled: {{ default true .enabled }}
           {{- end }}
@@ -85,6 +94,13 @@ data:
         {{- end }}
         {{- if hasKey . "multimodal" }}
         multimodal: {{ .multimodal }}
+        {{- end }}
+        {{- if hasKey . "params" }}
+        {{- if not (kindIs "map" .params) }}
+        {{- fail (printf "llm.seed.systemModels[%s/%s].params must be a mapping" .provider .id) }}
+        {{- end }}
+        params:
+          {{- toYaml .params | nindent 10 }}
         {{- end }}
         enabled: {{ default true .enabled }}
       {{- end }}

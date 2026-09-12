@@ -780,3 +780,77 @@ class TestSeedDefaults:
         db = _fake_db()
         with pytest.raises(ValueError):
             await seed(db, {"defaults": ["chat"]})
+
+
+# ---------------------------------------------------------------------------
+# seed — per-row params (models.params_json)
+# ---------------------------------------------------------------------------
+
+
+class TestSeedParams:
+    @pytest.mark.asyncio
+    async def test_system_model_params_land_in_params_json(self):
+        db = _fake_db(existing_api_keys=[{"provider": "openai"}])
+        payload = {
+            "systemModels": [
+                {
+                    "provider": "openai",
+                    "id": "gpt-5-mini",
+                    "capability": "chat",
+                    "family": "gpt-5",
+                    "params": {"reasoning_effort": "low", "temperature": 0},
+                }
+            ]
+        }
+        await seed(db, payload)
+
+        kwargs = db.create_model.await_args.kwargs
+        assert kwargs["params_json"] == {"reasoning_effort": "low", "temperature": 0}
+
+    @pytest.mark.asyncio
+    async def test_endpoint_model_params_land_in_params_json(self):
+        db = _fake_db()
+        payload = {
+            "systemEndpoints": [
+                {
+                    "label": "MiniMax",
+                    "baseUrl": "https://api.minimax.io/v1",
+                    "models": [
+                        {
+                            "id": "MiniMax-M3",
+                            "capabilities": ["chat", "auxiliary"],
+                            "params": {"pricing_id": "minimax/minimax-m3"},
+                        }
+                    ],
+                }
+            ]
+        }
+        await seed(db, payload)
+
+        kwargs = db.create_model.await_args.kwargs
+        assert kwargs["provider_kind"] == "endpoint"
+        assert kwargs["params_json"] == {"pricing_id": "minimax/minimax-m3"}
+
+    @pytest.mark.asyncio
+    async def test_absent_params_is_none(self):
+        db = _fake_db(existing_api_keys=[{"provider": "openai"}])
+        await seed(
+            db,
+            {"systemModels": [{"provider": "openai", "id": "gpt-5-mini"}]},
+        )
+        assert db.create_model.await_args.kwargs["params_json"] is None
+
+    @pytest.mark.asyncio
+    async def test_non_mapping_params_is_ignored_with_warning(self, caplog):
+        db = _fake_db(existing_api_keys=[{"provider": "openai"}])
+        with caplog.at_level("WARNING", logger="orchestrator.seed.llm_config"):
+            await seed(
+                db,
+                {
+                    "systemModels": [
+                        {"provider": "openai", "id": "gpt-5-mini", "params": "low"}
+                    ]
+                },
+            )
+        assert db.create_model.await_args.kwargs["params_json"] is None
+        assert "params must be a mapping" in caplog.text

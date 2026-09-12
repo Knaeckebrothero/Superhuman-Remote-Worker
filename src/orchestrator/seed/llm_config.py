@@ -55,6 +55,8 @@ Payload shape::
             contextWindow: 128000
             reasoningLevel: null
             capability: chat             # optional; defaults to 'chat'
+            params:                      # optional; lands in models.params_json
+              temperature: 0.2
           - id: "qwen3-embedding-8b"
             displayName: "Qwen3 Embedding 8B"
             capability: embedding        # routes to Admin → Defaults → Embedding
@@ -280,6 +282,28 @@ def _resolve_capabilities_from_entry(
     return out
 
 
+def _params_from_entry(entry: dict[str, Any], *, context: str) -> dict[str, Any] | None:
+    """Free-form per-row parameters (``models.params_json``).
+
+    Accepts ``params`` (helm spelling) or ``params_json``. Anything that is
+    not a mapping is ignored with a warning rather than failing the run —
+    the row is still worth seeding without its tuning.
+    """
+    raw = entry.get("params")
+    if raw is None:
+        raw = entry.get("params_json")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        logger.warning(
+            "%s: params must be a mapping, got %s — ignored",
+            context,
+            type(raw).__name__,
+        )
+        return None
+    return dict(raw)
+
+
 @dataclass
 class SeedReport:
     """Outcome summary for a single seed run."""
@@ -490,6 +514,9 @@ async def _seed_endpoints(
                 or model.get("context_window"),
                 reasoning_level=model.get("reasoningLevel")
                 or model.get("reasoning_level"),
+                params_json=_params_from_entry(
+                    model, context=f"systemEndpoints[{label}].models[{model_id}]"
+                ),
                 enabled=model.get("enabled", True),
                 seeded_from="helm:llm.seed",
                 on_conflict_do_nothing=True,
@@ -586,6 +613,9 @@ async def _seed_system_models(
             family=entry.get("family") or family_of(model_id),
             context_window=entry.get("contextWindow") or entry.get("context_window"),
             reasoning_level=entry.get("reasoningLevel") or entry.get("reasoning_level"),
+            params_json=_params_from_entry(
+                entry, context=f"systemModels[{provider}/{model_id}]"
+            ),
             enabled=entry.get("enabled", True),
             seeded_from=SEEDED_FROM_TAG,
             on_conflict_do_nothing=True,
