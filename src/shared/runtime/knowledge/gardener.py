@@ -30,7 +30,10 @@ _MD_LINK_RE = re.compile(r"(?<!\!)\[[^\]]*\]\(([^)]+)\)")
 # the markdown rule above. This vault is an Obsidian vault — wikilinks are the
 # dominant link syntax, so a parser that only knew _MD_LINK_RE saw a small
 # fraction of the real graph.
-_WIKILINK_RE = re.compile(r"(?<!\!)\[\[([^\]]+)\]\]")
+# "[" is excluded from the target as well as "]": a body full of unclosed "[["
+# openers otherwise made every one of them rescan the rest of the text for a
+# closing "]]", which is quadratic. No wikilink target contains a bracket.
+_WIKILINK_RE = re.compile(r"(?<!\!)\[\[([^\]\[]+)\]\]")
 # ATX heading anywhere in the body.
 _HEADING_RE = re.compile(r"^#{1,6}\s", re.MULTILINE)
 

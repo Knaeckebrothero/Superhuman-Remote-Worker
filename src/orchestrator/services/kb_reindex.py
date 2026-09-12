@@ -182,7 +182,11 @@ _DEFAULT_PRIORITY_RANK = 1
 _NOTE_ID_MAX = 100
 _CONFIDENCE_MAX = 20
 
-_H1_RE = re.compile(r"^#\s+(.+?)\s*$", re.MULTILINE)
+# The trailing "\s*$" is gone: a lazy "(.+?)" followed by an optional whitespace
+# run gave the engine a fresh way to split every trailing space on a hostile
+# line. "." already stops at the newline, so the title is trimmed at the call
+# site instead -- the same shape knowledge/gardener.py:_H1_RE already uses.
+_H1_RE = re.compile(r"^#\s+(.+)$", re.MULTILINE)
 
 
 def normalize_root_path(root_path: Optional[str]) -> str:
@@ -329,7 +333,7 @@ def note_fields(path: str, fm: Optional[Dict[str, Any]], body: str) -> Dict[str,
     note_id = str(fm.get("id") or stem)[:_NOTE_ID_MAX]
 
     m = _H1_RE.search(body or "")
-    title = m.group(1) if m else note_id
+    title = m.group(1).rstrip() if m else note_id
 
     note_type = str(fm.get("type", "")).strip().lower()
     if note_type not in VALID_NOTE_TYPES:

@@ -180,9 +180,11 @@ class TestKnowledgeNoteParsing:
     """Note titles and section splitting (alerts #465, #486, #484)."""
 
     def test_h1_title_is_extracted_and_stripped(self) -> None:
-        assert kb_reindex._H1_RE.search("# Weekly report  \n\nbody").group(1) == (
-            "Weekly report"
-        )
+        # The trailing-whitespace trim moved out of _H1_RE's tail into the call
+        # site; the stored title is unchanged, trailing spaces and all.
+        fields = kb_reindex.note_fields("notes/n.md", {}, "# Weekly report  \n\nbody")
+        assert fields["title"] == "Weekly report"
+        assert kb_reindex.note_fields("notes/n.md", {}, "no heading\n")["title"] == "n"
         assert gardener.note_title("# Weekly report\n\nbody") == "Weekly report"
 
     def test_sections_split_on_heading_breadcrumbs(self) -> None:

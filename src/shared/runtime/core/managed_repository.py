@@ -555,7 +555,10 @@ def repository_url_has_credentials(value: Any) -> bool:
     parsed = urlparse(text)
     if parsed.scheme:
         return parsed.username is not None or parsed.password is not None
-    return bool(re.match(r"^[^/\\\s]+@[^:]+:", text))
+    # "@" is excluded from the identity run so it cannot also be consumed by the
+    # host run that follows: overlapping on every "@" made a string of them cost
+    # quadratic time. An scp-style identity never contains one.
+    return bool(re.match(r"^[^/\\\s@]+@[^:]+:", text))
 
 
 def _wipe_validated_private_keys(validated: Iterable[dict[str, Any]]) -> None:
