@@ -50,6 +50,8 @@ from orchestrator.services.pinned_k8s_effect import (
 from orchestrator.services.persistent_recycler import (
     PersistentPodObservation,
     PersistentThreadRecycler,
+    persistent_recycle_view,
+    read_recycle_record,
 )
 from agent.database.postgres_db import PostgresDB as AgentPostgresDB
 from shared.persistent_input_delivery import (
@@ -1326,7 +1328,9 @@ async def _recycle_state(db: PostgresDB, thread_id: str):
     metadata = row["metadata"]
     if isinstance(metadata, str):
         metadata = json.loads(metadata)
-    return metadata["agent_pod"]["recycle"], metadata
+    # Resolved, not reached into: the record's durable home is a sibling of
+    # `agent_pod`, which a retired endpoint no longer leaves behind.
+    return read_recycle_record(metadata), metadata
 
 
 async def _runtime_identity(db: PostgresDB, thread_id: str) -> tuple[str, str]:
@@ -7304,13 +7308,7 @@ async def _retire_runtime_to_suspended(db: PostgresDB, ids: dict) -> None:
     # The precondition the watchdog meets, asserted rather than assumed.
     assert parked["status"] == "suspended"
     assert parked["agent_id"] is None
-    assert _json(parked["metadata"]).get("agent_pod") in (None, {})
-
-
-def _json(value):
-    if isinstance(value, str):
-        return json.loads(value)
-    return dict(value or {})
+    assert (_json(parked["metadata"]) or {}).get("agent_pod") in (None, {})
 
 
 @pytest.mark.asyncio
@@ -7348,7 +7346,7 @@ async def test_missing_pod_after_retirement_records_one_blocked_generation(db):
 
     # The authority invariant is untouched: no partial Pod marker was invented.
     thread = await db.get_thread(ids["thread"])
-    assert _json(thread["metadata"]).get("agent_pod") in (None, {})
+    assert (_json(thread["metadata"]) or {}).get("agent_pod") in (None, {})
     assert thread["agent_id"] is None
 
 
@@ -7396,6 +7394,50 @@ async def test_missing_pod_after_retirement_is_durable_and_single_generation(db)
     view = persistent_recycle_view(thread["metadata"])
     assert view["recycle_phase"] == "blocked"
     assert view["last_failure"] == "pinned_pod_protection_unresolved"
+
+
+@pytest.mark.asyncio
+async def test_malformed_nonempty_pod_authority_is_still_rejected(db):
+    """The invariant the correction routes around, not through.
+
+    Moving the record out of ``agent_pod`` must not make a partial marker
+    acceptable: a non-empty ``agent_pod`` still owes both a name and a UID.
+    """
+
+    ids = await _seed(db, protected_agent_pod=True, workspace_claim=False)
+    await _retire_runtime_to_suspended(db, ids)
+
+    async with db.acquire() as conn:
+        for marker in (
+            {"recycle": {"generation": "g", "phase": "blocked"}},
+            {"pod_name": f"persistent-{ids['thread'][:12]}"},
+            {"pod_uid": "some-uid"},
+            {"observed_build_sha": "x", "expected_build_sha": "y"},
+        ):
+            with pytest.raises(asyncpg.CheckViolationError) as refused:
+                await conn.execute(
+                    "UPDATE threads SET metadata=jsonb_set("
+                    "COALESCE(metadata,'{}'::jsonb),'{agent_pod}',$2::jsonb,true) "
+                    "WHERE id=$1::uuid",
+                    UUID(ids["thread"]),
+                    json.dumps(marker),
+                )
+            assert (
+                refused.value.constraint_name == "threads_agent_pod_authority_shape"
+            ), marker
+
+    # And the shape the correction actually writes is accepted, because it
+    # never touches `agent_pod` at all.
+    recycler = PersistentThreadRecycler(db=db, provisioner=FakeProvisioner())
+    result = await recycler.request_and_reconcile(
+        thread_id=ids["thread"],
+        reason="missing_pod",
+        expected_build_sha="new-build",
+        expected_project_id=ids["project"],
+    )
+    assert result.generation
+    thread = await db.get_thread(ids["thread"])
+    assert (_json(thread["metadata"]) or {}).get("agent_pod") in (None, {})
 
 
 @pytest.mark.asyncio
@@ -8536,7 +8578,7 @@ async def test_retryable_failure_keeps_hold_and_pages_once_before_convergence(db
             UPDATE threads
                SET metadata = jsonb_set(
                    metadata,
-                   '{agent_pod,recycle,next_retry_at}',
+                   '{persistent_recycle,next_retry_at}',
                    to_jsonb((now() - interval '1 minute')::text))
              WHERE id=$1
             """,
@@ -8582,7 +8624,7 @@ async def test_unsettled_old_runtime_times_out_without_forced_deletion(db):
             UPDATE threads
                SET metadata = jsonb_set(
                    metadata,
-                   '{agent_pod,recycle,drain_wait_started_at}',
+                   '{persistent_recycle,drain_wait_started_at}',
                    to_jsonb((now() - interval '6 minutes')::text))
              WHERE id=$1
             """,
@@ -8785,7 +8827,7 @@ async def test_notification_claim_crash_reclaims_once_and_success_is_terminal(db
             UPDATE threads
                SET metadata = jsonb_set(
                    metadata,
-                   '{agent_pod,recycle,notification,claim_expires_at}',
+                   '{persistent_recycle,notification,claim_expires_at}',
                    to_jsonb((now() - interval '1 minute')::text))
              WHERE id=$1
             """,
@@ -8898,7 +8940,7 @@ async def test_failed_notification_retries_after_bounded_backoff(db):
             UPDATE threads
                SET metadata = jsonb_set(
                    metadata,
-                   '{agent_pod,recycle,notification,next_retry_at}',
+                   '{persistent_recycle,notification,next_retry_at}',
                    to_jsonb((now() - interval '1 minute')::text))
              WHERE id=$1
             """,

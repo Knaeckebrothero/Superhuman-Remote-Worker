@@ -869,6 +869,7 @@ from orchestrator.services.docker_provisioner import docker_provisioner  # noqa:
 from orchestrator.services.persistent_provisioner import persistent_provisioner  # noqa: E402
 from orchestrator.services.persistent_recycler import (  # noqa: E402
     PersistentThreadRecycler,
+    read_recycle_record,
 )
 from orchestrator.services.pinned_agent_authority import (  # noqa: E402
     reconcile_legacy_pinned_agent_authority,
@@ -29538,7 +29539,7 @@ async def _phase5_wake_if_suspended(
                 metadata = json.loads(metadata)
             except (json.JSONDecodeError, TypeError):
                 metadata = {}
-        recycle = (metadata.get("agent_pod") or {}).get("recycle") or {}
+        recycle = read_recycle_record(metadata)
         if isinstance(recycle, dict) and recycle.get("phase") not in {
             None,
             "",

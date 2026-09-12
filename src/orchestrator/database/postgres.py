@@ -32765,6 +32765,13 @@ class PostgresDB:
                 marker["recycle"] = recycle
                 metadata = dict(metadata)
                 metadata["agent_pod"] = marker
+                # The record lives in a sibling of `agent_pod` so it can outlive
+                # a retired endpoint; the copy inside the marker is what the
+                # successor-publication CAS below matches on. Both homes are
+                # written here for the same reason the service writer keeps
+                # them in step -- a stale sibling would be republished over
+                # this one and drop `successor_attempt`.
+                metadata["persistent_recycle"] = recycle
                 await conn.execute(
                     "UPDATE threads SET metadata=$2::jsonb WHERE id=$1::uuid",
                     parsed_thread,
