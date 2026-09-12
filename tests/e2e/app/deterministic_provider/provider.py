@@ -21,7 +21,7 @@ import time
 import uuid
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Literal
+from typing import Any, AsyncIterator, Final, Literal
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -597,12 +597,7 @@ def create_inference_app(
                 raise
 
             structured_name = _structured_output_name(payload)
-            if structured_name not in {
-                None,
-                "ConversationTitle",
-                "ExtractedMemories",
-                "AssemblyResult",
-            }:
+            if structured_name not in _MODELLED_SCHEMAS:
                 await _account_rejection(
                     store,
                     run_id=run_id,
@@ -1034,6 +1029,23 @@ def _discover_run_ids(payload: dict[str, Any]) -> set[str]:
     return run_ids
 
 
+#: Structured-output schemas this fixture answers deterministically. Anything
+#: else is a real unexpected call and must stay a 422 — the set is deliberately
+#: an allowlist, not a fallback, so a NEW schema shows up as a rejection rather
+#: than as a silently fabricated answer.
+_MODELLED_SCHEMAS: Final = frozenset(
+    {
+        None,
+        "ConversationTitle",
+        "ExtractedMemories",
+        "AssemblyResult",
+        "ConversationSummary",
+        "CurationResult",
+        "KnowledgeAssemblyResult",
+    }
+)
+
+
 def _structured_output_name(payload: dict[str, Any]) -> str | None:
     response_format = payload.get("response_format")
     if not isinstance(response_format, dict):
@@ -1082,6 +1094,48 @@ def _structured_content(schema_name: str, run_id: str) -> str:
                 "actions_taken": [],
                 "gaps_identified": [],
                 "summary": f"E2E-{run_id} deterministic no-op assembly review.",
+            },
+            separators=(",", ":"),
+        )
+    if schema_name == "ConversationSummary":
+        # Context compaction (`SummarizeTask`) folds a long worker conversation
+        # through this schema. A loop member that runs long enough to compact
+        # asked for it and got a 422, which the agent retried three times and
+        # then degraded to trimming — real behaviour change, and two
+        # `unexpected_schema` rejections that hide a genuine unexpected call.
+        # The deterministic answer is a valid, content-free summary.
+        return json.dumps(
+            {
+                "summary": f"E2E-{run_id} deterministic conversation summary.",
+                "tasks_completed": "",
+                "tasks_in_progress": "",
+                "key_decisions": "",
+                "current_state": "",
+                "blockers": "",
+                "critical_facts": "",
+                "state_changes": "",
+                "pinned_instructions": "",
+                "identity_anchor": "",
+            },
+            separators=(",", ":"),
+        )
+    if schema_name == "CurationResult":
+        return json.dumps(
+            {
+                "notes_created": 0,
+                "notes_updated": 0,
+                "summary": f"E2E-{run_id} deterministic no-op curation.",
+            },
+            separators=(",", ":"),
+        )
+    if schema_name == "KnowledgeAssemblyResult":
+        return json.dumps(
+            {
+                "notes_refreshed": 0,
+                "notes_superseded": 0,
+                "notes_merged": 0,
+                "notes_archived": 0,
+                "summary": f"E2E-{run_id} deterministic no-op convergence.",
             },
             separators=(",", ":"),
         )

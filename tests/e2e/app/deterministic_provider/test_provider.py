@@ -1085,3 +1085,86 @@ async def test_control_state_never_retains_prompts_tool_arguments_or_headers(
         "outcome",
         "duration_ms",
     }
+
+
+async def test_auxiliary_schemas_are_modelled_and_an_unknown_one_is_not(
+    control: httpx.AsyncClient,
+    inference: httpx.AsyncClient,
+) -> None:
+    """Every structured schema a real worker asks for is answered, and only those.
+
+    A worker job that runs long enough compacts its context
+    (``ConversationSummary``) and may curate or converge its knowledge
+    (``CurationResult`` / ``KnowledgeAssemblyResult``). Leaving those
+    unmodelled made each one a 422 that the agent retried and then degraded
+    around — a real behaviour change, and `unexpected_schema` noise that hides
+    a genuine unexpected call. The allowlist stays an allowlist: a schema
+    nobody modelled is still a rejection, never a fabricated answer.
+    """
+
+    run_id = "aux-schemas-001"
+    await arm(control, run_id)
+
+    def structured(name: str) -> dict:
+        return chat_request(
+            run_id,
+            extra={
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {"name": name, "schema": {"type": "object"}},
+                }
+            },
+        )
+
+    summary = await inference.post(
+        "/v1/chat/completions", json=structured("ConversationSummary")
+    )
+    assert summary.status_code == 200
+    payload = json.loads(summary.json()["choices"][0]["message"]["content"])
+    assert payload["summary"] == f"E2E-{run_id} deterministic conversation summary."
+    # Every field the compaction model declares must be present, or the agent
+    # falls back to trimming exactly as it did against a 422.
+    assert set(payload) == {
+        "summary",
+        "tasks_completed",
+        "tasks_in_progress",
+        "key_decisions",
+        "current_state",
+        "blockers",
+        "critical_facts",
+        "state_changes",
+        "pinned_instructions",
+        "identity_anchor",
+    }
+
+    curation = await inference.post(
+        "/v1/chat/completions", json=structured("CurationResult")
+    )
+    assert curation.status_code == 200
+    assert json.loads(curation.json()["choices"][0]["message"]["content"]) == {
+        "notes_created": 0,
+        "notes_updated": 0,
+        "summary": f"E2E-{run_id} deterministic no-op curation.",
+    }
+
+    convergence = await inference.post(
+        "/v1/chat/completions", json=structured("KnowledgeAssemblyResult")
+    )
+    assert convergence.status_code == 200
+    assert json.loads(convergence.json()["choices"][0]["message"]["content"]) == {
+        "notes_refreshed": 0,
+        "notes_superseded": 0,
+        "notes_merged": 0,
+        "notes_archived": 0,
+        "summary": f"E2E-{run_id} deterministic no-op convergence.",
+    }
+
+    unknown = await inference.post(
+        "/v1/chat/completions", json=structured("NotAModelledSchema")
+    )
+    assert unknown.status_code == 422
+    assert unknown.json()["error"]["type"] == "unsupported_schema"
+
+    state = (await control.get(f"/control/scenarios/{run_id}")).json()
+    assert state["unexpected_count"] == 1
+    assert state["pending_calls"] == 0
