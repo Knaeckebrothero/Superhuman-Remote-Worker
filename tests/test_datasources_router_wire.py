@@ -20,6 +20,8 @@ are the ones a handler move can quietly change:
   200 with ``status: error``, while a disabled deployment is still a 403.
 """
 
+import json
+import re
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -545,7 +547,13 @@ def test_probe_of_an_unreachable_postgres_target_is_a_200_error_report():
         AsyncMock(side_effect=OSError("connection refused")),
     ):
         body = wire.client.post(f"/api/datasources/{DATASOURCE_ID}/test").json()
-    assert body == {"status": "error", "message": "connection refused"}
+    # The driver's own text can carry the connection URL (password included),
+    # so it goes to the log and the client gets the code's own wording plus
+    # the correlation id that finds that log line.
+    assert body["status"] == "error"
+    assert body["message"] == "PostgreSQL connection failed"
+    assert "connection refused" not in json.dumps(body)
+    assert re.fullmatch(r"[0-9a-f]{12}", body["error_ref"])
 
 
 def test_probe_of_an_unknown_type_names_the_type():
@@ -586,7 +594,7 @@ def test_probe_of_an_ssh_repository_connector_reports_no_api_probe():
     assert "clone at job start is the test" in body["message"]
 
 
-def test_probe_surfaces_a_gate_crash_as_a_500_with_its_message():
+def test_probe_surfaces_a_gate_crash_as_a_500_without_its_message():
     """The gate resolves the connector *inside* the operation's try/except."""
 
     async def exploding_gate(*_args, **_kwargs):
@@ -595,7 +603,9 @@ def test_probe_surfaces_a_gate_crash_as_a_500_with_its_message():
     wire = _wire(gates={"require_datasource_owner": exploding_gate})
     response = wire.client.post(f"/api/datasources/{DATASOURCE_ID}/test")
     assert response.status_code == 500
-    assert response.json()["detail"] == "pool exhausted"
+    detail = response.json()["detail"]
+    assert "pool exhausted" not in detail
+    assert re.fullmatch(r"Connector test failed \(error_ref=[0-9a-f]{12}\)", detail)
 
 
 # =============================================================================

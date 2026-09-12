@@ -12,6 +12,7 @@ relied on.
 
 from __future__ import annotations
 
+import re
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -505,8 +506,12 @@ class TestAcceptJobDiffGates:
             await accept_job_diff(_request(), JOB_ID, dependencies=deps)
 
         assert exc.value.status_code == 503
-        assert exc.value.detail == (
-            "Cloud backend 'nextcloud' unavailable: no such instance"
+        # The router's exception text is logged, not returned; the client gets
+        # the backend name it needs plus the id that finds the log line.
+        assert "no such instance" not in exc.value.detail
+        assert re.fullmatch(
+            r"Cloud backend 'nextcloud' unavailable \(error_ref=[0-9a-f]{12}\)",
+            exc.value.detail,
         )
         assert control.order == ["guard:mode_a_accept"]
 

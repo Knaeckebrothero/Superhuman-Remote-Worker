@@ -12,6 +12,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from uuid import uuid4
+
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 
 from agent.api.models import (
@@ -1023,9 +1025,14 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
                 )
 
             return {"tabs": tabs}
-        except Exception as e:
-            logger.error(f"Failed to get shell state: {e}")
-            return {"tabs": [], "message": f"Error: {str(e)}"}
+        except Exception:
+            error_ref = uuid4().hex[:12]
+            logger.exception("Failed to get shell state (error_ref=%s)", error_ref)
+            return {
+                "tabs": [],
+                "message": "Error: shell state unavailable",
+                "error_ref": error_ref,
+            }
 
     # =========================================================================
     # Orchestrator Integration Endpoints

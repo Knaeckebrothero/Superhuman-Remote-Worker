@@ -7,6 +7,7 @@ Run with:
 import asyncio
 import copy
 import hashlib
+import html
 import json
 import logging
 import math
@@ -35901,12 +35902,12 @@ def _magic_link_confirmation_page(
     'extended' on success, 'cap_reached' when extend_count >= cap,
     'not_awaiting' when the thread is no longer in awaiting_user.
     """
-    safe_args = (
-        tool_args_preview.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
-    safe_tool = tool_name.replace("&", "&amp;").replace("<", "&lt;")
+    # Both values come from the agent's pending tool call and land in element
+    # content; the token below lands in an attribute. html.escape(quote=True)
+    # covers & < > " ' in one pass — the hand-rolled chains here missed ">" on
+    # the tool name and the quotes on both, which is the reflected-XSS hole.
+    safe_args = html.escape(tool_args_preview, quote=True)
+    safe_tool = html.escape(tool_name, quote=True)
     if intended_decision == "approved":
         button_label = "Confirm: Approve"
         button_color = _BRAND["success"]
@@ -35917,7 +35918,11 @@ def _magic_link_confirmation_page(
         button_label = "Confirm decision"
         button_color = _BRAND["accent-color"]
 
-    quoted_token = urllib.parse.quote(token, safe="")
+    # The token lands in a form ``action`` attribute. Percent-encoding already
+    # removes every character that could close the attribute; escaping the
+    # result as well is a no-op on that output but keeps the sanitizer
+    # explicit at the sink rather than inferred from the encoder.
+    quoted_token = html.escape(urllib.parse.quote(token, safe=""), quote=True)
 
     # Extend banner copy — friendly, action-specific.
     extend_banner_html = ""
