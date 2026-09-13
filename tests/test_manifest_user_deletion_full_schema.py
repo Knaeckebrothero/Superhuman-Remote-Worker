@@ -1,5 +1,6 @@
 """Application user deletion retains history without orphaning live authority."""
 
+import asyncio
 from copy import deepcopy
 import json
 from types import SimpleNamespace
@@ -10,7 +11,11 @@ from fastapi import HTTPException
 import pytest
 
 from orchestrator.services.manifest_execution_snapshot import read_execution
+from orchestrator.services.datasource_policy_errors import (
+    DatasourceMaterializationAuthorizationError,
+)
 from orchestrator.services.manifest_resources import ManifestResourceService
+from orchestrator.services import manifest_retirement
 from orchestrator.services.manifest_store import ManifestStore, resource_key
 from orchestrator.services.manifest_workspaces import ManifestWorkspaceService
 from orchestrator.services.user_administration import delete_user
@@ -288,6 +293,109 @@ async def test_project_delete_ignores_only_settled_ownerless_session_history(
     assert await database.get_project(str(project["id"])) is None
     assert await database.get_thread(thread_id) is not None
     assert await ManifestStore(database).execution("Session", thread_id) is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("contender", ["resume", "native_apply", "admission"])
+async def test_project_delete_serializes_late_execution_contenders(
+    database, monkeypatch, contender
+):
+    """Deletion wins one catalog lock before any late execution can reopen it."""
+
+    departing, project = await owner(database, f"Delete race {contender}")
+    thread_id = await database.create_thread(
+        user_id=str(departing["id"]),
+        project_id=str(project["id"]),
+        authority_user_id=str(departing["id"]),
+        authority_project_ids=[str(project["id"])],
+        execution_lane="pinned",
+        initial_metadata={"config_override": {"workspace": {"backend": "none"}}},
+    )
+    await database.execute(
+        "UPDATE threads SET status='ended' WHERE id=$1::uuid", thread_id
+    )
+    assert await database.delete_user(str(departing["id"])) is True
+
+    contender_user, _ = await owner(database, f"Race actor {contender}")
+    await database.add_project_member(
+        str(project["id"]), str(contender_user["id"]), "editor"
+    )
+    deletion_holds_catalog = asyncio.Event()
+    allow_delete_commit = asyncio.Event()
+    retire = manifest_retirement.retire_project_resources
+
+    async def paused_retirement(conn, project_id):
+        await retire(conn, project_id)
+        deletion_holds_catalog.set()
+        await allow_delete_commit.wait()
+
+    monkeypatch.setattr(
+        manifest_retirement, "retire_project_resources", paused_retirement
+    )
+    deletion = asyncio.create_task(database.delete_project(str(project["id"])))
+    await asyncio.wait_for(deletion_holds_catalog.wait(), timeout=5)
+
+    if contender == "resume":
+        competing = asyncio.create_task(database.resume_thread(thread_id))
+    elif contender == "admission":
+        competing = asyncio.create_task(
+            database.create_thread(
+                user_id=str(contender_user["id"]),
+                project_id=str(project["id"]),
+                authority_user_id=str(contender_user["id"]),
+                authority_project_ids=[str(project["id"])],
+                execution_lane="pinned",
+                initial_metadata={
+                    "config_override": {"workspace": {"backend": "none"}}
+                },
+            )
+        )
+    else:
+        document = {
+            "apiVersion": "srw/v1alpha1",
+            "kind": "Expert",
+            "metadata": {
+                "name": "too-late",
+                "scope": {"kind": "Project", "name": str(project["id"])},
+            },
+            "spec": {"runtime": {"image": "example.invalid/too-late:v1"}},
+        }
+        competing = asyncio.create_task(
+            ManifestResourceService(database).apply(
+                json.dumps(document), contender_user, format="json"
+            )
+        )
+
+    await asyncio.sleep(0.1)
+    assert not competing.done()
+    allow_delete_commit.set()
+    assert await deletion is True
+    if contender == "resume":
+        assert await competing is False
+    elif contender == "admission":
+        with pytest.raises(DatasourceMaterializationAuthorizationError):
+            await competing
+    else:
+        with pytest.raises(HTTPException) as refused:
+            await competing
+        assert refused.value.status_code in {403, 404, 409}
+
+    assert await database.get_project(str(project["id"])) is None
+    assert (
+        await database.fetchval(
+            "SELECT count(*) FROM srw_execution_specs WHERE $1::uuid=ANY(project_ids)",
+            project["id"],
+        )
+        == 1
+    )
+    assert (
+        await database.fetchval(
+            "SELECT count(*) FROM srw_resources WHERE project_id=$1::uuid "
+            "AND deleted_at IS NULL",
+            project["id"],
+        )
+        == 0
+    )
 
 
 @pytest.mark.asyncio

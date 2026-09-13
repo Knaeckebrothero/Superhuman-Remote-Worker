@@ -281,6 +281,7 @@ async def test_create_job_materializes_links_in_job_transaction(monkeypatch):
     conn = AsyncMock()
     conn.fetch.side_effect = [
         [{"id": UUID(DATASOURCE_ID), "policy_revision": 7}],
+        [{"id": UUID(PROJECT_A)}],
         [{"project_id": UUID(PROJECT_A)}],
     ]
     conn.fetchrow.side_effect = [
@@ -312,8 +313,10 @@ async def test_create_job_materializes_links_in_job_transaction(monkeypatch):
     }
     assert "FROM users" in conn.fetchrow.await_args_list[0].args[0]
     assert "FOR UPDATE" in conn.fetchrow.await_args_list[0].args[0]
-    assert "FROM project_members" in conn.fetch.await_args_list[1].args[0]
-    assert "FOR UPDATE" in conn.fetch.await_args_list[1].args[0]
+    assert "FROM projects" in conn.fetch.await_args_list[1].args[0]
+    assert "FOR KEY SHARE" in conn.fetch.await_args_list[1].args[0]
+    assert "FROM project_members" in conn.fetch.await_args_list[2].args[0]
+    assert "FOR UPDATE" in conn.fetch.await_args_list[2].args[0]
     assert conn.executemany.await_args.args[1] == [(UUID(JOB_ID), UUID(DATASOURCE_ID))]
     assert str(result["id"]) == JOB_ID
 
@@ -323,6 +326,7 @@ async def test_create_job_rejects_membership_revoked_after_policy_resolution():
     conn = AsyncMock()
     conn.fetch.side_effect = [
         [{"id": UUID(DATASOURCE_ID), "policy_revision": 7}],
+        [{"id": UUID(PROJECT_A)}],
         [],
     ]
     conn.fetchrow.return_value = {"is_admin": False, "is_approved": True}

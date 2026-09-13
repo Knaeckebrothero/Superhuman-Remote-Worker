@@ -1208,7 +1208,29 @@ async def _lock_and_validate_work_owner(
         raise DatasourceMaterializationAuthorizationError(
             "Work owner is no longer authorized"
         )
-    if bool(actor["is_admin"]) or not target_project_uuids:
+    if not target_project_uuids:
+        return
+
+    # The catalog advisory lock orders this read after Project retirement. An
+    # administrator may bypass membership, but cannot materialize work against
+    # a Project row that the winning deletion transaction already removed.
+    # Detect that as the same domain refusal instead of leaking a later FK
+    # violation from the work INSERT.
+    projects = await conn.fetch(
+        """
+        SELECT id
+        FROM projects
+        WHERE id = ANY($1::uuid[])
+        ORDER BY id
+        FOR KEY SHARE
+        """,
+        target_project_uuids,
+    )
+    if {row["id"] for row in projects} != set(target_project_uuids):
+        raise DatasourceMaterializationAuthorizationError(
+            "Work owner is no longer authorized"
+        )
+    if bool(actor["is_admin"]):
         return
 
     rows = await conn.fetch(
