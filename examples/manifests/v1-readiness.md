@@ -47,6 +47,13 @@ including the repeatable acceptance harness at `a91e56b19`. They have not been
 pushed or rolled out to main dev. Concurrent changes in
 another checkout require their own integration review.
 
+The 2026-09-13 `develop` push at `a116c4682` contains the completion-workflow
+refactor. It does not yet contain this manifest candidate. Its
+[CI/CD run](https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/actions/runs/34764758725)
+is a separate publication checkpoint; passing that run does not establish
+deployment of workspace preparation. Integrating the two branches and verifying
+the combined revision remain required.
+
 ## Acceptance status — 2026-09-13
 
 The coherent candidate is deployed on local `k3d-srw`. The service-level
