@@ -1,5 +1,8 @@
 # SRW resource manifests (v1alpha1)
 
+See [first-release readiness](v1-readiness.md) for the current supported core,
+verification state and remaining rollout decisions.
+
 Read [resources.yaml](resources.yaml), [referenced-job.yaml](referenced-job.yaml),
 then [project.yaml](project.yaml) for the basic composition.
 [inline-job.yaml](inline-job.yaml) describes an ordinary image with no SRW hooks;
@@ -857,9 +860,24 @@ temporary credentials were cleaned up. No LLM or harness completion was used in
 this gate. See the [recorded evidence](workspace-preparation-k3d-evidence.json)
 and [operator setup](workspace-preparation.md).
 
-The full backend regression run with `PYTHONSAFEPATH=1` finished with 30,815
+The earlier backend regression run with `PYTHONSAFEPATH=1` finished with 30,815
 passes, 179 skips and one source-inspection failure caused by expanding a
 database docstring after the module had already been imported. The affected
-module passed all 10 tests in a fresh process with no runtime changes. Both
-production images built and passed Python 3.12 import checks; Helm lint,
+module passed all 10 tests in a fresh process with no runtime changes. The VM
+controller and preparer images built and passed Python 3.12 import checks; Helm lint,
 Ruff, SQL lint and endpoint/runtime-coordinate inventories also passed.
+
+The subsequent [MCP/harness preparation gate](verification/k3d-prepared-srw-mcp-2026-09-13.json)
+passed all six cases and cleanup on 2026-09-13. An owned deterministic model
+provider drove four actual SRW Jobs through SSH tools: cold preparation, a fresh
+cache hit, retained allocation and retained handoff. Failed preparation and
+cancellation of a running builder both stopped before workspace allocation.
+Metadata edits preserved the completed execution snapshots and Job identities.
+
+The [complete Job/Session smoke](verification/k3d-srw-adapter-2026-09-13.json)
+also passed after the cleanup-capture lock correction. It exercised sandbox and
+virtual Jobs, existing Job API selection, Session configuration updates and
+End/Resume, and sandbox/virtual/no-workspace Sessions, including exact cleanup.
+
+The [readiness page](v1-readiness.md) records the subsequent integration fixes,
+complete regression runs and MCP/harness acceptance state.

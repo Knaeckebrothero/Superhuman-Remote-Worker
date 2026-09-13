@@ -34,6 +34,9 @@ separate. Initialization and ordinary working files never flow back into the
 cache. `retention: Retain` and `instanceRef` preserve one working disk across Jobs;
 they do not turn that disk into a template. Reusing a retained instance works
 with new preparation disabled and does not rerun successful initialization.
+Starting the SRW harness preserves initialized files and existing working trees.
+An existing delivery repository must match the requested remote; a different
+remote is rejected without clearing the workspace.
 
 ## Policies
 
@@ -150,6 +153,10 @@ are not copied into manifests or API responses.
 Failed commands never publish an artifact or start a VM. Cancellation waits for
 the builder's terminal state before removing its disk. Controller restarts recover
 durable build records and never substitute a new writer for a missing one.
+Deleting work that failed before VM allocation uses signed cancellation evidence
+that no workspace source was ever supplied, plus exact runtime absence and the
+current owner generation. A supplied source or uncertain allocation still requires
+the existing VM retirement proof.
 An unaccounted-for or replaced builder is quarantined as `Lost`; its disk cannot
 be reused automatically. Inspect its exact Pod/PVC identities and establish that
 the writer has stopped before operator recovery. A timeout alone is insufficient.
@@ -163,3 +170,36 @@ permissions and NetworkPolicy so existing allocations can be cancelled and colle
 The implemented cache is a CDI PVC in the controller's namespace. OCI/S3 artifact
 export, cross-cluster distribution, generic-harness VM providers and sandbox image
 builders are separate capabilities. This feature does not enable those backends.
+
+## Repeatable local acceptance
+
+After a coherent Tilt deployment with the offline preparation settings above,
+run this gate from the same checkout using its installed Python dependencies:
+
+```bash
+python scripts/workspace-preparation-srw-k3d-gate.py --output /tmp/srw-prepared-mcp-evidence.json
+```
+
+The gate requires the local `k3d-srw` cluster, the normal development test login
+and Keycloak bootstrap access, trusted localhost TLS, and the local registry on
+port 5005. It verifies deployed source and hosting capabilities before creating
+resources. `--base-image` can select a different digest-pinned compatible VM
+image; the default is the pinned SRW development disk. A cold import can take
+tens of minutes.
+
+An owned deterministic model provider drives the installed SRW harness through
+real MCP admission and SSH tool calls. The gate checks two fresh Jobs sharing one
+prepared artifact with separate writable disks, a retained Job handoff, successful
+initialization exactly once per disk, metadata updates without execution replay,
+build failure and cancellation while the builder runs. The provider requires the
+actual shell proof before it permits the assignment to finish.
+
+Cleanup retires the owned Jobs, retained disks, recipe artifacts, model fixture
+and temporary credentials. The scope's imported base image remains subject to the
+configured cache TTL. Evidence includes resource identities and results; arbitrary
+tool output, logs and credentials are excluded. A failed cleanup keeps the gate
+failed and records the stage for recovery.
+
+The [2026-09-13 acceptance record](verification/k3d-prepared-srw-mcp-2026-09-13.json)
+passed all six cases and cleanup on the installed candidate. Each successful Job
+verified prepared software and disk contents through the actual SRW shell tool.
