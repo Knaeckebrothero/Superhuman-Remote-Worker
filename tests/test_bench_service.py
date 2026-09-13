@@ -6,6 +6,7 @@ import asyncio
 import copy
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -26,13 +27,20 @@ RUN_ID = "11111111-1111-1111-1111-111111111111"
 USER_ID = "22222222-2222-2222-2222-222222222222"
 
 
-def _request() -> Request:
+def _request(dependencies: bench_router.BenchDependencies | None = None) -> Request:
+    if dependencies is None:
+        dependencies = bench_router.BenchDependencies(
+            store=BenchStore(MagicMock()), create_job=AsyncMock()
+        )
     return Request(
         {
             "type": "http",
             "method": "POST",
             "path": "/api/bench/runs",
             "headers": [],
+            "app": SimpleNamespace(
+                state=SimpleNamespace(bench_dependencies_factory=lambda: dependencies)
+            ),
         }
     )
 
@@ -332,8 +340,6 @@ def test_arm_project_is_frozen_and_overrides_the_run_project():
 
 @pytest.mark.asyncio
 async def test_create_run_validates_and_persists_each_arm_project(monkeypatch):
-    import orchestrator.main
-
     legacy_project = "44444444-4444-4444-4444-444444444444"
     skills_project = "55555555-5555-5555-5555-555555555555"
     caller = {"id": USER_ID, "is_admin": False, "scopes": []}
@@ -344,9 +350,11 @@ async def test_create_run_validates_and_persists_each_arm_project(monkeypatch):
     )
     monkeypatch.setattr(bench_router, "require_project_member", require_member)
     monkeypatch.setattr(bench_router, "create_bench_run", create)
-    monkeypatch.setattr(orchestrator.main, "postgres_db", MagicMock())
-    monkeypatch.setattr(
-        orchestrator.main, "_with_validated_tool_overrides", lambda value: value
+    database = MagicMock()
+    dependencies = bench_router.BenchDependencies(
+        store=BenchStore(database),
+        create_job=AsyncMock(),
+        validate_tool_overrides=lambda value: value,
     )
 
     body = bench_router.BenchRunCreate(
@@ -359,7 +367,7 @@ async def test_create_run_validates_and_persists_each_arm_project(monkeypatch):
             {"name": "skills", "model": "m", "project_id": skills_project},
         ],
     )
-    await bench_router.create_run(_request(), body)
+    await bench_router.create_run(_request(dependencies), body)
 
     assert [call.args[2] for call in require_member.await_args_list] == [
         legacy_project,
@@ -374,8 +382,6 @@ async def test_create_run_validates_and_persists_each_arm_project(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_create_run_rejects_arm_outside_token_project_scope(monkeypatch):
-    import orchestrator.main
-
     allowed_project = "33333333-3333-3333-3333-333333333333"
     other_project = "44444444-4444-4444-4444-444444444444"
     caller = {
@@ -388,6 +394,12 @@ async def test_create_run_rejects_arm_outside_token_project_scope(monkeypatch):
     )
     require_member = AsyncMock()
     monkeypatch.setattr(bench_router, "require_project_member", require_member)
+    database = MagicMock()
+    dependencies = bench_router.BenchDependencies(
+        store=BenchStore(database),
+        create_job=AsyncMock(),
+        validate_tool_overrides=lambda value: value,
+    )
 
     body = bench_router.BenchRunCreate(
         name="paired",
@@ -397,18 +409,136 @@ async def test_create_run_rejects_arm_outside_token_project_scope(monkeypatch):
         arms=[{"name": "legacy", "model": "m", "project_id": other_project}],
     )
     with pytest.raises(HTTPException, match="outside the token's project scope") as exc:
-        await bench_router.create_run(_request(), body)
+        await bench_router.create_run(_request(dependencies), body)
 
     assert exc.value.status_code == 403
     assert require_member.await_count == 1
     assert require_member.await_args.args[1:] == (
-        orchestrator.main.postgres_db,
+        database,
         allowed_project,
     )
     assert require_member.await_args.kwargs == {
         "min_role": "editor",
         "allow_archived": False,
     }
+
+
+@pytest.mark.asyncio
+async def test_run_reads_use_the_request_application_store(monkeypatch):
+    caller = {"id": USER_ID, "is_admin": False, "scopes": []}
+    database = MagicMock()
+    store = MagicMock(db=database)
+    store.list_runs = AsyncMock(return_value=[{"id": RUN_ID}])
+    dependencies = bench_router.BenchDependencies(store=store, create_job=AsyncMock())
+    authorize = AsyncMock(return_value=caller)
+    monkeypatch.setattr(bench_router, "require_approved_user", authorize)
+
+    result = await bench_router.list_runs(_request(dependencies), limit=7)
+
+    assert result == [{"id": RUN_ID}]
+    authorize.assert_awaited_once_with(authorize.await_args.args[0], database)
+    store.list_runs.assert_awaited_once_with(created_by=USER_ID, limit=7)
+
+
+@pytest.mark.asyncio
+async def test_report_uses_bound_reporting_collaborators(monkeypatch):
+    caller = {"id": USER_ID, "is_admin": False, "scopes": []}
+    run = {"id": RUN_ID, "created_by": USER_ID}
+    database = MagicMock()
+    store = MagicMock(db=database)
+    store.get_run = AsyncMock(return_value=run)
+    audit_reader = MagicMock(is_available=True)
+    forge = MagicMock()
+    resolve_job_repo = AsyncMock(return_value=("repo", "branch"))
+    dependencies = bench_router.BenchDependencies(
+        store=store,
+        create_job=AsyncMock(),
+        audit_reader=audit_reader,
+        forge=forge,
+        resolve_job_repo=resolve_job_repo,
+    )
+    monkeypatch.setattr(
+        bench_router, "require_approved_user", AsyncMock(return_value=caller)
+    )
+    report = AsyncMock(return_value={"run_id": RUN_ID})
+    monkeypatch.setattr(bench_router, "compute_bench_report", report)
+
+    result = await bench_router.get_report(_request(dependencies), RUN_ID)
+
+    assert result == {"run_id": RUN_ID}
+    report.assert_awaited_once_with(
+        database,
+        run,
+        audit_reader=audit_reader,
+        gitea_client=forge,
+        resolve_job_repo=resolve_job_repo,
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancel_uses_authorized_application_operation_without_http_reentry(
+    monkeypatch,
+):
+    caller = {"id": USER_ID, "is_admin": False, "scopes": []}
+    run = {"id": RUN_ID, "created_by": USER_ID}
+    store = MagicMock(db=MagicMock())
+    store.get_run = AsyncMock(return_value=run)
+    cancel_job = AsyncMock(return_value={"status": "cancelled"})
+    dependencies = bench_router.BenchDependencies(
+        store=store, create_job=AsyncMock(), cancel_job=cancel_job
+    )
+    monkeypatch.setattr(
+        bench_router, "require_approved_user", AsyncMock(return_value=caller)
+    )
+
+    async def cancel_run(_store, visible_run, *, cancel_job_fn):
+        assert _store is store
+        assert visible_run is run
+        assert await cancel_job_fn("job-1") == {"status": "cancelled"}
+        return {"status": "cancelled"}
+
+    monkeypatch.setattr(bench_router, "cancel_bench_run", cancel_run)
+
+    result = await bench_router.cancel_run(_request(dependencies), RUN_ID)
+
+    assert result == {"status": "cancelled"}
+    cancel_job.assert_awaited_once_with("job-1", caller)
+
+
+@pytest.mark.asyncio
+async def test_application_cancel_adapter_revalidates_member_without_request(
+    monkeypatch,
+):
+    import orchestrator.main as main
+
+    caller = {"id": USER_ID, "is_admin": False, "scopes": []}
+    job = {"id": "job-1", "user_id": USER_ID, "execution_lane": "pinned"}
+    database = MagicMock()
+    database.get_job = AsyncMock(return_value=job)
+    authorize = AsyncMock(return_value=True)
+    cancel = AsyncMock(return_value={"status": "cancelled"})
+    monkeypatch.setattr(main, "postgres_db", database)
+    monkeypatch.setattr(main, "user_can_access_job", authorize)
+    monkeypatch.setattr(main, "_cancel_job_internal", cancel)
+
+    assert await main._cancel_bench_job("job-1", caller) == {"status": "cancelled"}
+
+    authorize.assert_awaited_once_with(caller, database, "job-1")
+    cancel.assert_awaited_once_with("job-1", job=job)
+
+
+def test_application_factory_binds_complete_bench_dependencies():
+    import orchestrator.main as main
+
+    dependencies = main._bench_dependencies()
+
+    assert dependencies.store.db is main.postgres_db
+    assert dependencies.create_job is main._create_bench_job
+    assert dependencies.validate_tool_overrides is main._with_validated_tool_overrides
+    assert dependencies.audit_reader is main.audit_reader
+    assert dependencies.forge is main.gitea_client
+    assert dependencies.resolve_job_repo is not None
+    assert dependencies.cancel_job is main._cancel_bench_job
 
 
 def test_seeded_queue_is_stable_and_skips_ledger_entries():

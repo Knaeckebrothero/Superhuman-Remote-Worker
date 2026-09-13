@@ -112,6 +112,7 @@ from orchestrator.security.access import (  # noqa: E402
     require_sudo_request_authority,
     require_thread_owner,
     user_can_access_any_job,
+    user_can_access_job,
     user_can_access_ide_entity,
     user_can_access_job_or_thread,
     user_visible_project_ids,
@@ -1099,7 +1100,10 @@ def _pinned_retirement_operations() -> PinnedRetirementOperations:
             docker_provisioner=docker_provisioner,
             vm_provisioner=vm_provisioner,
             session_router=session_router,
-            resolve_protected_reader_backend=_resolve_protected_reader_backend,
+            resolve_protected_reader_backend=functools.partial(
+                protected_cloud_engage._resolve_protected_reader_backend,
+                dependencies=_protected_cloud_engage_dependencies(),
+            ),
             resolve_ssh_key_path=resolve_ssh_key_path,
             logger=logger,
         )
@@ -10428,8 +10432,7 @@ def _rebind_main_cloud_router(router: Any) -> None:
 #                              _schedule_protected_engage, _record_protected_error,
 #                              _protected_cloud_delivery_state,
 #                              _protected_workspace_wait_payload
-#   B09 retirement           — _resolve_protected_reader_backend,
-#                              _retirement_stage_event_from_receipt
+#   B09 retirement           — _retirement_stage_event_from_receipt
 # Each disappears when its owning batch moves the caller; none is a public API.
 
 
@@ -10504,12 +10507,6 @@ def _protected_workspace_wait_payload(
 ) -> dict[str, Any]:
     return protected_cloud_engage._protected_workspace_wait_payload(
         state=state, error_code=error_code
-    )
-
-
-async def _resolve_protected_reader_backend(plan: Any) -> Any:
-    return await protected_cloud_engage._resolve_protected_reader_backend(
-        plan, dependencies=_protected_cloud_engage_dependencies()
     )
 
 
@@ -11067,13 +11064,38 @@ async def _create_bench_job(creator_id: str, command: JobCreate) -> dict[str, An
     )
 
 
+async def _cancel_bench_job(job_id: str, caller: dict[str, Any]) -> dict[str, str]:
+    """Revalidate one run member, then invoke the application control operation."""
+
+    job = await postgres_db.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+    if not await user_can_access_job(caller, postgres_db, job_id):
+        raise HTTPException(status_code=403, detail="Not authorized to access this job")
+    return await _cancel_job_internal(job_id, job=job)
+
+
 def _bench_dependencies():
     """Bind the benchmark task to this application's creation operation."""
     from orchestrator.routers.bench import BenchDependencies
     from orchestrator.services.bench import BenchStore
 
     return BenchDependencies(
-        store=BenchStore(postgres_db), create_job=_create_bench_job
+        store=BenchStore(postgres_db),
+        create_job=_create_bench_job,
+        validate_tool_overrides=_with_validated_tool_overrides,
+        audit_reader=audit_reader,
+        forge=gitea_client,
+        resolve_job_repo=(
+            lambda job_id: subjob_output_operations.resolve_job_repo(
+                job_id,
+                dependencies=subjob_output_operations.SubjobOutputDependencies(
+                    store=postgres_db,
+                    forge=gitea_client,
+                ),
+            )
+        ),
+        cancel_job=_cancel_bench_job,
     )
 
 
