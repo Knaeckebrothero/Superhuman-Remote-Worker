@@ -187,6 +187,15 @@ class CompletionRuntime:
             )
         return self._control
 
+    def reset(self) -> None:
+        """Release cached service objects during application shutdown/tests."""
+
+        self._finalizer = None
+        self._sweep_router = None
+        self._control = None
+        self._command_resolution = None
+        self._monitor = None
+
 
 class CompletionControlBoundary:
     """HTTP/application adapter over one :class:`CompletionControl` instance.

@@ -72,6 +72,14 @@ class VerificationTransactionPorts:
     resolve_workspace_contract: Callable[[dict[str, Any]], Any]
     deep_merge_dicts: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]]
     is_lite_config_override: Callable[[Any], bool]
+    enqueue_worker_batch_wake: Callable[..., Awaitable[Any]] = enqueue_worker_batch_wake
+    reset_worker_batch_attempts: Callable[..., Awaitable[Any]] = (
+        reset_worker_batch_attempts
+    )
+    unpark_unit: Callable[..., Awaitable[Any]] = unpark_unit
+    stateless_resume_context: Callable[[dict[str, Any]], dict[str, Any]] = (
+        _stateless_resume_context
+    )
 
 
 @dataclass(frozen=True)
@@ -286,7 +294,7 @@ async def materialize_critic_verdict_transactional(
         try:
             async with conn.transaction():
                 if queue_first:
-                    admitted = await enqueue_worker_batch_wake(
+                    admitted = await dependencies.transaction.enqueue_worker_batch_wake(
                         conn,
                         job_id=target_uuid,
                         fair_key=(
@@ -330,20 +338,25 @@ async def materialize_critic_verdict_transactional(
                         "queued_feedback_reason": transition["feedback_reason"],
                     }
                     resume_context = (
-                        _stateless_resume_context(resume_values)
+                        dependencies.transaction.stateless_resume_context(resume_values)
                         if queue_first
                         else resume_values
                     )
                     if queue_first:
                         if (
-                            await reset_worker_batch_attempts(conn, job_id=target_uuid)
+                            await dependencies.transaction.reset_worker_batch_attempts(
+                                conn, job_id=target_uuid
+                            )
                             is None
                         ):
                             raise RuntimeError(
                                 "critic return lost the worker queue row"
                             )
-                        if admitted.state == "parked" and not await unpark_unit(
-                            conn, unit_id=target_uuid
+                        if (
+                            admitted.state == "parked"
+                            and not await dependencies.transaction.unpark_unit(
+                                conn, unit_id=target_uuid
+                            )
                         ):
                             raise RuntimeError(
                                 "critic return could not unpark worker queue"

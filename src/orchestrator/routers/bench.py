@@ -312,8 +312,8 @@ async def get_report(request: Request, run_id: str) -> dict[str, Any]:
         audit_reader,
         gitea_client,
         postgres_db,
-        resolve_job_repo,
     )
+    from orchestrator.services import subjob_output
 
     caller = await require_approved_user(request, postgres_db)
     run = await _visible_run_or_404(BenchStore(postgres_db), run_id, caller)
@@ -324,7 +324,15 @@ async def get_report(request: Request, run_id: str) -> dict[str, Any]:
         run,
         audit_reader=audit_reader,
         gitea_client=gitea_client,
-        resolve_job_repo=resolve_job_repo,
+        resolve_job_repo=(
+            lambda job_id: subjob_output.resolve_job_repo(
+                job_id,
+                dependencies=subjob_output.SubjobOutputDependencies(
+                    store=postgres_db,
+                    forge=gitea_client,
+                ),
+            )
+        ),
     )
 
 

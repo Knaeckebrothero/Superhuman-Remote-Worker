@@ -485,6 +485,41 @@ forbidden_modules = ["shared.runtime", "shared.runtime.**"]
 as_packages = false
 
 [[tool.importlinter.contracts]]
+name = "Completion verification delegation and recovery do not import application startup"
+type = "forbidden"
+source_modules = [
+    "orchestrator.routers.job_completion",
+    "orchestrator.routers.verification",
+    "orchestrator.services.job_completion",
+    "orchestrator.services.legacy_job_completion",
+    "orchestrator.services.completion_runtime",
+    "orchestrator.services.completion_session_memory",
+    "orchestrator.services.completion_effects",
+    "orchestrator.services.completion_recovery",
+    "orchestrator.services.completion_control",
+    "orchestrator.services.completion_finalizer",
+    "orchestrator.services.completion_monitor",
+    "orchestrator.services.completion_sweep_router",
+    "orchestrator.services.completion_command_resolution",
+    "orchestrator.services.job_completion_commands",
+    "orchestrator.services.completion_effect_policy",
+    "orchestrator.services.completion_effect_reconciliation",
+    "orchestrator.services.completion_lifecycle",
+    "orchestrator.services.completion_teardown_authority",
+    "orchestrator.services.verification_workflow",
+    "orchestrator.services.verification_ledger",
+    "orchestrator.services.subjob_completion",
+    "orchestrator.services.subjob_output",
+]
+forbidden_modules = ["orchestrator.main"]
+ignore_imports = [
+    # B10 owns the remaining lazy application lookup, reached through the
+    # shared authorization chain. Keep every other transitive path checked.
+    "orchestrator.services.session_wake -> orchestrator.main",
+]
+unmatched_ignore_imports_alerting = "warn"
+
+[[tool.importlinter.contracts]]
 name = "MCP and VM controller do not depend on shared runtime"
 type = "forbidden"
 source_modules = ["mcp_server", "vm_controller"]
