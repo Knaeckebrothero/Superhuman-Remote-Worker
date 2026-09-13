@@ -13,15 +13,32 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.mark.parametrize("image_key", ["image.mcp", "vmController.preparation.image"])
-def test_tilt_image_clears_a_saved_digest(tmp_path, image_key):
+@pytest.mark.parametrize("receipt", ["current", "missing", "other-map", "ambiguous"])
+def test_tilt_image_replaces_a_saved_digest(tmp_path, image_key, receipt):
     binaries = tmp_path / "bin"
     binaries.mkdir()
     observation = tmp_path / "helm.json"
-    fake = f"#!{sys.executable}\n" + """
+    fake = (
+        f"#!{sys.executable}\n"
+        + """
 import json, os, sys
 from pathlib import Path
 args = sys.argv[1:]
-if Path(sys.argv[0]).name == 'kubectl':
+name = Path(sys.argv[0]).name
+receipt = os.environ['RECEIPT']
+if name == 'tilt':
+    assert args == ['get', 'imagemap', 'candidate-map', '-o', 'json']
+    print(json.dumps({'status': {
+        'imageFromLocal': 'localhost:5005/candidate:tilt-fresh',
+        'imageFromCluster': 'srw-registry:5000/candidate:' + ('old' if receipt == 'other-map' else 'tilt-fresh')
+    }}))
+elif name == 'docker':
+    assert args == ['image', 'inspect', 'localhost:5005/candidate:tilt-fresh']
+    digests = ['localhost:5005/candidate@sha256:' + 'b' * 64]
+    if receipt == 'missing': digests = []
+    if receipt == 'ambiguous': digests += ['localhost:5005/candidate@sha256:' + 'c' * 64]
+    print(json.dumps([{'RepoDigests': digests}]))
+elif name == 'kubectl':
     print(sys.stdin.read())
 elif args[0] == 'status':
     print(json.dumps({'info': {'status': 'deployed'}}))
@@ -32,7 +49,8 @@ elif args[:2] == ['upgrade', '--install']:
 else:
     raise AssertionError(args)
 """
-    for name in ("helm", "kubectl"):
+    )
+    for name in ("helm", "kubectl", "tilt", "docker"):
         executable = binaries / name
         executable.write_text(fake)
         executable.chmod(0o700)
@@ -54,12 +72,19 @@ else:
             "TILT_IMAGE_KEY_REPO_0": image_key + ".repository",
             "TILT_IMAGE_KEY_TAG_0": image_key + ".tag",
             "TILT_IMAGE_KEY_DIGEST_0": image_key + ".digest",
+            "TILT_IMAGE_MAP_0": "candidate-map",
             "OBSERVATION": str(observation),
+            "RECEIPT": receipt,
         },
         capture_output=True,
         text=True,
         timeout=10,
     )
+    if receipt != "current":
+        assert result.returncode != 0
+        assert "Could not verify the pushed Tilt image digest." in result.stderr
+        assert not observation.exists(), "Unverified image must not reach Helm apply."
+        return
     assert result.returncode == 0, result.stderr
     args = json.loads(observation.read_text())
     settings = {}
@@ -68,7 +93,7 @@ else:
             key, value = args[i + 1].split("=", 1)
             settings[key] = value
     assert settings == {
-        image_key + ".digest": "",
+        image_key + ".digest": "sha256:" + "b" * 64,
         image_key + ".repository": "srw-registry:5000/candidate",
         image_key + ".tag": "tilt-fresh",
     }

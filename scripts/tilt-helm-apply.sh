@@ -137,9 +137,13 @@ for ((i = 0; i < image_count; i++)); do
 
     flags+=(--set "${repo_key}=${img%:*}" --set "${tag_key}=${img##*:}")
     # An overlay's old digest wins over a fresh tag in these chart helpers.
-    # Clear it only for a Tilt-owned image slot declaring a digest field.
+    # Replace it with the exact image Tilt pushed. The controller cannot assume
+    # that k3d's node-side registry hostname also resolves inside a Pod.
     if [[ -n "$digest_key" ]]; then
-        flags+=(--set-string "${digest_key}=")
+        image_map_var="TILT_IMAGE_MAP_${i}"
+        image_map="${!image_map_var:?Tilt image map is required for a digest pin}"
+        digest="$(python3 "$(dirname -- "${BASH_SOURCE[0]}")/tilt-image-digest.py" "$image_map" "$img")"
+        flags+=(--set-string "${digest_key}=${digest}")
     fi
 done
 
