@@ -3505,7 +3505,8 @@ vmController:
     network:
       # Off = libguestfs --no-network plus Pod egress denial.
       enabled: false
-      # Operator assertion after testing the cluster's NetworkPolicy enforcement.
+      # Operator assertion after testing preparation isolation from Pod startup,
+      # including the selected Pod firewall / CNI combination.
       enforcementVerified: false
       # Install a trusted Pod-local firewall before the unprivileged builder.
       # Covers CNI startup races without changing node rules. Requires NET_ADMIN

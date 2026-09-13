@@ -79,6 +79,16 @@ The sample cold Job took 16m43s from admission to completion; the cache-hit Job
 took 4m29s, including its independent disk clone and VM boot. This run did not
 repeat a full nested SRW/Tilt deployment.
 
+The 2026-09-14 release candidate adds the preparation Pod firewall described
+below. Its [offline](verification/k3d-pod-firewall-prepared-srw-2026-09-14.json)
+and [online](verification/k3d-online-prepared-srw-2026-09-14.json) local k3d gates
+both passed all six MCP/VM/harness cases and cleanup. Online Jobs executed a
+package downloaded during preparation, including cache reuse and retained-disk
+handoff. Production firewall Pods also passed startup checks on all five main
+nodes in owned test namespaces. The candidate has not yet replaced main's
+installed chart/runtime; main therefore remains offline. See the
+[release verification record](verification/release-contract-2026-09-14.json).
+
 ```yaml
 vm:
   mode: same-cluster
@@ -185,11 +195,13 @@ trusted builder image. `insecureRegistryHosts` is an explicit development-only
 opt-in for registries such as a local k3d registry.
 
 For a private builder image, pin its digest and allow its registry host; the
-controller does not resolve private tags with image-pull credentials. For Tilt or
-a local k3d registry, allow the injected builder reference's host and configure
-`insecureRegistryHosts` when it serves HTTP. The registry address must resolve
-and be reachable from the controller and CDI Pods. A node-only registry mirror
-or a Docker-network hostname alone does not provide that Pod DNS route.
+controller does not resolve private tags with image-pull credentials. Tilt
+supplies a verified digest for its builder, which Kubernetes pulls through the
+node's configured registry route. Any unpinned image still needs a registry
+address the controller can resolve and reach; CDI must likewise reach a base
+image's registry. Allow the reference's host and configure `insecureRegistryHosts`
+when it serves HTTP. A node-only mirror or Docker-network hostname alone does
+not provide that Pod DNS route.
 
 ## Cache operations and failures
 

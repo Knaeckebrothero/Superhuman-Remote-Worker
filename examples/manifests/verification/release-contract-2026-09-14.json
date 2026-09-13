@@ -1,0 +1,234 @@
+{
+  "recordVersion": 1,
+  "milestone": "alpha manifest compatibility and preparation network isolation",
+  "authoredAPI": "srw/v1alpha1",
+  "runtimeSource": "23bb1fc74b0ddbbc040a095ad114dd92476af596",
+  "baselineSource": "5809c97f549f45f226984da300ddda9850cb2174",
+  "python": {
+    "files": 2572,
+    "unchanged": true,
+    "changed": [],
+    "result": {
+      "passed": 31017,
+      "skipped": 179,
+      "warnings": 180,
+      "durationSeconds": 1051.51
+    }
+  },
+  "upgrade": {
+    "revisions": [
+      433,
+      434,
+      435,
+      436
+    ],
+    "resources": 6,
+    "identityAndContentPreserved": true,
+    "identicalReapply": true,
+    "jsonYamlExportRoundTrips": true,
+    "cleanup": true,
+    "limit": "Same-schema rollback between these revisions, with no pending firewall-enabled preparations; no general down-migration claim."
+  },
+  "ordinarySRWSmoke": {
+    "status": "passed",
+    "workloads": 7,
+    "cleanup": true,
+    "scope": "Sandbox/virtual Jobs, existing Job API selection, Session configuration generations and sandbox/virtual/none selection."
+  },
+  "network": {
+    "k3d": {
+      "passed": true,
+      "cleanup": true,
+      "image": "srw-release-vm-preparer:20260913-final",
+      "nodes": [
+        "k3d-srw-server-0"
+      ],
+      "cases": 17,
+      "groups": {
+        "control": 1,
+        "offline-no-cni": 5,
+        "online-no-cni": 5,
+        "online-chart": 5,
+        "init": 1
+      },
+      "sourceHashes": {
+        "src/shared/workspace_preparation_network.py": "8d4038cecb10bd114c63a28371c8a7cb43e4c6341b1d7371a598a72a7bf4de2d",
+        "src/vm_controller/preparation_firewall.py": "0f1b21c4eaeb37ed5c9d4b79db8ccecc13902b96b9b6fae0f889cdb30c08e415",
+        "src/vm_controller/preparation_manifests.py": "116b96aba156bb6831387b80635fea0c7e7ed4be58e8e65d29d0fdaa677b35a1"
+      },
+      "ipv6ControlsAvailable": true
+    },
+    "main": {
+      "passed": true,
+      "cleanup": true,
+      "image": "ghcr.io/knaeckebrothero/superhuman-remote-worker-vm-preparer@sha256:3cf3f66351ba8ee328e6351e276720c06a42ef3923daeafa76683545281d3dcc",
+      "nodes": [
+        "node1",
+        "node2",
+        "node3",
+        "node4",
+        "node8"
+      ],
+      "cases": 85,
+      "groups": {
+        "control": 5,
+        "offline-no-cni": 25,
+        "online-no-cni": 25,
+        "online-chart": 25,
+        "init": 5
+      },
+      "sourceHashes": {
+        "src/shared/workspace_preparation_network.py": "8d4038cecb10bd114c63a28371c8a7cb43e4c6341b1d7371a598a72a7bf4de2d",
+        "src/vm_controller/preparation_firewall.py": "0f1b21c4eaeb37ed5c9d4b79db8ccecc13902b96b9b6fae0f889cdb30c08e415",
+        "src/vm_controller/preparation_manifests.py": "116b96aba156bb6831387b80635fea0c7e7ed4be58e8e65d29d0fdaa677b35a1"
+      },
+      "ipv6ControlsAvailable": true
+    }
+  },
+  "onlinePackage": {
+    "passed": true,
+    "cleanup": true,
+    "sourcePreserved": true,
+    "package": {
+      "buildUid": "459de085-9019-4628-a1d2-54ecbe37522f",
+      "package": "hello",
+      "version": "2.10-3build1",
+      "hello": "Hello, world!"
+    },
+    "image": "srw-release-vm-preparer:20260913-final",
+    "receipt": {
+      "buildUid": "459de085-9019-4628-a1d2-54ecbe37522f",
+      "cacheKey": "4ce005b23aa9510e190ed0df9204e9002981b84dfe82cd04dfdf527255698f44",
+      "diskBytes": 32212254720,
+      "diskSha256": "69c638e4c1bf64a20d83d8837fea65956bd644643bea3bac54a64bca46e6bd4b",
+      "phase": "Succeeded",
+      "pvcUid": "5bd0efb4-43ac-4882-9cb6-78332d1fb865",
+      "version": 1
+    },
+    "independentReadOnlyInspection": true,
+    "scope": "Production builder Pod factory and online chart policy; separate immutable-source clone. This case does not admit an SRW Job.",
+    "priorAttempts": "Two package builds succeeded but their readback fixture failed. The inspector required --format=raw; correcting its cache directory alone was insufficient. All attempts cleaned up."
+  },
+  "mainRollout": {
+    "deployed": false,
+    "onlineEnabled": false,
+    "reason": "PR #127 requires an approving review; PR #128 remains a candidate. Repository auto-merge is disabled."
+  },
+  "protectedResources": {
+    "main": {
+      "protectedCount": 239,
+      "allPreserved": true,
+      "missingOrReplaced": [],
+      "currentCounts": {
+        "VirtualMachine": 3,
+        "VirtualMachineInstance": 3,
+        "PersistentVolumeClaim": 234,
+        "DataVolume": 8
+      }
+    },
+    "k3d-srw": {
+      "protectedCount": 14,
+      "allPreserved": true,
+      "missingOrReplaced": [],
+      "currentCounts": {
+        "PersistentVolumeClaim": 12,
+        "DataVolume": 2
+      }
+    },
+    "observedAt": "2026-09-13T22:50:35.608769+00:00"
+  },
+  "limitations": [
+    "The authored API remains srw/v1alpha1, not a stable srw/v1 declaration.",
+    "Passing preparation network probes do not certify generic image hosting.",
+    "The real development Job is still running; its full-stack deployment and reviewable patch have not been accepted.",
+    "Main has not deployed this candidate and still uses offline preparation."
+  ],
+  "mainNamespaceAdmission": {
+    "namespace": "superhuman-remote-worker",
+    "dryRun": true,
+    "admitted": [
+      {
+        "networkEnabled": false,
+        "initCapability": [
+          "NET_ADMIN"
+        ],
+        "regularBuilderCapabilities": [
+          "ALL"
+        ]
+      },
+      {
+        "networkEnabled": true,
+        "initCapability": [
+          "NET_ADMIN"
+        ],
+        "regularBuilderCapabilities": [
+          "ALL"
+        ]
+      }
+    ]
+  },
+  "recordedAt": "2026-09-13T22:50:35.608920+00:00",
+  "developmentToolSource": "36e6262ea6ef5789e54d749ebd79b5261a9f09f3",
+  "developmentToolTests": {
+    "passed": 104,
+    "warnings": 1,
+    "durationSeconds": 19.61
+  },
+  "candidateCI": {
+    "head": "36e6262ea6ef5789e54d749ebd79b5261a9f09f3",
+    "status": "passed",
+    "url": "https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/actions/runs/34785999985"
+  },
+  "preparationHarness": {
+    "offline": {
+      "record": "k3d-pod-firewall-prepared-srw-2026-09-14.json",
+      "sha256": "54f19d85827f0812b6eca838228b265226be0f445eea9fc8b5621b05e808af78",
+      "status": "passed",
+      "cleanup": true,
+      "startedAt": "2026-09-13T22:03:17.405416+00:00",
+      "finishedAt": "2026-09-13T22:22:53.209232+00:00",
+      "cases": 6,
+      "realGuestShellProofs": 4,
+      "package": null,
+      "builderImage": "srw-registry:5000/srw-vm-preparer@sha256:477293ebb80fbf953254afd7b5d03d70d8ac6b7a4c481f281c248b9085c4e6eb",
+      "networkPolicyRevision": "7dac9b7521e894b528c4af3cb38ef1c70eb4acfecbbf710983295fe716d511c5"
+    },
+    "online": {
+      "record": "k3d-online-prepared-srw-2026-09-14.json",
+      "sha256": "c750be12f5c502cd81acb21a9c6ddc6bcf4d5302dc4b52e5300869ed4702b715",
+      "status": "passed",
+      "cleanup": true,
+      "startedAt": "2026-09-13T22:26:14.810819+00:00",
+      "finishedAt": "2026-09-13T22:47:24.293464+00:00",
+      "cases": 6,
+      "realGuestShellProofs": 4,
+      "package": "hello",
+      "builderImage": "srw-registry:5000/srw-vm-preparer@sha256:477293ebb80fbf953254afd7b5d03d70d8ac6b7a4c481f281c248b9085c4e6eb",
+      "networkPolicyRevision": "1d2a423859e7a8bef293445783656bdfe2a258a0165e55f7e3d59a218c7fbb6a"
+    },
+    "priorAttempts": [
+      {
+        "result": "failed with complete cleanup",
+        "reason": "Saved local preparer digest selected an image lacking the firewall module; init blocked the regular builder."
+      },
+      {
+        "result": "failed with complete cleanup",
+        "reason": "Clearing the digest required a registry hostname that the controller could not resolve. Tilt now supplies its verified pushed digest."
+      }
+    ]
+  },
+  "developmentAssignment": {
+    "jobID": "c7d46b72-57f5-4dbd-af5a-255f8f981654",
+    "provider": "MiniMax-M3",
+    "status": "processing",
+    "scope": "Manifest CLI stdin support plus full nested SRW k3d/Tilt acceptance. Separate real-provider workflow, not claimed complete.",
+    "createdAt": "2026-09-13T20:12:36.128586Z",
+    "readyAt": "2026-09-13T22:19:41Z",
+    "claim": "Premature legacy reaper claim expired naturally; no database claim deletion or frozen deadline extension."
+  },
+  "mainHealth": {
+    "deployments": 15,
+    "allCurrentAndReady": true,
+    "observedAt": "2026-09-13T22:50:35.608769+00:00"
+  }
+}
