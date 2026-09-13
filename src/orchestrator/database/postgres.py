@@ -33999,7 +33999,15 @@ class PostgresDB:
         release_outcome: str,
         agent_present: bool,
     ) -> bool:
-        """Return the exact unprotected Pod to the pool (or mark it absent)."""
+        """Return the exact unprotected Pod to the pool (or mark it absent).
+
+        A cleanly exiting session agent may deregister after the reciprocal
+        detach and before this external-effect receipt is appended. The warm
+        ledger deliberately has no agent foreign key for that reason. Missing,
+        or an exact already-offline detached actor, is therefore settled only
+        for an absent/replaced Pod outcome; a live unprotected Pod still
+        requires the exact draining actor to become ready.
+        """
 
         if release_outcome not in {
             "exact_live_unprotected_v1",
@@ -34039,8 +34047,30 @@ class PostgresDB:
                     warm["agent_id"],
                     "ready" if agent_present else "offline",
                 )
-                if changed != "UPDATE 1" or agent_changed != "UPDATE 1":
+                if changed != "UPDATE 1":
                     raise RuntimeError("warm finalizer release CAS lost")
+                if agent_changed != "UPDATE 1":
+                    actor = await conn.fetchrow(
+                        "SELECT hostname,pod_uid,status::text AS status,"
+                        "thread_id,current_job_id FROM agents "
+                        "WHERE id=$1::uuid FOR UPDATE",
+                        warm["agent_id"],
+                    )
+                    actor_already_absent = bool(
+                        not agent_present
+                        and (
+                            actor is None
+                            or (
+                                actor["hostname"] == warm["pod_name"]
+                                and actor["pod_uid"] == warm["pod_uid"]
+                                and actor["status"] == "offline"
+                                and actor["thread_id"] is None
+                                and actor["current_job_id"] is None
+                            )
+                        )
+                    )
+                    if not actor_already_absent:
+                        raise RuntimeError("warm finalizer release CAS lost")
                 return True
 
     async def get_pinned_warm_binding_protection(

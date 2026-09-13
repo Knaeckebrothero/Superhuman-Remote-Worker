@@ -6106,10 +6106,6 @@ async def test_warm_attach_patch_response_loss_binds_exact_marker(db, monkeypatc
             True,
             True,
             id="terminal-routed-deregistered-actor",
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason="release completion still requires the detached actor row",
-            ),
         ),
     ],
 )
