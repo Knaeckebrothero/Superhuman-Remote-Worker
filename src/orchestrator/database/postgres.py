@@ -36304,10 +36304,15 @@ class PostgresDB:
                     return None
                 if require_zero_admission:
                     if (
-                        str(row["status"] or "") != "created"
+                        str(row["status"] or "") not in {"created", "active"}
                         or row["runtime_authority_exposed"] is not True
                     ):
                         return None
+                    # Resume reopens a thread as created, but binding its next
+                    # exact actor makes the thread active before that life has
+                    # received any input.  Admission belongs to the
+                    # agent/Pod tuple below, not to the thread-wide status,
+                    # which also reflects work completed by older lives.
                     admitted_input = await conn.fetchval(
                         "SELECT EXISTS (SELECT 1 FROM thread_input_deliveries "
                         "WHERE thread_id=$1::uuid AND owner_agent_id=$2::uuid "

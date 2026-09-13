@@ -2400,10 +2400,6 @@ async def test_permanent_sandbox_absence_accepts_orchestrator_zero_receipt(db):
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=True,
-    reason="active resumed generations cannot receipt exact zero admission",
-)
 async def test_active_resumed_life_accepts_exact_zero_admission_receipt(db):
     """A newly attached resumed life is active before its first delivery."""
 
@@ -2412,9 +2408,7 @@ async def test_active_resumed_life_accepts_exact_zero_admission_receipt(db):
         protected_agent_pod=True,
         workspace_claim=False,
     )
-    authority = await db.begin_pinned_thread_retirement(
-        ids["thread"], permanent=False
-    )
+    authority = await db.begin_pinned_thread_retirement(ids["thread"], permanent=False)
     assert await db.authorize_pinned_thread_retirement(
         ids["thread"],
         token=authority["token"],
@@ -2439,6 +2433,81 @@ async def test_active_resumed_life_accepts_exact_zero_admission_receipt(db):
 
     assert receipt is not None
     assert receipt["quiescence_protocol"] == "agent_runtime_zero_v1"
+
+
+@pytest.mark.asyncio
+async def test_active_life_zero_admission_refuses_current_actor_delivery(db):
+    """The active allowance cannot hide input admitted to this exact life."""
+
+    ids = await _seed(
+        db,
+        protected_agent_pod=True,
+        workspace_claim=False,
+    )
+    generation = str((await db.get_thread(ids["thread"]))["runtime_generation"])
+    delivery_id = uuid4()
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            delivery = await persist_input_delivery(
+                conn,
+                thread_id=ids["thread"],
+                delivery_id=delivery_id,
+                role="human",
+                content="belongs to the active resumed life",
+                source="direct_human",
+                turn_number=1,
+                agent_id=ids["agent"],
+                pod_uid="old-pod",
+                runtime_generation=generation,
+                runtime_attach_token=ids["attach_token"],
+            )
+            claim_generation = int(delivery["claim_generation"])
+            assert await mark_input_delivery_queued(
+                conn,
+                delivery_id=delivery_id,
+                agent_id=ids["agent"],
+                pod_uid="old-pod",
+                runtime_generation=generation,
+                runtime_attach_token=ids["attach_token"],
+                claim_generation=claim_generation,
+            )
+            assert await transition_input_delivery(
+                conn,
+                delivery_id=delivery_id,
+                agent_id=ids["agent"],
+                pod_uid="old-pod",
+                runtime_generation=generation,
+                runtime_attach_token=ids["attach_token"],
+                claim_generation=claim_generation,
+                transition="admitted",
+                turn_number=1,
+            )
+
+    authority = await db.begin_pinned_thread_retirement(ids["thread"], permanent=False)
+    assert await db.authorize_pinned_thread_retirement(
+        ids["thread"],
+        token=authority["token"],
+        generation=authority["generation"],
+        settle_status="ended",
+    )
+
+    assert (
+        await db.acknowledge_pinned_thread_local_quiescence(
+            ids["thread"],
+            expected_runtime_generation=authority["generation"],
+            expected_retirement_token=authority["token"],
+            expected_agent_id=ids["agent"],
+            expected_attach_token=ids["attach_token"],
+            expected_settle_status="ended",
+            expected_quiescence_protocol="agent_runtime_zero_v1",
+            expected_workspace_generation=None,
+            expected_workspace_runtime_incarnation=None,
+            quiescence_actor="orchestrator",
+            expected_agent_pod_uid="old-pod",
+            require_zero_admission=True,
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio
