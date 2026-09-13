@@ -36,6 +36,13 @@ Explicit `workspace: null` and `connectors: {}` suppress those defaults. No deep
 private settings. The protocol remains `v1alpha1` while migration and execution
 semantics are exercised.
 
+All five resources accept `metadata.tags` (a string list), `metadata.labels`
+(a string map), and `metadata.annotations` (a string map). These classify or
+describe resources; they do not grant access or select execution resources.
+An admitted Job can update this metadata using its expected resource version,
+including after completion. Its authored specification, resolved dependencies
+and execution snapshot remain fixed, and reapplying it never starts another Job.
+
 For the shipped harness, `runtime: {adapter: srw/v1}` selects the installed SRW
 worker pool. Omit `image` so the definition follows installation upgrades; an
 explicit image must match that installation at admission. Generic runtimes require
