@@ -50,9 +50,19 @@ another checkout require their own integration review.
 The 2026-09-13 `develop` push at `a116c4682` contains the completion-workflow
 refactor. It does not yet contain this manifest candidate. Its
 [CI/CD run](https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/actions/runs/34764758725)
-is a separate publication checkpoint; passing that run does not establish
-deployment of workspace preparation. Integrating the two branches and verifying
-the combined revision remain required.
+passed, including 30,755 backend tests with 180 skips, image builds and chart
+publication. Policy and migration workflows passed too. Both fresh-cluster
+[application E2E profiles](https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/actions/runs/34764758792)
+passed on their first browser attempt with exact resource cleanup and cluster
+teardown. Main dev has installed chart `0.0.998`, app version `sha-a116c46`.
+All 15 deployments have their current replicas ready, including all six workers
+on the published agent image. Cockpit, API and MCP health probes return HTTP 200.
+The [publication evidence](verification/develop-publication-2026-09-13.json)
+records source/image identities and the temporary readiness delay during image
+pulls. No CI fix or manual deployment patch was needed.
+
+This separate publication does not establish deployment of workspace preparation.
+Integrating the two branches and verifying the combined revision remain required.
 
 ## Acceptance status — 2026-09-13
 
