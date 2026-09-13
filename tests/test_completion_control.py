@@ -314,7 +314,11 @@ async def test_flag_on_pinned_resume_queues_without_agent_selection_or_post():
         ),
         patch.object(main._completion_control_boundary, "guard", AsyncMock()),
         patch.object(main, "_user_experts_enabled", AsyncMock(return_value=False)),
-        patch.object(main, "_resume_missing_workspace", return_value=None),
+        patch.object(
+            main.job_workspace_runtime,
+            "resume_missing_workspace",
+            return_value=None,
+        ),
         patch.object(main, "postgres_db", db),
         patch.object(main, "_trigger_dispatch", MagicMock()),
     ):

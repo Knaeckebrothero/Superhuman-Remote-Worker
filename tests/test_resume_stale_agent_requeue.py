@@ -9,15 +9,13 @@ as real code. See knowledge-history/done/worker_pod_state_zombie_on_cancel.md.
 
 from __future__ import annotations
 
+from orchestrator.services.job_controls import resume_reject_should_requeue
+
 
 class TestResumeRejectShouldRequeue:
     def test_409_requeues(self):
-        import orchestrator.main as om
-
-        assert om._resume_reject_should_requeue(409) is True
+        assert resume_reject_should_requeue(409) is True
 
     def test_other_non_2xx_stay_502(self):
-        import orchestrator.main as om
-
         for code in (400, 403, 404, 500, 502, 503):
-            assert om._resume_reject_should_requeue(code) is False, code
+            assert resume_reject_should_requeue(code) is False, code

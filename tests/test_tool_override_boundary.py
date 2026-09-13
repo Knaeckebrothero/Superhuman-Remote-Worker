@@ -518,10 +518,6 @@ async def _create_job(db, request, body):
             AsyncMock(return_value=[]),
         ),
         patch(
-            "orchestrator.main._authorize_thread_datasource_ids",
-            AsyncMock(return_value=[]),
-        ),
-        patch(
             "orchestrator.main._enforce_job_create_grants", AsyncMock(return_value=None)
         ),
         patch("orchestrator.services.job_provisioning.provision_job_repo", AsyncMock()),
@@ -778,9 +774,6 @@ def session_create_env(monkeypatch):
     monkeypatch.setattr(main, "docker_provisioner", SimpleNamespace(is_available=False))
     monkeypatch.setattr(main, "agent_provisioner", SimpleNamespace(is_available=False))
     monkeypatch.setattr(main, "STATELESS_SESSION_ENABLED", False)
-    monkeypatch.setattr(
-        main, "_authorize_thread_datasource_ids", AsyncMock(return_value=[])
-    )
     grants = AsyncMock()
     monkeypatch.setattr(main, "_enforce_session_create_grants", grants)
     return main, db, conn, grants

@@ -11,7 +11,12 @@ from __future__ import annotations
 from typing import Any
 
 import orchestrator.main as main
-from orchestrator.routers import job_controls, job_lifecycle, thread_lifecycle
+from orchestrator.routers import (
+    job_assignment,
+    job_controls,
+    job_lifecycle,
+    thread_lifecycle,
+)
 
 
 async def create_job(request: Any, body: Any) -> Any:
@@ -19,6 +24,15 @@ async def create_job(request: Any, body: Any) -> Any:
         request,
         body,
         dependencies=main._job_lifecycle_route_dependencies(),
+    )
+
+
+async def assign_job_to_agent(request: Any, job_id: str, agent_id: str) -> Any:
+    return await job_assignment.assign_job_to_agent(
+        request,
+        job_id,
+        agent_id,
+        dependencies=main._job_assignment_dependencies(),
     )
 
 
@@ -264,6 +278,82 @@ async def dispatch_job_to_agent(job: dict[str, Any], agent: dict[str, Any]) -> b
 
 async def resume_job_on_agent(job: dict[str, Any], agent: dict[str, Any]) -> bool:
     return await main._job_delivery_operations().resume(job, agent)
+
+
+async def build_job_start_request(*args: Any, **kwargs: Any) -> Any:
+    return await main.job_start_bundle.build_job_start_request(
+        *args,
+        **kwargs,
+        dependencies=main._job_start_bundle_dependencies(),
+    )
+
+
+async def attest_pinned_k8s_job_workspace(*args: Any, **kwargs: Any) -> Any:
+    return await main.job_workspace_authority.attest_pinned_k8s_job_workspace(
+        *args,
+        **kwargs,
+        dependencies=main._job_workspace_authority_dependencies(),
+    )
+
+
+async def pinned_k8s_job_workspace_authority_is_current(
+    *args: Any, **kwargs: Any
+) -> Any:
+    return await (
+        main.job_workspace_authority.pinned_k8s_job_workspace_authority_is_current(
+            *args,
+            **kwargs,
+            dependencies=main._job_workspace_authority_dependencies(),
+        )
+    )
+
+
+def inject_matching_workspace_config(*args: Any, **kwargs: Any) -> Any:
+    return main.job_workspace_runtime.inject_matching_workspace_config(
+        *args,
+        **kwargs,
+        dependencies=main._job_workspace_runtime_dependencies(),
+    )
+
+
+def resume_missing_workspace(*args: Any, **kwargs: Any) -> Any:
+    return main.job_workspace_runtime.resume_missing_workspace(
+        *args,
+        **kwargs,
+        dependencies=main._job_workspace_runtime_dependencies(),
+    )
+
+
+async def classify_thread_project_ids(*args: Any, **kwargs: Any) -> Any:
+    return await main.thread_project_authorization_service.classify_thread_project_ids(
+        *args,
+        **kwargs,
+        dependencies=main._thread_project_authorization_dependencies(),
+    )
+
+
+async def authorize_thread_datasource_ids(*args: Any, **kwargs: Any) -> Any:
+    return await main.thread_datasource_authorization_service.authorize_thread_datasource_ids(
+        *args,
+        **kwargs,
+        dependencies=main._thread_datasource_authorization_dependencies(),
+    )
+
+
+async def revalidate_thread_datasource_selection(*args: Any, **kwargs: Any) -> Any:
+    return await main.thread_datasource_authorization_service.revalidate_thread_datasource_selection(
+        *args,
+        **kwargs,
+        dependencies=main._thread_datasource_authorization_dependencies(),
+    )
+
+
+async def apply_thread_config_update(*args: Any, **kwargs: Any) -> Any:
+    return await main.thread_config_update_service.apply_thread_config_update(
+        *args,
+        **kwargs,
+        dependencies=main._thread_config_update_dependencies(),
+    )
 
 
 async def initiate_pause(job: dict[str, Any]) -> None:

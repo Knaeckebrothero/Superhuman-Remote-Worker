@@ -1372,7 +1372,7 @@ async def test_stateless_bundle_refusal_never_mutates_job_status(monkeypatch):
         AsyncMock(side_effect=HTTPException(status_code=409, detail="revoked")),
     )
 
-    built = await orch_main._build_job_start_request(
+    built = await job_start_bundle.build_job_start_request(
         {
             "id": UNIT_ID,
             "description": "work",
@@ -1380,6 +1380,7 @@ async def test_stateless_bundle_refusal_never_mutates_job_status(monkeypatch):
             "config_override": {"workspace": {"backend": "sandbox"}},
         },
         persist_dispatch_state=False,
+        dependencies=orch_main._job_start_bundle_dependencies(),
     )
 
     assert built is None

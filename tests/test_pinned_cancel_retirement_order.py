@@ -44,7 +44,11 @@ def _bind_runtime(monkeypatch, store, enabled):
     monkeypatch.setattr(main, "maybe_wake_session", AsyncMock())
     monkeypatch.setattr(main, "_kick_session_wake_drain", Mock())
     monkeypatch.setattr(main, "_trigger_dispatch", Mock())
-    monkeypatch.setattr(main, "_resolve_job_notifications", AsyncMock())
+    monkeypatch.setattr(
+        main.job_freeze_notification_service,
+        "resolve_job_notifications",
+        AsyncMock(),
+    )
     return main
 
 

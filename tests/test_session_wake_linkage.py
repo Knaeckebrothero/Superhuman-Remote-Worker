@@ -175,10 +175,6 @@ def _patched(db):
             AsyncMock(return_value=[]),
         ),
         patch(
-            "orchestrator.main._authorize_thread_datasource_ids",
-            AsyncMock(return_value=[]),
-        ),
-        patch(
             "orchestrator.main._enforce_job_create_grants", AsyncMock(return_value=None)
         ),
         patch("orchestrator.services.job_provisioning.provision_job_repo", AsyncMock()),

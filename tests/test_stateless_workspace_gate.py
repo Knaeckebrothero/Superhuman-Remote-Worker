@@ -8,6 +8,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from tests import _b09_control_seams as control_seams
+
 # R1.B06: main no longer re-exports this. It belongs to
 # services/session_class_policy and lane B's admission path imports it
 # from there directly.
@@ -654,7 +656,7 @@ async def test_stateless_config_patch_cannot_enable_pinned_only_session_class(
     monkeypatch.setattr(orch_main, "postgres_db", db)
 
     with pytest.raises(HTTPException, match="pinned-only") as exc:
-        await orch_main._apply_thread_config_update(
+        await control_seams.apply_thread_config_update(
             THREAD_ID,
             thread,
             {"officer": {"enabled": True}},
@@ -764,7 +766,7 @@ async def test_stateless_config_cannot_mutate_workspace_tier():
         patch.object(orch_main, "log_security_event", audit),
     ):
         with pytest.raises(HTTPException) as exc:
-            await orch_main._apply_thread_config_update(
+            await control_seams.apply_thread_config_update(
                 THREAD_ID,
                 thread,
                 {"workspace": {"backend": "sandbox"}},
@@ -876,7 +878,7 @@ async def test_protected_config_cannot_mutate_runtime_class(fragment):
         patch.object(orch_main, "_enforce_session_create_grants", grants),
     ):
         with pytest.raises(HTTPException) as exc:
-            await orch_main._apply_thread_config_update(
+            await control_seams.apply_thread_config_update(
                 THREAD_ID,
                 thread,
                 fragment,
@@ -916,7 +918,7 @@ async def test_malformed_protected_authority_blocks_config_before_persist(metada
         patch.object(orch_main, "log_security_event", audit),
     ):
         with pytest.raises(HTTPException) as exc:
-            await orch_main._apply_thread_config_update(
+            await control_seams.apply_thread_config_update(
                 THREAD_ID,
                 thread,
                 {"llm": {"temperature": 0.1}},

@@ -290,7 +290,6 @@ from orchestrator.routers import (  # noqa: E402
 )
 from orchestrator.services import (  # noqa: E402
     officer_conference as officer_conference_service,
-    officer_notices as officer_notice_service,
     officer_paging as officer_paging_service,
     officer_post_lifecycle as officer_post_lifecycle_service,
     officer_post_policy as officer_post_policy_service,
@@ -455,7 +454,6 @@ from orchestrator.schemas.thread_config import (  # noqa: E402,F401
     ThreadWorkspaceUpgradeRequest,
 )
 from orchestrator.services.thread_project_authorization import (  # noqa: E402,F401
-    ProjectVerdict,
     thread_creation_project_ids as _thread_creation_project_ids,
 )
 from orchestrator.services.thread_config_update import (  # noqa: E402,F401
@@ -496,8 +494,8 @@ from orchestrator.services.session_workspace_policy import (  # noqa: E402,F401
 from orchestrator.services import agent_datasource_payload  # noqa: E402
 
 # ---------------------------------------------------------------------------
-# R1.B05 retained bridges: names this module no longer uses itself, but that
-# production callers and existing suites still resolve through `orchestrator.main`.
+# R1.B05 retained aliases: names this module no longer uses itself, but that
+# compatibility suites still resolve through `orchestrator.main`.
 # They are plain aliases — pure symbols with no application dependency (§P4) —
 # and each one goes when the batch that owns its callers re-points them.
 # ---------------------------------------------------------------------------
@@ -565,8 +563,8 @@ from orchestrator.services.cloud_task_registry import (  # noqa: E402
     CloudTaskRegistry,
 )
 
-# Called by code main still owns (B05 payloads, B06 attach/create/resume,
-# B09 End). Imported so ``main.<name>`` stays the same module attribute the
+# Called by code main still owns (B05 payloads and B06 attach/create/resume).
+# Imported so ``main.<name>`` stays the same module attribute the
 # call sites and their tests resolve; the thin wrappers below keep the
 # pre-extraction signatures and supply the dependencies.
 from orchestrator.services import datasources as datasources_operations  # noqa: E402
@@ -2818,7 +2816,7 @@ def _job_start_bundle_dependencies() -> job_start_bundle.JobStartBundleDependenc
     """Rebuilt per call. ``mint_worker_runtime_actor``,
     ``authorize_job_repository_transport`` and ``inject_blob_credentials`` are
     fields rather than imports because existing suites patch them on ``main``
-    and then drive ``_build_job_start_request`` (§P3)."""
+    and then drive the job-start owner (§P3)."""
 
     return job_start_bundle.JobStartBundleDependencies(
         store=postgres_db,
@@ -2863,12 +2861,6 @@ async def _job_project_repositories(*args: Any, **kwargs: Any) -> Any:
 
 async def _prepare_job_repository_before_claim(*args: Any, **kwargs: Any) -> Any:
     return await job_start_bundle.prepare_job_repository_before_claim(
-        *args, **kwargs, dependencies=_job_start_bundle_dependencies()
-    )
-
-
-async def _build_job_start_request(*args: Any, **kwargs: Any) -> Any:
-    return await job_start_bundle.build_job_start_request(
         *args, **kwargs, dependencies=_job_start_bundle_dependencies()
     )
 
@@ -3186,26 +3178,6 @@ def _job_workspace_authority_dependencies() -> (
     )
 
 
-async def _attest_pinned_k8s_job_workspace(*args: Any, **kwargs: Any) -> Any:
-    return await job_workspace_authority.attest_pinned_k8s_job_workspace(
-        *args, **kwargs, dependencies=_job_workspace_authority_dependencies()
-    )
-
-
-async def _pinned_k8s_job_workspace_authority_is_current(
-    *args: Any, **kwargs: Any
-) -> Any:
-    return await job_workspace_authority.pinned_k8s_job_workspace_authority_is_current(
-        *args, **kwargs, dependencies=_job_workspace_authority_dependencies()
-    )
-
-
-def _inject_matching_workspace_config(*args: Any, **kwargs: Any) -> Any:
-    return job_workspace_runtime.inject_matching_workspace_config(
-        *args, **kwargs, dependencies=_job_workspace_runtime_dependencies()
-    )
-
-
 async def _workspace_runtime_unchanged_before_delivery(
     *args: Any, **kwargs: Any
 ) -> Any:
@@ -3218,12 +3190,6 @@ async def _workspace_runtime_unchanged_before_delivery(
 from orchestrator.services.job_workspace_runtime import (  # noqa: E402
     WORKSPACE_CONTEXT_KEYS as _WORKSPACE_CONTEXT_KEYS,
 )
-
-
-def _resume_missing_workspace(*args: Any, **kwargs: Any) -> Any:
-    return job_workspace_runtime.resume_missing_workspace(
-        *args, **kwargs, dependencies=_job_workspace_runtime_dependencies()
-    )
 
 
 from orchestrator.services.job_workspace_runtime import (  # noqa: E402
@@ -3427,44 +3393,11 @@ from orchestrator.services.vm_workspace_policy import (  # noqa: E402
 )
 
 
-async def _pinned_retirement_is_current(retirement: Mapping[str, Any]) -> bool:
-    return await _pinned_retirement_operations().pinned_retirement_is_current(
-        retirement
-    )
-
-
 def _retirement_context_runtime_exposed(
     retirement: Mapping[str, Any],
 ) -> bool:
     return _pinned_retirement_operations().retirement_context_runtime_exposed(
         retirement
-    )
-
-
-def _never_delivered_protected_reader_shape(
-    retirement: Mapping[str, Any],
-    thread: Mapping[str, Any],
-    row: Mapping[str, Any] | None,
-    *,
-    require_current_revoked: bool,
-) -> bool:
-    return _pinned_retirement_operations().never_delivered_protected_reader_shape(
-        retirement,
-        thread,
-        row,
-        require_current_revoked=require_current_revoked,
-    )
-
-
-async def _revoke_never_delivered_protected_reader(
-    retirement: Mapping[str, Any],
-    thread: Mapping[str, Any],
-    row: Mapping[str, Any] | None,
-) -> bool:
-    return (
-        await _pinned_retirement_operations().revoke_never_delivered_protected_reader(
-            retirement, thread, row
-        )
     )
 
 
@@ -3476,92 +3409,11 @@ def _retirement_has_exact_local_quiescence(
     )
 
 
-def _captured_retirement_agent_pods(
-    retirement: Mapping[str, Any],
-) -> set[tuple[str, str, str, str]]:
-    return _pinned_retirement_operations().captured_retirement_agent_pods(retirement)
-
-
-def _pre_registration_agent_pod_zero_candidate(
-    retirement: Mapping[str, Any], thread: Mapping[str, Any]
-) -> tuple[str, str] | None:
-    return _pinned_retirement_operations().pre_registration_agent_pod_zero_candidate(
-        retirement, thread
-    )
-
-
-async def _recover_pre_registration_agent_pod_zero(
-    retirement: Mapping[str, Any], thread: Mapping[str, Any]
-) -> bool:
-    return (
-        await _pinned_retirement_operations().recover_pre_registration_agent_pod_zero(
-            retirement, thread
-        )
-    )
-
-
-def _agent_pod_provision_intent_zero_candidate(
-    retirement: Mapping[str, Any], thread: Mapping[str, Any]
-) -> dict[str, str] | None:
-    return _pinned_retirement_operations().agent_pod_provision_intent_zero_candidate(
-        retirement, thread
-    )
-
-
-async def _recover_agent_pod_provision_intent_zero(
-    retirement: Mapping[str, Any], thread: Mapping[str, Any]
-) -> bool:
-    return (
-        await _pinned_retirement_operations().recover_agent_pod_provision_intent_zero(
-            retirement, thread
-        )
-    )
-
-
-def _captured_agent_workspace_claim(
-    retirement: Mapping[str, Any],
-) -> dict[str, str] | None:
-    return _pinned_retirement_operations().captured_agent_workspace_claim(retirement)
-
-
-async def _reconcile_agent_workspace_claim_for_retirement(
-    retirement: Mapping[str, Any],
-) -> None:
-    await (
-        _pinned_retirement_operations().reconcile_agent_workspace_claim_for_retirement(
-            retirement
-        )
-    )
-
-
 async def _recover_captured_sandbox_process_zero(
     retirement: Mapping[str, Any],
 ) -> bool:
     return await _pinned_retirement_operations().recover_captured_process_zero(
         retirement
-    )
-
-
-async def _complete_retiring_soft_warm_binding_release(
-    retirement: Mapping[str, Any],
-) -> bool:
-    return await _pinned_retirement_operations().complete_retiring_soft_warm_binding_release(
-        retirement
-    )
-
-
-async def _cleanup_pinned_thread_retirement(
-    retirement: Mapping[str, Any],
-    *,
-    cleanup_agent_pod: bool = True,
-    defer_agent_workspace_claim_until_caller_exit: bool = False,
-) -> None:
-    await _pinned_retirement_operations().cleanup_pinned_thread_retirement(
-        retirement,
-        cleanup_agent_pod=cleanup_agent_pod,
-        defer_agent_workspace_claim_until_caller_exit=(
-            defer_agent_workspace_claim_until_caller_exit
-        ),
     )
 
 
@@ -6828,18 +6680,6 @@ async def _send_session_attach_locked(
     )
 
 
-async def _prepare_attach_abort_successor_workspace(
-    candidate: Mapping[str, Any], current: Mapping[str, Any]
-) -> Mapping[str, Any] | None:
-    return (
-        await session_attach_recovery_service.prepare_attach_abort_successor_workspace(
-            candidate,
-            current,
-            dependencies=_session_attach_recovery_dependencies(),
-        )
-    )
-
-
 async def _reconcile_attach_abort_successor(candidate: Mapping[str, Any]) -> bool:
     return await session_attach_recovery_service.reconcile_attach_abort_successor(
         candidate,
@@ -7134,64 +6974,6 @@ async def _authorize_thread_datasource_selection(
     )
 
 
-async def _authorize_thread_datasource_ids(
-    user: dict[str, Any] | None,
-    datasource_ids: list[str] | None,
-    *,
-    workspace_backend: str | None,
-    target_project_ids: list[str] | None = None,
-    effective_work_owner_id: str | None = None,
-    trusted_system_inheritance: bool = False,
-    legacy_job_id: str | None = None,
-) -> list[str]:
-    return (
-        await thread_datasource_authorization_service.authorize_thread_datasource_ids(
-            user,
-            datasource_ids,
-            workspace_backend=workspace_backend,
-            target_project_ids=target_project_ids,
-            effective_work_owner_id=effective_work_owner_id,
-            trusted_system_inheritance=trusted_system_inheritance,
-            legacy_job_id=legacy_job_id,
-            dependencies=_thread_datasource_authorization_dependencies(),
-        )
-    )
-
-
-async def _strip_still_denied_ack(
-    thread: dict[str, Any],
-    selected: list[str],
-    *,
-    actor: dict[str, Any] | None,
-    effective_work_owner_id: str | None,
-    project_ids: list[str],
-    trusted_system_inheritance: bool = False,
-) -> list[str]:
-    return await thread_datasource_authorization_service.strip_still_denied_ack(
-        thread,
-        selected,
-        actor=actor,
-        effective_work_owner_id=effective_work_owner_id,
-        project_ids=project_ids,
-        trusted_system_inheritance=trusted_system_inheritance,
-        dependencies=_thread_datasource_authorization_dependencies(),
-    )
-
-
-async def _revalidate_thread_datasource_selection(
-    thread: dict[str, Any],
-    datasource_ids: list[str] | None,
-    *,
-    target_project_ids: list[str] | None = None,
-) -> tuple[list[str], dict[str, int]]:
-    return await thread_datasource_authorization_service.revalidate_thread_datasource_selection(
-        thread,
-        datasource_ids,
-        target_project_ids=target_project_ids,
-        dependencies=_thread_datasource_authorization_dependencies(),
-    )
-
-
 async def _resolve_authorized_thread_datasources(
     thread: dict[str, Any],
     datasource_ids: list[str] | None,
@@ -7203,16 +6985,6 @@ async def _resolve_authorized_thread_datasources(
         datasource_ids,
         target_project_ids=target_project_ids,
         dependencies=_thread_datasource_authorization_dependencies(),
-    )
-
-
-async def _classify_thread_project_ids(
-    user: dict[str, Any], project_ids: list[str] | None
-) -> list[ProjectVerdict]:
-    return await thread_project_authorization_service.classify_thread_project_ids(
-        user,
-        project_ids,
-        dependencies=_thread_project_authorization_dependencies(),
     )
 
 
@@ -7256,32 +7028,6 @@ async def create_thread(
         request_body,
         request,
         dependencies=_thread_admission_dependencies(),
-    )
-
-
-async def _apply_thread_config_update(
-    thread_id: str,
-    thread_row: dict[str, Any] | None,
-    config_override: dict[str, Any],
-    datasource_ids: list[str] | None,
-    *,
-    request: Request,
-    actor: dict[str, Any] | None,
-    managed_runtime: bool = False,
-    snapshot_patch_protocol: int | None = None,
-    snapshot_generation: int | None = None,
-) -> tuple[dict[str, Any], list[str] | None]:
-    return await thread_config_update_service.apply_thread_config_update(
-        thread_id,
-        thread_row,
-        config_override,
-        datasource_ids,
-        request=request,
-        actor=actor,
-        managed_runtime=managed_runtime,
-        snapshot_patch_protocol=snapshot_patch_protocol,
-        snapshot_generation=snapshot_generation,
-        dependencies=_thread_config_update_dependencies(),
     )
 
 
@@ -7495,7 +7241,13 @@ def _notification_action_dependencies() -> (
                 *args, **kwargs, dependencies=_inbound_reply_dependencies()
             )
         ),
-        resolve_job_notifications=_resolve_job_notifications,
+        resolve_job_notifications=lambda *args, **kwargs: (
+            job_freeze_notification_service.resolve_job_notifications(
+                *args,
+                **kwargs,
+                dependencies=_job_freeze_notification_dependencies(),
+            )
+        ),
         resume_job_internal=lambda *args, **kwargs: (
             _job_control_operations().resume_job_internal(*args, **kwargs)
         ),
@@ -7512,7 +7264,7 @@ def _notification_action_dependencies() -> (
 
 
 # --- R1.B07 lane O: the Officer Post ---------------------------------------
-# Four wrappers below survive on purpose. Each has TWO composition sites —
+# The shared operations below survive on purpose. Each has multiple composition sites —
 # a dependency factory and a task-wiring site, or two factories — so the
 # name is what those sites share rather than a hop they go through.
 # Inlining would duplicate the same dependency expression twice, which is
@@ -7525,10 +7277,6 @@ def _officer_post_policy_dependencies() -> (
     return officer_post_policy_service.OfficerPostPolicyDependencies(
         auto_pull_release_enabled=lambda: OFFICER_AUTO_PULL_RELEASE_ENABLED,
     )
-
-
-def _officer_notice_dependencies() -> officer_notice_service.OfficerNoticeDependencies:
-    return officer_notice_service.OfficerNoticeDependencies(store=postgres_db)
 
 
 def _officer_conference_dependencies() -> (
@@ -7750,14 +7498,6 @@ def _job_freeze_notification_dependencies() -> (
 ):
     return job_freeze_notification_service.JobFreezeNotificationDependencies(
         notifier=notification_service,
-    )
-
-
-async def _resolve_job_notifications(*args: Any, **kwargs: Any) -> Any:
-    """Compatibility wrapper: eight job-control callers in this module (B09)
-    settle a job's feed rows through this name."""
-    return await job_freeze_notification_service.resolve_job_notifications(
-        *args, **kwargs, dependencies=_job_freeze_notification_dependencies()
     )
 
 
@@ -8130,7 +7870,13 @@ def _job_control_operations() -> job_control_operations.JobControlOperations:
             enforce_dispatch_grants=_enforce_dispatch_grants,
             grant_violations_detail=_grant_violations_detail,
             prepare_job_workspace_runtime=_prepare_job_workspace_runtime,
-            resume_missing_workspace=_resume_missing_workspace,
+            resume_missing_workspace=lambda *args, **kwargs: (
+                job_workspace_runtime.resume_missing_workspace(
+                    *args,
+                    **kwargs,
+                    dependencies=_job_workspace_runtime_dependencies(),
+                )
+            ),
             workspace_context_keys=_WORKSPACE_CONTEXT_KEYS,
             prepare_job_repository_before_claim=(_prepare_job_repository_before_claim),
             resume_job_on_agent=lambda job, agent: _job_delivery_operations().resume(
@@ -8166,22 +7912,50 @@ def _job_delivery_operations() -> job_delivery_operations.JobDeliveryOperations:
             gitea_client=gitea_client,
             workspace_context_keys=_WORKSPACE_CONTEXT_KEYS,
             prepare_job_workspace_runtime=_prepare_job_workspace_runtime,
-            attest_pinned_k8s_job_workspace=_attest_pinned_k8s_job_workspace,
-            build_job_start_request=_build_job_start_request,
-            pinned_k8s_job_workspace_authority_is_current=(
-                _pinned_k8s_job_workspace_authority_is_current
+            attest_pinned_k8s_job_workspace=lambda *args, **kwargs: (
+                job_workspace_authority.attest_pinned_k8s_job_workspace(
+                    *args,
+                    **kwargs,
+                    dependencies=_job_workspace_authority_dependencies(),
+                )
+            ),
+            build_job_start_request=lambda *args, **kwargs: (
+                job_start_bundle.build_job_start_request(
+                    *args,
+                    **kwargs,
+                    dependencies=_job_start_bundle_dependencies(),
+                )
+            ),
+            pinned_k8s_job_workspace_authority_is_current=lambda *args, **kwargs: (
+                job_workspace_authority.pinned_k8s_job_workspace_authority_is_current(
+                    *args,
+                    **kwargs,
+                    dependencies=_job_workspace_authority_dependencies(),
+                )
             ),
             prepare_pinned_job_mutation_target=_prepare_pinned_job_mutation_target,
             redispatch_livelock_trip=_redispatch_livelock_trip,
             bind_log_context=bind_log_context,
             reset_log_context=reset_log_context,
-            resume_missing_workspace=_resume_missing_workspace,
+            resume_missing_workspace=lambda *args, **kwargs: (
+                job_workspace_runtime.resume_missing_workspace(
+                    *args,
+                    **kwargs,
+                    dependencies=_job_workspace_runtime_dependencies(),
+                )
+            ),
             resolve_authorized_job_datasources=_resolve_authorized_job_datasources,
             apply_cloud_storage_override=_apply_cloud_storage_override,
             build_datasources_payload=_build_datasources_payload,
             job_project_repositories=_job_project_repositories,
             build_datasource_tool_override=_build_datasource_tool_override,
-            inject_matching_workspace_config=_inject_matching_workspace_config,
+            inject_matching_workspace_config=lambda *args, **kwargs: (
+                job_workspace_runtime.inject_matching_workspace_config(
+                    *args,
+                    **kwargs,
+                    dependencies=_job_workspace_runtime_dependencies(),
+                )
+            ),
             get_container_context=_get_container_context,
             get_vm_context=_get_vm_context,
             authorize_job_repository_transport=authorize_job_repository_transport,
@@ -8363,7 +8137,13 @@ def _thread_resume_operations(
             late_cloud_setup_attach_timeout_s=(
                 lambda: LATE_CLOUD_SETUP_ATTACH_TIMEOUT_S
             ),
-            classify_thread_project_ids=_classify_thread_project_ids,
+            classify_thread_project_ids=lambda *args, **kwargs: (
+                thread_project_authorization_service.classify_thread_project_ids(
+                    *args,
+                    **kwargs,
+                    dependencies=_thread_project_authorization_dependencies(),
+                )
+            ),
             resolve_session_config=_resolve_session_config,
             thread_project_ids=_thread_project_ids,
             require_stateless_workspace=_require_stateless_workspace,
@@ -9438,7 +9218,7 @@ def _rebind_main_cloud_router(router: Any) -> None:
 # =============================================================================
 # R1.B04 compatibility wrappers — moved code that main still calls
 # =============================================================================
-# These fourteen names moved to ``services/agent_cloud_mounts.py``,
+# These eleven names moved to ``services/agent_cloud_mounts.py``,
 # ``services/protected_cloud_engage.py`` and ``services/cloud_stage_authority.py``
 # in R1.B04, but their remaining callers here belong to later batches. Each
 # wrapper keeps the pre-extraction signature and supplies the dependencies, so
@@ -9454,8 +9234,8 @@ def _rebind_main_cloud_router(router: Any) -> None:
 #                              _schedule_protected_engage, _record_protected_error,
 #                              _protected_cloud_delivery_state,
 #                              _protected_workspace_wait_payload
-#   B09 retirement           — _retirement_stage_event_from_receipt
-# Each disappears when its owning batch moves the caller; none is a public API.
+# Their remaining consumers belong to B10/B12 composition. Each disappears
+# with that consumer; none is a public API.
 
 
 def _resolve_cloud_session_url(
@@ -10301,7 +10081,13 @@ def _job_assignment_dependencies() -> job_assignment.JobAssignmentDependencies:
         completion_commands_enabled=lambda: COMPLETION_COMMANDS_ENABLED,
         prepare_job_workspace_runtime=_prepare_job_workspace_runtime,
         prepare_job_repository_before_claim=_prepare_job_repository_before_claim,
-        resume_missing_workspace=_resume_missing_workspace,
+        resume_missing_workspace=lambda *args, **kwargs: (
+            job_workspace_runtime.resume_missing_workspace(
+                *args,
+                **kwargs,
+                dependencies=_job_workspace_runtime_dependencies(),
+            )
+        ),
         guard_completion_control=_completion_control_boundary.guard,
         claim_completion_control=_completion_control_boundary.claim,
         abort_completion_control_claim=_completion_control_boundary.abort,
@@ -10313,20 +10099,6 @@ def _job_assignment_dependencies() -> job_assignment.JobAssignmentDependencies:
             job, agent
         ),
         trigger_dispatch=_trigger_dispatch,
-    )
-
-
-async def assign_job_to_agent(
-    request: Request, job_id: str, agent_id: str
-) -> dict[str, str]:
-    """Bridge to ``routers/job_assignment.py`` (R1.B05 lane J).
-
-    Kept without a decorator: the route is declared on that router, and
-    ``tests/test_job_access.py`` calls this name positionally with three
-    arguments.
-    """
-    return await job_assignment.assign_job_to_agent(
-        request, job_id, agent_id, dependencies=_job_assignment_dependencies()
     )
 
 
@@ -10359,7 +10131,7 @@ app.include_router(verification_routes.router)
 #                              _assemble_session_attach_payload
 #   B04 cloud stage/mounts   — _require_pinned_workspace_credential_owner,
 #                              _slugify_mount_name, _cloud_workspace_driver
-#   B09 background push      — _agent_get_thread_workspace_locked
+#   B10 session wake         — the remaining late-bound delivery bridge
 # ---------------------------------------------------------------------------
 
 

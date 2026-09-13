@@ -92,7 +92,7 @@ async def test_flag_on_manual_assign_guard_blocks_before_workspace_or_agent_io(
     monkeypatch.setattr(main._completion_control_boundary, "guard", guard)
 
     with pytest.raises(main.HTTPException) as exc:
-        await main.assign_job_to_agent(MagicMock(), JOB_ID, AGENT_ID)
+        await control_seams.assign_job_to_agent(MagicMock(), JOB_ID, AGENT_ID)
 
     assert exc.value.status_code == 409
     guard.assert_awaited_once_with(JOB_ID, source="manual_assign")
@@ -113,7 +113,7 @@ async def test_flag_on_missing_workspace_uses_claimed_atomic_preflight(
     claim_control = AsyncMock(return_value=claim)
     monkeypatch.setattr(main._completion_control_boundary, "claim", claim_control)
 
-    result = await main.assign_job_to_agent(MagicMock(), JOB_ID, AGENT_ID)
+    result = await control_seams.assign_job_to_agent(MagicMock(), JOB_ID, AGENT_ID)
 
     assert result["status"] == "queued"
     claim_control.assert_awaited_once_with(job, source="manual_assign_workspace")
@@ -145,7 +145,7 @@ async def test_flag_on_live_workspace_claims_before_agent_post(
         lambda *_args, **_kwargs: order.append("post") or True
     )
 
-    result = await main.assign_job_to_agent(MagicMock(), JOB_ID, AGENT_ID)
+    result = await control_seams.assign_job_to_agent(MagicMock(), JOB_ID, AGENT_ID)
 
     assert result["status"] == "assigned"
     assert order == ["claim", "post"]
@@ -174,7 +174,7 @@ async def test_manual_assign_waits_for_legacy_runtime_adoption_before_claim(
     monkeypatch.setattr(main, "_prepare_job_workspace_runtime", prepare)
 
     with pytest.raises(main.HTTPException) as raised:
-        await main.assign_job_to_agent(MagicMock(), JOB_ID, AGENT_ID)
+        await control_seams.assign_job_to_agent(MagicMock(), JOB_ID, AGENT_ID)
 
     assert raised.value.status_code == 409
     assert raised.value.detail["code"] == "workspace_runtime_adoption_pending"
@@ -193,7 +193,7 @@ class TestManualAssignWorkspacePreflight:
         main.postgres_db.get_job.return_value = job
 
         with pytest.raises(main.HTTPException) as exc:
-            await main.assign_job_to_agent(MagicMock(), JOB_ID, AGENT_ID)
+            await control_seams.assign_job_to_agent(MagicMock(), JOB_ID, AGENT_ID)
 
         assert exc.value.status_code == 409
         main.postgres_db.get_agent.assert_not_awaited()
@@ -204,7 +204,7 @@ class TestManualAssignWorkspacePreflight:
     async def test_created_job_without_workspace_is_queued(self, collaborators):
         main.postgres_db.get_job.return_value = _job("created")
 
-        result = await main.assign_job_to_agent(MagicMock(), JOB_ID, AGENT_ID)
+        result = await control_seams.assign_job_to_agent(MagicMock(), JOB_ID, AGENT_ID)
 
         assert result["status"] == "queued"
         assert "not reserved" in result["message"]
@@ -224,7 +224,7 @@ class TestManualAssignWorkspacePreflight:
             "failed", workspace_status="failed"
         )
 
-        result = await main.assign_job_to_agent(MagicMock(), JOB_ID, AGENT_ID)
+        result = await control_seams.assign_job_to_agent(MagicMock(), JOB_ID, AGENT_ID)
 
         assert result["status"] == "queued"
         main.postgres_db.queue_job_for_resume.assert_awaited_once_with(JOB_ID)
@@ -240,7 +240,7 @@ class TestManualAssignWorkspacePreflight:
         )
         main.postgres_db.get_agent.return_value = _agent()
 
-        result = await main.assign_job_to_agent(MagicMock(), JOB_ID, AGENT_ID)
+        result = await control_seams.assign_job_to_agent(MagicMock(), JOB_ID, AGENT_ID)
 
         assert result == {
             "status": "assigned",
@@ -275,7 +275,7 @@ class TestAssignLaneChoice:
         main.postgres_db.get_job.return_value = _job("paused", workspace_status="ready")
         main.postgres_db.get_agent.return_value = _agent()
 
-        result = await main.assign_job_to_agent(MagicMock(), JOB_ID, AGENT_ID)
+        result = await control_seams.assign_job_to_agent(MagicMock(), JOB_ID, AGENT_ID)
 
         assert result["status"] == "assigned"
         collaborators.resume.assert_awaited_once()
@@ -291,7 +291,7 @@ class TestAssignLaneChoice:
         main.postgres_db.get_job.return_value = _job("paused", workspace_status="ready")
         main.postgres_db.get_agent.return_value = _agent()
 
-        result = await main.assign_job_to_agent(MagicMock(), JOB_ID, AGENT_ID)
+        result = await control_seams.assign_job_to_agent(MagicMock(), JOB_ID, AGENT_ID)
 
         assert result["status"] == "assigned"
         collaborators.dispatch.assert_awaited_once()

@@ -2122,9 +2122,11 @@ async def test_permanent_delete_reclaims_same_generation_retained_k8s_pvc(db):
             AsyncMock(return_value=True),
         ),
     ):
-        await orch_main._cleanup_pinned_thread_retirement(
-            permanent,
-            cleanup_agent_pod=False,
+        await (
+            orch_main._pinned_retirement_operations().cleanup_pinned_thread_retirement(
+                permanent,
+                cleanup_agent_pod=False,
+            )
         )
 
     provisioner.release_workspace.assert_awaited_once_with(
@@ -4329,8 +4331,10 @@ async def test_pinned_vm_retirement_uses_credential_process_zero_release(db):
         patch.object(orch_main, "postgres_db", db),
         patch.object(orch_main, "vm_provisioner", provisioner),
     ):
-        await orch_main._cleanup_pinned_thread_retirement(
-            retirement, cleanup_agent_pod=False
+        await (
+            orch_main._pinned_retirement_operations().cleanup_pinned_thread_retirement(
+                retirement, cleanup_agent_pod=False
+            )
         )
 
     provisioner.release_vm_captured.assert_awaited_once()
@@ -6193,7 +6197,9 @@ async def test_never_delivered_warm_attach_soft_end_releases_exact_authority(
             generation=ids["runtime_generation"],
             final_status="ended",
         )
-        assert await orch_main._complete_retiring_soft_warm_binding_release(authority)
+        assert await orch_main._pinned_retirement_operations().complete_retiring_soft_warm_binding_release(
+            authority
+        )
     current = await db.get_thread(ids["thread"])
     assert current["status"] == "ended"
     assert current["agent_id"] is None

@@ -108,7 +108,7 @@ async def test_fresh_dispatch_payload_uses_resolved_repository_uuid():
             AsyncMock(return_value=_worker_actor()),
         ),
     ):
-        request = await orch_main._build_job_start_request(_job())
+        request = await control_seams.build_job_start_request(_job())
 
     assert request is not None
     assert request.datasources[0]["datasource_id"] == DATASOURCE_ID
@@ -202,8 +202,8 @@ async def test_resume_payload_uses_resolved_repository_uuid():
             ),
         ),
         patch.object(
-            orch_main,
-            "_pinned_k8s_job_workspace_authority_is_current",
+            orch_main.job_workspace_authority,
+            "pinned_k8s_job_workspace_authority_is_current",
             AsyncMock(return_value=True),
         ),
         patch.object(

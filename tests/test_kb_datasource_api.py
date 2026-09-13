@@ -13,10 +13,8 @@ from fastapi import HTTPException
 
 from orchestrator.main import (
     ThreadCreateRequest,
-    _authorize_thread_datasource_ids,
     _authorize_thread_project_ids,
     _build_datasources_payload,
-    _revalidate_thread_datasource_selection,
     _revalidate_thread_project_ids,
     _thread_has_knowledge_scope,
     _thread_creation_project_ids,
@@ -792,7 +790,7 @@ async def test_thread_attachment_rejects_an_inaccessible_private_kb():
         patch("orchestrator.main.postgres_db", db),
         pytest.raises(HTTPException) as exc,
     ):
-        await _authorize_thread_datasource_ids(
+        await control_seams.authorize_thread_datasource_ids(
             {"id": owner_id},
             [str(datasource_id)],
             workspace_backend="virtual",
@@ -821,14 +819,14 @@ async def test_thread_attachment_allows_kb_but_not_clone_repo_on_lite_tier():
     db.get_datasource_policy_rows = AsyncMock(side_effect=lambda _ids: [policy_row])
 
     with patch("orchestrator.main.postgres_db", db):
-        selected = await _authorize_thread_datasource_ids(
+        selected = await control_seams.authorize_thread_datasource_ids(
             {"id": owner_id},
             [str(datasource_id), str(datasource_id)],
             workspace_backend="virtual",
         )
         policy_row["type"] = "repository"
         with pytest.raises(HTTPException) as exc:
-            await _authorize_thread_datasource_ids(
+            await control_seams.authorize_thread_datasource_ids(
                 {"id": owner_id},
                 [str(datasource_id)],
                 workspace_backend="virtual",
@@ -865,7 +863,7 @@ async def test_persisted_thread_datasource_is_denied_after_access_revocation():
         patch("orchestrator.main._thread_project_ids", AsyncMock(return_value=[])),
         pytest.raises(HTTPException) as exc,
     ):
-        await _revalidate_thread_datasource_selection(
+        await control_seams.revalidate_thread_datasource_selection(
             {"id": "thread-1", "user_id": owner_id},
             [str(datasource_id)],
         )
@@ -903,14 +901,14 @@ async def test_persisted_thread_revalidation_preserves_global_and_system_semanti
         (
             global_selection,
             global_revisions,
-        ) = await _revalidate_thread_datasource_selection(
+        ) = await control_seams.revalidate_thread_datasource_selection(
             {"id": "thread-user", "user_id": owner_id},
             [str(datasource_id)],
         )
         (
             system_selection,
             system_revisions,
-        ) = await _revalidate_thread_datasource_selection(
+        ) = await control_seams.revalidate_thread_datasource_selection(
             {"id": "thread-system", "user_id": None},
             [str(datasource_id), str(datasource_id)],
         )

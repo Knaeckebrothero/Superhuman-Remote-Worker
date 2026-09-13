@@ -776,7 +776,7 @@ async def test_session_update_rolls_back_settings_when_revision_capture_fails(
     monkeypatch.setattr(main, "postgres_db", db)
     monkeypatch.setattr(main, "_apply_thread_config_update_locked", change_settings)
     with pytest.raises(HTTPException, match="capture failed"):
-        await main._apply_thread_config_update(
+        await control_seams.apply_thread_config_update(
             WORK, thread, {}, [WORK], request=None, actor=None
         )
     assert connection.jobs == []
@@ -972,7 +972,9 @@ async def test_job_resume_uses_frozen_config_and_requires_capable_recipient(
         AsyncMock(return_value=("proceed", job, None)),
     )
     monkeypatch.setattr(
-        main, "_attest_pinned_k8s_job_workspace", AsyncMock(return_value=(job, None))
+        main.job_workspace_authority,
+        "attest_pinned_k8s_job_workspace",
+        AsyncMock(return_value=(job, None)),
     )
     monkeypatch.setattr(
         main, "_resolve_authorized_job_datasources", AsyncMock(return_value=[])
@@ -984,7 +986,9 @@ async def test_job_resume_uses_frozen_config_and_requires_capable_recipient(
         AsyncMock(return_value=(None, [], [])),
     )
     monkeypatch.setattr(
-        main, "_inject_matching_workspace_config", lambda _job, co, **_: (co, decision)
+        main.job_workspace_runtime,
+        "inject_matching_workspace_config",
+        lambda _job, co, **_: (co, decision),
     )
     monkeypatch.setattr(main, "_inject_lite_workspace_config", lambda co, **_: co)
     monkeypatch.setattr(main, "_is_experts_db_enabled", lambda: False)
@@ -1004,8 +1008,8 @@ async def test_job_resume_uses_frozen_config_and_requires_capable_recipient(
         AsyncMock(return_value=SimpleNamespace(to_payload=lambda: {})),
     )
     monkeypatch.setattr(
-        main,
-        "_pinned_k8s_job_workspace_authority_is_current",
+        main.job_workspace_authority,
+        "pinned_k8s_job_workspace_authority_is_current",
         AsyncMock(return_value=True),
     )
     monkeypatch.setattr(

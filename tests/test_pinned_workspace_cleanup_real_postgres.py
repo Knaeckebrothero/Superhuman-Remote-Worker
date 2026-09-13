@@ -241,7 +241,9 @@ async def test_pinned_workspace_end_and_permanent_delete(
     pvc_uid = resources["pvc"].metadata.uid
     pod_uid = resources["pod"].metadata.uid
     retirement = await _begin(db, ids, permanent_first)
-    await main._cleanup_pinned_thread_retirement(retirement, cleanup_agent_pod=False)
+    await main._pinned_retirement_operations().cleanup_pinned_thread_retirement(
+        retirement, cleanup_agent_pod=False
+    )
     assert effects == [("delete", pod_uid), ("finalizer", pod_uid)]
     assert (
         await db.fetchval(
@@ -278,7 +280,7 @@ async def test_pinned_workspace_end_and_permanent_delete(
             generation=retirement["generation"],
             settle_status="ended",
         )
-        await main._cleanup_pinned_thread_retirement(
+        await main._pinned_retirement_operations().cleanup_pinned_thread_retirement(
             retirement, cleanup_agent_pod=False
         )
     assert not resources
@@ -329,7 +331,7 @@ async def test_pinned_workspace_refuses_incomplete_cleanup_authority(
     elif fault == "absent_without_receipt":
         del resources["pod"]
     with pytest.raises(RuntimeError):
-        await main._cleanup_pinned_thread_retirement(
+        await main._pinned_retirement_operations().cleanup_pinned_thread_retirement(
             retirement, cleanup_agent_pod=False
         )
     assert effects == []
@@ -346,7 +348,7 @@ async def test_pinned_workspace_replays_lost_responses(db, monkeypatch, fault):
     ids, owner, p, resources, effects = await _scenario(db, monkeypatch)
     retirement = await _begin(db, ids, False)
     if fault == "retained_pvc_ack":
-        await main._cleanup_pinned_thread_retirement(
+        await main._pinned_retirement_operations().cleanup_pinned_thread_retirement(
             retirement, cleanup_agent_pod=False
         )
         assert await db.settle_pinned_thread_retirement(
@@ -394,11 +396,13 @@ async def test_pinned_workspace_replays_lost_responses(db, monkeypatch, fault):
 
         monkeypatch.setattr(p, "_set_context", lose_projection)
     with pytest.raises(RuntimeError):
-        await main._cleanup_pinned_thread_retirement(
+        await main._pinned_retirement_operations().cleanup_pinned_thread_retirement(
             retirement, cleanup_agent_pod=False
         )
     assert lost
-    await main._cleanup_pinned_thread_retirement(retirement, cleanup_agent_pod=False)
+    await main._pinned_retirement_operations().cleanup_pinned_thread_retirement(
+        retirement, cleanup_agent_pod=False
+    )
     assert len(effects) == 2
     assert set(resources) == (set() if fault == "retained_pvc_ack" else {"pvc"})
     current = await db.get_thread(owner.id)
@@ -430,13 +434,13 @@ async def test_pinned_snapshot_pins_host_key_and_rechecks_pod_before_delete(
     )
     if replaced_during_snapshot:
         with pytest.raises(RuntimeError, match="workspace cleanup is retryable"):
-            await main._cleanup_pinned_thread_retirement(
+            await main._pinned_retirement_operations().cleanup_pinned_thread_retirement(
                 retirement, cleanup_agent_pod=False
             )
         assert not effects
         assert set(resources) == {"pod", "pvc", "service"}
     else:
-        await main._cleanup_pinned_thread_retirement(
+        await main._pinned_retirement_operations().cleanup_pinned_thread_retirement(
             retirement, cleanup_agent_pod=False
         )
         assert set(resources) == {"pvc"}

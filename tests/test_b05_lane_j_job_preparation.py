@@ -185,7 +185,13 @@ def _job_assignment_deps() -> job_assignment_routes.JobAssignmentDependencies:
         completion_commands_enabled=lambda: main.COMPLETION_COMMANDS_ENABLED,
         prepare_job_workspace_runtime=main._prepare_job_workspace_runtime,
         prepare_job_repository_before_claim=main._prepare_job_repository_before_claim,
-        resume_missing_workspace=main._resume_missing_workspace,
+        resume_missing_workspace=lambda *args, **kwargs: (
+            job_workspace_runtime.resume_missing_workspace(
+                *args,
+                **kwargs,
+                dependencies=main._job_workspace_runtime_dependencies(),
+            )
+        ),
         guard_completion_control=main._completion_control_boundary.guard,
         claim_completion_control=main._completion_control_boundary.claim,
         abort_completion_control_claim=main._completion_control_boundary.abort,
@@ -842,7 +848,9 @@ class TestWorkspaceTierPredicates:
     def test_resume_missing_workspace_parity(self, job):
         assert job_workspace_runtime.resume_missing_workspace(
             job, dependencies=_workspace_runtime_deps()
-        ) == main._resume_missing_workspace(job)
+        ) == job_workspace_runtime.resume_missing_workspace(
+            job, dependencies=main._job_workspace_runtime_dependencies()
+        )
 
     @pytest.mark.parametrize("replace_endpoint", [False, True])
     @pytest.mark.parametrize(
@@ -865,8 +873,13 @@ class TestWorkspaceTierPredicates:
                 dependencies=_workspace_runtime_deps(),
             )
         )
-        theirs_cfg, theirs_decision = main._inject_matching_workspace_config(
-            job, {"llm": {"model": "m"}}, replace_endpoint=replace_endpoint
+        theirs_cfg, theirs_decision = (
+            job_workspace_runtime.inject_matching_workspace_config(
+                job,
+                {"llm": {"model": "m"}},
+                replace_endpoint=replace_endpoint,
+                dependencies=main._job_workspace_runtime_dependencies(),
+            )
         )
         assert mine_cfg == theirs_cfg
         assert mine_decision.effective_backend == theirs_decision.effective_backend
@@ -1193,7 +1206,9 @@ class TestPinnedK8sAttestationFence:
         mine = await job_workspace_authority.attest_pinned_k8s_job_workspace(
             job, dependencies=_authority_deps(workspace_provisioner=provisioner)
         )
-        theirs = await main._attest_pinned_k8s_job_workspace(job)
+        theirs = await job_workspace_authority.attest_pinned_k8s_job_workspace(
+            job, dependencies=main._job_workspace_authority_dependencies()
+        )
         assert mine[1] is None and theirs[1] is None
         provisioner.attest_workspace_runtime.assert_not_awaited()
 
@@ -3345,12 +3360,6 @@ LATE_BINDING_TABLE = [
     ),
     (
         _job_assignment_deps,
-        "resume_missing_workspace",
-        "_resume_missing_workspace",
-        _DIRECT,
-    ),
-    (
-        _job_assignment_deps,
         "guard_completion_control",
         "_completion_control_boundary.guard",
         _DIRECT,
@@ -3381,6 +3390,7 @@ LATE_BINDING_TABLE = [
 # Nested dependency objects; their own fields are proven through their factory.
 _NESTED_FIELDS = {
     (_start_bundle_deps, "workspace_runtime"),
+    (_job_assignment_deps, "resume_missing_workspace"),
 }
 
 

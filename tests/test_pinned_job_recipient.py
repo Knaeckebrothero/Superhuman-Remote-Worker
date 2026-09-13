@@ -338,12 +338,14 @@ async def test_fresh_start_delivers_hidden_recipient_before_existing_db_cas():
             AsyncMock(return_value=("proceed", job, None)),
         ),
         patch.object(
-            main,
-            "_attest_pinned_k8s_job_workspace",
+            main.job_workspace_authority,
+            "attest_pinned_k8s_job_workspace",
             AsyncMock(return_value=(job, None)),
         ),
         patch.object(
-            main, "_build_job_start_request", AsyncMock(return_value=start_request)
+            main.job_start_bundle,
+            "build_job_start_request",
+            AsyncMock(return_value=start_request),
         ),
         patch.object(
             main,
@@ -432,18 +434,18 @@ async def test_fresh_start_delivers_exact_k8s_authority_and_refuses_final_drift(
             AsyncMock(return_value=("proceed", job, None)),
         ),
         patch.object(
-            main,
-            "_attest_pinned_k8s_job_workspace",
+            main.job_workspace_authority,
+            "attest_pinned_k8s_job_workspace",
             AsyncMock(return_value=(job, authority)),
         ),
         patch.object(
-            main,
-            "_build_job_start_request",
+            main.job_start_bundle,
+            "build_job_start_request",
             AsyncMock(return_value=start_request),
         ),
         patch.object(
-            main,
-            "_pinned_k8s_job_workspace_authority_is_current",
+            main.job_workspace_authority,
+            "pinned_k8s_job_workspace_authority_is_current",
             current,
         ),
         patch.object(
@@ -502,7 +504,7 @@ async def test_final_recheck_attests_inherited_parent_without_child_runtime_snap
             AsyncMock(return_value=attestation),
         ) as attest,
     ):
-        assert await main._pinned_k8s_job_workspace_authority_is_current(
+        assert await control_seams.pinned_k8s_job_workspace_authority_is_current(
             child, authority
         )
 

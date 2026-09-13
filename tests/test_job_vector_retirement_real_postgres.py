@@ -89,7 +89,11 @@ async def client(stores, monkeypatch):
         "archive_and_cleanup_workspace",
         AsyncMock(),
     )
-    monkeypatch.setattr(main, "_resolve_job_notifications", AsyncMock())
+    monkeypatch.setattr(
+        main.job_freeze_notification_service,
+        "resolve_job_notifications",
+        AsyncMock(),
+    )
     monkeypatch.setattr(main, "snapshot_service", SimpleNamespace(is_available=False))
     app = FastAPI()
     app.state.job_control_route_dependencies_factory = (

@@ -4,6 +4,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from tests import _b09_control_seams as control_seams
+
 # R1.B06: these handlers moved to services/thread_config_update with their
 # routes in routers/thread_config. main's dependency factory still reads
 # main's attributes at call time, so the patches below keep steering what
@@ -14,6 +16,7 @@ from fastapi import HTTPException
 from orchestrator import main
 from orchestrator.services import thread_workspace_delivery
 from orchestrator.services.container_provisioner import WorkspaceRuntimeAttestation
+from orchestrator.services.container_provisioner import WorkspaceRuntimeAuthorityError
 
 
 JOB_ID = "11111111-1111-4111-8111-111111111111"
@@ -107,7 +110,9 @@ async def test_pinned_job_attestation_replaces_endpoint_with_exact_runtime():
         "attest_workspace_runtime",
         AsyncMock(return_value=_attestation()),
     ):
-        exact_job, authority = await main._attest_pinned_k8s_job_workspace(_job())
+        exact_job, authority = await control_seams.attest_pinned_k8s_job_workspace(
+            _job()
+        )
 
     assert authority is not None
     assert authority.attestation.runtime_incarnation == RUNTIME_A
@@ -125,11 +130,11 @@ async def test_pinned_job_same_ip_successor_is_refused_before_delivery():
             AsyncMock(return_value=_attestation(RUNTIME_B)),
         ),
         pytest.raises(
-            main.WorkspaceRuntimeAuthorityError,
+            WorkspaceRuntimeAuthorityError,
             match="runtime changed before delivery",
         ),
     ):
-        await main._attest_pinned_k8s_job_workspace(_job())
+        await control_seams.attest_pinned_k8s_job_workspace(_job())
 
 
 @pytest.mark.asyncio

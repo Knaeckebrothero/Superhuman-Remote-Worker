@@ -16,6 +16,8 @@ import pytest
 import pytest_asyncio
 from testcontainers.postgres import PostgresContainer
 
+from tests import _b09_control_seams as control_seams
+
 from orchestrator.database.postgres import PostgresDB
 from orchestrator.services.generic_harness_runtime import GenericPodObservation
 from orchestrator.services.manifest_execution import ManifestExecutionService
@@ -188,7 +190,7 @@ async def test_session_partial_patch_freezes_delta_and_rejects_stale_runtime_and
     )
     monkeypatch.setattr(main, "postgres_db", database)
     thread = await database.get_thread(thread_id)
-    delivery, _ = await main._apply_thread_config_update(
+    delivery, _ = await control_seams.apply_thread_config_update(
         thread_id,
         thread,
         {"llm": {"temperature": 0.7}},
@@ -221,7 +223,7 @@ async def test_session_partial_patch_freezes_delta_and_rejects_stale_runtime_and
         {"extra": {"instruction_files": []}},
     ]:
         with pytest.raises(HTTPException) as denied:
-            await main._apply_thread_config_update(
+            await control_seams.apply_thread_config_update(
                 thread_id,
                 stored,
                 replacement,
@@ -234,7 +236,7 @@ async def test_session_partial_patch_freezes_delta_and_rejects_stale_runtime_and
     assert (await read_execution(database, "Session", thread_id))["generation"] == 2
     for protocol, generation in [(None, None), (1, 1)]:
         with pytest.raises(HTTPException) as denied:
-            await main._apply_thread_config_update(
+            await control_seams.apply_thread_config_update(
                 thread_id,
                 stored,
                 {"llm": {"temperature": 0.9}},
@@ -252,7 +254,7 @@ async def test_session_partial_patch_freezes_delta_and_rejects_stale_runtime_and
         "UPDATE users SET is_approved=FALSE WHERE id=$1", actor["id"]
     )
     with pytest.raises(HTTPException) as denied:
-        await main._apply_thread_config_update(
+        await control_seams.apply_thread_config_update(
             thread_id,
             stored,
             {"llm": {"temperature": 0.9}},
@@ -545,7 +547,9 @@ async def test_native_srw_admission_delivers_frozen_configuration_from_database(
         "resolve_config",
         lambda **_: pytest.fail("Live SRW resolver used after admission"),
     )
-    delivered = await main._build_job_start_request(job)
+    delivered = await main.job_start_bundle.build_job_start_request(
+        job, dependencies=main._job_start_bundle_dependencies()
+    )
     assert delivered is not None
     assert delivered.config_override is None
     assert delivered.resolved_config["agent"]["llm"]["model"] == "admitted-model"

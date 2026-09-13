@@ -318,7 +318,9 @@ async def test_soft_retirement_retain_publishes_exact_claim_uid():
             AsyncMock(return_value=True),
         ) as publish,
     ):
-        await main._reconcile_agent_workspace_claim_for_retirement(retirement)
+        await main._pinned_retirement_operations().reconcile_agent_workspace_claim_for_retirement(
+            retirement
+        )
 
     provider.ensure_agent_workspace_claim.assert_awaited_once_with(
         "pvc-agent-s-aaaaaaaa-aaa",
@@ -375,7 +377,9 @@ async def test_permanent_retirement_deletes_original_before_pvc_fence():
         patch.object(main, "postgres_db", db),
         patch.object(main.asyncio, "sleep", AsyncMock()),
     ):
-        await main._reconcile_agent_workspace_claim_for_retirement(retirement)
+        await main._pinned_retirement_operations().reconcile_agent_workspace_claim_for_retirement(
+            retirement
+        )
 
     provider.delete_agent_workspace_claim_exact.assert_awaited_once_with(
         "pvc-agent-s-aaaaaaaa-aaa",
@@ -422,7 +426,9 @@ async def test_permanent_retirement_accepts_exact_claim_already_reclaimed():
         patch.object(main, "agent_provisioner", provider),
         patch.object(main, "postgres_db", db),
     ):
-        await main._reconcile_agent_workspace_claim_for_retirement(retirement)
+        await main._pinned_retirement_operations().reconcile_agent_workspace_claim_for_retirement(
+            retirement
+        )
 
     provider.agent_workspace_claim_authority.assert_not_awaited()
     provider.fence_agent_workspace_claim.assert_not_awaited()

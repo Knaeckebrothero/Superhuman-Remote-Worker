@@ -329,8 +329,8 @@ async def test_cold_thread_resolution_rejects_silent_deleted_connector(
     db.resolve_datasources_for_thread = AsyncMock(return_value=[])
     monkeypatch.setattr(main, "postgres_db", db)
     monkeypatch.setattr(
-        main,
-        "_revalidate_thread_datasource_selection",
+        main.thread_datasource_authorization_service,
+        "revalidate_thread_datasource_selection",
         AsyncMock(return_value=([DS_OWNED], {DS_OWNED: 3})),
     )
 

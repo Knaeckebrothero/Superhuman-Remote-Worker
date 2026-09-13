@@ -7,7 +7,7 @@ both halves of that failed during integration in ways nothing else caught:
 
 * ``_validate_mcp_datasource`` lost a positional parameter, so every caller
   raised ``TypeError`` — loud, but only at the call site.
-* ``_resume_missing_workspace`` gained an ``async``, so its synchronous caller
+* ``resume_missing_workspace`` once gained an ``async``, so its synchronous caller
   stored a coroutine object and logged ``Failed to resume job …: <coroutine
   object …>``. Four more (``_account_defaults_layer``, ``_grant_project_ids``,
   ``_enforce_save_grants``, ``_strip_save_grants``) lost theirs.
@@ -102,16 +102,6 @@ BRIDGES = {
     "_scholar_should_provision_parent_container": (
         job_workspace_runtime.scholar_should_provision_parent_container
     ),
-    "_resume_missing_workspace": job_workspace_runtime.resume_missing_workspace,
-    "_inject_matching_workspace_config": (
-        job_workspace_runtime.inject_matching_workspace_config
-    ),
-    "_attest_pinned_k8s_job_workspace": (
-        job_workspace_authority.attest_pinned_k8s_job_workspace
-    ),
-    "_pinned_k8s_job_workspace_authority_is_current": (
-        job_workspace_authority.pinned_k8s_job_workspace_authority_is_current
-    ),
     "_workspace_runtime_unchanged_before_delivery": (
         job_workspace_authority.workspace_runtime_unchanged_before_delivery
     ),
@@ -134,7 +124,6 @@ BRIDGES = {
     "_prepare_job_repository_before_claim": (
         job_start_bundle.prepare_job_repository_before_claim
     ),
-    "_build_job_start_request": job_start_bundle.build_job_start_request,
     "_thread_project_ids": thread_mount_rows.thread_project_ids,
     "_should_skip_session_folder": thread_mount_rows.should_skip_session_folder,
     "_resolve_thread_datasources": thread_mount_rows.resolve_thread_datasources,

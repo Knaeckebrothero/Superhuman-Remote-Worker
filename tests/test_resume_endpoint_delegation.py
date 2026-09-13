@@ -236,8 +236,8 @@ def resume_collaborators(monkeypatch, fake_conn, injector):
         ),
     )
     monkeypatch.setattr(
-        orchestrator.main,
-        "_pinned_k8s_job_workspace_authority_is_current",
+        orchestrator.main.job_workspace_authority,
+        "pinned_k8s_job_workspace_authority_is_current",
         AsyncMock(return_value=True),
     )
     recipient = orchestrator.main.PinnedJobRecipient(

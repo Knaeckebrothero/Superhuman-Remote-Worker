@@ -15,6 +15,8 @@ from uuid import UUID
 
 import pytest
 
+from tests import _b09_control_seams as control_seams
+
 # R1.B06: this operation moved to services/agent_thread_status.
 from orchestrator.services import agent_thread_status  # noqa: E402
 from fastapi import HTTPException
@@ -219,10 +221,8 @@ def test_public_workspace_undo_envelope_has_empty_canonical_payload():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("key", ["permission_mode", "narration_mode"])
 async def test_generic_orchestrator_config_update_cannot_bypass_inbox(key):
-    import orchestrator.main as orchestrator_main
-
     with pytest.raises(HTTPException) as exc:
-        await orchestrator_main._apply_thread_config_update(
+        await control_seams.apply_thread_config_update(
             str(THREAD_ID),
             {"id": THREAD_ID, "user_id": OWNER_ID},
             {"interactive": {key: "auto"}},

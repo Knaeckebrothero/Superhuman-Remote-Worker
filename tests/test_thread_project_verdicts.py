@@ -7,7 +7,8 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from fastapi import HTTPException
 
-from orchestrator.main import ProjectVerdict, _classify_thread_project_ids
+from orchestrator.services.thread_project_authorization import ProjectVerdict
+from tests import _b09_control_seams as control_seams
 
 
 USER = {"id": "11111111-1111-4111-8111-111111111111", "is_admin": False}
@@ -30,7 +31,7 @@ async def test_classify_projects_reports_deleted_and_revoked():
             side_effect=lambda pid, uid: roles.get(pid)
         )
 
-        verdicts = await _classify_thread_project_ids(
+        verdicts = await control_seams.classify_thread_project_ids(
             USER, [PROJECT_ALIVE, PROJECT_GONE, PROJECT_NO_ROLE]
         )
 
@@ -47,7 +48,7 @@ async def test_admin_is_allowed_on_any_existing_project():
         db.get_project = AsyncMock(return_value={"id": PROJECT_ALIVE})
         db.get_user_role_in_project = AsyncMock(return_value=None)
 
-        verdicts = await _classify_thread_project_ids(
+        verdicts = await control_seams.classify_thread_project_ids(
             {"id": USER["id"], "is_admin": True}, [PROJECT_ALIVE]
         )
 
@@ -60,7 +61,7 @@ async def test_admin_still_denied_on_deleted_project():
         db.get_project = AsyncMock(return_value=None)
         db.get_user_role_in_project = AsyncMock(return_value=None)
 
-        verdicts = await _classify_thread_project_ids(
+        verdicts = await control_seams.classify_thread_project_ids(
             {"id": USER["id"], "is_admin": True}, [PROJECT_GONE]
         )
 
@@ -88,7 +89,9 @@ async def test_archived_project_is_denied():
         )
         db.get_user_role_in_project = AsyncMock(return_value="owner")
 
-        verdicts = await _classify_thread_project_ids(USER, [PROJECT_ARCHIVED])
+        verdicts = await control_seams.classify_thread_project_ids(
+            USER, [PROJECT_ARCHIVED]
+        )
 
     assert verdicts == [ProjectVerdict(PROJECT_ARCHIVED, True, "archived")]
 
@@ -102,7 +105,7 @@ async def test_admin_is_denied_on_an_archived_project_too():
         )
         db.get_user_role_in_project = AsyncMock(return_value=None)
 
-        verdicts = await _classify_thread_project_ids(
+        verdicts = await control_seams.classify_thread_project_ids(
             {"id": USER["id"], "is_admin": True}, [PROJECT_ARCHIVED]
         )
 
@@ -119,7 +122,9 @@ async def test_revoked_outranks_archived():
         )
         db.get_user_role_in_project = AsyncMock(return_value=None)
 
-        verdicts = await _classify_thread_project_ids(USER, [PROJECT_ARCHIVED])
+        verdicts = await control_seams.classify_thread_project_ids(
+            USER, [PROJECT_ARCHIVED]
+        )
 
     assert verdicts == [ProjectVerdict(PROJECT_ARCHIVED, True, "revoked")]
 
@@ -130,7 +135,9 @@ async def test_null_status_is_not_archived():
         db.get_project = AsyncMock(return_value={"id": PROJECT_ALIVE, "status": None})
         db.get_user_role_in_project = AsyncMock(return_value="editor")
 
-        verdicts = await _classify_thread_project_ids(USER, [PROJECT_ALIVE])
+        verdicts = await control_seams.classify_thread_project_ids(
+            USER, [PROJECT_ALIVE]
+        )
 
     assert verdicts == [ProjectVerdict(PROJECT_ALIVE, False, None)]
 

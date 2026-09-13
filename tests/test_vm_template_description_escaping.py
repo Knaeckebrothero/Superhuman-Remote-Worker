@@ -321,6 +321,7 @@ async def test_create_job_strips_surrounding_whitespace(monkeypatch):
     )
     db = PostgresDB.__new__(PostgresDB)
     conn = MagicMock()
+    conn.execute = AsyncMock(return_value="SELECT 1")
     conn.fetchrow = AsyncMock(return_value={"id": "job-1", "status": "created"})
 
     acquired = MagicMock()

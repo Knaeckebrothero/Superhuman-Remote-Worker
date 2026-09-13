@@ -37,6 +37,7 @@ import pytest
 
 import tests.conftest  # noqa: F401 — applies license/crypto/env shims + sys.path
 import orchestrator.main as main
+from shared.backend_kinds import LITE_BACKENDS
 
 
 READY_CONTAINER = {
@@ -679,7 +680,7 @@ def _dispatch_would_refuse(config_override: dict | None) -> bool:
     """Replica of the backstop condition in _dispatch_job_to_agent."""
     ws_final = (config_override or {}).get("workspace", {})
     backend_final = ws_final.get("backend")
-    return backend_final not in main.LITE_BACKENDS and not ws_final.get("remote")
+    return backend_final not in LITE_BACKENDS and not ws_final.get("remote")
 
 
 class TestDispatchBackstopPredicate:

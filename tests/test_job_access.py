@@ -1578,11 +1578,13 @@ class TestJobMutationGates:
         self, user_a, job_a, fake_db, fake_request
     ):
         """Even the job owner can't manually assign — admin-only override."""
-        from orchestrator.main import assign_job_to_agent
+        from tests import _b09_control_seams as control_seams
 
         with _patch_caller_and_db(user_a, fake_db):
             with pytest.raises(HTTPException) as exc:
-                await assign_job_to_agent(fake_request, str(job_a["id"]), "some-agent")
+                await control_seams.assign_job_to_agent(
+                    fake_request, str(job_a["id"]), "some-agent"
+                )
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
@@ -1591,12 +1593,14 @@ class TestJobMutationGates:
     ):
         """Admin clears the gate; the in-body failure is a 500 (not a 403),
         proving the gate didn't fire."""
-        from orchestrator.main import assign_job_to_agent
+        from tests import _b09_control_seams as control_seams
 
         fake_db.get_job = AsyncMock(side_effect=RuntimeError("past gate ok"))
         with _patch_caller_and_db(user_admin, fake_db):
             with pytest.raises(HTTPException) as exc:
-                await assign_job_to_agent(fake_request, str(job_a["id"]), "some-agent")
+                await control_seams.assign_job_to_agent(
+                    fake_request, str(job_a["id"]), "some-agent"
+                )
         assert exc.value.status_code == 500
         assert "past gate ok" in exc.value.detail
 
