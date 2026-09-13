@@ -746,10 +746,10 @@ def test_critic_config_override_removes_self_closing_tools():
     LLM config exactly as before (via isinstance check), including edge cases like
     empty dict.
     """
-    from orchestrator.main import _critic_config_override
+    from orchestrator.services.verification_workflow import critic_config_override
 
     # Test 1: core tools are narrowed (self-closing tools removed)
-    override = _critic_config_override(parent_llm=None)
+    override = critic_config_override(parent_llm=None)
     core = override["tools"]["core"]
     assert "job_complete" not in core
     assert "mark_complete" not in core
@@ -759,16 +759,16 @@ def test_critic_config_override_removes_self_closing_tools():
     }
 
     # Test 2: parent_llm is NOT passed through when None
-    assert "llm" not in _critic_config_override(parent_llm=None)
+    assert "llm" not in critic_config_override(parent_llm=None)
 
     # Test 3: parent_llm IS passed through when provided
     mock_llm = {"model": "test-model", "api_key": "test-key"}
-    override_with_llm = _critic_config_override(parent_llm=mock_llm)
+    override_with_llm = critic_config_override(parent_llm=mock_llm)
     assert override_with_llm.get("llm") == mock_llm
 
     # Test 4: empty dict parent_llm is passed through (matches original isinstance behavior)
     empty_llm = {}
-    override_with_empty = _critic_config_override(parent_llm=empty_llm)
+    override_with_empty = critic_config_override(parent_llm=empty_llm)
     assert override_with_empty.get("llm") == empty_llm
 
 
@@ -788,9 +788,9 @@ def test_critic_config_override_removes_communication_tools():
     `job_complete` was already removed from the critic's toolset: a
     verification critic has no business blocking on a human reply.
     """
-    from orchestrator.main import _critic_config_override
+    from orchestrator.services.verification_workflow import critic_config_override
 
-    override = _critic_config_override(parent_llm=None)
+    override = critic_config_override(parent_llm=None)
 
     assert override["tools"]["communication"] == [], (
         "deep_merge REPLACES lists, so an empty list is what actually strips "
@@ -805,12 +805,12 @@ def test_critic_config_override_resolves_safe_job_inspection_for_parent():
     metadata is the authority that excludes the explicitly gated audit/debug
     surface.  Dispatch resolves the policy before the critic runs.
     """
-    from orchestrator.main import _critic_config_override
+    from orchestrator.services.verification_workflow import critic_config_override
     from orchestrator.services.config_resolver import resolve_config
     from shared.runtime.core.tool_policy import expand_category_true
     from agent.tools.registry import TOOL_REGISTRY, get_tools_by_category
 
-    override = _critic_config_override(parent_llm=None)
+    override = critic_config_override(parent_llm=None)
     assert override["tools"]["job_inspection"] is True
 
     capture = {}

@@ -100,9 +100,9 @@ def test_allowed_runtime_and_lightweight_dependencies_pass(boundary_tree):
     result = lint_boundaries(boundary_tree)
     assert result.returncode == 0, result.stdout + result.stderr
     # The generic manifest path also excludes the legacy harness adapter.
-    # 22 since R1.B07 added its own contract over the message-routing,
-    # notification, Officer-post and loop modules.
-    assert "Contracts: 22 kept, 0 broken" in result.stdout
+    # 23 since R1.B08 added its contract over completion, verification,
+    # delegation and recovery modules.
+    assert "Contracts: 23 kept, 0 broken" in result.stdout
 
 
 @pytest.mark.parametrize(

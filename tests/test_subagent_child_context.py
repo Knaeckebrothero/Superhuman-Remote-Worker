@@ -212,7 +212,7 @@ class TestToolSelection:
         The critic owns the verdict; its child gets only the non-explicit
         inspection reads shared by the roster allowlist and parent toolset.
         """
-        from orchestrator.main import _critic_config_override
+        from orchestrator.services.verification_workflow import critic_config_override
         from orchestrator.services.config_resolver import resolve_config
         from shared.runtime.core.loader import (
             get_all_tool_names,
@@ -224,7 +224,7 @@ class TestToolSelection:
         blob = resolve_config(
             base_config_name="critic",
             expert_type="worker",
-            request_override=_critic_config_override(parent_llm=None),
+            request_override=critic_config_override(parent_llm=None),
         )
         parent_names = get_all_tool_names(load_config_from_resolved(blob))
         parent_name_set = set(parent_names)
