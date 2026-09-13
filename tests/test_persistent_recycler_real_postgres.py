@@ -6096,15 +6096,29 @@ async def test_warm_attach_patch_response_loss_binds_exact_marker(db, monkeypatc
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "pod_already_absent,route_relabelled",
+    "pod_already_absent,route_relabelled,actor_already_deregistered",
     [
-        pytest.param(False, False, id="terminal-warm-labels"),
-        pytest.param(True, False, id="already-absent"),
-        pytest.param(False, True, id="terminal-routed-session-labels"),
+        pytest.param(False, False, False, id="terminal-warm-labels"),
+        pytest.param(True, False, False, id="already-absent"),
+        pytest.param(False, True, False, id="terminal-routed-session-labels"),
+        pytest.param(
+            False,
+            True,
+            True,
+            id="terminal-routed-deregistered-actor",
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason="release completion still requires the detached actor row",
+            ),
+        ),
     ],
 )
 async def test_never_delivered_warm_attach_soft_end_releases_exact_authority(
-    db, monkeypatch, pod_already_absent, route_relabelled
+    db,
+    monkeypatch,
+    pod_already_absent,
+    route_relabelled,
+    actor_already_deregistered,
 ):
     import orchestrator.main as orch_main
 
@@ -6214,6 +6228,8 @@ async def test_never_delivered_warm_attach_soft_end_releases_exact_authority(
             generation=ids["runtime_generation"],
             final_status="ended",
         )
+        if actor_already_deregistered:
+            assert await db.delete_agent(ids["agent"])
         assert await orch_main._pinned_retirement_operations().complete_retiring_soft_warm_binding_release(
             authority
         )
@@ -6236,7 +6252,10 @@ async def test_never_delivered_warm_attach_soft_end_releases_exact_authority(
         "status": "released",
         "release_outcome": "exact_absent_v1",
     }
-    assert dict(agent) == {"status": "offline", "thread_id": None}
+    if actor_already_deregistered:
+        assert agent is None
+    else:
+        assert dict(agent) == {"status": "offline", "thread_id": None}
     assert ("agents-a", ids["pod_name"]) not in api.pods
 
 
