@@ -206,7 +206,11 @@ def test_dark_tokens_match_the_shared_senate_palette() -> None:
     start = scss.index("$senate-theme: (")
     # Accent tokens moved to $accents on 2026-09-10; the login page wears the
     # default accent, so its Senate sub-map is appended to the base map.
-    senate_scss = scss[start : scss.index("\n);", start)] + "\n" + default_accent_block(scss, "senate")
+    senate_scss = (
+        scss[start : scss.index("\n);", start)]
+        + "\n"
+        + default_accent_block(scss, "senate")
+    )
     senate = {
         k: brand.normalize_hex(v)
         for k, v in re.findall(

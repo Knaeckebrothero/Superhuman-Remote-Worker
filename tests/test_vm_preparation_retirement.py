@@ -1,9 +1,11 @@
 """Prepared work that never received a disk can retire without inventing a VM."""
 
 import asyncio
+import importlib.util
 import json
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, Mock, call
 from uuid import uuid4
 
 import asyncpg
@@ -23,6 +25,55 @@ from tests.test_vm_preparation_lifecycle import complete, engine, request
 from vm_controller.workspace_preparation import allocation_name
 
 db = _postgres_db_fixture
+
+
+@pytest.mark.parametrize("workloads_fail", [False, True])
+def test_prepared_gate_revokes_active_tokens_after_workload_cleanup(workloads_fail):
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "scripts/workspace-preparation-srw-k3d-gate.py"
+    )
+    spec = importlib.util.spec_from_file_location("preparation_gate_test", path)
+    gate = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gate)
+    smoke = gate.PreparedSmoke.__new__(gate.PreparedSmoke)
+    smoke.prefix, smoke.token = "cutover-123456abcdef-", "fixture-only-token"
+    active_id = str(uuid4())
+    revoked = {
+        "name": smoke.prefix + "mcp",
+        "id": str(uuid4()),
+        "revoked_at": "2026-09-13T00:00:00Z",
+    }
+    active = {"name": smoke.prefix + "mcp", "id": active_id, "revoked_at": None}
+    other = {"name": "different-owner", "id": str(uuid4()), "revoked_at": None}
+    smoke.gate = SimpleNamespace(
+        login=Mock(),
+        request=Mock(
+            side_effect=[
+                [revoked, active, other],
+                {"status": "revoked"},
+                [revoked, {**active, "revoked_at": "2026-09-13T00:01:00Z"}, other],
+            ]
+        ),
+    )
+    smoke.evidence = {"cleanup": {}}
+    smoke._cleanup_owned = Mock(
+        side_effect=gate.GateFailure("fixture cleanup failed")
+        if workloads_fail
+        else None
+    )
+    if workloads_fail:
+        with pytest.raises(gate.GateFailure, match="fixture cleanup failed"):
+            smoke.cleanup()
+    else:
+        smoke.cleanup()
+    assert smoke.gate.request.call_args_list == [
+        call("GET", "/api/mcp-tokens"),
+        call("DELETE", "/api/mcp-tokens/" + active_id),
+        call("GET", "/api/mcp-tokens"),
+    ]
+    assert smoke.token is None
+    assert smoke.evidence["cleanup"]["mcpTokenRevoked"] is True
 
 
 @pytest.mark.asyncio
