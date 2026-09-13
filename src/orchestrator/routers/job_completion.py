@@ -33,11 +33,13 @@ async def complete_job(
     directly and never reads or writes any completion-command relation.
     """
 
+    await dependencies.require_internal(request)
     return await job_completion.complete_job(
         request,
         job_id,
         body,
         dependencies=dependencies,
+        _authorized=True,
     )
 
 

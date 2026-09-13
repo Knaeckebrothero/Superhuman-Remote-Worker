@@ -107,6 +107,7 @@ async def complete_job(
     body: JobCompleteRequest,
     *,
     dependencies: JobCompletionDependencies,
+    _authorized: bool = False,
 ) -> Any:
     """Authenticate, optionally admit a durable command, then run effects.
 
@@ -114,7 +115,8 @@ async def complete_job(
     directly and never reads or writes any completion-command relation.
     """
 
-    await dependencies.require_internal(request)
+    if not _authorized:
+        await dependencies.require_internal(request)
     if not dependencies.commands_enabled():
         return await dependencies.legacy_complete(
             request,
