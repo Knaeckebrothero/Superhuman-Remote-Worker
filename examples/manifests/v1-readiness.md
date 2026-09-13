@@ -14,12 +14,17 @@ The [manifest guide](README.md) describes the contract and executable examples.
 | Tags and labels | Common metadata on all five kinds, including version-checked metadata edits on admitted Jobs | Metadata does not grant permissions, select resources or trigger execution. A Job metadata edit preserves its admitted specification, dependencies and execution identity. |
 | Clients | Canonical API, thin resource CLI and MCP operations, including workspace-cache management | The broader operational CLI and distributable team packages remain extensions. |
 
-## Current candidate
+## Integrated implementation
 
-The preparation candidate through `dd060d9c3` includes initialization, retained
-disks and cache increments, the six Helm changes from `develop` at `1b40ea300`, and the endpoint
-inventory correction. It also corrects integration defects found while testing
-the real MCP-to-harness path:
+Integration merge `c0c443e03` combines the workspace-preparation candidate through
+`bdd5968df` with published `develop` at `a116c4682`, including its completion-workflow
+refactor. The merge preserves the published completion services and their import
+boundaries. It was built and tested in a separate worktree while development
+continued in the primary checkout; unpublished work there is outside this revision.
+
+The implementation includes initialization, retained disks, prepared-workspace
+caching and the earlier Helm integration. Testing the real MCP-to-harness path
+also produced these corrections:
 
 - Orchestrator preparation admission consumes the same Helm capability settings
   as the controller.
@@ -42,69 +47,64 @@ the real MCP-to-harness path:
 - Updating Job tags, labels or annotations keeps the captured execution and
   cannot silently resolve newer dependencies or replay completed work.
 
-These changes are committed locally on `feat/workspace-preparation-cache`,
-including the repeatable acceptance harness at `a91e56b19`. They have not been
-pushed or rolled out to main dev. Concurrent changes in
-another checkout require their own integration review.
-
-The 2026-09-13 `develop` push at `a116c4682` contains the completion-workflow
-refactor. It does not yet contain this manifest candidate. Its
-[CI/CD run](https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/actions/runs/34764758725)
-passed, including 30,755 backend tests with 180 skips, image builds and chart
-publication. Policy and migration workflows passed too. Both fresh-cluster
-[application E2E profiles](https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/actions/runs/34764758792)
-passed on their first browser attempt with exact resource cleanup and cluster
-teardown. Main dev has installed chart `0.0.998`, app version `sha-a116c46`.
-All 15 deployments have their current replicas ready, including all six workers
-on the published agent image. Cockpit, API and MCP health probes return HTTP 200.
-The [publication evidence](verification/develop-publication-2026-09-13.json)
-records source/image identities and the temporary readiness delay during image
-pulls. No CI fix or manual deployment patch was needed.
-
-This separate publication does not establish deployment of workspace preparation.
-Integrating the two branches and verifying the combined revision remain required.
+The [integration record](verification/develop-integration-2026-09-13.json) identifies
+the combined source and its new local acceptance results. The earlier
+[publication record](verification/develop-publication-2026-09-13.json) describes
+the separate `a116c4682` rollout at chart `0.0.998`; it is historical evidence for
+that parent revision.
 
 ## Acceptance status — 2026-09-13
 
-The coherent candidate is deployed on local `k3d-srw`. The service-level
-[preparation gate](workspace-preparation-k3d-evidence.json) passed with real VMs,
-retained disks, cache policies, cancellation and cleanup. Its separate Cilium
-network gate passed; that result does not certify the ordinary K3s profile.
+The combined revision `c0c443e03` is deployed on local `k3d-srw` through Tilt CI.
+Deployed source checks match the merged checkout, including the completion
+services. A readable application database backup was captured before Helm apply.
 
-The complete [MCP/harness preparation gate](verification/k3d-prepared-srw-mcp-2026-09-13.json)
-passed through `ee8d0eb67`: cold preparation, a fresh cache hit,
-retained allocation and handoff, failed build, running-builder cancellation and
-owned resource cleanup. The gate uses a deterministic model fixture with real MCP
-admission, the installed SRW harness and SSH tools. All four successful Jobs
-required actual guest shell output before completion. See
+The new [ordinary Job/Session smoke](verification/k3d-integrated-srw-adapter-2026-09-13.json)
+passed: sandbox/virtual Jobs, existing Job API workspace selection, frozen Session
+configuration, next-turn changes, End/Resume, and the same Session Expert on
+sandbox, virtual and no workspace. All seven workloads and owned fixture
+registrations retired successfully. Two Session deletions completed through
+explicit 503 continuations with exact identity readback.
+
+The new [MCP/harness preparation gate](verification/k3d-integrated-prepared-srw-2026-09-13.json)
+passed all six cases: cold preparation, a cache hit on an independent writable
+disk, retained allocation, handoff to a new Job/VM on the same disk, failed build
+and running-builder cancellation. All four successful Jobs required actual guest
+shell output before completion. The gate uses a deterministic model fixture with
+real MCP admission, the installed SRW harness and SSH tools. Owned workloads,
+retained disks, prepared artifacts and temporary credentials were cleaned up.
+The scoped base import remains under the installed cache TTL. See
 [repeatable local acceptance](workspace-preparation.md#repeatable-local-acceptance).
 
-The complete [ordinary Job/Session smoke](verification/k3d-srw-adapter-2026-09-13.json)
-passed through `dd060d9c3`, including sandbox/virtual Jobs, the existing Job API,
-Session configuration updates and End/Resume, and one unchanged Session Expert
-on sandbox, virtual and no workspace. All seven workloads, fixture registrations
-and temporary credentials retired successfully. Two Session deletions needed
-explicit 503 continuations with exact identity readback; no transport-ambiguous
-mutation was replayed. The earlier failed invocation was recovered separately.
+The combined Python 3.12.14 regression passed **30,974 tests**, with 179 skips
+and 175 warnings, in 36:28. It used `PYTHONSAFEPATH=1`, four bounded workers and
+no fail-fast flag. All 3,573 tracked inputs remained unchanged throughout the run.
+Ruff lint and formatting cover 2,001 files; all 23 import contracts, the 512-entry
+endpoint inventory, 105 runtime-coordinate classifications and both Helm lint
+profiles pass. Dependency and canonical-import checks pass in the isolated
+environment.
 
-The final Python 3.12 regression through `dd060d9c3` passed **30,951 tests** with
-179 skips in 37:38, using `PYTHONSAFEPATH=1` and four bounded workers. All 2,728
-recorded inputs remained unchanged. The 433 focused provisioning/PostgreSQL
-checks also pass. The [acceptance summary](verification/v1-stabilization-2026-09-13.json)
-records exact revisions, deployment checks and verification limits.
+The Cockpit tree is unchanged from the previously accepted candidate, whose
+3,137 tests, translations and production build passed. That frontend result is
+reused for this identical tree. The earlier
+[stabilization record](verification/v1-stabilization-2026-09-13.json) also records
+migration replay and focused controller/retirement checks. The service-level
+[preparation gate](workspace-preparation-k3d-evidence.json) includes additional
+cache-policy checks and a separate Cilium network test. Its network result does
+not certify the ordinary K3s profile or online guest package installation.
 
-All 3,137 Cockpit tests, translation checks and the production build pass. Both
-Helm lint profiles pass. The 276 focused retirement/provisioning/PostgreSQL checks,
-265 controller/auth checks and 24 final retirement/helper checks pass. Ruff lint
-and formatting pass across all source and tests. The full application migration
-chain replays from an empty database. A readable local database backup was taken
-before migration 0246.
+After the integrated gates, the shared golden DataVolume and PVC retained their
+original identities, and the unrelated scratch database remained running. The
+primary checkout's Tilt watcher remains paused; local k3d retains the integrated
+deployment.
 
 ## Release decisions still required
 
-Integrate the final candidate with the then-current `develop`, run CI and deploy
-matching chart, orchestrator, controller and builder artifacts. Enable preparation
-on main dev deliberately and repeat the actual developer workflow there. Verify
+Develop publication uses CI-built component images and a versioned Helm chart;
+[GitHub Actions](https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/actions?query=branch%3Adevelop)
+records those publication checks. Preparation remains disabled by default.
+Enable it deliberately on main dev and repeat the actual developer workflow
+there with matching orchestrator, controller and builder artifacts. Verify
 startup network enforcement before enabling online preparation.
 
 Keep `srw/v1alpha1` until supported backend behavior, migration/rollback handling
