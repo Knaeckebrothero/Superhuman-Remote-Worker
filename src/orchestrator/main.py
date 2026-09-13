@@ -6224,6 +6224,61 @@ def _captured_lite_backend_agent_zero_only(
     )
 
 
+def _captured_vm_recovery_identity(
+    context: Mapping[str, Any],
+    *,
+    permanent: bool,
+):
+    """Return the exact captured VM identity usable by crash recovery.
+
+    VM teardown is an orchestrator actuator, not an inference from an ended
+    thread.  Require the same reciprocal generation/UID shape captured at
+    retirement Begin before stopping the agent Pod or issuing an external
+    effect.
+    """
+    from orchestrator.services.vm_provisioner import VMTeardownIdentity
+
+    if str(context.get("workspace_backend") or "") not in {"vm", "remote"}:
+        return None
+    vm = context.get("vm")
+    workspace = context.get("workspace_container")
+    binding = context.get("workspace_binding")
+    provision_intent = context.get("workspace_provision_intent")
+    if (
+        not isinstance(vm, Mapping)
+        or workspace not in (None, {})
+        or binding not in (None, {})
+        or provision_intent not in (None, {})
+    ):
+        return None
+    generation = str(vm.get("provision_generation") or "")
+    identity_generation = str(vm.get("identity_provision_generation") or "")
+    vm_uid = str(vm.get("vm_uid") or "")
+    runtime_incarnation = str(vm.get("_runtime_incarnation") or "")
+    rootdisk_uid = str(vm.get("rootdisk_pvc_uid") or "")
+    try:
+        UUID(generation)
+    except (TypeError, ValueError):
+        return None
+    if (
+        identity_generation != generation
+        or vm.get("identity_authenticated") is not True
+        or not vm_uid
+        or runtime_incarnation != vm_uid
+        or (permanent and not rootdisk_uid)
+    ):
+        return None
+    return VMTeardownIdentity(
+        provision_generation=generation,
+        vm_uid=vm_uid,
+        rootdisk_pvc_uid=rootdisk_uid or None,
+        ssh_host=vm.get("ssh_host"),
+        ssh_port=vm.get("ssh_port"),
+        ssh_host_key_fingerprint=vm.get("ssh_host_key_fingerprint"),
+        credential_runtime_started=vm.get("credential_runtime_started"),
+    )
+
+
 async def _recover_captured_sandbox_process_zero(
     retirement: Mapping[str, Any],
 ) -> bool:
@@ -6273,16 +6328,27 @@ async def _recover_captured_sandbox_process_zero(
     lite_agent_zero_only = _captured_lite_backend_agent_zero_only(
         context, captured_workspace, captured_binding
     )
+    captured_vm_identity = _captured_vm_recovery_identity(context, permanent=permanent)
     if (
         workspace_backend != "sandbox"
         and not virtual_binding_agent_zero_only
         and not lite_agent_zero_only
+        and captured_vm_identity is None
     ):
-        # Every other backend still owes its own actuator. Say so: this
-        # refusal retried every sweep for days on dev without a trace.
+        # Unknown backends and incomplete VM authority remain fail-closed.
         logger.warning(
-            "Pinned retirement recovery has no process-zero actuator for "
-            "backend %r on thread %s; the durable marker stays pending",
+            "Pinned retirement recovery has no process-zero actuator or complete "
+            "captured authority for backend %r on thread %s; the durable marker "
+            "stays pending",
+            workspace_backend,
+            thread_id,
+        )
+        return False
+    if captured_vm_identity is not None and not vm_provisioner.lifecycle_available:
+        logger.warning(
+            "Pinned retirement recovery has no process-zero actuator or complete "
+            "captured authority for backend %r on thread %s; the durable marker "
+            "stays pending",
             workspace_backend,
             thread_id,
         )
@@ -6360,6 +6426,39 @@ async def _recover_captured_sandbox_process_zero(
         binding = captured_binding
         if not isinstance(workspace, Mapping) or not isinstance(binding, Mapping):
             return False
+        if captured_vm_identity is not None:
+            vm_result = await vm_provisioner.release_vm_captured(
+                thread_id,
+                captured_vm_identity,
+                ssh_host=captured_vm_identity.ssh_host,
+                ssh_port=captured_vm_identity.ssh_port,
+                purge_disk=permanent,
+                entity_type="thread",
+                capture_snapshot=False,
+            )
+            if vm_result.disposition != "completed":
+                logger.warning(
+                    "Pinned retirement VM process-zero remains retryable for "
+                    "thread %s: %s",
+                    thread_id,
+                    vm_result.disposition,
+                )
+                return False
+            receipt = await postgres_db.acknowledge_pinned_thread_local_quiescence(
+                thread_id,
+                expected_runtime_generation=generation,
+                expected_retirement_token=token,
+                expected_agent_id=str(context.get("agent_id") or ""),
+                expected_attach_token=str(context.get("runtime_attach_token") or ""),
+                expected_settle_status=str(context.get("settle_status") or ""),
+                expected_quiescence_protocol="workspace_actuator_zero_v1",
+                expected_workspace_generation=(
+                    captured_vm_identity.provision_generation
+                ),
+                expected_workspace_runtime_incarnation=captured_vm_identity.vm_uid,
+                quiescence_actor="orchestrator",
+            )
+            return receipt is not None
         if not workspace and (not binding or virtual_binding_agent_zero_only):
             receipt = await postgres_db.acknowledge_pinned_thread_local_quiescence(
                 thread_id,
