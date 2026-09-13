@@ -2400,6 +2400,48 @@ async def test_permanent_sandbox_absence_accepts_orchestrator_zero_receipt(db):
 
 
 @pytest.mark.asyncio
+@pytest.mark.xfail(
+    strict=True,
+    reason="active resumed generations cannot receipt exact zero admission",
+)
+async def test_active_resumed_life_accepts_exact_zero_admission_receipt(db):
+    """A newly attached resumed life is active before its first delivery."""
+
+    ids = await _seed(
+        db,
+        protected_agent_pod=True,
+        workspace_claim=False,
+    )
+    authority = await db.begin_pinned_thread_retirement(
+        ids["thread"], permanent=False
+    )
+    assert await db.authorize_pinned_thread_retirement(
+        ids["thread"],
+        token=authority["token"],
+        generation=authority["generation"],
+        settle_status="ended",
+    )
+
+    receipt = await db.acknowledge_pinned_thread_local_quiescence(
+        ids["thread"],
+        expected_runtime_generation=authority["generation"],
+        expected_retirement_token=authority["token"],
+        expected_agent_id=ids["agent"],
+        expected_attach_token=ids["attach_token"],
+        expected_settle_status="ended",
+        expected_quiescence_protocol="agent_runtime_zero_v1",
+        expected_workspace_generation=None,
+        expected_workspace_runtime_incarnation=None,
+        quiescence_actor="orchestrator",
+        expected_agent_pod_uid="old-pod",
+        require_zero_admission=True,
+    )
+
+    assert receipt is not None
+    assert receipt["quiescence_protocol"] == "agent_runtime_zero_v1"
+
+
+@pytest.mark.asyncio
 async def test_unexposed_permanent_delete_waits_for_external_runtime_cleanup(db):
     ids = await _seed(db, bind_agent=False)
     runtime_uid = str(uuid4())
