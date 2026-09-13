@@ -183,9 +183,12 @@ async def record_heartbeat(
     """Record heartbeat liveness and thread-aware IDE connection activity."""
 
     now = datetime.now(timezone.utc).isoformat()
-    merged = await _merge_vm(db, identity, {"last_heartbeat": now})
     connections = payload.get("code_server_connections")
+    telemetry: dict[str, Any] = {"last_heartbeat": now}
     if connections is not None:
+        telemetry["code_server_connections"] = connections
+    merged = await _merge_vm(db, identity, telemetry)
+    if merged and connections is not None:
         updates = {"code_server_connections": connections}
         if connections > 0:
             updates.update({"last_activity": now, "status": "active"})
@@ -197,7 +200,11 @@ async def record_heartbeat(
             else db.merge_ide_session_context
         )
         try:
-            await method(identity.entity_id, updates)
+            await method(
+                identity.entity_id,
+                updates,
+                expected_vm_generation=identity.provision_generation,
+            )
         except Exception:
             logger.warning(
                 "Could not update IDE session heartbeat for %s %s",

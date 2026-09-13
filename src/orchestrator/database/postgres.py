@@ -9736,7 +9736,11 @@ class PostgresDB:
         return result == "UPDATE 1"
 
     async def merge_ide_session_context(
-        self, job_id: str, session_updates: Dict[str, Any]
+        self,
+        job_id: str,
+        session_updates: Dict[str, Any],
+        *,
+        expected_vm_generation: str | None = None,
     ) -> bool:
         """Atomically merge updates into context.ide_session without touching other keys.
 
@@ -9746,6 +9750,8 @@ class PostgresDB:
         Args:
             job_id: Job UUID as string
             session_updates: Dictionary of keys to merge into context.ide_session
+            expected_vm_generation: Restrict heartbeat activity to an existing
+                live VM IDE on this generation.
 
         Returns:
             True if updated, False if not found
@@ -9767,17 +9773,31 @@ class PostgresDB:
             "    updated_at = CURRENT_TIMESTAMP "
             "WHERE id = $2"
         )
-        async with self.acquire() as conn:
-            result = await conn.execute(
-                query, json_module.dumps(session_updates), uuid_val
+        arguments = [json_module.dumps(session_updates), uuid_val]
+        if expected_vm_generation is not None:
+            # Heartbeats update an explicitly hosted VM IDE. They never create
+            # a runtime projection or relabel another/unknown backend. Check
+            # the current generation atomically with this write.
+            query += (
+                " AND context->'vm'->>'provision_generation' = $3"
+                " AND context->'vm'->>'status' = 'ready'"
+                " AND context->'ide_session'->>'restore_type' = 'vm'"
+                " AND context->'ide_session'->>'status' IN ('active','idle')"
             )
+            arguments.append(expected_vm_generation)
+        async with self.acquire() as conn:
+            result = await conn.execute(query, *arguments)
 
         return result == "UPDATE 1"
 
     async def merge_thread_ide_session_context(
-        self, thread_id: str, session_updates: Dict[str, Any]
+        self,
+        thread_id: str,
+        session_updates: Dict[str, Any],
+        *,
+        expected_vm_generation: str | None = None,
     ) -> bool:
-        """Atomically merge updates into threads.metadata.ide_session."""
+        """Merge IDE activity, optionally restricted to the current live VM."""
         import json as json_module
 
         try:
@@ -9794,10 +9814,17 @@ class PostgresDB:
             ") "
             "WHERE id = $2"
         )
-        async with self.acquire() as conn:
-            result = await conn.execute(
-                query, json_module.dumps(session_updates), uuid_val
+        arguments = [json_module.dumps(session_updates), uuid_val]
+        if expected_vm_generation is not None:
+            query += (
+                " AND metadata->'vm'->>'provision_generation' = $3"
+                " AND metadata->'vm'->>'status' = 'ready'"
+                " AND metadata->'ide_session'->>'restore_type' = 'vm'"
+                " AND metadata->'ide_session'->>'status' IN ('active','idle')"
             )
+            arguments.append(expected_vm_generation)
+        async with self.acquire() as conn:
+            result = await conn.execute(query, *arguments)
 
         return result == "UPDATE 1"
 

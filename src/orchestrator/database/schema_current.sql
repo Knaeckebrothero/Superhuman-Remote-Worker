@@ -3206,6 +3206,13 @@ BEGIN
     IF source_kind = 'job' THEN
         old_ide := COALESCE(old_state->'ide_session', '{}'::JSONB);
         new_ide := COALESCE(new_state->'ide_session', '{}'::JSONB);
+        IF public.vm_ide_heartbeat_cleanup_is_authorized(
+            source_kind, source_id, old_state, new_state
+        ) THEN
+            -- No endpoint/process was named by this exact legacy placeholder.
+            -- The VM itself still requires its independent process-zero receipt.
+            old_ide := '{}'::JSONB;
+        END IF;
         inherited_scope := declared_inherited
             AND old_ide <> '{}'::JSONB
             AND (
@@ -9347,7 +9354,13 @@ BEGIN
            AND NOT restore_projection_authorized
            AND NOT cancelled_creation_projection_authorized
            AND NOT cancel_claim_projection_authorized
-           AND NOT terminal_cancel_projection_authorized THEN
+           AND NOT terminal_cancel_projection_authorized
+           AND NOT (
+               scope_name = 'ide'
+               AND public.vm_ide_heartbeat_cleanup_is_authorized(
+                   source_kind, source_id, old_state, new_state
+               )
+           ) THEN
             RAISE EXCEPTION USING
                 ERRCODE = '23514',
                 CONSTRAINT = CASE WHEN scope_name = 'ide'
@@ -13751,6 +13764,51 @@ BEGIN
     RETURN NULL;
 END;
 $$;
+
+
+--
+-- Name: vm_ide_heartbeat_cleanup_is_authorized(text, uuid, jsonb, jsonb); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_ide_heartbeat_cleanup_is_authorized(requested_owner_kind text, requested_owner_id uuid, old_state jsonb, new_state jsonb) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $_$
+    SELECT COALESCE(
+      requested_owner_kind IN ('job', 'thread')
+      AND requested_owner_id IS NOT NULL
+      AND new_state = old_state - 'ide_session'
+      AND jsonb_typeof(old_state -> 'ide_session') = 'object'
+      AND (old_state -> 'ide_session')
+            - ARRAY['status', 'code_server_connections', 'last_activity'] = '{}'::JSONB
+      AND old_state -> 'ide_session' ->> 'status' IN ('active', 'idle')
+      AND jsonb_typeof(old_state -> 'ide_session' -> 'code_server_connections') = 'number'
+      AND old_state -> 'ide_session' ->> 'code_server_connections' ~ '^(0|[1-9][0-9]*)$'
+      AND (NOT (old_state -> 'ide_session' ? 'last_activity')
+           OR jsonb_typeof(old_state -> 'ide_session' -> 'last_activity') = 'string')
+      AND old_state -> 'vm' -> 'identity_authenticated' = 'true'::JSONB
+      AND old_state -> 'vm' ->> 'provision_generation'
+            ~ '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$'
+      AND old_state -> 'vm' ->> 'identity_provision_generation'
+            = old_state -> 'vm' ->> 'provision_generation'
+      AND old_state -> 'vm' ->> 'vm_uid'
+            ~ '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$'
+      AND NOT EXISTS (
+          SELECT 1 FROM public.managed_repository_workspace_creation_reservations AS reservation
+          WHERE reservation.owner_kind = requested_owner_kind
+            AND reservation.owner_id = requested_owner_id AND reservation.scope = 'ide'
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM public.managed_repository_workspace_cleanup_intents AS intent
+          WHERE intent.owner_kind = requested_owner_kind
+            AND intent.owner_id = requested_owner_id AND intent.scope = 'ide'
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM public.managed_repository_process_zero_receipts AS receipt
+          WHERE receipt.owner_kind = requested_owner_kind
+            AND receipt.owner_id = requested_owner_id AND receipt.scope = 'ide'
+      )
+    , FALSE);
+$_$;
 
 
 --
