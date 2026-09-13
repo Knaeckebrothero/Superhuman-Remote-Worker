@@ -19,7 +19,7 @@ from shared.workspace_preparation import (
     normalized_image,
     validate_request,
 )
-from vm_controller.preparation_manifests import builder_pod
+from vm_controller.preparation_manifests import builder_pod, firewall_command
 from vm_controller.preparation_registry import RegistryResolver
 from vm_controller.preparation_store import (
     PreparationConflict,
@@ -186,7 +186,12 @@ class VMWorkspacePreparation:
             builder_image=self.builder_image,
             disk_size=self.settings.disk_size,
             network_policy=(
-                self.settings.network_policy_revision
+                {
+                    "revision": self.settings.network_policy_revision,
+                    "podFirewall": self.settings.firewall,
+                }
+                if self.settings.pod_firewall
+                else self.settings.network_policy_revision
                 if self.settings.network_enabled
                 else "offline"
             ),
@@ -200,6 +205,8 @@ class VMWorkspacePreparation:
             "networkEnabled": self.settings.network_enabled,
             "diskSize": self.settings.disk_size,
         }
+        if self.settings.firewall is not None:
+            artifact_request["podFirewall"] = self.settings.firewall
         name = record_name("artifact", key)
         artifact = await self.store.get(name)
         if artifact and artifact.state["phase"] == "Failed":
@@ -428,6 +435,7 @@ class VMWorkspacePreparation:
                 image=artifact.request["builderImage"],
                 timeout=self.settings.build_timeout,
                 image_pull_secrets=self.settings.image_pull_secrets,
+                pod_firewall=artifact.request.get("podFirewall"),
             ),
         )
         if raw is not None:
@@ -450,11 +458,55 @@ class VMWorkspacePreparation:
             or pod.spec.containers[0].image != artifact.request["builderImage"]
         ):
             raise PreparationConflict("Build Pod identity changed.")
+        firewall = artifact.request.get("podFirewall")
+        init_containers = pod.spec.init_containers or []
+        if firewall is not None:
+            if (
+                len(init_containers) != 1
+                or init_containers[0].name != "network-firewall"
+                or init_containers[0].image != artifact.request["builderImage"]
+                or init_containers[0].command != firewall_command(firewall)
+            ):
+                raise PreparationConflict("Build Pod firewall identity changed.")
+        elif init_containers:
+            raise PreparationConflict("Build Pod has an unexpected init container.")
         if not artifact.state.get("pod_uid"):
             await self.store.save(
                 artifact, {**artifact.state, "pod_uid": pod.metadata.uid}
             )
         statuses = pod.status.container_statuses or []
+        init_statuses = pod.status.init_container_statuses or []
+        if (
+            firewall is not None
+            and pod.status.phase == "Failed"
+            and len(init_statuses) == 1
+            and init_statuses[0].name == "network-firewall"
+            and init_statuses[0].restart_count == 0
+            and init_statuses[0].state.terminated is not None
+            and init_statuses[0].state.terminated.exit_code != 0
+            and len(statuses) == 1
+            and statuses[0].name == "builder"
+            and statuses[0].restart_count == 0
+            and not statuses[0].container_id
+            and statuses[0].state.waiting is not None
+            and statuses[0].state.waiting.reason == "PodInitializing"
+            and not (statuses[0].last_state and statuses[0].last_state.terminated)
+        ):
+            # This init container cannot mount the disk; Kubernetes reports
+            # that the regular builder never started. Retire the exact Pod
+            # before releasing its failed artifact, as for a terminal builder.
+            await self.store.save(
+                artifact,
+                {
+                    **artifact.state,
+                    "phase": "Releasing",
+                    "terminal": True,
+                    "receipt": None,
+                    "exit_code": init_statuses[0].state.terminated.exit_code,
+                    "failure_stage": "PodFirewall",
+                },
+            )
+            return
         if len(statuses) != 1 or statuses[0].state.terminated is None:
             if pod.status.phase in {"Failed", "Succeeded"}:
                 # Eviction can lose the process status. Never infer that an

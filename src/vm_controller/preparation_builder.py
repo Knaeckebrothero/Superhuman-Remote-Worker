@@ -70,7 +70,7 @@ def prepare(request, *, disk=Path("/disk/disk.img")):
                 process.wait()
             raise
         if code:
-            raise RuntimeError("Offline preparation failed.")
+            raise RuntimeError("Workspace preparation failed.")
     digest = hashlib.sha256()
     fd = os.open(disk, os.O_RDONLY | os.O_NOFOLLOW)
     with os.fdopen(fd, "rb") as stream:

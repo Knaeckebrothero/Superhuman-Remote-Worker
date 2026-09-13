@@ -3507,6 +3507,11 @@ vmController:
       enabled: false
       # Operator assertion after testing the cluster's NetworkPolicy enforcement.
       enforcementVerified: false
+      # Install a trusted Pod-local firewall before the unprivileged builder.
+      # Covers CNI startup races without changing node rules. Requires NET_ADMIN
+      # on this init container only; supports public IPv4 HTTP(S) and Pod DNS.
+      # Keep additionalEgress empty and retain the blocked ranges in this mode.
+      podFirewall: false
       # Public IPv4 HTTP(S); private/cluster/metadata ranges are excluded below.
       blockedCidrs:
         - 0.0.0.0/8

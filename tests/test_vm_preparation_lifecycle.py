@@ -11,6 +11,7 @@ from kubernetes import client
 
 from shared.workspace_preparation import preparation_request
 from shared.workspace_preparation_settings import PreparationSettings
+from shared.workspace_preparation_network import DEFAULT_BLOCKED_CIDRS
 from vm_controller.preparation_store import PreparationConflict, Record, now
 from vm_controller.workspace_preparation import VMWorkspacePreparation, allocation_name
 
@@ -201,6 +202,126 @@ async def complete(service, value, **finish):
         if result or wait["status"] == "failed":
             return result, wait
     raise AssertionError("Build did not retire")
+
+
+@pytest.mark.asyncio
+async def test_firewall_profile_is_frozen_across_controller_restart_and_versions_cache():
+    service = engine(pod_firewall=True, network_policy_revision="a" * 64)
+    value = request()
+    await service.prepare(value)
+    (artifact,) = await service.store.records("artifact")
+    expected = {
+        "version": 1,
+        "networkEnabled": False,
+        "blockedCidrs": list(DEFAULT_BLOCKED_CIDRS),
+    }
+    assert artifact.request["podFirewall"] == expected
+    restarted = engine(
+        service.store, network_enabled=True, network_policy_revision="b" * 64
+    )
+    # Bound work keeps the admitted profile even if operators change defaults.
+    service.store.finish(artifact.state["pod"])
+    await restarted.prepare(value)
+    ready, _ = await restarted.prepare(value)
+    assert ready is not None
+    await restarted.prepare(request())
+    artifacts = await service.store.records("artifact")
+    assert (
+        len(artifacts) == 2
+        and artifacts[0].request["cacheKey"] != artifacts[1].request["cacheKey"]
+    )
+    assert artifacts[0].request["podFirewall"] == expected
+    # The disabled profile preserves the old durable request shape.
+    assert "podFirewall" not in artifacts[1].request
+
+
+@pytest.mark.asyncio
+async def test_changed_firewall_cannot_reuse_cache_even_with_same_operator_revision():
+    service = engine(pod_firewall=True, network_policy_revision="a" * 64)
+    await service.prepare(request())
+    restarted = engine(
+        service.store,
+        pod_firewall=True,
+        network_policy_revision="a" * 64,
+        blocked_cidrs=(*DEFAULT_BLOCKED_CIDRS, "203.0.113.0/24"),
+    )
+    await restarted.prepare(request())
+    artifacts = await service.store.records("artifact")
+    assert len(artifacts) == 2
+    assert artifacts[0].request["cacheKey"] != artifacts[1].request["cacheKey"]
+
+
+def failed_firewall_status(*, writer_started=False):
+    raw = {
+        "phase": "Failed",
+        "initContainerStatuses": [
+            {
+                "name": "network-firewall",
+                "image": BUILDER,
+                "imageID": "init-image",
+                "restartCount": 0,
+                "ready": False,
+                "state": {"terminated": {"exitCode": 1, "reason": "Error"}},
+            }
+        ],
+        "containerStatuses": [
+            {
+                "name": "builder",
+                "image": BUILDER,
+                "imageID": "",
+                "restartCount": 0,
+                "ready": False,
+                "state": {"waiting": {"reason": "PodInitializing"}},
+            }
+        ],
+    }
+    if writer_started:
+        raw["containerStatuses"][0]["containerID"] = "containerd://unknown-writer"
+    return client.ApiClient()._ApiClient__deserialize(raw, "V1PodStatus")
+
+
+@pytest.mark.asyncio
+async def test_failed_firewall_releases_only_after_never_started_writer_and_exact_pod_removal():
+    service = engine(pod_firewall=True, network_policy_revision="a" * 64)
+    value = request()
+    await service.prepare(value)
+    (name,) = service.store.pods
+    service.store.pods[name].status = failed_firewall_status()
+    ready, wait = await service.prepare(value)
+    assert ready is None and wait["preparation"]["phase"] == "Releasing"
+    assert (
+        name not in service.store.pods
+    )  # DELETE returned; absence is not observed yet.
+    ready, wait = await service.prepare(value)
+    assert ready is None and wait["status"] == "failed"
+    assert not service.store.pods
+    (artifact,) = await service.store.records("artifact")
+    assert artifact.state["failure_stage"] == "PodFirewall"
+    assert artifact.state["phase"] == "Failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutation",
+    ["writer_started", "init_replaced", "init_missing", "unknown_main_state"],
+)
+async def test_ambiguous_firewall_failure_keeps_disk_quarantined(mutation):
+    service = engine(pod_firewall=True, network_policy_revision="a" * 64)
+    value = request()
+    await service.prepare(value)
+    (pod,) = service.store.pods.values()
+    pod.status = failed_firewall_status(writer_started=mutation == "writer_started")
+    if mutation == "init_replaced":
+        pod.spec.init_containers[0].image = "unrelated-image"
+    elif mutation == "init_missing":
+        pod.spec.init_containers = None
+    elif mutation == "unknown_main_state":
+        pod.status.container_statuses = None
+    ready, failed = await service.prepare(value)
+    assert ready is None and failed["status"] == "failed"
+    (artifact,) = await service.store.records("artifact")
+    assert artifact.state["phase"] == "Lost"
+    assert service.store.pods and service.store.disks
 
 
 @pytest.mark.asyncio

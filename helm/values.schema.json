@@ -1898,6 +1898,9 @@
                 "enforcementVerified": {
                   "type": "boolean"
                 },
+                "podFirewall": {
+                  "type": "boolean"
+                },
                 "blockedCidrs": {
                   "type": "array",
                   "minItems": 1,

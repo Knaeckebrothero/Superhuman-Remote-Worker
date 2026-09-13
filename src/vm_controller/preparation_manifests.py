@@ -1,12 +1,60 @@
-"""Constrained, non-restarting offline builders for controller-owned disks."""
+"""Constrained, non-restarting builders for controller-owned disks."""
 
-from shared.workspace_preparation import PREPARATION_LABEL
+from shared.workspace_preparation import PREPARATION_LABEL, canonical
+from shared.workspace_preparation_network import firewall_policy
+
+
+def firewall_command(policy):
+    return [
+        "python",
+        "-m",
+        "vm_controller.preparation_firewall",
+        "--policy",
+        canonical(firewall_policy(policy)),
+    ]
+
+
+def firewall_init_container(image, policy):
+    return {
+        "name": "network-firewall",
+        "image": image,
+        "imagePullPolicy": "IfNotPresent",
+        "command": firewall_command(policy),
+        "env": [
+            {
+                "name": "SRW_PREPARATION_POD_UID",
+                "valueFrom": {"fieldRef": {"fieldPath": "metadata.uid"}},
+            }
+        ],
+        "securityContext": {
+            "runAsNonRoot": False,
+            "runAsUser": 0,
+            "runAsGroup": 0,
+            "allowPrivilegeEscalation": False,
+            "readOnlyRootFilesystem": True,
+            "capabilities": {"drop": ["ALL"], "add": ["NET_ADMIN"]},
+        },
+        "resources": {
+            "requests": {"cpu": "10m", "memory": "32Mi"},
+            "limits": {"cpu": "100m", "memory": "64Mi"},
+        },
+        "volumeMounts": [{"name": "firewall-runtime", "mountPath": "/run"}],
+    }
 
 
 def builder_pod(
-    *, namespace, name, uid, disk, input_name, image, timeout, image_pull_secrets=()
+    *,
+    namespace,
+    name,
+    uid,
+    disk,
+    input_name,
+    image,
+    timeout,
+    image_pull_secrets=(),
+    pod_firewall=None,
 ):
-    return {
+    body = {
         "apiVersion": "v1",
         "kind": "Pod",
         "metadata": {
@@ -78,3 +126,12 @@ def builder_pod(
             ],
         },
     }
+    if pod_firewall is not None:
+        body["spec"]["initContainers"] = [firewall_init_container(image, pod_firewall)]
+        body["spec"]["volumes"].append(
+            {
+                "name": "firewall-runtime",
+                "emptyDir": {"medium": "Memory", "sizeLimit": "1Mi"},
+            }
+        )
+    return body

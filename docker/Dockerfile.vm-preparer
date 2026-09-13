@@ -1,11 +1,11 @@
-# Trusted offline VM disk builder. Authored preparation runs inside the
+# Trusted VM disk builder. Authored preparation runs inside the
 # libguestfs appliance, never in this container's host Python process.
 FROM python:3.12-slim-bookworm
 
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-       libguestfs-tools linux-image-amd64 ca-certificates \
+       libguestfs-tools linux-image-amd64 ca-certificates iptables \
     && libguestfs-make-fixed-appliance /opt/srw-guestfs \
     && chmod -R a+rX /opt/srw-guestfs \
     && rm -rf /var/lib/apt/lists/*
@@ -21,10 +21,12 @@ ENV LIBGUESTFS_BACKEND=direct \
 
 WORKDIR /app
 COPY src/shared/__init__.py src/shared/workspace_initialization.py src/shared/workspace_preparation.py ./src/shared/
-COPY src/vm_controller/__init__.py src/vm_controller/preparation_builder.py ./src/vm_controller/
+COPY src/shared/workspace_preparation_network.py ./src/shared/
+COPY src/vm_controller/__init__.py src/vm_controller/preparation_builder.py src/vm_controller/preparation_firewall.py ./src/vm_controller/
 COPY pyproject.toml ./
 RUN pip install --no-cache-dir --no-deps -e .
 
-# CDI disk files belong to qemu (107); no host devices or privileges are needed.
+# CDI disk files belong to qemu (107); the builder needs no host devices or
+# added privileges. Optional Pod networking uses a separate trusted init process.
 USER 107:107
 ENTRYPOINT ["python", "-m", "vm_controller.preparation_builder"]

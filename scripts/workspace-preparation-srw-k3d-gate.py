@@ -48,6 +48,7 @@ def preparation_identity():
     shared = [
         "src/shared/workspace_preparation.py",
         "src/shared/workspace_preparation_settings.py",
+        "src/shared/workspace_preparation_network.py",
         "src/shared/workspace_initialization.py",
         "src/shared/vm_workspace_storage.py",
     ]

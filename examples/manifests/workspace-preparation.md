@@ -50,7 +50,7 @@ remote is rejected without clearing the workspace.
 
 The key includes the scope, resolved base and builder digests, builder protocol,
 ordered commands, architecture, preparation disk size and operator network policy
-revision. CPU and RAM affect the allocated workspace, so they do not invalidate
+revision and, when enabled, the complete Pod firewall profile. CPU and RAM affect the allocated workspace, so they do not invalidate
 its prepared contents. Changing a template affects new executions; existing
 executions retain their captured recipe. Updating a package repository without
 changing those inputs needs `Rebuild` or explicit cache eviction.
@@ -111,15 +111,52 @@ handoff; polling never resets it or spends ordinary boot retries.
 Builds receive no service-account token, host socket, host devices, workspace SSH
 key or Connector credentials. Networking is off by default. Package downloads
 require `network.enabled: true` and `network.enforcementVerified: true` after the
-operator verifies CNI enforcement from the first application packet, including
-new Pod startup. Merely having a NetworkPolicy object is insufficient; the local
-k3d K3s profile allowed startup traffic before enforcing the policy.
-`scripts/workspace-preparation-network-gate.py` exercises the boundary in its own
-disposable namespace. Run it with an explicit kubeconfig, context and reachable
-vm-preparer image. The generated policy permits cluster DNS and
-public HTTP/HTTPS, excluding private and link-local ranges. Explicit
-`network.additionalEgress` rules can authorize internal package mirrors. This
-setting is installation-owned and applies only to preparation Pods.
+operator verifies isolation from the first application packet, including new Pod
+startup. Merely having a NetworkPolicy object is insufficient; both the local
+k3d K3s profile and main dev allowed startup traffic before enforcing the policy.
+
+The optional `network.podFirewall: true` profile installs default-deny rules in
+each builder Pod before preparation starts. A separate trusted init container
+uses the same pinned preparer image and receives `NET_ADMIN` only in the Pod's
+network namespace. It mounts neither the disk nor authored input. The ordinary
+builder stays UID 107, drops all capabilities and cannot alter these rules.
+There is no host network, device, credential or service-account mount. The
+namespace's admission policy must permit that trusted init capability; SRW does
+not relax Pod Security settings automatically. The preparer image must include
+the matching firewall module and iptables tools.
+
+Online mode permits IPv4 HTTP/HTTPS outside the configured blocked CIDRs and
+DNS to the Pod's exact IPv4 resolver addresses on port 53. IPv6 is denied.
+The profile requires the default private/special exclusions, allows additional
+blocked CIDRs, and rejects `network.additionalEgress` because arbitrary Kubernetes
+rules cannot be translated into this bounded profile. Offline mode permits no
+network traffic. The chart's CNI NetworkPolicy remains in place in both modes.
+An init failure prevents the builder from starting; uncertain process state
+still quarantines the artifact rather than releasing its disk.
+
+Run the dedicated gate with the candidate preparer image before attesting this
+profile on an installation:
+
+```bash
+python scripts/workspace-preparation-firewall-gate.py \
+  --context YOUR_CONTEXT --image YOUR_PREPARER_IMAGE_AT_DIGEST \
+  --output /tmp/srw-preparation-firewall.json
+```
+
+It uses an owned namespace, tests every selected node without CNI isolation and
+then with the actual chart policy, includes positive network controls and a
+failed-init case, and verifies cleanup. It changes no existing policies.
+`--node` can select individual nodes; `--waves` controls repeated Pod startups.
+This network gate does not by itself prove that a particular guest image can
+install packages; also exercise that image's real preparation recipe.
+
+For installations relying solely on an independently verified CNI,
+`scripts/workspace-preparation-network-gate.py` remains the policy-only check.
+Its generated policy permits cluster DNS and public HTTP/HTTPS, excluding
+private and link-local ranges. Explicit `network.additionalEgress` can authorize
+internal mirrors only when Pod firewall mode is off. All these settings are
+installation-owned and apply only to preparation Pods; they do not enable
+generic harness hosting or change execution workspace networking.
 
 Public OCI base images are resolved only through `registryHosts` and the separate
 `tokenHosts` allowlist. Private base-registry authentication and preparation-time
