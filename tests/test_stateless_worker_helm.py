@@ -194,6 +194,36 @@ def test_completion_control_settings_change_orchestrator_rollout_checksum() -> N
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
+def test_stateless_admission_settings_change_orchestrator_rollout_checksum() -> None:
+    def checksum(*settings: str) -> str:
+        deployment = _only_kind(
+            _render(*settings, show_only="templates/orchestrator/deployment.yaml"),
+            "Deployment",
+        )
+        return deployment["spec"]["template"]["metadata"]["annotations"][
+            "checksum/stateless-admission-settings"
+        ]
+
+    disabled = checksum()
+    sessions = checksum("agent.stateless.enabled=true")
+    recovery = checksum(
+        "agent.stateless.enabled=true",
+        "agent.stateless.cloudPushRecoveryEnabled=true",
+    )
+    worker = checksum(
+        "agent.stateless.enabled=true",
+        "agent.stateless.worker.enabled=true",
+    )
+    default_worker = checksum(
+        "agent.stateless.enabled=true",
+        "agent.stateless.worker.enabled=true",
+        "agent.stateless.worker.defaultEnabled=true",
+    )
+
+    assert len({disabled, sessions, recovery, worker, default_worker}) == 5
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
 def test_generic_pool_opens_sessions_without_opening_worker_admission() -> None:
     documents = _render(
         "agent.stateless.enabled=true",
