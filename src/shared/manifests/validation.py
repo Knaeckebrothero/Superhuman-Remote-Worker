@@ -159,6 +159,17 @@ def validate_documents(documents: list[dict]) -> list[dict]:
     validator = Draft202012Validator(_schema())
     for number, document in enumerate(documents, 1):
         check_json_value(document, document=number, budget=budget)
+        if (
+            isinstance(document, dict)
+            and "apiVersion" in document
+            and document["apiVersion"] != API_VERSION
+        ):
+            fail(
+                "UnsupportedAPIVersion",
+                f"Only {API_VERSION} resource manifests are supported.",
+                document=number,
+                path="/apiVersion",
+            )
         error = best_match(validator.iter_errors(document))
         if error is not None:
             _schema_issue(error, number)

@@ -3,6 +3,9 @@
 The implemented resource API is `srw/v1alpha1`. The candidate first release
 contains the core below; this is not a stable `srw/v1` compatibility declaration.
 The [manifest guide](README.md) describes the contract and executable examples.
+The [compatibility contract](compatibility.md) records supported adapter/backend
+combinations, retry semantics, version handling and upgrade/rollback boundaries.
+Its portable alpha fixtures preserve resolution behavior from published develop.
 
 | Area | Implemented core | Current boundary |
 | --- | --- | --- |
