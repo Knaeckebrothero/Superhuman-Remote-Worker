@@ -393,6 +393,10 @@ _srw_helm_env = {
 for i in range(len(_srw_images)):
     _srw_helm_env['TILT_IMAGE_KEY_REPO_%s' % i] = _srw_images[i][1]
     _srw_helm_env['TILT_IMAGE_KEY_TAG_%s' % i] = _srw_images[i][2]
+    # These chart images also accept a digest, which outranks the tag. Tilt
+    # owns the local image selection, including a pin saved by an earlier gate.
+    if _srw_images[i][0] in ['srw-mcp', 'srw-vm-preparer']:
+        _srw_helm_env['TILT_IMAGE_KEY_DIGEST_%s' % i] = _srw_images[i][2][:-4] + '.digest'
 
 k8s_custom_deploy(
     'srw',
