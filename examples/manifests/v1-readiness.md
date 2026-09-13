@@ -102,10 +102,16 @@ deployment.
 
 Develop publication uses CI-built component images and a versioned Helm chart;
 [GitHub Actions](https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/actions?query=branch%3Adevelop)
-records those publication checks. Preparation remains disabled by default.
-Enable it deliberately on main dev and repeat the actual developer workflow
-there with matching orchestrator, controller and builder artifacts. Verify
-startup network enforcement before enabling online preparation.
+records those publication checks. Preparation remains disabled by default in the
+chart. Main dev enables offline preparation through Fleet. Its
+[six-case acceptance](verification/main-dev-prepared-srw-2026-09-13.json) passed
+on chart `0.0.999`, release revision 970: cold build, a fresh cache-hit disk,
+retained allocation and handoff, failed preparation, running-builder cancellation
+and exact cleanup. The four successful Jobs required real harness/guest shell
+output. The sample cold Job took 16m43s; its cache-hit counterpart took 4m29s.
+All 15 deployments and public health checks passed after cleanup.
+The main-cluster startup network-policy test failed, so online preparation stays
+disabled. Verify startup network enforcement before enabling package downloads.
 
 Keep `srw/v1alpha1` until supported backend behavior, migration/rollback handling
 and version compatibility guarantees have been reviewed. Changing a version

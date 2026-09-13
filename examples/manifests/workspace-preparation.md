@@ -67,6 +67,18 @@ HMAC authentication and an amd64 SRW-compatible VM image. Build/publish the
 CI. Deploy the chart, orchestrator and controller from the same revision before
 enabling preparation. The default is disabled.
 
+Main dev enabled offline preparation through Fleet on 2026-09-13, using chart
+`0.0.999` and its published controller/builder images. Its startup network-policy
+check allowed both public and private traffic, so online preparation remains
+disabled there. Offline commands still run with libguestfs `--no-network`.
+The [main-dev acceptance](verification/main-dev-prepared-srw-2026-09-13.json)
+passed cold preparation, fresh cache reuse, retained handoff, build failure,
+running-builder cancellation and cleanup through MCP and the real SRW harness.
+The successful Jobs verified their prepared tool and workspace files through SSH.
+The sample cold Job took 16m43s from admission to completion; the cache-hit Job
+took 4m29s, including its independent disk clone and VM boot. This run did not
+repeat a full nested SRW/Tilt deployment.
+
 ```yaml
 vm:
   mode: same-cluster
