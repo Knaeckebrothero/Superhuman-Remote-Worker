@@ -1429,7 +1429,7 @@ def test_colocated_vm_lifecycle_auth_is_paired_and_dedicated(
     assert {
         "apiGroups": ["coordination.k8s.io"],
         "resources": ["leases"],
-        "verbs": ["get", "list", "create", "delete"],
+        "verbs": ["get", "list", "create", "update", "delete"],
     } in vm_role["rules"]
 
 

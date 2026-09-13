@@ -339,6 +339,10 @@ docker_build(
         'src/vm_controller/',
         'src/shared/__init__.py',
         'src/shared/vm_lifecycle_auth.py',
+        'src/shared/workspace_initialization.py',
+        'src/shared/vm_workspace_storage.py',
+        'src/shared/workspace_preparation.py',
+        'src/shared/workspace_preparation_settings.py',
         'pyproject.toml',
         '.dockerignore',
         'docker/Dockerfile.vm-controller',
@@ -350,6 +354,21 @@ docker_build(
 )
 
 # (image name, chart repository key, chart tag key)
+docker_build(
+    'srw-vm-preparer',
+    context='.',
+    dockerfile='docker/Dockerfile.vm-preparer',
+    only=[
+        'src/vm_controller/__init__.py',
+        'src/vm_controller/preparation_builder.py',
+        'src/shared/__init__.py',
+        'src/shared/workspace_initialization.py',
+        'src/shared/workspace_preparation.py',
+        'pyproject.toml', '.dockerignore', 'docker/Dockerfile.vm-preparer',
+    ],
+    ignore=['**/__pycache__', '**/*.pyc'],
+)
+
 _srw_images = [
     ('srw-orchestrator', 'image.orchestrator.repository', 'image.orchestrator.tag'),
     ('srw-cockpit', 'image.cockpit.repository', 'image.cockpit.tag'),
@@ -357,6 +376,7 @@ _srw_images = [
     ('srw-mcp', 'image.mcp.repository', 'image.mcp.tag'),
     ('srw-workspace', 'image.workspace.repository', 'image.workspace.tag'),
     ('srw-vm-controller', 'vmController.image.repository', 'vmController.image.tag'),
+    ('srw-vm-preparer', 'vmController.preparation.image.repository', 'vmController.preparation.image.tag'),
 ]
 
 # Tilt fills in TILT_IMAGE_<i> (the freshly built+pushed ref) per image_deps

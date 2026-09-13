@@ -4041,6 +4041,7 @@ class ContainerProvisioner:
                         else None
                     ),
                     admission_source=admission_source,
+                    _mutation_guard_held=True,
                 )
                 if captured is None:
                     captured = await self.prepare_workspace_cleanup_intent(
@@ -4050,6 +4051,7 @@ class ContainerProvisioner:
                         reclaim_shared_resources=False,
                         allow_stale_predecessor=True,
                         admission_source=admission_source,
+                        _mutation_guard_held=True,
                     )
                 if captured is None:
                     captured = await self.prepare_workspace_cleanup_intent(
@@ -4059,6 +4061,7 @@ class ContainerProvisioner:
                         reclaim_shared_resources=False,
                         allow_orphan=True,
                         admission_source=admission_source,
+                        _mutation_guard_held=True,
                     )
             elif non_pinned:
                 captured = await self.prepare_ide_cleanup_intent(
@@ -5293,6 +5296,7 @@ class ContainerProvisioner:
         allow_orphan: bool = False,
         allow_stale_predecessor: bool = False,
         admission_source: Literal["automatic", "explicit"] = "explicit",
+        _mutation_guard_held: bool = False,
     ) -> dict[str, Any] | None:
         """Capture and persist exact cleanup authority before Kubernetes I/O."""
 
@@ -5334,7 +5338,15 @@ class ContainerProvisioner:
             if not automatic_admission_enabled:
                 return None
         if not allow_stale_predecessor:
-            cancellation = await self.request_workspace_creation_cancellation(
+            # Reconciliation, finalizer release and exact deletion already own
+            # this physical mutation domain on a dedicated DB connection.
+            # Re-entering the public wrapper would wait on that same owner.
+            cancel_creation = (
+                self._request_workspace_creation_cancellation_guarded
+                if _mutation_guard_held
+                else self.request_workspace_creation_cancellation
+            )
+            cancellation = await cancel_creation(
                 owner,
                 target_disposition=target_disposition,
                 reclaim_shared_resources=reclaim_shared_resources,
@@ -5764,6 +5776,7 @@ class ContainerProvisioner:
                 ),
                 snapshot_restore_required=bool(intent.get("snapshot_restore_required")),
                 allow_orphan=(str(intent.get("intent_source")) == "orphan"),
+                _mutation_guard_held=True,
             )
             if (
                 not isinstance(intent, dict)
@@ -6939,6 +6952,7 @@ class ContainerProvisioner:
                     target_disposition=target_disposition,
                     reclaim_shared_resources=reclaim_shared_resources,
                     suspended_at=suspended_at,
+                    _mutation_guard_held=True,
                 )
                 if cleanup_intent is None:
                     cleanup_intent = await self.prepare_workspace_cleanup_intent(
@@ -6947,6 +6961,7 @@ class ContainerProvisioner:
                         target_disposition="deleted",
                         reclaim_shared_resources=False,
                         allow_stale_predecessor=True,
+                        _mutation_guard_held=True,
                     )
                 if (
                     not isinstance(cleanup_intent, dict)

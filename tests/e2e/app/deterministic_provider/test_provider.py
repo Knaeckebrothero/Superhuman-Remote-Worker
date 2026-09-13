@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import subprocess
 
 import httpx
 import pytest
@@ -531,6 +533,76 @@ async def test_worker_job_scenario_completes_without_any_off_pod_tool(
     state = (await control.get(f"/control/scenarios/{run_id}")).json()
     assert state["worker_job_tool_steps"] == 10
     assert state["remaining_required_responses"] == 0
+
+
+@pytest.mark.parametrize("retained", [False, True])
+@pytest.mark.parametrize("proof", ["valid", "wrong-run", "failed-command", "absent"])
+async def test_prepared_workspace_scenario_requires_successful_correlated_shell_proof(
+    control, inference, tmp_path, retained, proof
+):
+    run_id = "prepared-workspace-" + ("reuse" if retained else "fresh")
+    await arm(control, run_id, scenario="prepared-workspace-job", required_responses=1)
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": name, "parameters": {"type": "object"}},
+        }
+        for name in (
+            "read_file",
+            "todo_complete",
+            "next_phase_todos",
+            "job_complete",
+            "run_command",
+        )
+    ]
+    for _ in range(7):
+        response = await inference.post(
+            "/v1/chat/completions", json=chat_request(run_id, extra={"tools": tools})
+        )
+        assert response.status_code == 200
+    function = response.json()["choices"][0]["message"]["tool_calls"][0]["function"]
+    assert function["name"] == "run_command"
+    arguments = json.loads(function["arguments"])
+
+    tool = tmp_path / "srw-cache-check"
+    tool.write_text("#!/bin/sh\nprintf '%s\\n' srw-prepared-tool-v1\n")
+    tool.chmod(0o755)
+    (tmp_path / ".srw-initialize-count").write_text("initialized\n")
+    if retained:
+        (tmp_path / ".srw-execution-marker").write_text("previous-job\n")
+    result = subprocess.run(
+        ["sh", "-c", arguments["command"]],
+        cwd=tmp_path,
+        env={**os.environ, "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"]},
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert result.returncode == 0
+    assert (tmp_path / ".srw-execution-marker").read_text() == run_id + "\n"
+    output = "Exit code: 0\n--- stdout ---\n" + result.stdout
+    if proof == "wrong-run":
+        output = output.replace(run_id, run_id + "-different")
+    elif proof == "failed-command":
+        output = output.replace("Exit code: 0", "Exit code: 1")
+    elif proof == "absent":
+        output = "Exit code: 0\n--- stdout ---\n"
+    payload = chat_request(run_id, extra={"tools": tools})
+    payload["messages"].append(
+        {"role": "tool", "tool_call_id": "prepared-command", "content": output}
+    )
+    response = await inference.post("/v1/chat/completions", json=payload)
+    if proof == "valid":
+        assert response.status_code == 200
+        assert (
+            response.json()["choices"][0]["message"]["tool_calls"][0]["function"][
+                "name"
+            ]
+            == "todo_complete"
+        )
+    else:
+        assert response.status_code == 422
+        assert response.json()["error"]["type"] == "workspace_proof_missing"
 
 
 async def test_worker_job_scenario_fails_closed_without_a_required_tool(

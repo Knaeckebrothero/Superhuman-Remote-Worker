@@ -67,11 +67,55 @@ class ManifestWorkspaceService:
         default_image,
         storage_class_name=None,
         harness_namespace=None,
+        vm_provisioner=None,
     ):
         self.db, self.runtime = db, runtime
+        self.vm_provisioner = vm_provisioner
         self.namespace, self.default_image = namespace, default_image
         self.storage_class_name = storage_class_name
         self.harness_namespace = harness_namespace or namespace
+
+    async def preparation_cache(self, user, scope, *, uid=None, request=None):
+        """Inspect/evict scoped immutable artifacts through authenticated hosting."""
+        from orchestrator.services.manifest_authority import ManifestAuthority
+        import httpx
+
+        if scope["kind"] not in {"Account", "Project"}:
+            raise HTTPException(
+                422, "Preparation caches belong to an Account or Project."
+            )
+        if scope["kind"] != "Account" or scope.get("name") not in {"me", "personal"}:
+            try:
+                UUID(str(scope.get("name")))
+            except ValueError:
+                raise HTTPException(
+                    422, "Preparation scope requires a UUID or me."
+                ) from None
+        scope = await ManifestAuthority(self.db, user, request=request).scope(
+            scope, write=uid is not None
+        )
+        if self.vm_provisioner is None:
+            raise HTTPException(503, "VM preparation hosting is unavailable.")
+        values = {"scope": {"kind": scope["kind"], "uid": str(UUID(scope["name"]))}}
+        if uid is not None:
+            values["uid"] = str(uid)
+        try:
+            return await self.vm_provisioner.preparation_operation(
+                "delete" if uid else "list", values
+            )
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 409:
+                raise HTTPException(
+                    409,
+                    "The artifact is still in use, building, or awaiting verified cleanup.",
+                ) from None
+            raise HTTPException(
+                503, "Preparation cache operation is unavailable."
+            ) from None
+        except (ValueError, httpx.RequestError):
+            raise HTTPException(
+                503, "Authenticated preparation hosting is unavailable."
+            ) from None
 
     async def read(self, instance_id, user, *, write=False, request=None):
         row = await self.db.fetchrow(
@@ -107,6 +151,15 @@ class ManifestWorkspaceService:
                 raise HTTPException(
                     422, "Workspace instance references require a UUID."
                 ) from None
+            recipe = (
+                json.loads(row["recipe"])
+                if isinstance(row["recipe"], str)
+                else row["recipe"]
+            )
+            if recipe.get("backend") == "vm":
+                raise HTTPException(
+                    422, "Retained VM instances require the SRW VM harness adapter."
+                )
             if row["execution_id"] or row["status"] != "Detached":
                 raise HTTPException(
                     409,
@@ -358,6 +411,12 @@ class ManifestWorkspaceService:
         )
         return True
 
+    async def reconcile_vm_detach(self):
+        if self.vm_provisioner is not None:
+            from orchestrator.services.retained_vm_workspaces import reconcile_detached
+
+            await reconcile_detached(self.db, self.vm_provisioner)
+
     async def view(self, instance_id, user, *, request=None):
         row = await self.read(instance_id, user, request=request)
         recipe = (
@@ -375,6 +434,19 @@ class ManifestWorkspaceService:
         }
 
     async def delete(self, instance_id, user, *, expected_generation, request=None):
+        initial = await self.read(instance_id, user, write=True, request=request)
+        recipe = (
+            json.loads(initial["recipe"])
+            if isinstance(initial["recipe"], str)
+            else initial["recipe"]
+        )
+        if recipe.get("backend") == "vm":
+            return await self._delete_vm(
+                instance_id,
+                user,
+                expected_generation=expected_generation,
+                request=request,
+            )
         async with self.db.transaction_scope():
             await ManifestStore(self.db).lock_catalog()
             await self.db.fetchrow(
@@ -409,3 +481,50 @@ class ManifestWorkspaceService:
                 row["id"],
             )
             return {"deleted": True, "uid": str(instance_id)}
+
+    async def _delete_vm(self, instance_id, user, *, expected_generation, request=None):
+        from orchestrator.services.retained_vm_workspaces import object_value
+
+        if self.vm_provisioner is None:
+            raise HTTPException(503, "VM workspace hosting is unavailable.")
+        async with self.db.transaction_scope():
+            await ManifestStore(self.db).lock_catalog()
+            await self.db.fetchrow(
+                "SELECT id FROM srw_workspace_instances WHERE id=$1 FOR UPDATE",
+                UUID(str(instance_id)),
+            )
+            row = await self.read(instance_id, user, write=True, request=request)
+            if row["generation"] != expected_generation:
+                raise HTTPException(
+                    409, "Workspace generation changed; read its current status."
+                )
+            if row["status"] == "Released":
+                return {"deleted": True, "uid": str(instance_id)}
+            if row["execution_id"]:
+                terminal_unallocated = not row["pvc_uid"] and await self.db.fetchval(
+                    "SELECT j.status IN ('completed','failed','cancelled') FROM srw_execution_specs s JOIN jobs j ON s.work_kind='Job' AND s.work_id=j.id WHERE s.id=$1",
+                    row["execution_id"],
+                )
+                if not terminal_unallocated:
+                    raise HTTPException(
+                        409,
+                        "Workspace processes must be fenced and ownership released before deletion.",
+                    )
+            elif row["status"] not in {"Detached", "Deleting"}:
+                raise HTTPException(409, "Workspace is not ready for deletion.")
+            binding = deepcopy(object_value(row["backend_state"])["storage"])
+            binding["pvc_uid"] = row["pvc_uid"]
+            # Persist the deletion intent before external I/O. A lost response
+            # or rollback must never make a tombstoned disk available to a Job.
+            await self.db.execute(
+                "UPDATE srw_workspace_instances SET status='Deleting',updated_at=now() WHERE id=$1",
+                row["id"],
+            )
+        if not await self.vm_provisioner.release_workspace_storage(binding):
+            return {"deleted": False, "uid": str(instance_id), "status": "Deleting"}
+        await self.db.execute(
+            "UPDATE srw_workspace_instances SET status='Released',execution_id=NULL,updated_at=now() WHERE id=$1 AND generation=$2 AND status='Deleting'",
+            UUID(str(instance_id)),
+            expected_generation,
+        )
+        return {"deleted": True, "uid": str(instance_id)}

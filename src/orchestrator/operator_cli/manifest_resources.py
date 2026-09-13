@@ -117,6 +117,14 @@ def _parser():
     )
     command.add_argument("resource_id")
     command.add_argument("--expected-version", required=True, type=int)
+    command = commands.add_parser(
+        "cache", help="Inspect or evict prepared workspace artifacts."
+    )
+    cache_commands = command.add_subparsers(dest="cache_operation", required=True)
+    scope(cache_commands.add_parser("list"))
+    remove = cache_commands.add_parser("delete")
+    remove.add_argument("artifact_id")
+    scope(remove)
     return parser
 
 
@@ -256,6 +264,12 @@ async def _run(args, token):
             return await client.export_manifest_resource(
                 args.resource_id, output_format=args.output_format
             )
+        if args.operation == "cache":
+            scope = scope or {"kind": "Account", "name": "me"}
+            options = {"scope_kind": scope["kind"], "scope_name": scope["name"]}
+            if args.cache_operation == "list":
+                return await client.list_workspace_cache(**options)
+            return await client.delete_workspace_cache(args.artifact_id, **options)
         return await client.delete_manifest_resource(
             args.resource_id, expected_version=args.expected_version
         )

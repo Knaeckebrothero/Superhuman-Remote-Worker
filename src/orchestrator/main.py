@@ -686,10 +686,13 @@ from orchestrator.services.stale_verification_sweeper import (  # noqa: E402
 from orchestrator.services.dispatch_guards import (  # noqa: E402
     VM_CAPACITY_POLL,
     VM_GOLDEN_POLL,
+    VM_PREPARATION_POLL,
+    VM_PARK_PREPARATION,
     VM_HEADSCALE_POLL,
     VM_PARK_CAPACITY,
     VM_PARK_EXHAUSTED,
     VM_PARK_GOLDEN,
+    VM_PARK_INITIALIZATION,
     VM_PARK_HEADSCALE,
     VM_PARKED,
     VM_PROVISION,
@@ -7476,7 +7479,20 @@ async def _try_dispatch_pending_jobs() -> None:
                         )
                         await _fail_vm_parked_job(job_id, vm_error)
                         continue
-                    if vm_decision in (VM_GOLDEN_POLL, VM_CAPACITY_POLL):
+                    if vm_decision == VM_PARK_PREPARATION:
+                        park_error = (
+                            "Workspace preparation did not complete within its deadline"
+                        )
+                        await postgres_db.merge_vm_context(
+                            job_id, {"status": "failed", "error": park_error}
+                        )
+                        await _fail_vm_parked_job(job_id, park_error)
+                        continue
+                    if vm_decision in (
+                        VM_GOLDEN_POLL,
+                        VM_CAPACITY_POLL,
+                        VM_PREPARATION_POLL,
+                    ):
                         # No VM exists yet — the controller is waiting on a
                         # shared golden-image import (cold import after an
                         # agent-vm-base bump: ~30 min, longer than timeout_s).
@@ -7489,7 +7505,9 @@ async def _try_dispatch_pending_jobs() -> None:
                         # knowledge-history/done/
                         # golden_image_cold_import_fails_inflight_vm_jobs.md.
                         wait_anchor = (
-                            "capacity_wait_started_at"
+                            "preparation_wait_started_at"
+                            if vm_decision == VM_PREPARATION_POLL
+                            else "capacity_wait_started_at"
                             if vm_decision == VM_CAPACITY_POLL
                             else "golden_wait_started_at"
                         )
@@ -7513,7 +7531,12 @@ async def _try_dispatch_pending_jobs() -> None:
                             description=job.get("description", ""),
                             fresh=False,
                         )
-                        if vm_decision == VM_CAPACITY_POLL:
+                        if vm_decision == VM_PREPARATION_POLL:
+                            logger.info(
+                                "Dispatcher: job %s waiting on workspace preparation",
+                                job_id,
+                            )
+                        elif vm_decision == VM_CAPACITY_POLL:
                             logger.info(
                                 "Dispatcher: job %s waiting on VM capacity (%s/%s) "
                                 "— polling",
@@ -7635,6 +7658,13 @@ async def _try_dispatch_pending_jobs() -> None:
                         await postgres_db.merge_vm_context(
                             job_id,
                             {"status": "failed", "error": park_error},
+                        )
+                        await _fail_vm_parked_job(job_id, park_error)
+                        continue
+                    if vm_decision == VM_PARK_INITIALIZATION:
+                        park_error = "Workspace initialization did not complete within its deadline"
+                        await postgres_db.merge_vm_context(
+                            job_id, {"status": "failed", "error": park_error}
                         )
                         await _fail_vm_parked_job(job_id, park_error)
                         continue
@@ -23705,6 +23735,7 @@ def _manifest_execution_service():
         default_image=container_provisioner._workspace_image,
         storage_class_name=container_provisioner._storage_class,
         harness_namespace=namespace,
+        vm_provisioner=vm_provisioner,
     )
     return ManifestExecutionService(
         postgres_db,

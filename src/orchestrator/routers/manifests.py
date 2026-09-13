@@ -3,7 +3,7 @@
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 import json
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Query
@@ -278,6 +278,40 @@ async def get_workspace_instance(
     user = await dependencies.require_approved_user(request)
     return await _execution(dependencies).workspace.view(
         instance_id, user, request=request
+    )
+
+
+@router.get("/api/workspace-cache")
+async def list_workspace_cache(
+    request: Request,
+    scope_kind: Literal["Account", "Project"] = "Account",
+    scope_name: str = "me",
+    *,
+    dependencies: ManifestDependencies = Depends(get_manifest_dependencies),
+) -> dict:
+    user = await dependencies.require_approved_user(request)
+    return await _execution(dependencies).workspace.preparation_cache(
+        user,
+        {"kind": scope_kind, "name": scope_name},
+        request=request,
+    )
+
+
+@router.delete("/api/workspace-cache/{artifact_id}")
+async def delete_workspace_cache(
+    artifact_id: UUID,
+    request: Request,
+    scope_kind: Literal["Account", "Project"] = "Account",
+    scope_name: str = "me",
+    *,
+    dependencies: ManifestDependencies = Depends(get_manifest_dependencies),
+) -> dict:
+    user = await dependencies.require_approved_user(request)
+    return await _execution(dependencies).workspace.preparation_cache(
+        user,
+        {"kind": scope_kind, "name": scope_name},
+        uid=artifact_id,
+        request=request,
     )
 
 

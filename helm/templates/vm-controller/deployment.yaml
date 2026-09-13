@@ -90,6 +90,10 @@ spec:
               value: {{ .Values.vmController.persistentRootdisk.gc.enabled | default false | quote }}
             - name: VM_ROOTDISK_ORPHAN_HOURS
               value: {{ .Values.vmController.persistentRootdisk.gc.orphanHours | default 72 | quote }}
+            {{- range $key, $value := (include "srw.vmPreparationEnvironment" . | fromYaml) }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
             - name: LOG_LEVEL
               value: {{ .Values.logLevel | quote }}
           ports:

@@ -1,5 +1,6 @@
 import {ChangeDetectionStrategy, Component, computed, DestroyRef, effect, ElementRef, inject, OnInit, signal, viewChild} from '@angular/core';
 import {takeUntilDestroyed} from '@angular/core/rxjs-interop';
+import {TranslocoService} from '@jsverse/transloco';
 import {AdminModelsService} from '../../../core/services/admin-models.service';
 import {AdminProvidersService} from '../../../core/services/admin-providers.service';
 import {AdminModelsCoordinatorService} from '../models/admin-models-coordinator.service';
@@ -1139,6 +1140,7 @@ export class AdminCatalogComponent implements OnInit {
   readonly providers = inject(AdminProvidersService);
   private readonly coordinator = inject(AdminModelsCoordinatorService);
   private readonly destroyRef = inject(DestroyRef);
+  private readonly transloco = inject(TranslocoService);
 
   private readonly discoverPaneRef = viewChild<ElementRef<HTMLElement>>('discoverPane');
 
@@ -1564,11 +1566,7 @@ export class AdminCatalogComponent implements OnInit {
    */
   confirmHelmOverride(model: CatalogModel | null | undefined): boolean {
     if (!model?.managed_by_helm) return true;
-    return confirm(
-      'This row is managed by Helm (reconcile: true in the deployment values). ' +
-        'Your change will be reverted on the next helm upgrade unless the values ' +
-        'are updated too. Continue?',
-    );
+    return confirm(this.transloco.translate('admin.helm.confirmOverride'));
   }
 
   toggleEnabled(model: CatalogModel, checked: boolean): void {

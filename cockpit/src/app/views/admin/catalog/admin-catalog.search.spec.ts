@@ -1,5 +1,6 @@
 import {CUSTOM_ELEMENTS_SCHEMA, signal, ɵresolveComponentResources} from '@angular/core';
 import {TestBed} from '@angular/core/testing';
+import {TranslocoService} from '@jsverse/transloco';
 import {beforeAll, beforeEach, describe, expect, it, vi} from 'vitest';
 import {of, Subject} from 'rxjs';
 import {AdminModelsService} from '../../../core/services/admin-models.service';
@@ -53,6 +54,7 @@ describe('AdminCatalogComponent search/fetch form', () => {
     TestBed.configureTestingModule({
       imports: [AdminCatalogComponent],
       providers: [
+        {provide: TranslocoService, useValue: {translate: vi.fn((key: string) => key)}},
         {provide: AdminModelsService, useValue: models},
         {provide: AdminProvidersService, useValue: providers},
         {

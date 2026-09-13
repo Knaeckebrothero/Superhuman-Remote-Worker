@@ -377,7 +377,7 @@ APP_INPUT_DELIVERY_CONSTRAINTS_NOT_VALID = (
 )
 APP_CURRENT_MIGRATION_HEAD = (
     ROOT
-    / "src/orchestrator/database/migrations/app/0244_validate_helm_provenance_checks.sql"
+    / "src/orchestrator/database/migrations/app/0246_vm_ide_heartbeat_projection.sql"
 )
 AUDIT_EXPANSION = (
     ROOT

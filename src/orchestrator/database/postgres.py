@@ -3715,6 +3715,7 @@ class PostgresDB:
                 SELECT j.id, j.status, j.completion_outcome_kind,
                        j.config_name, j.expert_id, j.config_override,
                        execution.harness_adapter AS execution_harness_adapter,
+                       workspace_binding.instance_id AS workspace_instance_id,
                        COALESCE(
                            CASE WHEN execution.harness_adapter = 'srw/v1' THEN
                                execution.resolved #> '{spec,execution,expert,inline,runtime,config,resolved}'
@@ -3737,6 +3738,8 @@ class PostgresDB:
                 LEFT JOIN projects p ON p.id = j.project_id
                 LEFT JOIN srw_execution_specs execution
                     ON execution.work_kind='Job' AND execution.work_id=j.id
+                LEFT JOIN srw_execution_workspace_bindings workspace_binding
+                    ON workspace_binding.execution_id=execution.id
                 WHERE j.id = $1
                 """,
                 uuid_val,
@@ -9733,7 +9736,11 @@ class PostgresDB:
         return result == "UPDATE 1"
 
     async def merge_ide_session_context(
-        self, job_id: str, session_updates: Dict[str, Any]
+        self,
+        job_id: str,
+        session_updates: Dict[str, Any],
+        *,
+        expected_vm_generation: str | None = None,
     ) -> bool:
         """Atomically merge updates into context.ide_session without touching other keys.
 
@@ -9743,6 +9750,8 @@ class PostgresDB:
         Args:
             job_id: Job UUID as string
             session_updates: Dictionary of keys to merge into context.ide_session
+            expected_vm_generation: Restrict heartbeat activity to an existing
+                live VM IDE on this generation.
 
         Returns:
             True if updated, False if not found
@@ -9764,17 +9773,31 @@ class PostgresDB:
             "    updated_at = CURRENT_TIMESTAMP "
             "WHERE id = $2"
         )
-        async with self.acquire() as conn:
-            result = await conn.execute(
-                query, json_module.dumps(session_updates), uuid_val
+        arguments = [json_module.dumps(session_updates), uuid_val]
+        if expected_vm_generation is not None:
+            # Heartbeats update an explicitly hosted VM IDE. They never create
+            # a runtime projection or relabel another/unknown backend. Check
+            # the current generation atomically with this write.
+            query += (
+                " AND context->'vm'->>'provision_generation' = $3"
+                " AND context->'vm'->>'status' = 'ready'"
+                " AND context->'ide_session'->>'restore_type' = 'vm'"
+                " AND context->'ide_session'->>'status' IN ('active','idle')"
             )
+            arguments.append(expected_vm_generation)
+        async with self.acquire() as conn:
+            result = await conn.execute(query, *arguments)
 
         return result == "UPDATE 1"
 
     async def merge_thread_ide_session_context(
-        self, thread_id: str, session_updates: Dict[str, Any]
+        self,
+        thread_id: str,
+        session_updates: Dict[str, Any],
+        *,
+        expected_vm_generation: str | None = None,
     ) -> bool:
-        """Atomically merge updates into threads.metadata.ide_session."""
+        """Merge IDE activity, optionally restricted to the current live VM."""
         import json as json_module
 
         try:
@@ -9791,10 +9814,17 @@ class PostgresDB:
             ") "
             "WHERE id = $2"
         )
-        async with self.acquire() as conn:
-            result = await conn.execute(
-                query, json_module.dumps(session_updates), uuid_val
+        arguments = [json_module.dumps(session_updates), uuid_val]
+        if expected_vm_generation is not None:
+            query += (
+                " AND metadata->'vm'->>'provision_generation' = $3"
+                " AND metadata->'vm'->>'status' = 'ready'"
+                " AND metadata->'ide_session'->>'restore_type' = 'vm'"
+                " AND metadata->'ide_session'->>'status' IN ('active','idle')"
             )
+            arguments.append(expected_vm_generation)
+        async with self.acquire() as conn:
+            result = await conn.execute(query, *arguments)
 
         return result == "UPDATE 1"
 
@@ -13014,7 +13044,9 @@ class PostgresDB:
         Kubernetes/VM deletion acknowledgements are control-plane facts, not
         proof that a partitioned node or guest stopped using a delivered
         deploy key. The provisioner records this receipt only after an exact
-        endpoint retirement plus an independent zero scan. A later ambiguous
+        endpoint retirement plus an independent zero scan, or authenticated
+        cancellation evidence that preparation never issued a workspace source
+        together with exact runtime absence. A later ambiguous
         delete response may replay only when the receipt still matches the
         server-owned runtime generation in the same owner row.
         """
@@ -19592,7 +19624,10 @@ class PostgresDB:
         expected_attach_token: str | None,
         expected_vm_context: Mapping[str, Any] | None,
         provision_context: Mapping[str, Any],
-    ) -> bool:
+        poll: bool = False,
+        preparation_only: bool = False,
+        expected_preparation_context: Mapping[str, Any] | None = None,
+    ) -> bool | dict:
         """Install one VM provision generation before any controller effect.
 
         The caller's earlier route/read snapshot is advisory.  This method is
@@ -19601,6 +19636,11 @@ class PostgresDB:
         the caller observed, then publishes the new provision generation and
         ``provisioning`` status in the same update.  A stale upgrade therefore
         cannot dispatch after End, Resume, rebind, or another VM attempt.
+
+        ``preparation_only`` instead returns a separate durable cache stage;
+        it installs no physical VM authority and preserves an existing stage's
+        deadline. VM admission then compares ``expected_preparation_context``
+        before consuming that stage in the same transaction.
 
         ``None`` means the ``vm`` member was absent/JSON-null.  Present scalar
         or array values fail closed instead of being truthiness-coerced to an
@@ -19649,6 +19689,19 @@ class PostgresDB:
         ):
             return False
         proposed["provision_generation"] = provision_generation
+        if preparation_only:
+            from shared.workspace_preparation import validate_request
+
+            try:
+                preparation = validate_request(proposed["preparation_request"])
+            except (ValueError, TypeError, KeyError):
+                return False
+            if (
+                preparation["allocationId"] != str(parsed_thread)
+                or preparation["ownerKind"] != "session"
+                or preparation["runtimeGeneration"] != str(parsed_runtime_generation)
+            ):
+                return False
         expected_vm = (
             dict(expected_vm_context) if expected_vm_context is not None else None
         )
@@ -19680,7 +19733,24 @@ class PostgresDB:
                 if current_vm != expected_vm:
                     return False
                 current_vm_status = str((current_vm or {}).get("status") or "")
-                if current_vm_status in {
+                if poll:
+                    if (
+                        current_vm_status
+                        not in {
+                            "waiting_golden",
+                            "waiting_capacity",
+                            "waiting_headscale",
+                            "waiting_preparation",
+                            "provisioning",
+                        }
+                        or (current_vm or {}).get("provision_generation")
+                        != provision_generation
+                        or (current_vm or {}).get("identity_authenticated") is not False
+                        or current_vm_status == "provisioning"
+                        and not (current_vm or {}).get("preparation_request")
+                    ):
+                        return False
+                elif current_vm_status in {
                     "provisioning",
                     "created",
                     "starting",
@@ -19689,6 +19759,7 @@ class PostgresDB:
                     "waiting_golden",
                     "waiting_capacity",
                     "waiting_headscale",
+                    "waiting_preparation",
                 }:
                     return False
                 if not (
@@ -19712,6 +19783,32 @@ class PostgresDB:
                     len(inverse_agents) != 1 or inverse_agents[0]["id"] != parsed_agent
                 ):
                     return False
+
+                # Cache construction has no physical VM identity. Keep it out
+                # of metadata.vm so End can retire this runtime without
+                # inventing VM/PVC UIDs or relaxing physical fencing.
+                stage = metadata.get("workspace_preparation")
+                if stage is not None and not isinstance(stage, dict):
+                    return False
+                if preparation_only:
+                    if stage and stage.get("preparation_request") == preparation:
+                        return dict(stage) if stage.get("status") != "failed" else False
+                    if stage and stage.get("preparation_cancelled_revision") != (
+                        stage.get("preparation_request") or {}
+                    ).get("revision"):
+                        return False
+                    proposed.update(status="waiting_preparation", preparation_only=True)
+                    metadata["workspace_preparation"] = proposed
+                    await conn.execute(
+                        "UPDATE threads SET metadata=$2::jsonb WHERE id=$1::uuid",
+                        parsed_thread,
+                        json.dumps(metadata),
+                    )
+                    return proposed
+                if expected_preparation_context is not None:
+                    if stage != dict(expected_preparation_context):
+                        return False
+                    metadata.pop("workspace_preparation", None)
 
                 # Installing a VM generation is also the exact workspace-tier
                 # transition boundary.  Session upgrades historically left
@@ -19768,6 +19865,26 @@ class PostgresDB:
                     parsed_runtime_generation,
                 )
                 return result == "UPDATE 1"
+
+    async def merge_thread_preparation_if_current(
+        self, thread_id, runtime_generation, expected, updates
+    ) -> bool:
+        """CAS cache progress without installing physical VM authority."""
+        async with self.acquire() as conn:
+            return (
+                await conn.execute(
+                    "UPDATE threads SET metadata=jsonb_set(metadata,'{workspace_preparation}',"
+                    "(metadata->'workspace_preparation') || $4::jsonb) "
+                    "WHERE id=$1::uuid AND runtime_generation=$2::uuid "
+                    "AND runtime_retirement_token IS NULL AND status<>'ended' "
+                    "AND metadata->'workspace_preparation'=$3::jsonb",
+                    UUID(str(thread_id)),
+                    UUID(str(runtime_generation)),
+                    json.dumps(expected),
+                    json.dumps(updates),
+                )
+                == "UPDATE 1"
+            )
 
     async def merge_thread_vm_context(
         self, thread_id: str, vm_updates: Dict[str, Any]
@@ -19893,17 +20010,76 @@ class PostgresDB:
                     "starting",
                     "restoring",
                     "ssh_pending",
+                    "waiting_preparation",
+                    "waiting_golden",
+                    "waiting_capacity",
+                    "waiting_headscale",
                 )
             )
         )
         query = (
             "SELECT id::text AS entity_id, user_id::text AS user_id, "
-            "metadata->'vm' AS vm FROM threads WHERE ("
+            "COALESCE(metadata->'workspace_preparation',metadata->'vm') AS vm FROM threads WHERE ("
             + status_clause
+            + (
+                ""
+                if ready
+                else " OR metadata->'workspace_preparation'->>'status'='waiting_preparation'"
+            )
             + ") AND threads.status <> 'ended' AND threads.ended_at IS NULL"
+            + " AND runtime_retirement_token IS NULL"
         )
         async with self.acquire() as conn:
             return [dict(row) for row in await conn.fetch(query)]
+
+    async def list_vm_preparation_cancellations(self) -> list:
+        """Terminal executions still holding a preparation allocation."""
+        query = """
+            SELECT id::text AS entity_id,'job' AS entity_type,context->'vm' AS vm
+            FROM jobs
+            WHERE (status IN ('completed','failed','cancelled') OR context->'vm'->>'status'='failed')
+              AND jsonb_typeof(context->'vm'->'preparation_request')='object'
+              AND context->'vm'->>'preparation_cancelled_revision' IS DISTINCT FROM
+                  context->'vm'->'preparation_request'->>'revision'
+            UNION ALL
+            SELECT id::text,'thread',metadata->'vm'
+            FROM threads
+            WHERE (status='ended' OR runtime_retirement_token IS NOT NULL OR metadata->'vm'->>'status'='failed')
+              AND jsonb_typeof(metadata->'vm'->'preparation_request')='object'
+              AND metadata->'vm'->>'preparation_cancelled_revision' IS DISTINCT FROM
+                  metadata->'vm'->'preparation_request'->>'revision'
+            UNION ALL
+            SELECT id::text,'thread',metadata->'workspace_preparation'
+            FROM threads
+            WHERE (status='ended' OR runtime_retirement_token IS NOT NULL OR metadata->'workspace_preparation'->>'status'='failed')
+              AND jsonb_typeof(metadata->'workspace_preparation'->'preparation_request')='object'
+              AND metadata->'workspace_preparation'->>'preparation_cancelled_revision' IS DISTINCT FROM
+                  metadata->'workspace_preparation'->'preparation_request'->>'revision'
+            LIMIT 50
+        """
+        async with self.acquire() as conn:
+            return [dict(row) for row in await conn.fetch(query)]
+
+    async def acknowledge_vm_preparation_cancelled(
+        self, entity_type, entity_id, request
+    ):
+        if entity_type not in {"job", "thread"}:
+            raise ValueError("Invalid preparation owner")
+        table, column = (
+            ("jobs", "context") if entity_type == "job" else ("threads", "metadata")
+        )
+        async with self.acquire() as conn:
+            for field in (
+                ("vm",) if entity_type == "job" else ("vm", "workspace_preparation")
+            ):
+                await conn.execute(
+                    f"UPDATE {table} SET {column}=jsonb_set({column},'{{{field}}}',"
+                    f"({column}->'{field}') || jsonb_build_object('preparation_cancelled_revision',$3::text)) "
+                    f"WHERE id=$1::uuid AND {column}->'{field}'->'preparation_request'=$2::jsonb",
+                    UUID(entity_id),
+                    json.dumps(request),
+                    request["revision"],
+                )
 
     async def merge_thread_snapshot_context(
         self, thread_id: str, snapshot_updates: Dict[str, Any]

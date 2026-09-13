@@ -513,6 +513,8 @@ POST   /api/vms                                                                 
 DELETE /api/vms/{job_id}                                                                gated:require_job_access
 GET    /api/vms/{job_id}                                                                gated:require_job_access
 GET    /api/voice/capabilities                                                          gated:require_approved_user
+GET    /api/workspace-cache                                                             gated:require_approved_user
+DELETE /api/workspace-cache/{artifact_id}                                               gated:require_approved_user
 DELETE /api/workspace-instances/{instance_id}                                           gated:require_approved_user
 GET    /api/workspace-instances/{instance_id}                                           gated:require_approved_user
 GET    /api/workspace/status                                                            admin:_require_admin

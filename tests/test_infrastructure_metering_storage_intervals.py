@@ -354,6 +354,13 @@ def test_untrusted_or_noncanonical_claim_owner_hints_remain_unknown(
             "golden-image-claim",
         ),
         (
+            "srw-prepared-11111111222233334444555555555555",
+            {"srw.io/preparation-disk": "11111111-2222-3333-4444-555555555555"},
+            "golden_image_pvc",
+            "shared-platform",
+            "workspace-preparation-cache",
+        ),
+        (
             "postgres-data",
             {"app.kubernetes.io/managed-by": "Helm"},
             "platform_pvc",
@@ -1433,3 +1440,55 @@ async def test_reobserved_retained_asset_resolves_gap_and_keeps_lifecycle() -> N
         observed_at=RECEIVED_AT,
     )
     observe.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mismatch", [None, "pvc_uid", "namespace", "owner_id"])
+async def test_retained_rootdisk_attribution_survives_original_job_deletion(mismatch):
+    workspace_id = uuid4()
+    name = f"srw-ws-{workspace_id.hex}"
+    projection = project_storage_item(
+        _vm_rootdisk_item(
+            name=name,
+            labels={
+                "srw.io/rootdisk": "true",
+                "srw.io/workspace-instance": str(workspace_id),
+                "srw.io/owner-kind": "job",
+                "srw.io/owner-id": str(OWNER_ID),
+                "job-id": str(OWNER_ID),
+            },
+        )
+    )
+    state = {
+        "namespace": "srw",
+        "storage": {
+            "uid": str(workspace_id),
+            "owner_id": str(OWNER_ID),
+            "owner_kind": "job",
+        },
+    }
+    row = {
+        "owner_id": USER_ID,
+        "project_id": PROJECT_ID,
+        "pvc_name": name,
+        "pvc_uid": projection.source_uid,
+        "backend_state": state,
+    }
+    if mismatch == "pvc_uid":
+        row["pvc_uid"] = "replaced"
+    if mismatch == "namespace":
+        state["namespace"] = "other"
+    if mismatch == "owner_id":
+        state["storage"]["owner_id"] = str(uuid4())
+    conn = AsyncMock()
+    conn.fetchrow.return_value = row
+    attribution = await StorageIntervalReconciler._resolve_claim_owner(conn, projection)
+    if mismatch:
+        assert attribution.scope == "unknown"
+        assert attribution.reason_code == "retained-workspace-identity-mismatch"
+    else:
+        assert attribution.scope == "customer"
+        assert attribution.user_id == USER_ID and attribution.project_id == PROJECT_ID
+        assert attribution.reason_code == "retained-vm-rootdisk-identity"
+    assert "FROM srw_workspace_instances" in conn.fetchrow.await_args.args[0]
+    assert "FROM jobs" not in conn.fetchrow.await_args.args[0]

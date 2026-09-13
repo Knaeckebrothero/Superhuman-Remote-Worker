@@ -369,6 +369,7 @@ async def agent_upgrade_thread_to_vm(
             "waiting_golden",
             "waiting_capacity",
             "waiting_headscale",
+            "waiting_preparation",
         ):
             return {
                 "status": vm_ctx["status"],

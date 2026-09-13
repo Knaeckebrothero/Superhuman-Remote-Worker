@@ -17501,6 +17501,7 @@ async def _poll_vm_ready(
     """
     import time
 
+    adaptive_preparation_timeout = timeout is None
     if timeout is None:
         timeout = _vm_upgrade_poll_timeout
     start = time.monotonic()
@@ -17510,6 +17511,15 @@ async def _poll_vm_ready(
     while time.monotonic() < deadline:
         ws = await client.get_thread_workspace(thread_id)
         if ws:
+            preparation_budget = ws.get("vm_preparation_timeout_s", 0)
+            if (
+                adaptive_preparation_timeout
+                and type(preparation_budget) is int
+                and 0 < preparation_budget <= 3 * 86400 + 3900
+            ):
+                # Server-owned preparation gets one bounded extension. Repeated
+                # progress responses never move the absolute deadline forward.
+                deadline = max(deadline, start + timeout + preparation_budget)
             vm_status = ws.get("vm_status")
             if vm_status == "ready" and ws.get("vm_ssh_host"):
                 return {
