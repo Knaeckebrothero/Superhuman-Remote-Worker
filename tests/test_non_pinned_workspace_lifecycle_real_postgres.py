@@ -1969,6 +1969,46 @@ async def test_0195_soft_settled_thread_promotes_to_exact_terminal_reclaim(db):
 
 
 @pytest.mark.asyncio
+async def test_settled_none_workspace_outcome_is_rejected_as_missing_provisioner(db):
+    """Characterize the live soft-End -> permanent-End database rejection."""
+
+    thread_id = uuid4()
+    metadata = {
+        "config_override": {"workspace": {"backend": "none"}},
+        "workspace_container": {"volume_reclaimed": False},
+        "_stateless_workspace_retirement_settled": {
+            "terminal_token": 3,
+            "cleanup_complete": True,
+            "permanent": False,
+            "backing_id": None,
+            "runtime_incarnation": None,
+            "snapshot_restore_required": False,
+            "workspace_absence_proven": False,
+        },
+    }
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO threads (id, status, execution_lane, metadata) "
+            "VALUES ($1, 'ended', 'stateless', $2::jsonb)",
+            thread_id,
+            json.dumps(metadata),
+        )
+        await conn.execute(
+            "INSERT INTO run_queue (unit_id, unit_kind, state, lease_token) "
+            "VALUES ($1, 'session_turn', 'done', 3)",
+            thread_id,
+        )
+
+    with pytest.raises(asyncpg.CheckViolationError) as exc:
+        await db.begin_stateless_thread_workspace_retirement(
+            str(thread_id), force=True, permanent=True
+        )
+
+    assert exc.value.constraint_name == "managed_repository_workspace_provisioner_required"
+    assert await db.get_thread(str(thread_id)) is not None
+
+
+@pytest.mark.asyncio
 async def test_0195_permanent_thread_cleanup_retains_uid_and_repairs_legacy_projection(
     db,
 ):
