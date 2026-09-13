@@ -268,6 +268,11 @@ class InstanceLifecycleReconciler:
         can never be snapshotted (gone/unreachable pod) is force-deleted after
         a bounded number of attempts rather than retried forever.
         """
+        # Taking ownership can already probe external teardown identity. Do
+        # not claim a dispatch-owned VM that is still preparing: an unrelated
+        # probe failure would otherwise fence dispatch until the claim expires.
+        if not await manager.is_reapable(inst):
+            return
         async with self._lifecycle_action(manager, inst, source="reap") as permit:
             if not permit.local:
                 return
