@@ -4,6 +4,10 @@ from uuid import UUID
 
 from fastapi import HTTPException
 
+from orchestrator.services.manifest_execution_retirement import (
+    execution_references_block_retirement,
+)
+
 
 async def retire_user_manifests(conn, user_id: UUID) -> bool:
     """Prepare the existing user DELETE in its transaction, without cloud effects.
@@ -48,20 +52,12 @@ async def retire_user_manifests(conn, user_id: UUID) -> bool:
         and row["deleted_at"] is None
     ]
     retired_text = [str(value) for value in retired]
-    if await conn.fetchval(
-        """SELECT EXISTS(SELECT 1 FROM srw_execution_specs s
-        LEFT JOIN jobs j ON s.work_kind='Job' AND j.id=s.work_id
-        LEFT JOIN threads t ON s.work_kind='Session' AND t.id=s.work_id
-        WHERE (s.owner_id=$1 OR s.resource_id=ANY($2::uuid[]) OR EXISTS(
-          SELECT 1 FROM jsonb_array_elements(s.dependencies) d
-          WHERE d->>'uid'=ANY($3::text[])))
-        AND ((j.id IS NOT NULL AND j.status NOT IN ('completed','failed','cancelled'))
-          OR (t.id IS NOT NULL AND t.status IS DISTINCT FROM 'ended')
-          OR EXISTS(SELECT 1 FROM srw_execution_attempts a WHERE a.execution_id=s.id
-            AND (a.cleaned_at IS NULL OR a.phase NOT IN ('Succeeded','Failed','Cancelled')))))""",
-        user_id,
-        retired,
-        retired_text,
+    if await execution_references_block_retirement(
+        conn,
+        owner_id=user_id,
+        retiring_owner_id=user_id,
+        resource_ids=retired,
+        dependency_ids=retired_text,
     ):
         raise HTTPException(
             409,

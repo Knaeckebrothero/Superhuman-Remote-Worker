@@ -3,6 +3,10 @@
 import json
 from fastapi import HTTPException
 
+from orchestrator.services.manifest_execution_retirement import (
+    execution_references_block_retirement,
+)
+
 
 async def _assert_no_expert_pointers(conn, resources, *, deleting_project=None):
     expert_ids = [
@@ -48,15 +52,8 @@ async def retire_removed_children(db, manager_id, retained_ids):
     ids = [row["id"] for row in rows]
     text_ids = [str(value) for value in ids]
     await _assert_no_expert_pointers(db, rows)
-    if await db.fetchval(
-        """SELECT EXISTS(SELECT 1 FROM srw_execution_specs s
-        LEFT JOIN jobs j ON s.work_kind='Job' AND j.id=s.work_id
-        LEFT JOIN threads t ON s.work_kind='Session' AND t.id=s.work_id
-        WHERE (s.resource_id=ANY($1::uuid[]) OR EXISTS(
-          SELECT 1 FROM jsonb_array_elements(s.dependencies) d WHERE d->>'uid'=ANY($2::text[])))
-        AND (j.status IN ('created','processing','paused','pending_review') OR t.id IS NOT NULL))""",
-        ids,
-        text_ids,
+    if await execution_references_block_retirement(
+        db, resource_ids=ids, dependency_ids=text_ids
     ):
         raise HTTPException(
             409, "Removed Project definitions are referenced by unfinished work."
@@ -88,16 +85,11 @@ async def retire_project_resources(conn, project_id):
     )
     ids = [row["id"] for row in resources]
     await _assert_no_expert_pointers(conn, resources, deleting_project=project_id)
-    active = await conn.fetchval(
-        """SELECT EXISTS(SELECT 1 FROM srw_execution_specs s
-        LEFT JOIN jobs j ON s.work_kind='Job' AND j.id=s.work_id
-        LEFT JOIN threads t ON s.work_kind='Session' AND t.id=s.work_id
-        WHERE ($1=ANY(s.project_ids) OR s.resource_id=ANY($2::uuid[]) OR EXISTS(
-          SELECT 1 FROM jsonb_array_elements(s.dependencies) d WHERE d->>'uid'=ANY($3::text[])))
-        AND (j.status IN ('created','processing','paused','pending_review') OR t.id IS NOT NULL))""",
-        project_id,
-        ids,
-        [str(value) for value in ids],
+    active = await execution_references_block_retirement(
+        conn,
+        project_id=project_id,
+        resource_ids=ids,
+        dependency_ids=[str(value) for value in ids],
     )
     if active:
         raise HTTPException(

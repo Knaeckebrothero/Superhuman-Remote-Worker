@@ -273,6 +273,10 @@ async def test_project_delete_ignores_only_settled_ownerless_session_history(
         )
         == 0
     )
+    with pytest.raises(HTTPException) as resumable:
+        await database.delete_project(str(project["id"]))
+    assert resumable.value.status_code == 409
+    assert await database.get_project(str(project["id"])) is not None
 
     assert await database.delete_user(str(user["id"])) is True
     assert (await database.get_thread(thread_id))["user_id"] is None

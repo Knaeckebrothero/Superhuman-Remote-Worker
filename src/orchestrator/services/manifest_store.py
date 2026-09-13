@@ -4,6 +4,10 @@ from copy import deepcopy
 import json
 from uuid import UUID, uuid4
 
+from orchestrator.services.manifest_execution_retirement import (
+    execution_references_block_retirement,
+)
+
 from fastapi import HTTPException
 
 
@@ -249,14 +253,10 @@ class ManifestStore:
                         409,
                         "Repoint active Expert references and defaults before deleting this resource.",
                     )
-            in_use = await self.db.fetchval(
-                """SELECT EXISTS(SELECT 1 FROM srw_execution_specs s
-                LEFT JOIN jobs j ON s.work_kind='Job' AND j.id=s.work_id
-                LEFT JOIN threads t ON s.work_kind='Session' AND t.id=s.work_id
-                WHERE (s.resource_id=$1 OR s.dependencies @> $2::jsonb)
-                AND (j.status IN ('created','processing','paused','pending_review') OR t.id IS NOT NULL))""",
-                row["id"],
-                json.dumps([{"uid": str(row["id"])}]),
+            in_use = await execution_references_block_retirement(
+                self.db,
+                resource_ids=[row["id"]],
+                dependency_ids=[str(row["id"])],
             )
             if in_use:
                 raise HTTPException(409, "Resource is referenced by unfinished work.")
