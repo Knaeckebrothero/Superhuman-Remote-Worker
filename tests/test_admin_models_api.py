@@ -388,8 +388,12 @@ def model_catalog_service():
     from orchestrator.services.family_matcher import detect_family
     from shared.runtime.core import loader
 
+    store = MagicMock()
+    # Provenance lookups are awaited on every list/create/update response.
+    store.get_system_setting = AsyncMock(return_value=None)
+    store.list_system_llm_endpoints = AsyncMock(return_value=[])
     return ModelCatalogService(
-        store=MagicMock(),
+        store=store,
         probe=AsyncMock(),
         get_config_dir=lambda: loader.get_project_root() / "config",
         load_settings_matrix=lambda path: {},

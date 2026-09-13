@@ -26,6 +26,9 @@ applied without a wait and is inert on its own, so it costs nothing and is back
 in step with this Job the moment the replicas return.
 */ -}}
 {{- if and .Values.llm.seed.enabled (gt (int .Values.orchestrator.replicas) 0) }}
+{{- /* Dev-mode inline key values are rendered into this dedicated Secret by
+       llm-seed-inline-secret.yaml; only this Job reads it. */}}
+{{- $inlineSecret := printf "%s-llm-seed-inline" (include "srw.fullname" .) }}
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -144,8 +147,13 @@ spec:
             - name: {{ printf "SEED_%s_API_KEY" ($provider | upper | replace "-" "_") | quote }}
               valueFrom:
                 secretKeyRef:
+                  {{- if hasKey $ref "value" }}
+                  name: {{ $inlineSecret | quote }}
+                  key: {{ $provider | quote }}
+                  {{- else }}
                   name: {{ required "systemApiKeys entry missing secretName" $ref.secretName | quote }}
                   key: {{ required "systemApiKeys entry missing key" $ref.key | quote }}
+                  {{- end }}
                   # A provider listed here whose key is absent from the Secret is
                   # tolerated: the env var stays unset and the seeder skips that
                   # provider (src/orchestrator/seed/llm_config.py _resolve_secret_value).
@@ -153,12 +161,17 @@ spec:
                   optional: true
             {{- end }}
             {{- range $i, $ep := .Values.llm.seed.systemEndpoints }}
-            {{- if $ep.apiKeyRef }}
+            {{- if or $ep.apiKeyRef (hasKey $ep "apiKey") }}
             - name: {{ printf "SEED_ENDPOINT_%d_API_KEY" $i | quote }}
               valueFrom:
                 secretKeyRef:
+                  {{- if hasKey $ep "apiKey" }}
+                  name: {{ $inlineSecret | quote }}
+                  key: {{ printf "endpoint-%d" $i | quote }}
+                  {{- else }}
                   name: {{ required "apiKeyRef.secretName is required" $ep.apiKeyRef.secretName | quote }}
                   key: {{ required "apiKeyRef.key is required" $ep.apiKeyRef.key | quote }}
+                  {{- end }}
                   # Keyed endpoints tolerate a missing key too — the seeder
                   # creates the endpoint keyless rather than failing the pod.
                   optional: true

@@ -37,6 +37,7 @@ from typing import (
 )
 from uuid import UUID, uuid4
 
+from shared.helm_provenance import provenance_from_breadcrumb
 from shared.credential_connectors import CredentialConnectorAttachedError
 
 try:
@@ -44783,6 +44784,7 @@ class PostgresDB:
             rows = await conn.fetch(
                 """
                 SELECT id, provider, key_prefix, label, seeded_from,
+                       source, helm_value_hash, source_updated_at,
                        created_at, updated_at
                 FROM system_api_keys
                 ORDER BY provider
@@ -44806,25 +44808,40 @@ class PostgresDB:
         key_prefix: str,
         label: str | None = None,
         seeded_from: str | None = None,
+        *,
+        source: str | None = None,
+        helm_value_hash: str | None = None,
     ) -> Dict[str, Any]:
         """Create or replace the system-level API key for a provider.
 
         ``seeded_from`` is a breadcrumb set by the helm seed job; admin-UI
         edits pass ``None`` so subsequent re-seeds skip overwriting.
+
+        ``source`` records who is writing (see ``shared.helm_provenance``);
+        when omitted it is derived from ``seeded_from``. ``helm_value_hash``
+        is only ever set by the seed Job and survives admin rotations, so a
+        later reconcile can still tell "what Helm last applied".
         """
+        source = source or provenance_from_breadcrumb(seeded_from)
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
                 INSERT INTO system_api_keys
-                    (provider, api_key, key_prefix, label, seeded_from)
-                VALUES ($1, $2, $3, $4, $5)
+                    (provider, api_key, key_prefix, label, seeded_from,
+                     source, helm_value_hash, source_updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP)
                 ON CONFLICT (provider) DO UPDATE
                 SET api_key = EXCLUDED.api_key,
                     key_prefix = EXCLUDED.key_prefix,
                     label = EXCLUDED.label,
                     seeded_from = EXCLUDED.seeded_from,
+                    source = EXCLUDED.source,
+                    helm_value_hash = COALESCE(EXCLUDED.helm_value_hash,
+                                               system_api_keys.helm_value_hash),
+                    source_updated_at = CURRENT_TIMESTAMP,
                     updated_at = CURRENT_TIMESTAMP
                 RETURNING id, provider, key_prefix, label, seeded_from,
+                          source, helm_value_hash, source_updated_at,
                           created_at, updated_at
                 """,
                 provider,
@@ -44832,6 +44849,8 @@ class PostgresDB:
                 key_prefix,
                 label,
                 seeded_from,
+                source,
+                helm_value_hash,
             )
             return dict(row)
 
@@ -46079,6 +46098,7 @@ class PostgresDB:
             endpoint_rows = await conn.fetch(
                 """
                 SELECT id, label, base_url, key_prefix, transport_kind,
+                       source, helm_value_hash, source_updated_at,
                        created_at, updated_at
                 FROM llm_endpoints
                 WHERE user_id IS NULL
@@ -46096,7 +46116,8 @@ class PostgresDB:
             row = await conn.fetchrow(
                 """
                 SELECT id, label, base_url, api_key, key_prefix,
-                       transport_kind, created_at, updated_at
+                       transport_kind, source, helm_value_hash,
+                       source_updated_at, created_at, updated_at
                 FROM llm_endpoints
                 WHERE id = $1 AND user_id IS NULL
                 """,
@@ -46118,20 +46139,29 @@ class PostgresDB:
         api_key: str | None,
         key_prefix: str | None,
         transport_kind: str | None = None,
+        *,
+        source: str | None = None,
+        helm_value_hash: str | None = None,
+        seeded_from: str | None = None,
     ) -> Dict[str, Any]:
         """Create a new system-scoped LLM endpoint. Label must be globally unique.
 
         ``transport_kind`` is the stable routing marker (see
         ``shared.subscription_routing``); NULL for an ordinary
-        OpenAI-compatible endpoint.
+        OpenAI-compatible endpoint. ``source`` (see ``shared.helm_provenance``)
+        defaults to a derivation from ``seeded_from``, which this table does
+        not store — the breadcrumb only informs provenance here.
         """
+        source = source or provenance_from_breadcrumb(seeded_from)
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
                 INSERT INTO llm_endpoints
-                    (user_id, label, base_url, api_key, key_prefix, transport_kind)
-                VALUES (NULL, $1, $2, $3, $4, $5)
+                    (user_id, label, base_url, api_key, key_prefix, transport_kind,
+                     source, helm_value_hash, source_updated_at)
+                VALUES (NULL, $1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP)
                 RETURNING id, label, base_url, key_prefix, transport_kind,
+                          source, helm_value_hash, source_updated_at,
                           created_at, updated_at
                 """,
                 label,
@@ -46139,6 +46169,8 @@ class PostgresDB:
                 _encrypt_optional(api_key),
                 key_prefix,
                 transport_kind,
+                source,
+                helm_value_hash,
             )
             return dict(row)
 
@@ -46151,14 +46183,28 @@ class PostgresDB:
         key_prefix: str | None = None,
         clear_api_key: bool = False,
         transport_kind: str | None = None,
+        source: str | None = None,
+        helm_value_hash: str | None = None,
     ) -> Dict[str, Any] | None:
         """Patch a system endpoint. Only non-None fields are updated.
 
-        Returns None if no row matches (endpoint missing or user-scoped).
+        ``source`` stamps who is writing (``shared.helm_provenance``) and
+        bumps ``source_updated_at``; ``helm_value_hash`` is set by the seed
+        Job only. Returns None if no row matches (endpoint missing or
+        user-scoped).
         """
         sets: List[str] = []
         args: List[Any] = [UUID(endpoint_id)]
         param_idx = 2
+        if source is not None:
+            sets.append(f"source = ${param_idx}")
+            sets.append("source_updated_at = CURRENT_TIMESTAMP")
+            args.append(source)
+            param_idx += 1
+        if helm_value_hash is not None:
+            sets.append(f"helm_value_hash = ${param_idx}")
+            args.append(helm_value_hash)
+            param_idx += 1
         if label is not None:
             sets.append(f"label = ${param_idx}")
             args.append(label)
@@ -46189,6 +46235,7 @@ class PostgresDB:
                 row = await conn.fetchrow(
                     """
                     SELECT id, label, base_url, key_prefix, transport_kind,
+                           source, helm_value_hash, source_updated_at,
                            created_at, updated_at
                     FROM llm_endpoints
                     WHERE id = $1 AND user_id IS NULL
@@ -46203,6 +46250,7 @@ class PostgresDB:
             SET {", ".join(sets)}
             WHERE id = $1 AND user_id IS NULL
             RETURNING id, label, base_url, key_prefix, transport_kind,
+                      source, helm_value_hash, source_updated_at,
                       created_at, updated_at
         """
         async with self.acquire() as conn:
@@ -46238,7 +46286,8 @@ class PostgresDB:
     _MODEL_FIELDS = (
         "id, provider_kind, provider_ref, model_id, display_label, "
         "capabilities, family, context_window, reasoning_level, "
-        "params_json, enabled, seeded_from, notes, created_at, updated_at"
+        "params_json, enabled, seeded_from, notes, "
+        "source, helm_value_hash, source_updated_at, created_at, updated_at"
     )
 
     @staticmethod
@@ -46365,8 +46414,13 @@ class PostgresDB:
         seeded_from: str | None = None,
         notes: str | None = None,
         on_conflict_do_nothing: bool = False,
+        source: str | None = None,
+        helm_value_hash: str | None = None,
     ) -> Dict[str, Any] | None:
         """Insert a catalog row.
+
+        ``source`` (``shared.helm_provenance``) defaults to a derivation from
+        ``seeded_from``; ``helm_value_hash`` is set by the seed Job only.
 
         ``context_window=0`` and ``params_json={"temperature": 0}`` round-trip
         as themselves — only literal ``None`` is treated as "use default".
@@ -46383,6 +46437,7 @@ class PostgresDB:
         canonical = self._canonicalize_capabilities(
             capability=capability, capabilities=capabilities
         )
+        source = source or provenance_from_breadcrumb(seeded_from)
         on_conflict = (
             "ON CONFLICT (provider_kind, provider_ref, model_id) DO NOTHING"
             if on_conflict_do_nothing
@@ -46394,8 +46449,10 @@ class PostgresDB:
                 INSERT INTO models
                     (provider_kind, provider_ref, model_id, display_label,
                      capabilities, family, context_window,
-                     reasoning_level, params_json, enabled, seeded_from, notes)
-                VALUES ($1, $2, $3, $4, $5::TEXT[], $6, $7, $8, $9, $10, $11, $12)
+                     reasoning_level, params_json, enabled, seeded_from, notes,
+                     source, helm_value_hash, source_updated_at)
+                VALUES ($1, $2, $3, $4, $5::TEXT[], $6, $7, $8, $9, $10, $11, $12,
+                        $13, $14, CURRENT_TIMESTAMP)
                 {on_conflict}
                 RETURNING {self._MODEL_FIELDS}
                 """,
@@ -46411,6 +46468,8 @@ class PostgresDB:
                 enabled,
                 seeded_from,
                 notes,
+                source,
+                helm_value_hash,
             )
         return self._row_to_model(row) if row else None
 
@@ -46438,6 +46497,11 @@ class PostgresDB:
             "params_json",
             "enabled",
             "notes",
+            # Provenance (shared.helm_provenance): ``source`` stamps who is
+            # writing and bumps source_updated_at; ``helm_value_hash`` is set
+            # by the seed Job only.
+            "source",
+            "helm_value_hash",
         }
         # Capability changes are coupled — canonicalize singular/array
         # spellings into the array form before writing.
@@ -46464,6 +46528,8 @@ class PostgresDB:
             idx += 1
         if not sets:
             return await self.get_model(model_id)
+        if "source" in fields:
+            sets.append("source_updated_at = CURRENT_TIMESTAMP")
         sets.append("updated_at = CURRENT_TIMESTAMP")
         async with self.acquire() as conn:
             row = await conn.fetchrow(
@@ -46673,13 +46739,28 @@ class PostgresDB:
         model: str | None,
         *,
         updated_by: str | None = None,
+        source: str | None = None,
+        helm_value_hash: str | None = None,
     ) -> None:
-        """Set or clear the default model ID for ``kind``."""
+        """Set or clear the default model ID for ``kind``.
+
+        ``source`` / ``helm_value_hash`` are the provenance columns
+        (``shared.helm_provenance``), forwarded to the settings upsert.
+        """
         key = self._default_llm_model_key(kind)
         if model is None or model == "":
             await self.delete_system_setting(key)
             return
-        await self.upsert_system_setting(key, {"model": model}, updated_by=updated_by)
+        # Forward provenance only when given so callers (and their mocks)
+        # that never set it keep the original call shape.
+        extra: Dict[str, Any] = {}
+        if source is not None:
+            extra["source"] = source
+        if helm_value_hash is not None:
+            extra["helm_value_hash"] = helm_value_hash
+        await self.upsert_system_setting(
+            key, {"model": model}, updated_by=updated_by, **extra
+        )
 
     # Catalog capabilities that support a "first-enabled-alphabetical" fallback
     # when the admin pin is missing or dangling. Whisper/tts gained catalog
@@ -54150,7 +54231,8 @@ class PostgresDB:
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT key, value, credentials_ref, updated_at, updated_by
+                SELECT key, value, credentials_ref, updated_at, updated_by,
+                       source, helm_value_hash, source_updated_at
                 FROM system_settings WHERE key = $1
                 """,
                 key,
@@ -54173,32 +54255,51 @@ class PostgresDB:
         *,
         credentials_ref: Optional[str] = None,
         updated_by: Optional[str] = None,
+        source: Optional[str] = None,
+        helm_value_hash: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Create or replace a system_settings row.
 
-        Returns the post-write row (after the DB-side updated_at is set).
+        ``source`` (``shared.helm_provenance``) records who is writing; when
+        omitted it is derived from ``updated_by`` — a ``helm:`` actor is the
+        seed Job, anything else (an admin id, or no actor) counts as the
+        application/UI. Boot-time seeders pass ``source='default'``
+        explicitly. ``helm_value_hash`` is set by the seed Job only and
+        survives later writes. Returns the post-write row (after the DB-side
+        updated_at is set).
         """
         # ``updated_by`` is a TEXT column; coerce non-str actor ids (e.g. a
         # UUID) so callers passing a raw uuid don't trip asyncpg's type check.
         if updated_by is not None:
             updated_by = str(updated_by)
+        if source is None:
+            source = "helm" if (updated_by or "").startswith("helm:") else "ui"
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
                 INSERT INTO system_settings
-                    (key, value, credentials_ref, updated_at, updated_by)
-                VALUES ($1, $2::jsonb, $3, CURRENT_TIMESTAMP, $4)
+                    (key, value, credentials_ref, updated_at, updated_by,
+                     source, helm_value_hash, source_updated_at)
+                VALUES ($1, $2::jsonb, $3, CURRENT_TIMESTAMP, $4,
+                        $5, $6, CURRENT_TIMESTAMP)
                 ON CONFLICT (key) DO UPDATE SET
                     value = EXCLUDED.value,
                     credentials_ref = EXCLUDED.credentials_ref,
                     updated_at = CURRENT_TIMESTAMP,
-                    updated_by = EXCLUDED.updated_by
-                RETURNING key, value, credentials_ref, updated_at, updated_by
+                    updated_by = EXCLUDED.updated_by,
+                    source = EXCLUDED.source,
+                    helm_value_hash = COALESCE(EXCLUDED.helm_value_hash,
+                                               system_settings.helm_value_hash),
+                    source_updated_at = CURRENT_TIMESTAMP
+                RETURNING key, value, credentials_ref, updated_at, updated_by,
+                          source, helm_value_hash, source_updated_at
                 """,
                 key,
                 json.dumps(value),
                 credentials_ref,
                 updated_by,
+                source,
+                helm_value_hash,
             )
         d = self._row_to_dict(row) or {}
         raw_value = d.get("value")

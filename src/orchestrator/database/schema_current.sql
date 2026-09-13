@@ -15836,7 +15836,11 @@ CREATE TABLE public.llm_endpoints (
     key_prefix character varying(12),
     created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
     updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
-    transport_kind text
+    transport_kind text,
+    source text DEFAULT 'ui'::text NOT NULL,
+    helm_value_hash text,
+    source_updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    CONSTRAINT llm_endpoints_source_check CHECK ((source = ANY (ARRAY['default'::text, 'helm'::text, 'ui'::text])))
 );
 
 
@@ -16500,8 +16504,12 @@ CREATE TABLE public.models (
     notes text,
     created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
     updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
+    source text DEFAULT 'ui'::text NOT NULL,
+    helm_value_hash text,
+    source_updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
     CONSTRAINT models_capabilities_check CHECK (((cardinality(capabilities) >= 1) AND (capabilities <@ ARRAY['chat'::text, 'auxiliary'::text, 'embedding'::text, 'vision'::text, 'whisper'::text, 'tts'::text, 'search'::text, 'fetch'::text, 'rerank'::text]))),
-    CONSTRAINT models_provider_kind_check CHECK ((provider_kind = ANY (ARRAY['system'::text, 'endpoint'::text])))
+    CONSTRAINT models_provider_kind_check CHECK ((provider_kind = ANY (ARRAY['system'::text, 'endpoint'::text]))),
+    CONSTRAINT models_source_check CHECK ((source = ANY (ARRAY['default'::text, 'helm'::text, 'ui'::text])))
 );
 
 
@@ -18735,6 +18743,10 @@ CREATE TABLE public.system_api_keys (
     updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
     discovery_cache_json jsonb,
     discovery_cache_at timestamp with time zone,
+    source text DEFAULT 'ui'::text NOT NULL,
+    helm_value_hash text,
+    source_updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    CONSTRAINT system_api_keys_source_check CHECK ((source = ANY (ARRAY['default'::text, 'helm'::text, 'ui'::text]))),
     CONSTRAINT valid_system_api_key_provider CHECK (((provider)::text = ANY ((ARRAY['openai'::character varying, 'anthropic'::character varying, 'google'::character varying, 'groq'::character varying, 'openrouter'::character varying, 'mistral'::character varying, 'vision'::character varying])::text[])))
 );
 
@@ -18748,7 +18760,11 @@ CREATE TABLE public.system_settings (
     value jsonb NOT NULL,
     credentials_ref text,
     updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
-    updated_by text
+    updated_by text,
+    source text DEFAULT 'ui'::text NOT NULL,
+    helm_value_hash text,
+    source_updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    CONSTRAINT system_settings_source_check CHECK ((source = ANY (ARRAY['default'::text, 'helm'::text, 'ui'::text])))
 );
 
 

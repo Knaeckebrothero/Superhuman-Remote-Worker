@@ -899,6 +899,13 @@
     }
   },
   "admin": {
+    "helm": {
+      "badge": "Helm",
+      "badgeDrift": "Helm · overridden",
+      "tooltip": "Declared with reconcile: true in the deployment's Helm values. Edits made here are reverted on the next helm upgrade.",
+      "tooltipDrift": "Edited here after Helm applied it. The next helm upgrade reverts this row to the declared value.",
+      "confirmOverride": "This row is managed by Helm (reconcile: true in the deployment values). Your change will be reverted on the next helm upgrade unless the values are updated too. Continue?"
+    },
     "nav": {
       "models": "Models",
       "users": "Users",

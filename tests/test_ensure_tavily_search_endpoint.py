@@ -48,8 +48,8 @@ async def test_key_creates_endpoint_catalog_row_and_empty_defaults(monkeypatch):
         "ops": ["search", "extract", "crawl", "map"],
     }
     assert db.set_default_llm_model.await_args_list == [
-        call("search", TAVILY_MODEL_ID),
-        call("fetch", TAVILY_MODEL_ID),
+        call("search", TAVILY_MODEL_ID, source="default"),
+        call("fetch", TAVILY_MODEL_ID, source="default"),
     ]
 
 
@@ -90,4 +90,6 @@ async def test_existing_admin_default_is_not_clobbered(monkeypatch):
     db = _db(defaults={"search": "brave"})
 
     assert await ensure_tavily_search_endpoint(db) is True
-    assert db.set_default_llm_model.await_args_list == [call("fetch", TAVILY_MODEL_ID)]
+    assert db.set_default_llm_model.await_args_list == [
+        call("fetch", TAVILY_MODEL_ID, source="default")
+    ]
