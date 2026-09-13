@@ -4014,6 +4014,11 @@ class PostgresDB:
         description = (description or "").strip()
 
         async def _write(active_conn) -> Any:
+            from orchestrator.services.manifest_execution_retirement import (
+                lock_manifest_execution_catalog,
+            )
+
+            await lock_manifest_execution_catalog(active_conn)
             await _lock_and_compare_policy_snapshot(
                 active_conn,
                 datasource_uuids,
@@ -29809,6 +29814,11 @@ class PostgresDB:
 
         async with self.acquire() as conn:
             async with conn.transaction():
+                from orchestrator.services.manifest_execution_retirement import (
+                    lock_manifest_execution_catalog,
+                )
+
+                await lock_manifest_execution_catalog(conn)
                 await _lock_and_compare_policy_snapshot(
                     conn, selected_uuids, policy_snapshot
                 )
@@ -38763,8 +38773,13 @@ class PostgresDB:
         """Resume a thread and revive only its durably pending session work."""
         async with self.acquire() as conn:
             async with conn.transaction():
+                from orchestrator.services.manifest_execution_retirement import (
+                    lock_manifest_execution_catalog,
+                )
+
+                await lock_manifest_execution_catalog(conn)
                 thread = await conn.fetchrow(
-                    "SELECT status::text AS status, execution_lane, metadata, "
+                    "SELECT status::text AS status, user_id, execution_lane, metadata, "
                     "runtime_generation, runtime_retirement_token "
                     "FROM threads WHERE id = $1::uuid FOR UPDATE",
                     thread_id,
@@ -38772,6 +38787,7 @@ class PostgresDB:
                 if (
                     thread is None
                     or str(thread["status"] or "") != "ended"
+                    or thread.get("user_id", True) is None
                     or thread["runtime_retirement_token"] is not None
                 ):
                     return False
@@ -38921,6 +38937,7 @@ class PostgresDB:
                         WHERE id = $1::uuid
                           AND status = 'ended'
                           AND runtime_retirement_token IS NULL
+                          AND user_id IS NOT NULL
                           AND NOT (COALESCE(metadata, '{}'::jsonb)
                                    ? '_stateless_workspace_retirement_pending')
                           AND NOT (COALESCE(metadata, '{}'::jsonb)
@@ -38972,6 +38989,7 @@ class PostgresDB:
                             ended_at      = NULL,
                             last_activity = CURRENT_TIMESTAMP
                         WHERE id = $1::uuid AND status = 'ended'
+                          AND user_id IS NOT NULL
                           AND runtime_retirement_token IS NULL
                         RETURNING id
                         """,

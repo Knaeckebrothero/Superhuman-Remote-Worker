@@ -69,6 +69,7 @@ class Connection:
         self.revisions = []
         self.in_transaction = False
         self.jobs = []
+        self.catalog_locks = 0
 
     @asynccontextmanager
     async def transaction(self):
@@ -129,6 +130,10 @@ class Connection:
         raise AssertionError(query)
 
     async def execute(self, query, *args):
+        if "pg_advisory_xact_lock" in query and "srw-resource-catalog" in query:
+            assert self.in_transaction
+            self.catalog_locks += 1
+            return "SELECT 1"
         if "INSERT INTO srw_execution_spec_revisions" in query:
             assert self.in_transaction
             self.revisions.append(deepcopy(args))
@@ -206,6 +211,7 @@ async def test_native_capture_uses_active_connection_and_never_srw_parser(monkey
             execution_manifest=prepared(config),
         )
     render.assert_not_awaited()
+    assert connection.catalog_locks == 1
     assert (
         result["resolved"]["spec"]["execution"]["expert"]["inline"]["runtime"]["config"]
         == config
@@ -224,6 +230,7 @@ async def test_job_snapshot_conflict_rolls_back_job_insert(monkeypatch):
             description="Task", job_id=WORK, execution_manifest=prepared({})
         )
     assert connection.jobs == []
+    assert connection.catalog_locks == 1
     args, kwargs = capture.await_args
     assert args == (db, connection)
     assert kwargs["work_id"] == WORK
@@ -256,6 +263,7 @@ async def test_thread_snapshot_captures_complete_initial_metadata_in_insert_tran
     )
     assert str(connection.jobs[0]["id"]) == thread_id
     assert connection.jobs[0]["metadata"]["expert_id"] == WORK
+    assert connection.catalog_locks == 1
 
 
 @pytest.mark.asyncio

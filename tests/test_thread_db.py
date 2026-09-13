@@ -1245,6 +1245,24 @@ class TestEndThread:
         assert "control_admission_agent_id = NULL" in sql
 
     @pytest.mark.asyncio
+    async def test_resume_refuses_ownerless_historical_thread(self):
+        conn = _mock_conn()
+        conn.fetchrow = AsyncMock(
+            return_value={
+                "status": "ended",
+                "user_id": None,
+                "execution_lane": "pinned",
+                "runtime_generation": None,
+                "runtime_retirement_token": None,
+                "metadata": {},
+            }
+        )
+        db = _make_db_with_conn(conn)
+
+        assert await db.resume_thread("tid-1") is False
+        conn.fetchval.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_stateless_retirement_marker_fences_resume_until_settled(self):
         pending_conn = _mock_conn()
         pending_conn.fetchrow = AsyncMock(

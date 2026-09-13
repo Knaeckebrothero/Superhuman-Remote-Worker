@@ -6,6 +6,7 @@ from uuid import UUID, uuid4
 
 from orchestrator.services.manifest_execution_retirement import (
     execution_references_block_retirement,
+    lock_manifest_execution_catalog,
 )
 
 from fastapi import HTTPException
@@ -48,9 +49,7 @@ class ManifestStore:
         A single transaction lock keeps the alpha's whole-resource ownership
         model explicit. Execution reconciliation does not hold this lock.
         """
-        await self.db.execute(
-            "SELECT pg_advisory_xact_lock(hashtextextended('srw-resource-catalog', 0))"
-        )
+        await lock_manifest_execution_catalog(self.db)
 
     async def by_name(self, kind, scope, name, *, revision=None):
         row = decoded(

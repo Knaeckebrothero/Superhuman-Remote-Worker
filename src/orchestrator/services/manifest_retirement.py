@@ -5,6 +5,7 @@ from fastapi import HTTPException
 
 from orchestrator.services.manifest_execution_retirement import (
     execution_references_block_retirement,
+    lock_manifest_execution_catalog,
 )
 
 
@@ -76,9 +77,7 @@ async def retire_removed_children(db, manager_id, retained_ids):
 
 async def retire_project_resources(conn, project_id):
     # The same lock orders legacy Project deletion against native apply.
-    await conn.execute(
-        "SELECT pg_advisory_xact_lock(hashtextextended('srw-resource-catalog',0))"
-    )
+    await lock_manifest_execution_catalog(conn)
     resources = await conn.fetch(
         "SELECT id,kind,linked_id FROM srw_resources WHERE project_id=$1 AND deleted_at IS NULL FOR UPDATE",
         project_id,

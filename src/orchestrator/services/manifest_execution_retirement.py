@@ -15,6 +15,14 @@ from typing import Literal
 from uuid import UUID
 
 
+async def lock_manifest_execution_catalog(conn) -> None:
+    """Order definition retirement against execution admission and Resume."""
+
+    await conn.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended('srw-resource-catalog', 0))"
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ExecutionRetirementAssessment:
     execution_id: UUID
@@ -332,4 +340,5 @@ __all__ = [
     "ExecutionRetirementAssessment",
     "classify_execution_references",
     "execution_references_block_retirement",
+    "lock_manifest_execution_catalog",
 ]

@@ -613,6 +613,8 @@ async def capture_execution(
 ) -> dict:
     """Capture one new execution on the exact admission transaction."""
     async with db.using_connection(conn):
+        store = ManifestStore(db)
+        await store.lock_catalog()
         prepared = (
             deepcopy(execution_manifest)
             if execution_manifest is not None
@@ -625,7 +627,6 @@ async def capture_execution(
                 **srw_inputs,
             )
         )
-        store = ManifestStore(db)
         if replace_session:
             if work_kind != "Session":
                 raise ValueError("Only session specifications may be updated")

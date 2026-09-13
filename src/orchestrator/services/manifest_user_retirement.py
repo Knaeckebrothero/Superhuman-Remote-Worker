@@ -6,6 +6,7 @@ from fastapi import HTTPException
 
 from orchestrator.services.manifest_execution_retirement import (
     execution_references_block_retirement,
+    lock_manifest_execution_catalog,
 )
 
 
@@ -17,9 +18,7 @@ async def retire_user_manifests(conn, user_id: UUID) -> bool:
     Released workspace receipts and immutable execution revisions remain for
     history; live processes and retained storage must be released first.
     """
-    await conn.execute(
-        "SELECT pg_advisory_xact_lock(hashtextextended('srw-resource-catalog',0))"
-    )
+    await lock_manifest_execution_catalog(conn)
     if not await conn.fetchval("SELECT id FROM users WHERE id=$1 FOR UPDATE", user_id):
         return False
 
