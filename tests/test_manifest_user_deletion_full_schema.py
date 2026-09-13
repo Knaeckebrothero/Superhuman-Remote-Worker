@@ -234,10 +234,6 @@ async def test_personal_default_project_can_be_removed_after_account_deletion(da
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="project-owned native KB creator provenance blocks account deletion",
-)
 @pytest.mark.asyncio
 async def test_account_deletion_detaches_native_project_kb_creator(database):
     """A synthetic project connector outlives its departing creator."""

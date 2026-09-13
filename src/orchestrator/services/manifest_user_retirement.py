@@ -154,4 +154,40 @@ async def retire_user_manifests(conn, user_id: UUID) -> bool:
     await conn.execute(
         "UPDATE srw_resource_secrets SET owner_id=NULL WHERE owner_id=$1", user_id
     )
+    # A native KB connector is owned by its project, not by the user who
+    # happened to create that project.  Its ``created_by`` column is audit
+    # provenance, but the historical FK is restrictive.  Detach only the
+    # exact synthetic shape that project deletion itself owns: one valid
+    # native project marker with one reciprocal project link and no others.
+    # Personal/shared connectors keep their creator and continue to refuse
+    # account deletion until their ownership is handled explicitly.
+    await conn.execute(
+        """
+        UPDATE datasources AS datasource
+           SET created_by = NULL,
+               updated_at = now()
+         WHERE datasource.created_by = $1
+           AND datasource.type = 'kb'
+           AND datasource.scope_mode = 'projects'
+           AND COALESCE(datasource.is_global, false) = false
+           AND datasource.job_id IS NULL
+           AND COALESCE(datasource.config->>'native_project_id', '') ~*
+               '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+           AND EXISTS (
+               SELECT 1
+                 FROM project_datasources AS link
+                WHERE link.datasource_id = datasource.id
+                  AND link.project_id =
+                      (datasource.config->>'native_project_id')::uuid
+           )
+           AND NOT EXISTS (
+               SELECT 1
+                 FROM project_datasources AS other_link
+                WHERE other_link.datasource_id = datasource.id
+                  AND other_link.project_id <>
+                      (datasource.config->>'native_project_id')::uuid
+           )
+        """,
+        user_id,
+    )
     return True
