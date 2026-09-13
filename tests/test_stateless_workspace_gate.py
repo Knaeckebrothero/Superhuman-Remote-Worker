@@ -114,6 +114,10 @@ def test_record_shaped_mapping_preserves_stateless_sandbox_authority():
                 "repo_name": "thread-aaaaaaaa",
             },
         ),
+        _metadata(
+            "none",
+            workspace_container={"volume_reclaimed": False},
+        ),
         json.dumps(
             _metadata(
                 "virtual",
@@ -128,7 +132,12 @@ def test_record_shaped_mapping_preserves_stateless_sandbox_authority():
             )
         ),
     ],
-    ids=["virtual", "none-with-gitea", "valid-virtual-binding-json"],
+    ids=[
+        "virtual",
+        "none-with-gitea",
+        "none-with-settled-volume-outcome",
+        "valid-virtual-binding-json",
+    ],
 )
 def test_classifier_admits_only_unmaterialized_lite_workspaces(metadata):
     backend, refusal = stateless_workspace_check(_thread(metadata))
