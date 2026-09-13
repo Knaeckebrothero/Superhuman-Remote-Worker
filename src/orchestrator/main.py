@@ -676,6 +676,7 @@ from shared.thread_presence import (  # noqa: E402
     refresh_thread_presence,
 )
 from shared.pinned_session_identity import PinnedSessionBinding  # noqa: E402
+from shared.pinned_session_identity import PinnedJobRecipient  # noqa: E402, F401
 from orchestrator.services.stateless_workspace_gate import (  # noqa: E402
     declared_thread_workspace_backend,
     stateless_session_workspace_check,
@@ -827,9 +828,6 @@ from orchestrator.services import subscription_discovery  # noqa: E402
 from shared.runtime.core.model_registry import (  # noqa: E402
     UnknownModelError,
     resolve_model as _resolve_model,
-)
-from shared.pinned_session_identity import (  # noqa: E402
-    PinnedJobRecipient,
 )
 
 # Lite (no-workspace-pod) backend names. Canonical set lives agent-side in the
@@ -2978,15 +2976,15 @@ from orchestrator.services.job_start_bundle import (  # noqa: E402
 )
 
 
-from orchestrator.services.job_start_bundle import (  # noqa: E402
+from orchestrator.services.job_mutation_target import (  # noqa: E402
     PinnedJobMutationTarget as _PinnedJobMutationTarget,
 )
 
 
-from orchestrator.services.job_start_bundle import (  # noqa: E402
+from orchestrator.services.job_mutation_target import (  # noqa: E402, F401
     FRESH_PINNED_RECIPIENT_ATTESTATION_ATTEMPTS as _FRESH_PINNED_RECIPIENT_ATTESTATION_ATTEMPTS,
 )
-from orchestrator.services.job_start_bundle import (  # noqa: E402
+from orchestrator.services.job_mutation_target import (  # noqa: E402, F401
     FRESH_PINNED_RECIPIENT_ATTESTATION_DELAY_S as _FRESH_PINNED_RECIPIENT_ATTESTATION_DELAY_S,
 )
 
@@ -2997,132 +2995,18 @@ async def _prepare_pinned_job_mutation_target(
     job_id: str,
     require_idle: bool,
 ) -> _PinnedJobMutationTarget | None:
-    """Resolve and freshly attest the exact process for pinned job control."""
+    from orchestrator.services import job_mutation_target
 
-    fresh = await postgres_db.get_agent(agent_id)
-    if not fresh or not fresh.get("pod_ip"):
-        logger.warning(
-            "Pinned recipient unavailable for job %s (agent=%s)", job_id, agent_id
-        )
-        return None
-
-    status = str(fresh.get("status") or "")
-    current_job_id = str(fresh.get("current_job_id") or "") or None
-    is_fresh_accept = status == "ready" and current_job_id is None
-    if require_idle:
-        is_exact_retry = status == "working" and current_job_id == job_id
-        if not (is_fresh_accept or is_exact_retry):
-            logger.warning(
-                "Pinned recipient cannot accept/replay job %s "
-                "(agent=%s status=%s current=%s)",
-                job_id,
-                agent_id,
-                status,
-                current_job_id,
-            )
-            return None
-    elif status != "working" or current_job_id != job_id:
-        logger.warning(
-            "Pinned recipient no longer owns job %s (agent=%s status=%s current=%s)",
-            job_id,
-            agent_id,
-            status,
-            current_job_id,
-        )
-        return None
-
-    metadata = fresh.get("metadata") or {}
-    if isinstance(metadata, str):
-        try:
-            metadata = json.loads(metadata)
-        except (TypeError, ValueError):
-            metadata = {}
-    process_generation = (
-        str(metadata.get("dispatch_process_generation") or "").strip()
-        if isinstance(metadata, Mapping)
-        else ""
-    )
-    if not process_generation:
-        logger.warning(
-            "Pinned recipient lacks process generation for job %s (agent=%s)",
-            job_id,
-            agent_id,
-        )
-        return None
-
-    pod_uid = str(fresh.get("pod_uid") or "").strip() or None
-    ready_url = f"http://{fresh['pod_ip']}:{fresh['pod_port']}/ready"
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            ready_response = await client.get(ready_url)
-        ready_payload = (
-            ready_response.json() if ready_response.status_code == 200 else {}
-        )
-    except Exception as exc:
-        logger.info(
-            "Pinned recipient capability probe failed for agent %s (%s)",
-            agent_id,
-            type(exc).__name__,
-        )
-        return None
-    if not (
-        isinstance(ready_payload, Mapping)
-        and ready_payload.get("ready") is True
-        and isinstance(ready_payload.get("capabilities"), Mapping)
-        and ready_payload["capabilities"].get("pinned_recipient_binding") is True
-    ):
-        logger.warning(
-            "Pinned recipient binding capability unavailable for agent %s", agent_id
-        )
-        return None
-
-    if pod_uid is not None:
-        # A newly started agent can answer its own /ready probe one API-cache
-        # beat before Kubernetes publishes containerStatuses[*].ready=true.
-        # A single false result after the dispatcher has claimed the job then
-        # strands that safe pre-delivery claim until lease recovery. Give only
-        # the fresh-idle path a short startup grace while re-attesting the same
-        # immutable Pod UID and IP every time. Existing working recipients and
-        # all control mutations remain fail-fast.
-        attempts = (
-            _FRESH_PINNED_RECIPIENT_ATTESTATION_ATTEMPTS
-            if require_idle and is_fresh_accept
-            else 1
-        )
-        attested = False
-        for attempt in range(attempts):
-            attested = await agent_provisioner.attest_pinned_job_recipient(
-                str(fresh.get("hostname") or ""),
-                expected_pod_uid=pod_uid,
-                expected_pod_ip=str(fresh["pod_ip"]),
-            )
-            if attested:
-                if attempt:
-                    logger.info(
-                        "Pinned recipient Pod became attestable for job %s "
-                        "after %s retries (agent=%s)",
-                        job_id,
-                        attempt,
-                        agent_id,
-                    )
-                break
-            if attempt + 1 < attempts:
-                await asyncio.sleep(_FRESH_PINNED_RECIPIENT_ATTESTATION_DELAY_S)
-        if not attested:
-            logger.warning(
-                "Pinned recipient Pod attestation failed for job %s (agent=%s)",
-                job_id,
-                agent_id,
-            )
-            return None
-
-    return _PinnedJobMutationTarget(
-        agent=fresh,
-        recipient=PinnedJobRecipient(
-            expected_agent_id=agent_id,
-            expected_pod_uid=pod_uid,
-            expected_process_generation=process_generation,
-            expected_job_id=job_id,
+    return await job_mutation_target.prepare_pinned_job_mutation_target(
+        agent_id=agent_id,
+        job_id=job_id,
+        require_idle=require_idle,
+        dependencies=job_mutation_target.PinnedJobMutationTargetDependencies(
+            store=postgres_db,
+            agent_provisioner=agent_provisioner,
+            logger=logger,
+            http_client_factory=httpx.AsyncClient,
+            sleep=asyncio.sleep,
         ),
     )
 

@@ -29,7 +29,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Mapping, NamedTuple, Protocol
+from typing import Any, Awaitable, Callable, Mapping, Protocol
 
 from fastapi import HTTPException
 
@@ -54,20 +54,13 @@ from orchestrator.services.manifest_execution_snapshot import (
     srw_snapshot_config,
 )
 from shared.backend_kinds import LITE_BACKENDS
-from shared.pinned_session_identity import PinnedJobRecipient
+from orchestrator.services.job_mutation_target import (
+    FRESH_PINNED_RECIPIENT_ATTESTATION_ATTEMPTS,
+    FRESH_PINNED_RECIPIENT_ATTESTATION_DELAY_S,
+    PinnedJobMutationTarget,
+)
 from shared.runtime.core.loader import canonical_config_name
 from shared.workspace_contract import WORKSPACE_RUNTIME_CONTEXT_KEY
-
-
-class PinnedJobMutationTarget(NamedTuple):
-    agent: dict[str, Any]
-    recipient: PinnedJobRecipient
-
-
-# A freshly pinned recipient can still be mid-attestation when a mutation
-# arrives; bound the retry so a wedged pod cannot hold the request open.
-FRESH_PINNED_RECIPIENT_ATTESTATION_ATTEMPTS = 8
-FRESH_PINNED_RECIPIENT_ATTESTATION_DELAY_S = 0.25
 
 
 class JobStartBundleStore(Protocol):
@@ -778,3 +771,17 @@ async def build_job_start_request(
         return None
     finally:
         reset_log_context(_log_token)
+
+
+__all__ = [
+    "FRESH_PINNED_RECIPIENT_ATTESTATION_ATTEMPTS",
+    "FRESH_PINNED_RECIPIENT_ATTESTATION_DELAY_S",
+    "JobStartBundleDependencies",
+    "JobStartBundleStore",
+    "PinnedJobMutationTarget",
+    "build_job_start_request",
+    "job_project_repositories",
+    "mask_repository_transport",
+    "prepare_job_repository_before_claim",
+    "redispatch_livelock_trip",
+]
