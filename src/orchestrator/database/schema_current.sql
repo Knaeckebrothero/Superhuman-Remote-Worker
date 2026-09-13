@@ -2858,6 +2858,13 @@ BEGIN
     old_workspace := COALESCE(old_state->'workspace_container', '{}'::JSONB);
     new_workspace := COALESCE(new_state->'workspace_container', '{}'::JSONB);
 
+    IF source_kind = 'thread'
+       AND OLD.status::TEXT = 'ended'
+       AND public.stateless_none_workspace_outcome_is_authority_free(old_state)
+    THEN
+        old_workspace := '{}'::JSONB;
+    END IF;
+
     -- Origin migration 0185/0200 is the authority for a *pinned* thread's
     -- Kubernetes agent runtime, so that scope is handed over here.  It does
     -- not protect metadata.vm or a Docker workspace lease: both remain under
@@ -9653,6 +9660,14 @@ BEGIN
         IF source_kind = 'thread' AND scope_name = 'ide' THEN
             CONTINUE;
         END IF;
+        IF source_kind = 'thread'
+           AND scope_name = 'workspace_container'
+           AND public.stateless_none_workspace_outcome_is_authority_free(
+               source_state
+           )
+        THEN
+            CONTINUE;
+        END IF;
         -- An effectful creation cancelled above still owns the exact partial
         -- resource inventory and rotated reconciliation token.  Its
         -- same-generation cancellation path will capture the accepted Pod (or
@@ -13010,6 +13025,82 @@ BEGIN
     RETURN NEW;
 END;
 $$;
+
+
+--
+-- Name: stateless_none_workspace_outcome_is_authority_free(jsonb); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.stateless_none_workspace_outcome_is_authority_free(requested_state jsonb) RETURNS boolean
+    LANGUAGE sql IMMUTABLE
+    AS $_$
+    SELECT COALESCE(
+        jsonb_typeof(requested_state) = 'object'
+        AND requested_state #>> '{config_override,workspace,backend}' = 'none'
+        AND COALESCE(requested_state->'_workspace_binding', '{}'::JSONB)
+            = '{}'::JSONB
+        AND jsonb_typeof(requested_state->'workspace_container') = 'object'
+        AND requested_state->'workspace_container' ? 'volume_reclaimed'
+        AND jsonb_typeof(
+            requested_state->'workspace_container'->'volume_reclaimed'
+        ) = 'boolean'
+        AND (requested_state->'workspace_container')
+            - ARRAY['status', 'volume_reclaimed'] = '{}'::JSONB
+        AND (
+            NOT (requested_state->'workspace_container' ? 'status')
+            OR jsonb_typeof(
+                requested_state->'workspace_container'->'status'
+            ) = 'string'
+        )
+        AND jsonb_typeof(
+            requested_state->'_stateless_workspace_retirement_settled'
+        ) = 'object'
+        AND (requested_state->'_stateless_workspace_retirement_settled')
+            - ARRAY[
+                'terminal_token',
+                'cleanup_complete',
+                'permanent',
+                'backing_id',
+                'runtime_incarnation',
+                'snapshot_restore_required',
+                'workspace_absence_proven'
+            ] = '{}'::JSONB
+        AND jsonb_typeof(
+            requested_state
+                #> '{_stateless_workspace_retirement_settled,terminal_token}'
+        ) = 'number'
+        AND requested_state
+                #>> '{_stateless_workspace_retirement_settled,terminal_token}'
+            ~ '^(0|[1-9][0-9]*)$'
+        AND requested_state
+                #> '{_stateless_workspace_retirement_settled,cleanup_complete}'
+            = 'true'::JSONB
+        AND jsonb_typeof(
+            requested_state
+                #> '{_stateless_workspace_retirement_settled,permanent}'
+        ) = 'boolean'
+        AND requested_state
+                #> '{_stateless_workspace_retirement_settled,backing_id}'
+            = 'null'::JSONB
+        AND requested_state
+                #> '{_stateless_workspace_retirement_settled,runtime_incarnation}'
+            = 'null'::JSONB
+        AND requested_state
+                #> '{_stateless_workspace_retirement_settled,snapshot_restore_required}'
+            = 'false'::JSONB
+        AND requested_state
+                #> '{_stateless_workspace_retirement_settled,workspace_absence_proven}'
+            = 'false'::JSONB
+        AND NOT requested_state ?| ARRAY[
+            '_stateless_workspace_retirement_pending',
+            '_stateless_claim_retirement',
+            '_stateless_claim_losses',
+            '_stateless_claim_loss_hold',
+            '_stateless_active_claim'
+        ],
+        FALSE
+    );
+$_$;
 
 
 --
