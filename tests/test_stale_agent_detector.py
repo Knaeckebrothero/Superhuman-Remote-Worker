@@ -881,6 +881,26 @@ def _lite_recovery_mocks(current):
     return db, provisioner
 
 
+def _vm_retirement(*, backend="vm"):
+    retirement, current = _lite_retirement(backend=backend, permanent=True)
+    generation = "55555555-5555-4555-8555-555555555556"
+    vm_uid = "vm-incarnation-uid"
+    retirement["context"]["vm"] = {
+        "status": "ready",
+        "provision_generation": generation,
+        "identity_provision_generation": generation,
+        "identity_authenticated": True,
+        "vm_uid": vm_uid,
+        "_runtime_incarnation": vm_uid,
+        "rootdisk_pvc_uid": "rootdisk-pvc-uid",
+        "ssh_host": "192.0.2.44",
+        "ssh_port": 22,
+        "ssh_host_key_fingerprint": "SHA256:" + "A" * 43,
+        "credential_runtime_started": True,
+    }
+    return retirement, current
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("permanent", [False, True])
 async def test_lite_backend_retirement_recovers_through_agent_runtime_zero(
@@ -926,6 +946,68 @@ async def test_lite_backend_retirement_recovers_through_agent_runtime_zero(
         quiescence_actor="orchestrator",
         expected_agent_pod_uid="lite-pod-uid",
         require_zero_admission=True,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["vm", "remote"])
+async def test_non_sandbox_recovery_uses_the_captured_vm_actuator(monkeypatch, backend):
+    """Leader recovery must break the VM receipt/End retry dependency cycle."""
+    from orchestrator.services.vm_provisioner import VMTeardownResult
+
+    retirement, current = _vm_retirement(backend=backend)
+    db, provisioner = _lite_recovery_mocks(current)
+    vm_provisioner = MagicMock(lifecycle_available=True)
+    vm_provisioner.release_vm_captured = AsyncMock(
+        return_value=VMTeardownResult("completed", True)
+    )
+    original_wait = main._wait_for_captured_agent_pod_retired
+
+    async def immediate_observation(*args, **kwargs):
+        return await original_wait(*args, **kwargs, timeout_s=0)
+
+    monkeypatch.setattr(
+        main, "_wait_for_captured_agent_pod_retired", immediate_observation
+    )
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "agent_provisioner", provisioner),
+        patch.object(main, "vm_provisioner", vm_provisioner),
+    ):
+        assert await main._recover_captured_sandbox_process_zero(retirement)
+
+    provisioner.delete_agent_pod_exact.assert_awaited_once_with(
+        "persistent-lite", expected_pod_uid="lite-pod-uid", namespace="agents-a"
+    )
+    vm_provisioner.release_vm_captured.assert_awaited_once()
+    call = vm_provisioner.release_vm_captured.await_args
+    assert call.args[0] == retirement["context"]["thread_id"]
+    assert (
+        call.args[1].provision_generation
+        == retirement["context"]["vm"]["provision_generation"]
+    )
+    assert call.args[1].vm_uid == retirement["context"]["vm"]["vm_uid"]
+    assert call.args[1].rootdisk_pvc_uid == "rootdisk-pvc-uid"
+    assert call.kwargs == {
+        "ssh_host": "192.0.2.44",
+        "ssh_port": 22,
+        "purge_disk": True,
+        "entity_type": "thread",
+        "capture_snapshot": False,
+    }
+    db.acknowledge_pinned_thread_local_quiescence.assert_awaited_once_with(
+        retirement["context"]["thread_id"],
+        expected_runtime_generation=retirement["generation"],
+        expected_retirement_token=retirement["token"],
+        expected_agent_id=retirement["context"]["agent_id"],
+        expected_attach_token=retirement["context"]["runtime_attach_token"],
+        expected_settle_status="ended",
+        expected_quiescence_protocol="workspace_actuator_zero_v1",
+        expected_workspace_generation=retirement["context"]["vm"][
+            "provision_generation"
+        ],
+        expected_workspace_runtime_incarnation=retirement["context"]["vm"]["vm_uid"],
+        quiescence_actor="orchestrator",
     )
 
 

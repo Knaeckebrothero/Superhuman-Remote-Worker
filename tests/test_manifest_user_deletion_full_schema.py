@@ -3,6 +3,7 @@
 from copy import deepcopy
 import json
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
 from fastapi import HTTPException
@@ -226,6 +227,63 @@ async def test_personal_default_project_can_be_removed_after_account_deletion(da
         )
         == 1
     )
+
+
+@pytest.mark.asyncio
+async def test_project_delete_ignores_only_settled_ownerless_session_history(
+    database, monkeypatch
+):
+    """A real End plus account retirement leaves history, not resumable work."""
+    import orchestrator.main as main
+
+    user, project = await owner(database, "Settled session owner")
+    thread_id = await database.create_thread(
+        user_id=str(user["id"]),
+        project_id=str(project["id"]),
+        authority_user_id=str(user["id"]),
+        authority_project_ids=[str(project["id"])],
+        execution_lane="pinned",
+        initial_metadata={"config_override": {"workspace": {"backend": "none"}}},
+    )
+    thread = await database.get_thread(thread_id)
+    monkeypatch.setattr(main, "postgres_db", database)
+    monkeypatch.setattr(main, "_conclude_conference_if_any", AsyncMock())
+    monkeypatch.setattr(main, "snapshot_service", SimpleNamespace(is_available=False))
+    monkeypatch.setattr(main, "gitea_client", SimpleNamespace(is_initialized=False))
+
+    assert await main._end_thread_flow(
+        thread_id, thread, permanent=False, force=True
+    ) == {"status": "ended"}
+    ended = await database.get_thread(thread_id)
+    assert ended["status"] == "ended"
+    assert ended["runtime_retirement_token"] is None
+    execution = await ManifestStore(database).execution("Session", thread_id)
+    assert execution["project_ids"] == [project["id"]]
+    assert (
+        await database.fetchval(
+            "SELECT count(*) FROM srw_execution_attempts WHERE execution_id=$1",
+            execution["id"],
+        )
+        == 0
+    )
+    assert (
+        await database.fetchval(
+            "SELECT count(*) FROM srw_workspace_instances WHERE execution_id=$1",
+            execution["id"],
+        )
+        == 0
+    )
+
+    assert await database.delete_user(str(user["id"])) is True
+    assert (await database.get_thread(thread_id))["user_id"] is None
+    assert (await ManifestStore(database).execution("Session", thread_id))[
+        "owner_id"
+    ] is None
+
+    assert await database.delete_project(str(project["id"])) is True
+    assert await database.get_project(str(project["id"])) is None
+    assert await database.get_thread(thread_id) is not None
+    assert await ManifestStore(database).execution("Session", thread_id) is not None
 
 
 @pytest.mark.asyncio
