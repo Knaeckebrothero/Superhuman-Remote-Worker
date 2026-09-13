@@ -1462,6 +1462,10 @@ def _prepared_workspace_tool_call(
                 "printf 'SRW_PREPARED_PASS:%s\\n' " + shlex.quote(run_id),
             ]
         )
+        if "-job-sudo-" in run_id:
+            # Keep sudo as the first word to exercise the harness gate. This
+            # only queries the installed version; it runs no privileged command.
+            command = "sudo --version >/dev/null && (\n" + command + "\n)"
         return ToolCallSpec(
             name="run_command",
             arguments=json.dumps(

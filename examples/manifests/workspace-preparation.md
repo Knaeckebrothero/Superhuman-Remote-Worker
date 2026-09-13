@@ -38,6 +38,12 @@ Starting the SRW harness preserves initialized files and existing working trees.
 An existing delivery repository must match the requested remote; a different
 remote is rejected without clearing the workspace.
 
+The SRW adapter carries the workspace's sudo decision into the admitted harness
+configuration: VM commands reach the guest's sudo gate, and a denied sandbox
+upgrade remains blocked. The preparation acceptance script's `--sudo-version`
+option tests this delivery with a top-level version query in every successful VM
+Job; it executes no privileged command.
+
 ## Policies
 
 | Setting | Behavior |

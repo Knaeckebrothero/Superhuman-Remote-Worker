@@ -87,6 +87,18 @@ def apply_srw_delivery_bindings(
     for key in ("workspace", "tools"):
         if isinstance((override or {}).get(key), dict):
             transient[key] = deepcopy(override[key])
+    # Workspace delivery selects the sudo gate too: VM commands reach the
+    # guest's gate, while a denied sandbox upgrade must remain blocked. Other
+    # private shell settings still come exclusively from the admitted snapshot.
+    shell = (override or {}).get("shell")
+    if isinstance(shell, dict):
+        sudo = {
+            key: deepcopy(shell[key])
+            for key in ("sudo_action", "sudo_block_message")
+            if key in shell
+        }
+        if sudo:
+            transient["shell"] = sudo
     result = deepcopy(blob)
     result["agent"] = deep_merge(result["agent"], transient)
     checked = deep_merge(deepcopy(policy), transient)

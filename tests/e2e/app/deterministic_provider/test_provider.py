@@ -537,10 +537,15 @@ async def test_worker_job_scenario_completes_without_any_off_pod_tool(
 
 @pytest.mark.parametrize("retained", [False, True])
 @pytest.mark.parametrize("proof", ["valid", "wrong-run", "failed-command", "absent"])
+@pytest.mark.parametrize("sudo_version", [False, True])
 async def test_prepared_workspace_scenario_requires_successful_correlated_shell_proof(
-    control, inference, tmp_path, retained, proof
+    control, inference, tmp_path, retained, proof, sudo_version
 ):
-    run_id = "prepared-workspace-" + ("reuse" if retained else "fresh")
+    run_id = (
+        "prepared-workspace-"
+        + ("job-sudo-" if sudo_version else "")
+        + ("reuse" if retained else "fresh")
+    )
     await arm(control, run_id, scenario="prepared-workspace-job", required_responses=1)
     tools = [
         {
@@ -563,10 +568,15 @@ async def test_prepared_workspace_scenario_requires_successful_correlated_shell_
     function = response.json()["choices"][0]["message"]["tool_calls"][0]["function"]
     assert function["name"] == "run_command"
     arguments = json.loads(function["arguments"])
+    assert arguments["command"].startswith("sudo --version ") is sudo_version
 
     tool = tmp_path / "srw-cache-check"
     tool.write_text("#!/bin/sh\nprintf '%s\\n' srw-prepared-tool-v1\n")
     tool.chmod(0o755)
+    if sudo_version:
+        sudo = tmp_path / "sudo"
+        sudo.write_text('#!/bin/sh\ntest "$#" -eq 1 && test "$1" = --version\n')
+        sudo.chmod(0o755)
     (tmp_path / ".srw-initialize-count").write_text("initialized\n")
     if retained:
         (tmp_path / ".srw-execution-marker").write_text("previous-job\n")

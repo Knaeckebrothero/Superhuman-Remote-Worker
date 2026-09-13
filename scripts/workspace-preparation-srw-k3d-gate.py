@@ -274,10 +274,13 @@ def preparation_recipe(prefix, base_image, *, retention="Delete", online_package
 
 
 class PreparedSmoke(smoke_module.Smoke):
-    def __init__(self, *args, base_image, online_package=False, **kwargs):
+    def __init__(
+        self, *args, base_image, online_package=False, sudo_version=False, **kwargs
+    ):
         super().__init__(*args, **kwargs)
         self.base_image = base_image
         self.online_package = online_package
+        self.sudo_version = sudo_version
         self.token = None
         self.cache_uids = set()
         self.instance_uids = set()
@@ -365,7 +368,7 @@ asyncio.run(run())
 
     def exercise(self, case, *, binding=None, retention="Delete"):
         self.evidence["stage"] = "job-" + case
-        run_id = self.prefix + "job-" + case
+        run_id = self.prefix + "job-" + ("sudo-" if self.sudo_version else "") + case
         self.fixture.arm(run_id, "prepared-workspace-job", 100)
         worker = smoke_module.authored_expert(self.prefix, self.image, self.model)
         worker["spec"]["runtime"]["config"]["config"]["tools"]["shell"] = [
@@ -753,6 +756,11 @@ def main(argv=None):
         help="Install Ubuntu's hello package during preparation and require it in every guest shell proof",
     )
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--sudo-version",
+        action="store_true",
+        help="Require a top-level sudo version query in each VM shell proof; no privileged command is executed",
+    )
     args = parser.parse_args(argv)
     require(
         image_reference(args.base_image)[2].startswith("sha256:"),
@@ -768,6 +776,7 @@ def main(argv=None):
         "baseImage": args.base_image,
         "provider": "deterministic fixture; real SRW harness and SSH tools",
         "onlinePackage": "hello" if args.online_package else None,
+        "sudoVersionQuery": args.sudo_version,
     }
     admin = fixture = smoke = None
     with httpx.Client(
@@ -820,6 +829,7 @@ def main(argv=None):
                 admin,
                 base_image=args.base_image,
                 online_package=args.online_package,
+                sudo_version=args.sudo_version,
             )
             smoke.gate.login()
             fixture.create(fixture_image)
