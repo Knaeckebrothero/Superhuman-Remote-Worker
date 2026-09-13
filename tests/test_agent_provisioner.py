@@ -276,6 +276,33 @@ async def test_pinned_session_recipient_accepts_only_protected_warm_pool_pod():
     )
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="warm authority does not yet recognize its exact routed label shape",
+)
+@pytest.mark.asyncio
+async def test_pinned_session_recipient_accepts_protected_routed_warm_pool_pod():
+    provisioner, _ = _make_provisioner()
+    generation = "22222222-2222-4222-8222-222222222222"
+    thread_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    provisioner._core_api.read_namespaced_pod.return_value = _ready_recipient_pod(
+        purpose="session",
+        thread_id=thread_id,
+        runtime_generation=generation,
+        finalizers=[PINNED_AUTHORITY_FINALIZER],
+    )
+
+    assert await provisioner.attest_pinned_session_recipient(
+        "agent-a",
+        thread_id=thread_id,
+        expected_runtime_generation=generation,
+        expected_pod_uid="pod-a",
+        expected_pod_ip="10.42.0.17",
+        authority_kind="warm_pool",
+        namespace="test-ns",
+    )
+
+
 @pytest.mark.asyncio
 async def test_pinned_session_recipient_never_crosses_authority_shapes():
     provisioner, _ = _make_provisioner()
