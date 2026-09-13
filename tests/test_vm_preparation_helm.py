@@ -13,6 +13,32 @@ ENABLED = (
 )
 
 
+@pytest.mark.parametrize("enabled", ["true", "false"])
+def test_orchestrator_receives_every_preparation_admission_setting(enabled):
+    docs = render(*ENABLED, "vmController.preparation.enabled=" + enabled)
+    config = next(
+        d
+        for d in docs
+        if d["kind"] == "ConfigMap" and "VM_PREPARATION_ENABLED" in d.get("data", {})
+    )
+    orchestrator = next(
+        d
+        for d in docs
+        if d["kind"] == "Deployment" and d["metadata"]["name"].endswith("-orchestrator")
+    )
+    env = {
+        item["name"]: item
+        for item in orchestrator["spec"]["template"]["spec"]["containers"][0]["env"]
+    }
+    for key in config["data"]:
+        if key.startswith("VM_PREPARATION_"):
+            assert env[key]["valueFrom"]["configMapKeyRef"] == {
+                "name": config["metadata"]["name"],
+                "key": key,
+            }
+    assert config["data"]["VM_PREPARATION_ENABLED"] == enabled
+
+
 def test_preparation_capability_map_matches_controller_and_only_builder_gets_egress_policy():
     docs = render(*ENABLED)
     config = next(

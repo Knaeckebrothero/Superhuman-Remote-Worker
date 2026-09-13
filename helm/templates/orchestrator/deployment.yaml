@@ -1324,6 +1324,14 @@ spec:
                   name: {{ include "srw.configMapName" . }}
                   key: VM_PERSISTENT_ROOTDISK
                   optional: true
+            # Admission must see the same capabilities as the VM controller.
+            {{- range $key, $_ := (include "srw.vmPreparationEnvironment" . | fromYaml) }}
+            - name: {{ $key }}
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" $ }}
+                  key: {{ $key }}
+            {{- end }}
             # Workspace containers
             - name: WORKSPACE_IMAGE
               valueFrom:
