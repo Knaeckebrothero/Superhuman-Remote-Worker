@@ -100,9 +100,8 @@ def test_allowed_runtime_and_lightweight_dependencies_pass(boundary_tree):
     result = lint_boundaries(boundary_tree)
     assert result.returncode == 0, result.stdout + result.stderr
     # The generic manifest path also excludes the legacy harness adapter.
-    # 23 since R1.B08 added its contract over completion, verification,
-    # delegation and recovery modules.
-    assert "Contracts: 23 kept, 0 broken" in result.stdout
+    # 24 since R1.B09 added its contract over control, delivery and retirement.
+    assert "Contracts: 24 kept, 0 broken" in result.stdout
 
 
 @pytest.mark.parametrize(
@@ -136,6 +135,15 @@ def test_allowed_runtime_and_lightweight_dependencies_pass(boundary_tree):
         ("orchestrator/services/job_queries.py", "orchestrator.main"),
         ("orchestrator/services/job_projection.py", "orchestrator.main"),
         ("orchestrator/services/job_reads.py", "orchestrator.main"),
+        ("orchestrator/routers/bench.py", "orchestrator.main"),
+        ("orchestrator/routers/job_controls.py", "orchestrator.main"),
+        ("orchestrator/routers/thread_lifecycle.py", "orchestrator.main"),
+        ("orchestrator/services/job_controls.py", "orchestrator.main"),
+        (
+            "orchestrator/services/manifest_execution_retirement.py",
+            "orchestrator.main",
+        ),
+        ("orchestrator/services/pinned_retirement.py", "orchestrator.main"),
         ("orchestrator/services/preference_defaults.py", "orchestrator.main"),
         ("orchestrator/services/session_workspace_policy.py", "orchestrator.main"),
         ("orchestrator/schemas/job_create.py", "orchestrator.main"),

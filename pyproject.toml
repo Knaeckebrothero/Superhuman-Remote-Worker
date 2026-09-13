@@ -520,6 +520,36 @@ ignore_imports = [
 unmatched_ignore_imports_alerting = "warn"
 
 [[tool.importlinter.contracts]]
+name = "Job and thread controls assignment delivery and retirement do not import application startup"
+type = "forbidden"
+source_modules = [
+    "orchestrator.routers.bench",
+    "orchestrator.routers.job_assignment",
+    "orchestrator.routers.job_controls",
+    "orchestrator.routers.job_lifecycle",
+    "orchestrator.routers.thread_lifecycle",
+    "orchestrator.schemas.job_controls",
+    "orchestrator.schemas.thread_lifecycle",
+    "orchestrator.services.bench",
+    "orchestrator.services.job_assignment",
+    "orchestrator.services.job_control_delivery",
+    "orchestrator.services.job_controls",
+    "orchestrator.services.job_mutation_controls",
+    "orchestrator.services.job_mutation_target",
+    "orchestrator.services.manifest_execution_retirement",
+    "orchestrator.services.pinned_retirement",
+    "orchestrator.services.thread_resume",
+    "orchestrator.services.thread_retirement",
+]
+forbidden_modules = ["orchestrator.main"]
+ignore_imports = [
+    # B10 owns the one remaining lazy lookup reached through the shared
+    # authorization/session-wake chain. Every other indirect path remains gated.
+    "orchestrator.services.session_wake -> orchestrator.main",
+]
+unmatched_ignore_imports_alerting = "warn"
+
+[[tool.importlinter.contracts]]
 name = "MCP and VM controller do not depend on shared runtime"
 type = "forbidden"
 source_modules = ["mcp_server", "vm_controller"]
