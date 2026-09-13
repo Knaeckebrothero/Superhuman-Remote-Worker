@@ -234,6 +234,47 @@ async def test_personal_default_project_can_be_removed_after_account_deletion(da
     )
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="project-owned native KB creator provenance blocks account deletion",
+)
+@pytest.mark.asyncio
+async def test_account_deletion_detaches_native_project_kb_creator(database):
+    """A synthetic project connector outlives its departing creator."""
+
+    user, project = await owner(database, "Native KB creator")
+    datasource_id = uuid4()
+    await database.execute(
+        "INSERT INTO datasources "
+        "(id,name,type,created_by,project_id,scope_mode,config) "
+        "VALUES ($1,'Project knowledge','kb',$2,$3::uuid,'projects',"
+        "jsonb_build_object('native_project_id',$3::uuid::text))",
+        datasource_id,
+        user["id"],
+        project["id"],
+    )
+    await database.execute(
+        "INSERT INTO project_datasources (project_id,datasource_id,read_only) "
+        "VALUES ($1,$2,true)",
+        project["id"],
+        datasource_id,
+    )
+
+    assert await database.delete_user(str(user["id"])) is True
+    connector = await database.fetchrow(
+        "SELECT created_by,project_id FROM datasources WHERE id=$1",
+        datasource_id,
+    )
+    assert dict(connector) == {"created_by": None, "project_id": project["id"]}
+    assert await database.delete_project(str(project["id"])) is True
+    assert (
+        await database.fetchval(
+            "SELECT count(*) FROM datasources WHERE id=$1", datasource_id
+        )
+        == 0
+    )
+
+
 @pytest.mark.asyncio
 async def test_project_delete_ignores_only_settled_ownerless_session_history(
     database, monkeypatch
