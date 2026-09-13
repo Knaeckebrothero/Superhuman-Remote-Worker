@@ -184,10 +184,6 @@ async def test_legacy_adoption_refuses_ambiguous_namespace_before_any_patch():
     assert patch_calls == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="warm release does not yet settle an exact terminal deleting Pod",
-)
 @pytest.mark.asyncio
 async def test_warm_release_removes_finalizer_from_exact_terminal_deleting_pod():
     class NotFound(Exception):
@@ -219,9 +215,7 @@ async def test_warm_release_removes_finalizer_from_exact_terminal_deleting_pod()
                 raise NotFound()
             return self.pod
 
-        def patch_namespaced_pod(
-            self, *, name, namespace, body, _request_timeout=None
-        ):
+        def patch_namespaced_pod(self, *, name, namespace, body, _request_timeout=None):
             del name, namespace, _request_timeout
             assert body[-1] == {
                 "op": "replace",

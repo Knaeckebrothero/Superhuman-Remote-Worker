@@ -6095,9 +6095,16 @@ async def test_warm_attach_patch_response_loss_binds_exact_marker(db, monkeypatc
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("pod_already_absent", [False, True])
+@pytest.mark.parametrize(
+    "pod_already_absent,route_relabelled",
+    [
+        pytest.param(False, False, id="terminal-warm-labels"),
+        pytest.param(True, False, id="already-absent"),
+        pytest.param(False, True, id="terminal-routed-session-labels"),
+    ],
+)
 async def test_never_delivered_warm_attach_soft_end_releases_exact_authority(
-    db, monkeypatch, pod_already_absent
+    db, monkeypatch, pod_already_absent, route_relabelled
 ):
     import orchestrator.main as orch_main
 
@@ -6123,6 +6130,16 @@ async def test_never_delivered_warm_attach_soft_end_releases_exact_authority(
         expected_runtime_generation=ids["runtime_generation"],
     )
     assert reserved.bound
+    if route_relabelled:
+        # Session route publication keeps the protected UID but gives the warm
+        # Pod its exact thread/generation selector identity.
+        api.pods[("agents-a", ids["pod_name"])].metadata.labels.update(
+            {
+                "srw/purpose": "session",
+                "srw.io/thread-id": ids["thread"],
+                "srw.io/runtime-generation": ids["runtime_generation"],
+            }
+        )
     virtual_binding = await db.bind_thread_workspace_backing(
         ids["thread"],
         backing_kind="virtual",
