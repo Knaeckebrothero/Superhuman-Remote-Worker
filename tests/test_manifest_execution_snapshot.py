@@ -1001,7 +1001,7 @@ async def test_resume_preflight_checks_frozen_policy_without_live_expert(monkeyp
     db = SimpleNamespace(fetchrow=AsyncMock(return_value=frozen))
     check = AsyncMock(side_effect=main.GrantDenied(["revoked model grant"]))
     monkeypatch.setattr(main, "postgres_db", db)
-    monkeypatch.setattr(main, "_guard_completion_control", AsyncMock())
+    monkeypatch.setattr(main._completion_control_boundary, "guard", AsyncMock())
     monkeypatch.setattr(main, "_user_experts_enabled", AsyncMock(return_value=True))
     monkeypatch.setattr(main, "_enforce_dispatch_grants", check)
     monkeypatch.setattr(

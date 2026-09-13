@@ -182,9 +182,9 @@ async def test_flag_off_guard_never_builds_completion_service():
     getter = MagicMock()
     with (
         patch.object(main, "COMPLETION_COMMANDS_ENABLED", False),
-        patch.object(main, "_get_completion_control", getter),
+        patch.object(main._completion_runtime, "control", getter),
     ):
-        await main._guard_completion_control(str(uuid4()), source="test")
+        await main._completion_control_boundary.guard(str(uuid4()), source="test")
     getter.assert_not_called()
 
 
@@ -210,7 +210,7 @@ async def test_public_control_endpoints_return_exact_409_before_mutation(
     db.queue_stateless_job_for_resume = AsyncMock()
     with (
         patch.object(main, auth_name, authorized),
-        patch.object(main, "_guard_completion_control", guard),
+        patch.object(main._completion_control_boundary, "guard", guard),
         patch.object(main, "postgres_db", db),
     ):
         with pytest.raises(HTTPException) as exc:
@@ -251,7 +251,7 @@ async def test_blocking_reply_internal_resume_guard_precedes_queue_mutation():
     guard = AsyncMock(side_effect=HTTPException(409, "completion finalizing"))
     with (
         patch.object(main, "postgres_db", db),
-        patch.object(main, "_guard_completion_control", guard),
+        patch.object(main._completion_control_boundary, "guard", guard),
     ):
         with pytest.raises(HTTPException) as exc:
             await main._internal_resume_job(job_id, "reply")
@@ -281,7 +281,7 @@ async def test_flag_on_pinned_resume_queues_without_agent_selection_or_post():
             "require_internal_or_job_access",
             AsyncMock(return_value=({}, job)),
         ),
-        patch.object(main, "_guard_completion_control", AsyncMock()),
+        patch.object(main._completion_control_boundary, "guard", AsyncMock()),
         patch.object(main, "_user_experts_enabled", AsyncMock(return_value=False)),
         patch.object(main, "_resume_missing_workspace", return_value=None),
         patch.object(main, "postgres_db", db),

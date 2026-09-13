@@ -104,7 +104,12 @@ def wire(monkeypatch):
     monkeypatch.setattr(main, "_datasource_defaults_on_omission", lambda: False)
     monkeypatch.setattr(main, "_enforce_job_create_grants", AsyncMock())
     monkeypatch.setattr(main, "STATELESS_WORKER_DEFAULT_ENABLED", False)
-    monkeypatch.setattr(main, "_spawn_scholar_subjob", AsyncMock(return_value=None))
+    scholar = AsyncMock(return_value=None)
+    monkeypatch.setattr(
+        main.subjob_completion_operations,
+        "spawn_scholar_subjob",
+        scholar,
+    )
     monkeypatch.setattr(main, "_trigger_dispatch", dispatch)
     monkeypatch.setattr(
         "orchestrator.services.datasource_policy.default_datasource_selection", defaults
@@ -124,6 +129,7 @@ def wire(monkeypatch):
         authorize=authorize,
         expert=expert,
         provision=provision,
+        scholar=scholar,
         dispatch=dispatch,
         enforce_grants=enforce_grants,
     )
@@ -1573,7 +1579,7 @@ async def test_normal_provisioning_failure_leaves_insert_but_does_not_dispatch(w
     assert response.json() == {"detail": "fixture provisioning failure"}
     wire.db.create_job.assert_awaited_once()
     wire.provision.assert_awaited_once()
-    main._spawn_scholar_subjob.assert_not_awaited()
+    wire.scholar.assert_not_awaited()
     wire.dispatch.assert_not_called()
 
 
@@ -1600,7 +1606,7 @@ async def test_inactive_officer_preflight_is_returned_without_scholar_or_normal_
     }
     wire.officer.admit.assert_awaited_once()
     wire.officer.preflight.assert_awaited_once()
-    main._spawn_scholar_subjob.assert_not_awaited()
+    wire.scholar.assert_not_awaited()
     wire.provision.assert_not_awaited()
     wire.dispatch.assert_not_called()
 

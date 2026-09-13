@@ -1138,8 +1138,8 @@ async def _reply(*args, **kwargs):
 
     Call inside the patch scope: ``main._inbound_reply_dependencies()`` binds
     ``postgres_db``, ``notification_service``, ``_internal_resume_job``,
-    ``_guard_completion_control`` and ``_completion_dispatch_guard_kwargs`` at
-    call time, so those patches keep steering the code under test.
+    the completion-control boundary at call time, so those patches keep
+    steering the code under test.
     """
     return await inbound_reply_svc.route_inbound_reply(
         *args, **kwargs, dependencies=main._inbound_reply_dependencies()

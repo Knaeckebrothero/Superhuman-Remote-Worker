@@ -110,8 +110,8 @@ def _route_inbound_reply(om, *args, **kwargs):
     """Drive the extracted reply funnel with the application's collaborators.
 
     ``main._inbound_reply_dependencies()`` binds ``main.postgres_db``,
-    ``main.notification_service``, ``main._guard_completion_control``,
-    ``main._completion_dispatch_guard_kwargs`` and ``main._internal_resume_job``
+    ``main.notification_service``, the completion-control boundary, and
+    ``main._internal_resume_job``
     at call time, so building it inside the patch scope keeps every patch below
     steering the code under test.
     """
@@ -143,7 +143,7 @@ class TestUrgentReplyRoutesToGuidance:
         )
         with (
             patch.object(om, "postgres_db", db),
-            patch.object(om, "_guard_completion_control", guard),
+            patch.object(om._completion_control_boundary, "guard", guard),
             pytest.raises(HTTPException) as exc,
         ):
             await _route_inbound_reply(
@@ -167,7 +167,7 @@ class TestUrgentReplyRoutesToGuidance:
         guard = AsyncMock()
         with (
             patch.object(om, "postgres_db", db),
-            patch.object(om, "_guard_completion_control", guard),
+            patch.object(om._completion_control_boundary, "guard", guard),
             patch.object(om, "_internal_resume_job", resume),
             pytest.raises(HTTPException) as exc,
         ):
@@ -190,7 +190,7 @@ class TestUrgentReplyRoutesToGuidance:
         with (
             patch.object(om, "COMPLETION_COMMANDS_ENABLED", True),
             patch.object(om, "postgres_db", db),
-            patch.object(om, "_guard_completion_control", guard),
+            patch.object(om._completion_control_boundary, "guard", guard),
             pytest.raises(HTTPException) as exc,
         ):
             await _route_inbound_reply(

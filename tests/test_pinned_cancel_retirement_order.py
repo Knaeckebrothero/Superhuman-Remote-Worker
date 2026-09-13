@@ -33,7 +33,11 @@ def _bind_runtime(monkeypatch, store, enabled):
 
     monkeypatch.setattr(main, "postgres_db", store)
     monkeypatch.setattr(main, "COMPLETION_COMMANDS_ENABLED", enabled)
-    monkeypatch.setattr(main, "_handle_scholar_completion", AsyncMock())
+    monkeypatch.setattr(
+        main.subjob_completion_operations,
+        "handle_scholar_completion",
+        AsyncMock(),
+    )
     monkeypatch.setattr(main, "maybe_wake_session", AsyncMock())
     monkeypatch.setattr(main, "_kick_session_wake_drain", Mock())
     monkeypatch.setattr(main, "_trigger_dispatch", Mock())

@@ -56,7 +56,7 @@ def test_orchestrator_images_smoke_import_always_on_drain() -> None:
 
 
 def test_drain_singleton_wires_app_vector_and_fresh_resolver() -> None:
-    orchestrator.main._session_memory_effect_drain_instance = None
+    orchestrator.main._session_memory_runtime.reset()
     executor_instance = object()
     drain_instance = object()
     with (
@@ -69,18 +69,18 @@ def test_drain_singleton_wires_app_vector_and_fresh_resolver() -> None:
             return_value=drain_instance,
         ) as drain_cls,
     ):
-        first = orchestrator.main._get_session_memory_effect_drain()
-        second = orchestrator.main._get_session_memory_effect_drain()
+        first = orchestrator.main._session_memory_runtime.drain()
+        second = orchestrator.main._session_memory_runtime.drain()
 
     assert first is drain_instance
     assert second is drain_instance
     executor_cls.assert_called_once_with(
         orchestrator.main.postgres_db,
         orchestrator.main.vector_db,
-        orchestrator.main._resolve_session_memory_effect_config,
+        orchestrator.main._session_memory_runtime.resolve_effect_config,
     )
     drain_cls.assert_called_once_with(orchestrator.main.postgres_db, executor_instance)
-    orchestrator.main._session_memory_effect_drain_instance = None
+    orchestrator.main._session_memory_runtime.reset()
 
 
 @pytest.mark.asyncio
@@ -112,7 +112,7 @@ async def test_config_resolver_reauthorizes_captured_project_without_redirect() 
             AsyncMock(return_value=resolved),
         ) as session_resolve,
     ):
-        result = await orchestrator.main._resolve_session_memory_effect_config(
+        result = await orchestrator.main._session_memory_runtime.resolve_effect_config(
             thread, "project", PROJECT_ID
         )
 
@@ -135,7 +135,7 @@ async def test_config_resolver_missing_captured_project_is_retryable() -> None:
         ) as resolve,
     ):
         with pytest.raises(RuntimeError, match="project no longer exists"):
-            await orchestrator.main._resolve_session_memory_effect_config(
+            await orchestrator.main._session_memory_runtime.resolve_effect_config(
                 {"id": THREAD_ID, "metadata": {}}, "project", PROJECT_ID
             )
 
@@ -159,7 +159,7 @@ async def test_config_resolver_project_scope_requires_thread_owner() -> None:
         ) as resolve,
     ):
         with pytest.raises(RuntimeError, match="requires an owning user"):
-            await orchestrator.main._resolve_session_memory_effect_config(
+            await orchestrator.main._session_memory_runtime.resolve_effect_config(
                 {"id": THREAD_ID, "user_id": None, "metadata": {}},
                 "project",
                 PROJECT_ID,
