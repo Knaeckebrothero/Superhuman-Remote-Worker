@@ -15,6 +15,7 @@ from orchestrator.database.postgres import (
     OrphanRecoveryBatch,
     RecoveredJob,
 )
+from orchestrator.services.pinned_retirement import PinnedRetirementOperations
 
 
 def _mock_db(shutdown_event: asyncio.Event, stall_return: int = 0):
@@ -264,21 +265,23 @@ def test_virtual_binding_agent_zero_requires_exact_nonphysical_shape(
         "ssh_host_key_fingerprint": None,
         **binding_patch,
     }
-    assert not main._captured_virtual_binding_agent_zero_only(
+    assert not main._pinned_retirement_operations().captured_virtual_binding_agent_zero_only(
         context, workspace, binding
     )
 
 
 def test_virtual_binding_agent_zero_accepts_exact_project_cloud_shape():
-    assert main._captured_virtual_binding_agent_zero_only(
-        {"workspace_backend": "virtual"},
-        {},
-        {
-            "generation": "66666666-6666-4666-8666-666666666666",
-            "kind": "virtual",
-            "backing_id": f"rclone:{'a' * 64}",
-            "ssh_host_key_fingerprint": None,
-        },
+    assert (
+        main._pinned_retirement_operations().captured_virtual_binding_agent_zero_only(
+            {"workspace_backend": "virtual"},
+            {},
+            {
+                "generation": "66666666-6666-4666-8666-666666666666",
+                "kind": "virtual",
+                "backing_id": f"rclone:{'a' * 64}",
+                "ssh_host_key_fingerprint": None,
+            },
+        )
     )
 
 
@@ -303,16 +306,24 @@ async def test_captured_agent_stop_retries_after_exact_pod_disappeared(
         side_effect=[first_authority, "exact_absent"]
     )
     provisioner.release_agent_pod_finalizer_exact = AsyncMock(return_value=True)
-    original_wait = main._wait_for_captured_agent_pod_retired
 
-    async def immediate_observation(*args, **kwargs):
-        return await original_wait(*args, **kwargs, timeout_s=0)
+    async def immediate_observation(
+        _self, pod_name, pod_uid, *, namespace, allowed, **_kwargs
+    ):
+        state = await provisioner.agent_pod_authority(
+            pod_name, expected_pod_uid=pod_uid, namespace=namespace
+        )
+        return state if state in allowed else None
 
     monkeypatch.setattr(main, "agent_provisioner", provisioner)
     monkeypatch.setattr(
-        main, "_wait_for_captured_agent_pod_retired", immediate_observation
+        PinnedRetirementOperations,
+        "_wait_for_captured_agent_pod_retired",
+        immediate_observation,
     )
-    await main._stop_captured_retirement_agent(retirement)
+    await main._pinned_retirement_operations().stop_captured_retirement_agent(
+        retirement
+    )
     provisioner.delete_agent_pod_exact.assert_awaited_once_with(
         "captured-agent",
         expected_pod_uid="captured-uid",
@@ -348,17 +359,25 @@ async def test_captured_agent_stop_refuses_unproven_initial_absence(
     provisioner.delete_agent_pod_exact = AsyncMock(return_value=True)
     provisioner.agent_pod_authority = AsyncMock(return_value=authority)
     provisioner.release_agent_pod_finalizer_exact = AsyncMock(return_value=True)
-    original_wait = main._wait_for_captured_agent_pod_retired
 
-    async def immediate_observation(*args, **kwargs):
-        return await original_wait(*args, **kwargs, timeout_s=0)
+    async def immediate_observation(
+        _self, pod_name, pod_uid, *, namespace, allowed, **_kwargs
+    ):
+        state = await provisioner.agent_pod_authority(
+            pod_name, expected_pod_uid=pod_uid, namespace=namespace
+        )
+        return state if state in allowed else None
 
     monkeypatch.setattr(main, "agent_provisioner", provisioner)
     monkeypatch.setattr(
-        main, "_wait_for_captured_agent_pod_retired", immediate_observation
+        PinnedRetirementOperations,
+        "_wait_for_captured_agent_pod_retired",
+        immediate_observation,
     )
     with pytest.raises(RuntimeError, match="exact agent Pod termination is retryable"):
-        await main._stop_captured_retirement_agent(retirement)
+        await main._pinned_retirement_operations().stop_captured_retirement_agent(
+            retirement
+        )
     provisioner.release_agent_pod_finalizer_exact.assert_not_awaited()
 
 
@@ -916,13 +935,19 @@ async def test_lite_backend_retirement_recovers_through_agent_runtime_zero(
     """
     retirement, current = _lite_retirement(permanent=permanent)
     db, provisioner = _lite_recovery_mocks(current)
-    original_wait = main._wait_for_captured_agent_pod_retired
 
-    async def immediate_observation(*args, **kwargs):
-        return await original_wait(*args, **kwargs, timeout_s=0)
+    async def immediate_observation(
+        _self, pod_name, pod_uid, *, namespace, allowed, **_kwargs
+    ):
+        state = await provisioner.agent_pod_authority(
+            pod_name, expected_pod_uid=pod_uid, namespace=namespace
+        )
+        return state if state in allowed else None
 
     monkeypatch.setattr(
-        main, "_wait_for_captured_agent_pod_retired", immediate_observation
+        PinnedRetirementOperations,
+        "_wait_for_captured_agent_pod_retired",
+        immediate_observation,
     )
     with (
         patch.object(main, "postgres_db", db),
@@ -961,13 +986,19 @@ async def test_non_sandbox_recovery_uses_the_captured_vm_actuator(monkeypatch, b
     vm_provisioner.release_vm_captured = AsyncMock(
         return_value=VMTeardownResult("completed", True)
     )
-    original_wait = main._wait_for_captured_agent_pod_retired
 
-    async def immediate_observation(*args, **kwargs):
-        return await original_wait(*args, **kwargs, timeout_s=0)
+    async def immediate_observation(
+        _self, pod_name, pod_uid, *, namespace, allowed, **_kwargs
+    ):
+        state = await provisioner.agent_pod_authority(
+            pod_name, expected_pod_uid=pod_uid, namespace=namespace
+        )
+        return state if state in allowed else None
 
     monkeypatch.setattr(
-        main, "_wait_for_captured_agent_pod_retired", immediate_observation
+        PinnedRetirementOperations,
+        "_wait_for_captured_agent_pod_retired",
+        immediate_observation,
     )
     with (
         patch.object(main, "postgres_db", db),
@@ -1149,13 +1180,19 @@ async def test_recovery_logs_when_the_receipt_is_refused_after_the_pod_stop(
     db, provisioner = _lite_recovery_mocks(current)
     db.acknowledge_pinned_thread_local_quiescence = AsyncMock(return_value=None)
     db.acknowledge_settled_virtual_actor_exit = AsyncMock(return_value=None)
-    original_wait = main._wait_for_captured_agent_pod_retired
 
-    async def immediate_observation(*args, **kwargs):
-        return await original_wait(*args, **kwargs, timeout_s=0)
+    async def immediate_observation(
+        _self, pod_name, pod_uid, *, namespace, allowed, **_kwargs
+    ):
+        state = await provisioner.agent_pod_authority(
+            pod_name, expected_pod_uid=pod_uid, namespace=namespace
+        )
+        return state if state in allowed else None
 
     monkeypatch.setattr(
-        main, "_wait_for_captured_agent_pod_retired", immediate_observation
+        PinnedRetirementOperations,
+        "_wait_for_captured_agent_pod_retired",
+        immediate_observation,
     )
     caplog.set_level(logging.WARNING)
     with (

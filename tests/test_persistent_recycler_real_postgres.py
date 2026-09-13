@@ -47,6 +47,7 @@ from orchestrator.services.pinned_k8s_effect import (
     PINNED_AUTHORITY_FINALIZER,
     PINNED_WARM_PROTECTION_FENCE_ANNOTATION,
 )
+from orchestrator.services.pinned_retirement import PinnedRetirementOperations
 from orchestrator.services.persistent_recycler import (
     PersistentPodObservation,
     PersistentThreadRecycler,
@@ -3251,7 +3252,7 @@ async def test_pre_registration_pod_recovery_refuses_a_late_agent_owner(db):
     ):
         current = await db.get_thread(ids["thread"])
         assert current is not None
-        assert not await orch_main._recover_pre_registration_agent_pod_zero(
+        assert not await orch_main._pinned_retirement_operations().recover_pre_registration_agent_pod_zero(
             retirement, current
         )
 
@@ -3316,7 +3317,7 @@ async def test_pre_registration_pod_recovery_reaps_exact_offline_orphan(db):
     ):
         current = await db.get_thread(ids["thread"])
         assert current is not None
-        assert await orch_main._recover_pre_registration_agent_pod_zero(
+        assert await orch_main._pinned_retirement_operations().recover_pre_registration_agent_pod_zero(
             retirement, current
         )
 
@@ -3425,7 +3426,7 @@ async def test_pre_registration_recovery_proves_physical_workspace_zero(db):
     ):
         current = await db.get_thread(ids["thread"])
         assert current is not None
-        assert await orch_main._recover_pre_registration_agent_pod_zero(
+        assert await orch_main._pinned_retirement_operations().recover_pre_registration_agent_pod_zero(
             retirement, current
         )
 
@@ -6145,13 +6146,19 @@ async def test_never_delivered_warm_attach_soft_end_releases_exact_authority(
             == "exact_absent"
         )
         provisioner.delete_agent_pod_exact = delete_exact
-        original_wait = orch_main._wait_for_captured_agent_pod_retired
 
-        async def immediate_observation(*args, **kwargs):
-            return await original_wait(*args, **kwargs, timeout_s=0)
+        async def immediate_observation(
+            _self, pod_name, pod_uid, *, namespace, allowed, **_kwargs
+        ):
+            state = await provisioner.agent_pod_authority(
+                pod_name, expected_pod_uid=pod_uid, namespace=namespace
+            )
+            return state if state in allowed else None
 
         monkeypatch.setattr(
-            orch_main, "_wait_for_captured_agent_pod_retired", immediate_observation
+            PinnedRetirementOperations,
+            "_wait_for_captured_agent_pod_retired",
+            immediate_observation,
         )
     with (
         patch.object(orch_main, "postgres_db", db),

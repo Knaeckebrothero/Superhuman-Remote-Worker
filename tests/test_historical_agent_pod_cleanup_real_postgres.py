@@ -290,7 +290,7 @@ async def _scenario(
             settle_status="ended",
         )
     k8s.mark_terminal("agents-a", current["pod_name"])
-    await main._stop_captured_retirement_agent(permanent)
+    await main._pinned_retirement_operations().stop_captured_retirement_agent(permanent)
     assert old_pod.metadata.finalizers == [PINNED_AUTHORITY_FINALIZER]
     assert k8s.removed_pods == [current["pod_uid"]]
     return old, current, permanent, k8s, provider

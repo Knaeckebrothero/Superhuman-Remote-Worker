@@ -2456,7 +2456,18 @@ class PinnedRetirementOperations:
     never_delivered_protected_reader_shape = _never_delivered_protected_reader_shape
     revoke_never_delivered_protected_reader = _revoke_never_delivered_protected_reader
     retirement_has_exact_local_quiescence = _retirement_has_exact_local_quiescence
+    wait_for_captured_agent_pod_retired = _wait_for_captured_agent_pod_retired
     captured_retirement_agent_pods = _captured_retirement_agent_pods
+    stop_captured_retirement_agent = _stop_captured_retirement_agent
+    pre_registration_agent_pod_zero_candidate = (
+        _pre_registration_agent_pod_zero_candidate
+    )
+    recover_pre_registration_agent_pod_zero = _recover_pre_registration_agent_pod_zero
+    agent_pod_provision_intent_zero_candidate = (
+        _agent_pod_provision_intent_zero_candidate
+    )
+    recover_agent_pod_provision_intent_zero = _recover_agent_pod_provision_intent_zero
+    captured_virtual_binding_agent_zero_only = _captured_virtual_binding_agent_zero_only
     captured_agent_workspace_claim = _captured_agent_workspace_claim
     reconcile_agent_workspace_claim_for_retirement = (
         _reconcile_agent_workspace_claim_for_retirement
