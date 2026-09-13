@@ -4,6 +4,8 @@ Spec: knowledge-base/knowledge/features/merged_pr_completion_grant.md. Mirrors
 tests/test_public_datasources.py, whose helper this one is modelled on.
 """
 
+from tests import _b09_control_seams as control_seams
+
 from unittest.mock import AsyncMock
 
 import pytest
@@ -329,7 +331,7 @@ class TestUnmergedPrGateReason:
         """No PR record means no grant read and no forge call at all."""
         db = _fake_db()
         with patch("orchestrator.main.postgres_db", db):
-            reason = await orchestrator.main._unmerged_pr_gate_reason(
+            reason = await control_seams.unmerged_pr_gate_reason(
                 _job(pull_request=False), user={"id": OWNER_ID, "is_admin": False}
             )
         assert reason is None
@@ -346,7 +348,7 @@ class TestUnmergedPrGateReason:
                     AsyncMock(return_value="pull request #1 (x/y) is open, not merged"),
                 )
             )
-            reason = await orchestrator.main._unmerged_pr_gate_reason(
+            reason = await control_seams.unmerged_pr_gate_reason(
                 _pending_job(), user={"id": OWNER_ID, "is_admin": False}
             )
         assert reason is None
@@ -361,7 +363,7 @@ class TestUnmergedPrGateReason:
                     AsyncMock(return_value="pull request #1 (x/y) is open, not merged"),
                 )
             )
-            reason = await orchestrator.main._unmerged_pr_gate_reason(
+            reason = await control_seams.unmerged_pr_gate_reason(
                 _pending_job(), user={"id": OWNER_ID, "is_admin": False}
             )
         assert reason is not None
@@ -378,7 +380,7 @@ class TestUnmergedPrGateReason:
                     AsyncMock(return_value="pull request #1 (x/y) is open, not merged"),
                 )
             )
-            await orchestrator.main._unmerged_pr_gate_reason(_pending_job(), user=None)
+            await control_seams.unmerged_pr_gate_reason(_pending_job(), user=None)
         db.get_user.assert_awaited_once_with(OWNER_ID)
         assert db.user_can_complete_unmerged_pr.await_args.args[0]["id"] == OWNER_ID
 
@@ -392,7 +394,7 @@ class TestUnmergedPrGateReason:
                     AsyncMock(return_value="blocked"),
                 )
             )
-            await orchestrator.main._unmerged_pr_gate_reason(
+            await control_seams.unmerged_pr_gate_reason(
                 _pending_job(), user={"id": OWNER_ID, "is_admin": False}
             )
         assert db.user_can_complete_unmerged_pr.await_args.args[1] == PROJECT_ID
@@ -427,7 +429,7 @@ class TestApproveJobGate:
                 )
             )
             with pytest.raises(HTTPException) as excinfo:
-                await orchestrator.main.approve_job(MagicMock(), "job-1", None)
+                await control_seams.approve_job(MagicMock(), "job-1", None)
         assert excinfo.value.status_code == 403
         assert "not merged" in str(excinfo.value.detail)
 
@@ -444,10 +446,13 @@ class TestApproveJobGate:
                 )
             )
             merge_policy = stack.enter_context(
-                patch("orchestrator.main._unmerged_pr_gate_reason", AsyncMock())
+                patch(
+                    "orchestrator.main.job_control_operations.JobControlOperations._unmerged_pr_gate_reason",
+                    AsyncMock(),
+                )
             )
             with pytest.raises(HTTPException) as excinfo:
-                await orchestrator.main.approve_job(MagicMock(), "job-1", None)
+                await control_seams.approve_job(MagicMock(), "job-1", None)
 
         assert excinfo.value.status_code == 409
         assert excinfo.value.detail["code"] == "pr_deliverable_unverified"
@@ -468,12 +473,12 @@ class TestApproveJobGate:
             )
             stack.enter_context(
                 patch(
-                    "orchestrator.main._unmerged_pr_gate_reason",
+                    "orchestrator.main.job_control_operations.JobControlOperations._unmerged_pr_gate_reason",
                     AsyncMock(return_value="pull request #1 is open, not merged"),
                 )
             )
             with pytest.raises(HTTPException) as excinfo:
-                await orchestrator.main.approve_job(MagicMock(), "job-1", None)
+                await control_seams.approve_job(MagicMock(), "job-1", None)
 
         assert excinfo.value.status_code == 403
         assert "not merged" in str(excinfo.value.detail)
@@ -494,7 +499,7 @@ class TestApproveJobGate:
                 )
             )
             with pytest.raises(HTTPException) as excinfo:
-                await orchestrator.main.approve_job(MagicMock(), "job-1", None)
+                await control_seams.approve_job(MagicMock(), "job-1", None)
         # The sentinel fires only if execution reached the completion claim,
         # which is past the gate. What matters is that the refusal is not ours.
         assert excinfo.value.status_code != 403

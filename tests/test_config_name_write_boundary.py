@@ -206,7 +206,8 @@ class TestJobCreateWriteBoundary:
     async def test_hostile_name_is_refused_before_any_insert(
         self, name, user_a, fake_db, fake_request
     ):
-        from orchestrator.main import JobCreate, create_job
+        from orchestrator.main import JobCreate
+        from tests._b09_control_seams import create_job
 
         fake_db.create_job = AsyncMock()
         # No default project: the boundary under test must fire on a plain,
@@ -606,9 +607,17 @@ def _resume_stack(user: dict, db, thread_row: dict) -> ExitStack:
         patch("orchestrator.main.ensure_session_workspace", AsyncMock())
     )
     stack.enter_context(
-        patch("orchestrator.main._thread_config_drift", AsyncMock(return_value=[]))
+        patch(
+            "orchestrator.main.thread_resume_operations.thread_config_drift",
+            AsyncMock(return_value=[]),
+        )
     )
-    stack.enter_context(patch("orchestrator.main._await_late_cloud_setup", AsyncMock()))
+    stack.enter_context(
+        patch(
+            "orchestrator.main.thread_resume_operations.await_late_cloud_setup",
+            AsyncMock(),
+        )
+    )
     stack.enter_context(
         patch(
             "orchestrator.main._await_protected_cloud_runtime_ready",
@@ -633,7 +642,7 @@ class TestResumeReprovisionFailsLoudly:
     async def test_refused_config_name_records_a_failed_state(
         self, user_a, fake_request
     ):
-        from orchestrator.main import resume_thread
+        from tests._b09_control_seams import resume_thread
 
         thread_row = _preparable_thread(
             user_id=str(user_a["id"]),
@@ -672,7 +681,7 @@ class TestResumeReprovisionFailsLoudly:
     async def test_legacy_path_refusal_records_a_failed_state(
         self, user_a, fake_request
     ):
-        from orchestrator.main import resume_thread
+        from tests._b09_control_seams import resume_thread
 
         thread_row = _preparable_thread(
             user_id=str(user_a["id"]),

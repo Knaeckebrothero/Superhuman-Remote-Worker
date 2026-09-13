@@ -8,6 +8,8 @@ disposition, and the live endpoints select the right freeze behavior.
 
 from __future__ import annotations
 
+from tests import _b09_control_seams as control_seams
+
 from tests import b08_completion_helpers as b08_helpers
 
 import dataclasses
@@ -495,10 +497,16 @@ def _patch_completion(stack: ExitStack, db: _EndpointDB) -> None:
         "orchestrator.main.subjob_completion_operations.handle_delegation_child_completion",
         "orchestrator.main.verification_operations.trigger_verification_on_complete",
         "orchestrator.main.project_loop_advance_service.advance_project_loop",
-        "orchestrator.main._archive_and_cleanup_workspace",
         "orchestrator.main.maybe_wake_session",
     ):
         stack.enter_context(patch(target, AsyncMock(return_value=[])))
+    stack.enter_context(
+        patch.object(
+            control_seams,
+            "archive_and_cleanup_workspace",
+            AsyncMock(return_value=[]),
+        )
+    )
     stack.enter_context(
         patch("orchestrator.main._kick_session_wake_drain", MagicMock())
     )
@@ -850,8 +858,9 @@ class TestCompleteJobClassA:
                 )
             )
             stack.enter_context(
-                patch(
-                    "orchestrator.main._capture_workspace_snapshot_for_freeze",
+                patch.object(
+                    control_seams,
+                    "capture_workspace_snapshot_for_freeze",
                     AsyncMock(),
                 )
             )

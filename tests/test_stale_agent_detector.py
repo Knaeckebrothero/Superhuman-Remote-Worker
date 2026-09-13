@@ -435,8 +435,16 @@ async def test_detector_retries_durable_attach_abort_after_request_task_failure(
         with (
             patch.object(main, "_schedule_attach_abort_successor", schedule_from_sweep),
             patch.object(main, "_trigger_dispatch", MagicMock()),
-            patch.object(main, "_release_thread_resources", AsyncMock()),
-            patch.object(main, "_suspend_thread_resources", AsyncMock()),
+            patch.object(
+                main.thread_retirement_operations,
+                "release_thread_resources",
+                AsyncMock(),
+            ),
+            patch.object(
+                main.thread_retirement_operations,
+                "suspend_thread_resources",
+                AsyncMock(),
+            ),
         ):
             await main.stale_agent_detector(shutdown_event)
         assert len(scheduled) == 1
@@ -457,8 +465,12 @@ async def test_stale_detector_uses_graph_progress_stall_window():
     with (
         patch.object(main, "postgres_db", db),
         patch.object(main, "_trigger_dispatch", MagicMock()),
-        patch.object(main, "_release_thread_resources", AsyncMock()),
-        patch.object(main, "_suspend_thread_resources", AsyncMock()),
+        patch.object(
+            main.thread_retirement_operations, "release_thread_resources", AsyncMock()
+        ),
+        patch.object(
+            main.thread_retirement_operations, "suspend_thread_resources", AsyncMock()
+        ),
     ):
         await main.stale_agent_detector(shutdown_event)
 
@@ -488,8 +500,12 @@ async def test_stale_detector_triggers_dispatch_on_graph_progress_stall():
     with (
         patch.object(main, "postgres_db", db),
         patch.object(main, "_trigger_dispatch") as trigger_dispatch,
-        patch.object(main, "_release_thread_resources", AsyncMock()),
-        patch.object(main, "_suspend_thread_resources", AsyncMock()),
+        patch.object(
+            main.thread_retirement_operations, "release_thread_resources", AsyncMock()
+        ),
+        patch.object(
+            main.thread_retirement_operations, "suspend_thread_resources", AsyncMock()
+        ),
     ):
         await main.stale_agent_detector(shutdown_event)
 
@@ -516,8 +532,12 @@ async def test_step_failure_does_not_block_downstream_recovery():
     with (
         patch.object(main, "postgres_db", db),
         patch.object(main, "_trigger_dispatch", MagicMock()),
-        patch.object(main, "_release_thread_resources", AsyncMock()),
-        patch.object(main, "_suspend_thread_resources", AsyncMock()),
+        patch.object(
+            main.thread_retirement_operations, "release_thread_resources", AsyncMock()
+        ),
+        patch.object(
+            main.thread_retirement_operations, "suspend_thread_resources", AsyncMock()
+        ),
     ):
         await main.stale_agent_detector(shutdown_event)
 
@@ -557,8 +577,12 @@ async def test_lease_expiry_recovery_runs_and_triggers_dispatch():
         patch.object(main, "_kick_officer_event_drain") as kick_wake_drain,
         patch.object(main, "notify_all_officers", AsyncMock()) as notify_all,
         patch.object(main, "notify_owning_officers", AsyncMock()) as notify_owning,
-        patch.object(main, "_release_thread_resources", AsyncMock()),
-        patch.object(main, "_suspend_thread_resources", AsyncMock()),
+        patch.object(
+            main.thread_retirement_operations, "release_thread_resources", AsyncMock()
+        ),
+        patch.object(
+            main.thread_retirement_operations, "suspend_thread_resources", AsyncMock()
+        ),
     ):
         await main.stale_agent_detector(shutdown_event)
 
@@ -599,8 +623,12 @@ async def test_lease_recovery_groups_wakes_per_owning_project():
         patch.object(main, "_kick_officer_event_drain"),
         patch.object(main, "notify_all_officers", AsyncMock()) as notify_all,
         patch.object(main, "notify_owning_officers", AsyncMock()) as notify_owning,
-        patch.object(main, "_release_thread_resources", AsyncMock()),
-        patch.object(main, "_suspend_thread_resources", AsyncMock()),
+        patch.object(
+            main.thread_retirement_operations, "release_thread_resources", AsyncMock()
+        ),
+        patch.object(
+            main.thread_retirement_operations, "suspend_thread_resources", AsyncMock()
+        ),
     ):
         await main.stale_agent_detector(shutdown_event)
 
@@ -632,8 +660,12 @@ async def test_lease_recovery_of_projectless_jobs_notifies_nobody():
         patch.object(main, "_kick_officer_event_drain") as kick_wake_drain,
         patch.object(main, "notify_all_officers", AsyncMock()) as notify_all,
         patch.object(main, "notify_owning_officers", AsyncMock()) as notify_owning,
-        patch.object(main, "_release_thread_resources", AsyncMock()),
-        patch.object(main, "_suspend_thread_resources", AsyncMock()),
+        patch.object(
+            main.thread_retirement_operations, "release_thread_resources", AsyncMock()
+        ),
+        patch.object(
+            main.thread_retirement_operations, "suspend_thread_resources", AsyncMock()
+        ),
     ):
         await main.stale_agent_detector(shutdown_event)
 
@@ -668,8 +700,12 @@ async def test_orphan_recovery_wakes_only_the_owning_projects_officer():
         patch.object(main, "_kick_officer_event_drain"),
         patch.object(main, "notify_all_officers", AsyncMock()) as notify_all,
         patch.object(main, "notify_owning_officers", AsyncMock()) as notify_owning,
-        patch.object(main, "_release_thread_resources", AsyncMock()),
-        patch.object(main, "_suspend_thread_resources", AsyncMock()),
+        patch.object(
+            main.thread_retirement_operations, "release_thread_resources", AsyncMock()
+        ),
+        patch.object(
+            main.thread_retirement_operations, "suspend_thread_resources", AsyncMock()
+        ),
     ):
         await main.stale_agent_detector(shutdown_event)
 
@@ -714,8 +750,12 @@ async def test_agents_offline_scopes_to_derived_projects_and_falls_back_global()
         patch.object(main, "_kick_officer_event_drain") as kick_wake_drain,
         patch.object(main, "notify_all_officers", AsyncMock()) as notify_all,
         patch.object(main, "notify_owning_officers", AsyncMock()) as notify_owning,
-        patch.object(main, "_release_thread_resources", AsyncMock()),
-        patch.object(main, "_suspend_thread_resources", AsyncMock()),
+        patch.object(
+            main.thread_retirement_operations, "release_thread_resources", AsyncMock()
+        ),
+        patch.object(
+            main.thread_retirement_operations, "suspend_thread_resources", AsyncMock()
+        ),
     ):
         await main.stale_agent_detector(shutdown_event)
 
@@ -751,8 +791,12 @@ async def test_agents_offline_fully_derivable_skips_the_fleet_fanout():
         patch.object(main, "_kick_officer_event_drain"),
         patch.object(main, "notify_all_officers", AsyncMock()) as notify_all,
         patch.object(main, "notify_owning_officers", AsyncMock()) as notify_owning,
-        patch.object(main, "_release_thread_resources", AsyncMock()),
-        patch.object(main, "_suspend_thread_resources", AsyncMock()),
+        patch.object(
+            main.thread_retirement_operations, "release_thread_resources", AsyncMock()
+        ),
+        patch.object(
+            main.thread_retirement_operations, "suspend_thread_resources", AsyncMock()
+        ),
     ):
         await main.stale_agent_detector(shutdown_event)
 
@@ -771,8 +815,12 @@ async def test_lease_recovery_uses_strict_audit_fingerprint_reader():
         patch.object(main, "postgres_db", db),
         patch.object(main, "audit_reader", reader),
         patch.object(main, "_trigger_dispatch", MagicMock()),
-        patch.object(main, "_release_thread_resources", AsyncMock()),
-        patch.object(main, "_suspend_thread_resources", AsyncMock()),
+        patch.object(
+            main.thread_retirement_operations, "release_thread_resources", AsyncMock()
+        ),
+        patch.object(
+            main.thread_retirement_operations, "suspend_thread_resources", AsyncMock()
+        ),
     ):
         await main.stale_agent_detector(shutdown_event)
 
@@ -806,8 +854,12 @@ async def test_lease_circuit_trip_kicks_only_durable_wake_drain_not_dispatch():
         patch.object(main, "_trigger_dispatch") as trigger_dispatch,
         patch.object(main, "_kick_officer_event_drain") as kick_wake_drain,
         patch.object(main, "notify_all_officers", AsyncMock()) as notify_all,
-        patch.object(main, "_release_thread_resources", AsyncMock()),
-        patch.object(main, "_suspend_thread_resources", AsyncMock()),
+        patch.object(
+            main.thread_retirement_operations, "release_thread_resources", AsyncMock()
+        ),
+        patch.object(
+            main.thread_retirement_operations, "suspend_thread_resources", AsyncMock()
+        ),
     ):
         await main.stale_agent_detector(shutdown_event)
 
@@ -827,8 +879,12 @@ async def test_lease_recovery_survives_orphan_recovery_failure():
     with (
         patch.object(main, "postgres_db", db),
         patch.object(main, "_trigger_dispatch", MagicMock()),
-        patch.object(main, "_release_thread_resources", AsyncMock()),
-        patch.object(main, "_suspend_thread_resources", AsyncMock()),
+        patch.object(
+            main.thread_retirement_operations, "release_thread_resources", AsyncMock()
+        ),
+        patch.object(
+            main.thread_retirement_operations, "suspend_thread_resources", AsyncMock()
+        ),
     ):
         await main.stale_agent_detector(shutdown_event)
 
@@ -1121,8 +1177,12 @@ async def test_sweep_reports_unresolved_pinned_retirements(caplog):
     with (
         patch.object(main, "postgres_db", db),
         patch.object(main, "_trigger_dispatch", MagicMock()),
-        patch.object(main, "_release_thread_resources", AsyncMock()),
-        patch.object(main, "_suspend_thread_resources", AsyncMock()),
+        patch.object(
+            main.thread_retirement_operations, "release_thread_resources", AsyncMock()
+        ),
+        patch.object(
+            main.thread_retirement_operations, "suspend_thread_resources", AsyncMock()
+        ),
         patch.object(
             main, "_retry_pending_pinned_retirement", AsyncMock(return_value=False)
         ),

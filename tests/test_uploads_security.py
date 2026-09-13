@@ -590,7 +590,8 @@ class TestCreateJobUploadOwnership:
     async def test_another_users_upload_is_403(
         self, uploads_dir, user_a, user_b, fake_db, fake_request
     ):
-        from orchestrator.main import JobCreate, create_job
+        from orchestrator.main import JobCreate
+        from tests._b09_control_seams import create_job
 
         upload_id = _mint()
         _write_upload(uploads_dir, upload_id, owner=str(user_a["id"]))
@@ -613,7 +614,8 @@ class TestCreateJobUploadOwnership:
     ):
         """The dispatcher reads the ids from ``jobs.context``; a body that
         sets them there directly must meet the same check."""
-        from orchestrator.main import JobCreate, create_job
+        from orchestrator.main import JobCreate
+        from tests._b09_control_seams import create_job
 
         upload_id = _mint("config" if key == "config_upload_id" else "documents")
         _write_upload(uploads_dir, upload_id, owner=str(user_a["id"]))
@@ -631,7 +633,8 @@ class TestCreateJobUploadOwnership:
     async def test_malformed_and_missing_upload_ids_are_refused(
         self, uploads_dir, user_a, fake_db, fake_request
     ):
-        from orchestrator.main import JobCreate, create_job
+        from orchestrator.main import JobCreate
+        from tests._b09_control_seams import create_job
 
         fake_request.headers = {}
         fake_request.cookies = {}
@@ -649,7 +652,8 @@ class TestCreateJobUploadOwnership:
         """Sentinel on the step right after the ownership check: reaching it
         proves the owner's own upload was accepted. An HTTPException subclass
         so ``create_job``'s ``except Exception`` → 500 wrapper lets it out."""
-        from orchestrator.main import JobCreate, create_job
+        from orchestrator.main import JobCreate
+        from tests._b09_control_seams import create_job
 
         class _PastTheUploadCheck(HTTPException):
             pass

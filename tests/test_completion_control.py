@@ -1,5 +1,7 @@
 """Focused M2 command-aware control admission proofs."""
 
+from tests import _b09_control_seams as control_seams
+
 import dataclasses
 import json
 from contextlib import asynccontextmanager
@@ -18,7 +20,36 @@ from unittest.mock import MagicMock, patch
 
 import orchestrator.main as main
 from orchestrator.routers import job_diff as job_diff_routes
+from orchestrator.routers import job_controls as job_control_routes
+from orchestrator.routers import job_lifecycle as job_lifecycle_routes
 from orchestrator.services import agent_messaging
+
+
+async def _resume_endpoint(request, job_id, body):
+    return await job_control_routes.resume_job(
+        request,
+        job_id,
+        body,
+        dependencies=main._job_control_route_dependencies(),
+    )
+
+
+async def _approve_endpoint(request, job_id, body):
+    return await job_control_routes.approve_job(
+        request,
+        job_id,
+        body,
+        dependencies=main._job_control_route_dependencies(),
+    )
+
+
+async def _agent_release_endpoint(request, job_id, **kwargs):
+    return await job_lifecycle_routes.agent_release_job(
+        request,
+        job_id,
+        dependencies=main._job_mutation_route_dependencies(),
+        **kwargs,
+    )
 
 
 def _send_agent_message(job_id, body):
@@ -192,8 +223,8 @@ async def test_flag_off_guard_never_builds_completion_service():
 @pytest.mark.parametrize(
     ("endpoint", "auth_name"),
     [
-        (main.resume_job, "require_internal_or_job_access"),
-        (main.approve_job, "require_internal_or_job_access"),
+        (_resume_endpoint, "require_internal_or_job_access"),
+        (_approve_endpoint, "require_internal_or_job_access"),
         (job_diff_routes.accept_job_diff, "require_job_access"),
         (job_diff_routes.reject_job_diff, "require_job_access"),
     ],
@@ -214,9 +245,9 @@ async def test_public_control_endpoints_return_exact_409_before_mutation(
         patch.object(main, "postgres_db", db),
     ):
         with pytest.raises(HTTPException) as exc:
-            if endpoint is main.resume_job:
+            if endpoint is _resume_endpoint:
                 await endpoint(MagicMock(), job_id, None)
-            elif endpoint is main.approve_job:
+            elif endpoint is _approve_endpoint:
                 await endpoint(MagicMock(), job_id, None)
             else:
                 # The diff routes carry ``auth_name`` as a field default on
@@ -254,7 +285,7 @@ async def test_blocking_reply_internal_resume_guard_precedes_queue_mutation():
         patch.object(main._completion_control_boundary, "guard", guard),
     ):
         with pytest.raises(HTTPException) as exc:
-            await main._internal_resume_job(job_id, "reply")
+            await main._job_control_operations().internal_resume_job(job_id, "reply")
     assert exc.value.detail == "completion finalizing"
     db.queue_job_for_resume.assert_not_awaited()
 
@@ -287,7 +318,7 @@ async def test_flag_on_pinned_resume_queues_without_agent_selection_or_post():
         patch.object(main, "postgres_db", db),
         patch.object(main, "_trigger_dispatch", MagicMock()),
     ):
-        result = await main.resume_job(MagicMock(), job_id, None)
+        result = await _resume_endpoint(MagicMock(), job_id, None)
 
     assert result["status"] == "queued"
     db.queue_job_for_resume.assert_awaited_once()
@@ -319,7 +350,7 @@ async def test_delayed_agent_release_reports_owner_conflict_without_dispatch():
         patch.object(main, "_trigger_dispatch", trigger),
     ):
         with pytest.raises(HTTPException) as exc:
-            await main.agent_release_job(MagicMock(), job_id, agent_id=old_agent)
+            await _agent_release_endpoint(MagicMock(), job_id, agent_id=old_agent)
 
     assert exc.value.status_code == 409
     assert exc.value.detail == "Job ownership changed before agent release"
@@ -356,7 +387,7 @@ async def test_leased_agent_release_routes_to_recovery_without_dispatch(enabled)
         patch.object(main, "postgres_db", db),
         patch.object(main, "_trigger_dispatch", trigger),
     ):
-        result = await main.agent_release_job(MagicMock(), job_id, agent_id=agent_id)
+        result = await _agent_release_endpoint(MagicMock(), job_id, agent_id=agent_id)
 
     assert result == {"status": "lease_recovery_pending", "job_id": job_id}
     db.route_pinned_agent_release_to_lease_recovery.assert_awaited_once_with(
@@ -453,6 +484,6 @@ async def test_flag_off_cascade_pause_preserves_unusable_agent_early_return(assi
         patch.object(main, "COMPLETION_COMMANDS_ENABLED", False),
         patch.object(main, "postgres_db", db),
     ):
-        await main._cascade_pause_to_children(str(uuid4()))
+        await control_seams.cascade_pause_to_children(str(uuid4()))
 
     db.pause_job.assert_not_awaited()

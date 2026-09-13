@@ -1,5 +1,7 @@
 """Control-plane contract for OKF Knowledge Base datasources (Slice 4)."""
 
+from tests import _b09_control_seams as control_seams
+
 import asyncio
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
@@ -19,7 +21,6 @@ from orchestrator.main import (
     _thread_has_knowledge_scope,
     _thread_creation_project_ids,
     create_thread,
-    resume_thread,
 )
 from orchestrator.routers.datasources import (
     DatasourcesDependencies,
@@ -1089,10 +1090,13 @@ async def test_resume_revalidates_datasources_before_mutating_thread_status():
             AsyncMock(return_value=(user, thread)),
         ),
         patch("orchestrator.main.postgres_db", db),
-        patch("orchestrator.main._thread_config_drift", AsyncMock(return_value=drift)),
+        patch(
+            "orchestrator.main.thread_resume_operations.thread_config_drift",
+            AsyncMock(return_value=drift),
+        ),
         pytest.raises(HTTPException) as exc,
     ):
-        await resume_thread("thread-1", object())
+        await control_seams.resume_thread("thread-1", object())
 
     assert exc.value.status_code == 428
     assert exc.value.detail["drift"][0]["id"] == f"connector:{datasource_id}"
@@ -1138,10 +1142,13 @@ async def test_resume_blocks_revoked_native_project_scope_before_status_mutation
             AsyncMock(return_value=(user, thread)),
         ),
         patch("orchestrator.main.postgres_db", db),
-        patch("orchestrator.main._thread_config_drift", AsyncMock(return_value=drift)),
+        patch(
+            "orchestrator.main.thread_resume_operations.thread_config_drift",
+            AsyncMock(return_value=drift),
+        ),
         pytest.raises(HTTPException) as exc,
     ):
-        await resume_thread("thread-1", object())
+        await control_seams.resume_thread("thread-1", object())
 
     assert exc.value.status_code == 428
     assert exc.value.detail["drift"][0]["id"] == f"project:{project_id}"

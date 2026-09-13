@@ -1,5 +1,7 @@
 """Pinned job mutations are bound to one registered runtime process."""
 
+from tests import _b09_control_seams as control_seams
+
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -363,7 +365,7 @@ async def test_fresh_start_delivers_hidden_recipient_before_existing_db_cas():
         patch.object(main.postgres_db, "heartbeat", heartbeat),
         patch.object(main, "COMPLETION_COMMANDS_ENABLED", False),
     ):
-        assert await main._dispatch_job_to_agent(job, selected)
+        assert await control_seams.dispatch_job_to_agent(job, selected)
 
     assert _MutationClient.posts == [
         (
@@ -456,7 +458,7 @@ async def test_fresh_start_delivers_exact_k8s_authority_and_refuses_final_drift(
         ),
         patch.object(main.httpx, "AsyncClient", _MutationClient),
     ):
-        assert await main._dispatch_job_to_agent(job, selected) is False
+        assert await control_seams.dispatch_job_to_agent(job, selected) is False
 
     # Workspace authority is rechecked before recipient attestation, and the
     # recipient attestation is the final awaited authority check before HTTP.

@@ -1,5 +1,7 @@
 """Real migrated PostgreSQL proof for End -> Resume -> permanent deletion."""
 
+from tests import _b09_control_seams as control_seams
+
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -360,7 +362,7 @@ async def test_permanent_end_replays_current_projection_after_historical_commit(
     monkeypatch.setattr(main, "gitea_client", SimpleNamespace(is_initialized=False))
     monkeypatch.setattr(main, "_conclude_conference_if_any", AsyncMock())
 
-    assert await main.end_thread(
+    assert await control_seams.end_thread(
         thread_id, SimpleNamespace(), permanent=True, force=True
     ) == {"status": "deleted"}
     assert await database.get_thread(thread_id) is None

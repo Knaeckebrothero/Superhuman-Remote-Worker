@@ -113,7 +113,7 @@ def _patched(db, *, inherited, defaults):
 
 async def _create(db, fake_request, body, *, inherited, defaults):
     import orchestrator.security.access as access_module
-    from orchestrator.main import create_job
+    from tests._b09_control_seams import create_job
 
     with ExitStack() as stack:
         stack.enter_context(patch.object(access_module, "_INTERNAL_KEY", "secret"))

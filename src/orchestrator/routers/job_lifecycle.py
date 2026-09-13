@@ -82,6 +82,17 @@ async def create_job(
     the project's config and resources are inherited, while the root job still
     receives its own isolated repository. Subjobs branch within that root repo.
     """
+    return await admit_job_request(request, job, dependencies=dependencies)
+
+
+async def admit_job_request(
+    request: Request,
+    job: PublicJobCreateBody,
+    *,
+    dependencies: JobLifecycleRouteDependencies,
+) -> dict[str, Any]:
+    """Run the shared REST admission adapter for either mounted create route."""
+
     internal_call = dependencies.is_internal_call(request)
     dependencies.strip_raw_officer_claim_context(job)
     caller: dict[str, Any] | None = None
@@ -105,6 +116,26 @@ async def create_job(
         origin="internal_rest" if internal_call else "user_rest",
         dependencies=dependencies.job_admission_dependencies(request),
     )
+
+
+@router.delete("/api/jobs/{job_id}")
+async def delete_job(
+    request: Request,
+    job_id: str,
+    *,
+    dependencies: JobControlRouteDependencies = Depends(
+        get_job_control_route_dependencies
+    ),
+) -> dict[str, Any]:
+    """Delete a job and its requirements.
+
+    P4c: destructive. Caller must own the job OR be project-owner OR admin.
+    Plain project membership is not enough — mirrors G3 sudo-authority gate.
+    """
+    caller, job = await dependencies.require_job_access(
+        request, dependencies.store, job_id
+    )
+    return await dependencies.operations.delete(job_id, caller=caller, job=job)
 
 
 @router.post("/api/jobs/{job_id}/subjob-merge")
@@ -144,26 +175,6 @@ async def subjob_merge(
             "Squash merge failed for subjob %s: %s", job_id, exc, exc_info=True
         )
         raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-
-@router.delete("/api/jobs/{job_id}")
-async def delete_job(
-    request: Request,
-    job_id: str,
-    *,
-    dependencies: JobControlRouteDependencies = Depends(
-        get_job_control_route_dependencies
-    ),
-) -> dict[str, Any]:
-    """Delete a job and its requirements.
-
-    P4c: destructive. Caller must own the job OR be project-owner OR admin.
-    Plain project membership is not enough — mirrors G3 sudo-authority gate.
-    """
-    caller, job = await dependencies.require_job_access(
-        request, dependencies.store, job_id
-    )
-    return await dependencies.operations.delete(job_id, caller=caller, job=job)
 
 
 @router.put("/api/jobs/{job_id}/cancel")

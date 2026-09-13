@@ -1,5 +1,7 @@
 """Detached-rewind REST endpoint + orchestrator-side rewind SQL."""
 
+from tests import _b09_control_seams as control_seams
+
 import asyncio
 import inspect
 from unittest.mock import AsyncMock, MagicMock
@@ -185,7 +187,7 @@ async def test_rewind_endpoint_rejects_live_agent(monkeypatch):
     from fastapi import HTTPException
 
     with pytest.raises(HTTPException) as exc:
-        await orch_main.rewind_thread_detached(
+        await control_seams.rewind_thread_detached(
             "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
             MagicMock(),
             orch_main.ThreadRewindRequest(message_id="m1", mode="conversation"),
@@ -217,7 +219,7 @@ async def test_detached_rewind_rejects_stateless_thread_without_agent_id(monkeyp
     monkeypatch.setattr(orch_main, "postgres_db", fake_db)
 
     with pytest.raises(HTTPException) as exc:
-        await orch_main.rewind_thread_detached(
+        await control_seams.rewind_thread_detached(
             "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
             MagicMock(),
             orch_main.ThreadRewindRequest(message_id="m1", mode="conversation"),
@@ -252,7 +254,7 @@ async def test_rewind_endpoint_allows_ended_thread_with_stale_agent_id(monkeypat
     )
     monkeypatch.setattr(orch_main, "postgres_db", fake_db)
 
-    out = await orch_main.rewind_thread_detached(
+    out = await control_seams.rewind_thread_detached(
         "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
         MagicMock(),
         orch_main.ThreadRewindRequest(message_id="m1", mode="conversation"),
@@ -274,7 +276,7 @@ async def test_rewind_endpoint_rejects_code_mode(monkeypatch):
     from fastapi import HTTPException
 
     with pytest.raises(HTTPException) as exc:
-        await orch_main.rewind_thread_detached(
+        await control_seams.rewind_thread_detached(
             "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
             MagicMock(),
             orch_main.ThreadRewindRequest(message_id="m1", mode="both"),
@@ -300,7 +302,7 @@ async def test_rewind_endpoint_happy_path(monkeypatch):
     )
     monkeypatch.setattr(orch_main, "postgres_db", fake_db)
 
-    out = await orch_main.rewind_thread_detached(
+    out = await control_seams.rewind_thread_detached(
         "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
         MagicMock(),
         orch_main.ThreadRewindRequest(message_id="m1", mode="conversation"),

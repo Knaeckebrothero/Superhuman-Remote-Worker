@@ -519,7 +519,11 @@ async def test_application_cancel_adapter_revalidates_member_without_request(
     cancel = AsyncMock(return_value={"status": "cancelled"})
     monkeypatch.setattr(main, "postgres_db", database)
     monkeypatch.setattr(main, "user_can_access_job", authorize)
-    monkeypatch.setattr(main, "_cancel_job_internal", cancel)
+    monkeypatch.setattr(
+        main.job_mutation_operations.JobControlOperations,
+        "cancel",
+        cancel,
+    )
 
     assert await main._cancel_bench_job("job-1", caller) == {"status": "cancelled"}
 

@@ -111,7 +111,7 @@ def _route_inbound_reply(om, *args, **kwargs):
 
     ``main._inbound_reply_dependencies()`` binds ``main.postgres_db``,
     ``main.notification_service``, the completion-control boundary, and
-    ``main._internal_resume_job``
+    ``control_seams.internal_resume_job``
     at call time, so building it inside the patch scope keeps every patch below
     steering the code under test.
     """
@@ -168,7 +168,11 @@ class TestUrgentReplyRoutesToGuidance:
         with (
             patch.object(om, "postgres_db", db),
             patch.object(om._completion_control_boundary, "guard", guard),
-            patch.object(om, "_internal_resume_job", resume),
+            patch.object(
+                om.job_control_operations.JobControlOperations,
+                "internal_resume_job",
+                resume,
+            ),
             pytest.raises(HTTPException) as exc,
         ):
             await _route_inbound_reply(
@@ -214,7 +218,11 @@ class TestUrgentReplyRoutesToGuidance:
         resume = AsyncMock()
         with (
             patch.object(om, "postgres_db", db),
-            patch.object(om, "_internal_resume_job", resume),
+            patch.object(
+                om.job_control_operations.JobControlOperations,
+                "internal_resume_job",
+                resume,
+            ),
         ):
             strategy, sequence = await _route_inbound_reply(
                 om, JOB_ID, "officer", "stop retrying X, read file Z", urgent=True
@@ -241,7 +249,11 @@ class TestUrgentReplyRoutesToGuidance:
         resume = AsyncMock()
         with (
             patch.object(om, "postgres_db", db),
-            patch.object(om, "_internal_resume_job", resume),
+            patch.object(
+                om.job_control_operations.JobControlOperations,
+                "internal_resume_job",
+                resume,
+            ),
         ):
             strategy, _ = await _route_inbound_reply(
                 om, JOB_ID, "officer", "wake up and do Y", urgent=True
@@ -264,7 +276,11 @@ class TestUrgentReplyRoutesToGuidance:
         resume = AsyncMock()
         with (
             patch.object(om, "postgres_db", db),
-            patch.object(om, "_internal_resume_job", resume),
+            patch.object(
+                om.job_control_operations.JobControlOperations,
+                "internal_resume_job",
+                resume,
+            ),
         ):
             strategy, _ = await _route_inbound_reply(om, JOB_ID, "t1", "the answer")
 
@@ -287,7 +303,11 @@ class TestUrgentReplyRoutesToGuidance:
         resume = AsyncMock()
         with (
             patch.object(om, "postgres_db", db),
-            patch.object(om, "_internal_resume_job", resume),
+            patch.object(
+                om.job_control_operations.JobControlOperations,
+                "internal_resume_job",
+                resume,
+            ),
         ):
             strategy, _ = await _route_inbound_reply(
                 om, JOB_ID, "officer", "adjust course", urgent=False
@@ -306,7 +326,11 @@ class TestUrgentReplyRoutesToGuidance:
         resume = AsyncMock()
         with (
             patch.object(om, "postgres_db", db),
-            patch.object(om, "_internal_resume_job", resume),
+            patch.object(
+                om.job_control_operations.JobControlOperations,
+                "internal_resume_job",
+                resume,
+            ),
         ):
             strategy, _ = await _route_inbound_reply(
                 om, JOB_ID, "officer", "for the next boundary", urgent=False

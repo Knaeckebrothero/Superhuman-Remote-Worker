@@ -2211,7 +2211,11 @@ class TestHandleCriticVerdictOnCompleteWiring:
             main_module.postgres_db, "get_job", AsyncMock(return_value=target)
         )
         resume_mock = AsyncMock()
-        monkeypatch.setattr(main_module, "_internal_resume_job", resume_mock)
+        monkeypatch.setattr(
+            main_module.job_control_operations.JobControlOperations,
+            "internal_resume_job",
+            resume_mock,
+        )
 
         job = _make_critic_job()
         actions: list[str] = []
@@ -2318,7 +2322,11 @@ class TestHandleCriticVerdictOnCompleteWiring:
             main_module.postgres_db, "get_job", AsyncMock(return_value=target)
         )
         resume_mock = AsyncMock()
-        monkeypatch.setattr(main_module, "_internal_resume_job", resume_mock)
+        monkeypatch.setattr(
+            main_module.job_control_operations.JobControlOperations,
+            "internal_resume_job",
+            resume_mock,
+        )
 
         job = _make_critic_job()
         actions: list[str] = []

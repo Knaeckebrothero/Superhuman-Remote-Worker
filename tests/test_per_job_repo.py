@@ -1,5 +1,7 @@
 """Tests for the per-job repo model (resolve_job_repo, _graft_subjob_output, etc.)."""
 
+from tests import _b09_control_seams as control_seams
+
 from tests import b08_completion_helpers as b08_helpers
 
 import os
@@ -202,7 +204,7 @@ class TestDeleteJobGiteaCleanup:
             mock_gitea.delete_repo = AsyncMock()
             mock_gitea.delete_branch = AsyncMock()
 
-            result = await orch_main.delete_job(
+            result = await control_seams.delete_job(
                 _stub_request(), "abcd1234-1111-4111-8111-111111111111"
             )
 
@@ -235,7 +237,7 @@ class TestDeleteJobGiteaCleanup:
             mock_gitea.delete_branch = AsyncMock()
             mock_gitea.delete_repo = AsyncMock()
 
-            result = await orch_main.delete_job(
+            result = await control_seams.delete_job(
                 _stub_request(), "abcd1234-1111-4111-8111-111111111111"
             )
 
@@ -271,7 +273,7 @@ class TestDeleteJobGiteaCleanup:
             mock_gitea.delete_branch = AsyncMock()
             mock_gitea.delete_repo = AsyncMock()
 
-            result = await orch_main.delete_job(
+            result = await control_seams.delete_job(
                 _stub_request(), "12345678-1111-4111-8111-111111111111"
             )
 
@@ -308,7 +310,7 @@ class TestDeleteJobGiteaCleanup:
             mock_gitea.delete_branch = AsyncMock()
             mock_gitea.delete_repo = AsyncMock()
 
-            result = await orch_main.delete_job(_stub_request(), str(job["id"]))
+            result = await control_seams.delete_job(_stub_request(), str(job["id"]))
 
         assert result == DELETE_RESULT
         mock_gitea.delete_branch.assert_awaited_once_with(
@@ -341,7 +343,7 @@ class TestDeleteJobGiteaCleanup:
             mock_gitea.delete_repo = AsyncMock(return_value=False)
 
             with pytest.raises(HTTPException) as exc:
-                await orch_main.delete_job(_stub_request(), "some-id")
+                await control_seams.delete_job(_stub_request(), "some-id")
 
             assert exc.value.status_code == 503
             mock_db.delete_job.assert_not_awaited()
@@ -365,7 +367,9 @@ class TestDeleteJobGiteaCleanup:
             patch(f"{MODULE}.postgres_db") as mock_db,
             patch(f"{MODULE}.gitea_client") as mock_gitea,
             patch(f"{MODULE}.snapshot_service") as mock_snapshots,
-            patch(f"{MODULE}._archive_and_cleanup_workspace") as cleanup_workspace,
+            patch(
+                "orchestrator.main.thread_retirement_operations.ThreadRetirementOperations.archive_and_cleanup_workspace"
+            ) as cleanup_workspace,
             _bypass_job_access_gate(job),
         ):
             mock_db.has_child_jobs = AsyncMock(return_value=False)
@@ -400,7 +404,7 @@ class TestDeleteJobGiteaCleanup:
             mock_gitea.is_initialized = False
             mock_snapshots.is_available = False
 
-            result = await orch_main.delete_job(_stub_request(), str(job["id"]))
+            result = await control_seams.delete_job(_stub_request(), str(job["id"]))
 
         assert result == DELETE_RESULT
         cleanup_workspace.assert_awaited_once_with(str(job["id"]))
@@ -423,7 +427,9 @@ class TestDeleteJobGiteaCleanup:
 
         with (
             patch(f"{MODULE}.postgres_db") as mock_db,
-            patch(f"{MODULE}._archive_and_cleanup_workspace") as cleanup_workspace,
+            patch(
+                "orchestrator.main.thread_retirement_operations.ThreadRetirementOperations.archive_and_cleanup_workspace"
+            ) as cleanup_workspace,
             _bypass_job_access_gate(job),
         ):
             mock_db.has_child_jobs = AsyncMock(return_value=False)
@@ -431,7 +437,7 @@ class TestDeleteJobGiteaCleanup:
             mock_db.delete_job = AsyncMock()
 
             with pytest.raises(HTTPException) as exc_info:
-                await orch_main.delete_job(_stub_request(), str(job["id"]))
+                await control_seams.delete_job(_stub_request(), str(job["id"]))
 
         assert exc_info.value.status_code == 409
         cleanup_workspace.assert_not_awaited()
@@ -448,7 +454,9 @@ class TestDeleteJobGiteaCleanup:
 
         with (
             patch(f"{MODULE}.postgres_db") as mock_db,
-            patch(f"{MODULE}._archive_and_cleanup_workspace") as cleanup_workspace,
+            patch(
+                "orchestrator.main.thread_retirement_operations.ThreadRetirementOperations.archive_and_cleanup_workspace"
+            ) as cleanup_workspace,
             _bypass_job_access_gate(job),
         ):
             mock_db.has_child_jobs = AsyncMock(return_value=False)
@@ -458,7 +466,7 @@ class TestDeleteJobGiteaCleanup:
             mock_db.delete_job = AsyncMock()
 
             with pytest.raises(HTTPException) as exc_info:
-                await orch_main.delete_job(_stub_request(), str(job["id"]))
+                await control_seams.delete_job(_stub_request(), str(job["id"]))
 
         assert exc_info.value.status_code == 500
         assert "strict prune failed" in str(exc_info.value.detail)
@@ -484,7 +492,7 @@ class TestDeleteJobGiteaCleanup:
             mock_db.get_job = AsyncMock(return_value=None)
 
             with pytest.raises(HTTPException) as exc_info:
-                await orch_main.delete_job(_stub_request(), "missing-id")
+                await control_seams.delete_job(_stub_request(), "missing-id")
             assert exc_info.value.status_code == 404
 
 
@@ -508,7 +516,7 @@ class TestSubjobMergeEndpoint:
             mock_db.get_job = AsyncMock(return_value=job)
 
             with pytest.raises(HTTPException) as exc_info:
-                await orch_main.subjob_merge(_stub_request(), "root-job-id")
+                await control_seams.subjob_merge(_stub_request(), "root-job-id")
             assert exc_info.value.status_code == 400
 
     @pytest.mark.asyncio
@@ -520,7 +528,7 @@ class TestSubjobMergeEndpoint:
             mock_db.get_job = AsyncMock(return_value=None)
 
             with pytest.raises(HTTPException) as exc_info:
-                await orch_main.subjob_merge(_stub_request(), "missing-id")
+                await control_seams.subjob_merge(_stub_request(), "missing-id")
             assert exc_info.value.status_code == 404
 
     @pytest.mark.asyncio
@@ -541,7 +549,7 @@ class TestSubjobMergeEndpoint:
             mock_db.get_job = AsyncMock(return_value=job)
             mock_gitea.is_initialized = True
 
-            result = await orch_main.subjob_merge(_stub_request(), "subjob-id")
+            result = await control_seams.subjob_merge(_stub_request(), "subjob-id")
             assert result["status"] == "skipped"
 
     @pytest.mark.asyncio
@@ -568,7 +576,7 @@ class TestSubjobMergeEndpoint:
                 "output_path": "outputs/001-scholar-abc",
             }
 
-            result = await orch_main.subjob_merge(_stub_request(), "subjob-id")
+            result = await control_seams.subjob_merge(_stub_request(), "subjob-id")
             assert result["status"] == "grafted"
             assert result["job_id"] == "subjob-id"
             assert result["output_path"] == "outputs/001-scholar-abc"

@@ -35,6 +35,7 @@ file.
 
 from __future__ import annotations
 
+
 from tests import b08_completion_helpers as b08_helpers
 
 import json
@@ -51,6 +52,9 @@ from orchestrator.services import agent_datasource_payload
 from orchestrator.services import job_datasource_selection
 from orchestrator.services import job_dispatch_credentials
 from orchestrator.services import job_start_bundle
+from orchestrator.services.managed_repository_authority import (
+    ManagedRepositoryAuthorityError,
+)
 from orchestrator.services import job_workspace_authority
 from orchestrator.services import job_workspace_runtime
 from orchestrator.services.container_provisioner import (
@@ -188,8 +192,12 @@ def _job_assignment_deps() -> job_assignment_routes.JobAssignmentDependencies:
         completion_resume_guard_kwargs=(
             main._completion_control_boundary.resume_guard_kwargs
         ),
-        dispatch_job_to_agent=main._dispatch_job_to_agent,
-        resume_job_on_agent=main._resume_job_on_agent,
+        dispatch_job_to_agent=lambda job, agent: (
+            main._job_delivery_operations().dispatch(job, agent)
+        ),
+        resume_job_on_agent=lambda job, agent: (
+            main._job_delivery_operations().resume(job, agent)
+        ),
         trigger_dispatch=main._trigger_dispatch,
     )
 
@@ -2241,7 +2249,7 @@ class TestJobRepositoryPreparation:
     @pytest.mark.asyncio
     async def test_authority_error_leaves_the_job_unclaimed(self, monkeypatch):
         monkeypatch.setattr(main, "postgres_db", _NullStore())
-        error = main.ManagedRepositoryAuthorityError("scoped_key_missing")
+        error = ManagedRepositoryAuthorityError("scoped_key_missing")
         monkeypatch.setattr(
             main,
             "prepare_job_primary_repository_authority",
@@ -3063,6 +3071,7 @@ class TestAssignRouteBehaviour:
 
 _DIRECT = "direct"
 _CALLED = "called"
+_DELIVERY = "delivery"
 
 LATE_BINDING_TABLE = [
     (_datasource_payload_deps, "logger", "logger", _DIRECT),
@@ -3364,8 +3373,8 @@ LATE_BINDING_TABLE = [
         "_completion_control_boundary.resume_guard_kwargs",
         _DIRECT,
     ),
-    (_job_assignment_deps, "dispatch_job_to_agent", "_dispatch_job_to_agent", _DIRECT),
-    (_job_assignment_deps, "resume_job_on_agent", "_resume_job_on_agent", _DIRECT),
+    (_job_assignment_deps, "dispatch_job_to_agent", "dispatch", _DELIVERY),
+    (_job_assignment_deps, "resume_job_on_agent", "resume", _DELIVERY),
     (_job_assignment_deps, "trigger_dispatch", "_trigger_dispatch", _DIRECT),
 ]
 
@@ -3384,6 +3393,14 @@ class TestLateBoundResolution:
     def test_a_patched_application_global_reaches_the_dependency_object(
         self, factory, field, main_name, mode, monkeypatch
     ):
+        if mode == _DELIVERY:
+            sentinel = object()
+            operation = SimpleNamespace(
+                **{main_name: lambda *_args, **_kwargs: sentinel}
+            )
+            monkeypatch.setattr(main, "_job_delivery_operations", lambda: operation)
+            assert getattr(factory(), field)({}, {}) is sentinel
+            return
         if mode == _CALLED and main_name == "vm_provisioner":
             monkeypatch.setattr(
                 main, "vm_provisioner", SimpleNamespace(mode="sentinel-vm-mode")

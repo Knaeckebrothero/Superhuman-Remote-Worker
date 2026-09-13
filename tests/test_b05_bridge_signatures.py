@@ -52,9 +52,6 @@ BRIDGES = {
     "_account_defaults_layer": session_config_resolution.account_defaults_layer,
     "_acknowledged_grant_strip": session_config_resolution.acknowledged_grant_strip,
     "_resolve_session_config": session_config_resolution.resolve_session_config,
-    "_require_supported_protected_session_class": (
-        session_config_resolution.require_supported_protected_session_class
-    ),
     "_agent_toolset_measurement": agent_toolset_probe.agent_toolset_measurement,
     "_user_experts_enabled": grant_enforcement.user_experts_enabled,
     "_grant_project_ids": grant_enforcement.grant_project_ids,
@@ -144,9 +141,6 @@ BRIDGES = {
     "_resolve_thread_repositories": thread_mount_rows.resolve_thread_repositories,
     "_require_pinned_workspace_credential_owner": (
         thread_workspace_delivery.require_pinned_workspace_credential_owner
-    ),
-    "_agent_get_thread_workspace_locked": (
-        thread_workspace_delivery.agent_get_thread_workspace_locked
     ),
     "_schedule_stateless_workspace_ensure": (
         stateless_workspace_scheduler.schedule_stateless_workspace_ensure

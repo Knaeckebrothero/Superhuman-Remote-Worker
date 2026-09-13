@@ -15,6 +15,8 @@ two attach paths (``resume_thread._reprovision`` and the sessions router's
 knowledge-history/done/session_resume_cloud_sync_race_late_provision.md
 """
 
+from tests import _b09_control_seams as control_seams
+
 import asyncio
 
 import pytest
@@ -36,7 +38,7 @@ class TestAwaitLateCloudSetup:
         """Nothing in flight for this thread (already done, never needed, or
         scheduled on the other HA replica) — the attach must not stall."""
         await asyncio.wait_for(
-            orchestrator.main._await_late_cloud_setup("t-unknown"), timeout=1
+            control_seams.await_late_cloud_setup("t-unknown"), timeout=1
         )
 
     @pytest.mark.asyncio
@@ -50,12 +52,10 @@ class TestAwaitLateCloudSetup:
             await asyncio.sleep(0.05)  # stands in for the WebDAV round-trips
             persisted["nc_session_folder"] = "sessions/t1"
 
-        orchestrator.main._register_late_cloud_setup(
-            "t1", asyncio.create_task(_provision())
-        )
+        control_seams.register_late_cloud_setup("t1", asyncio.create_task(_provision()))
 
         # The attach path reads only after the gate.
-        await orchestrator.main._await_late_cloud_setup("t1")
+        await control_seams.await_late_cloud_setup("t1")
         assert persisted == {"nc_session_folder": "sessions/t1"}
 
     @pytest.mark.asyncio
@@ -68,9 +68,7 @@ class TestAwaitLateCloudSetup:
             await asyncio.sleep(0.05)
             persisted["nc_session_folder"] = "sessions/t1"
 
-        orchestrator.main._register_late_cloud_setup(
-            "t1", asyncio.create_task(_provision())
-        )
+        control_seams.register_late_cloud_setup("t1", asyncio.create_task(_provision()))
 
         await asyncio.sleep(0)  # yield once, as a fast attach would
         assert persisted == {}
@@ -84,13 +82,9 @@ class TestAwaitLateCloudSetup:
         async def _provision() -> None:
             raise RuntimeError("webdav exploded")
 
-        orchestrator.main._register_late_cloud_setup(
-            "t1", asyncio.create_task(_provision())
-        )
+        control_seams.register_late_cloud_setup("t1", asyncio.create_task(_provision()))
 
-        await asyncio.wait_for(
-            orchestrator.main._await_late_cloud_setup("t1"), timeout=1
-        )
+        await asyncio.wait_for(control_seams.await_late_cloud_setup("t1"), timeout=1)
 
     @pytest.mark.asyncio
     async def test_wedged_provisioning_times_out_instead_of_hanging_resume(
@@ -104,10 +98,10 @@ class TestAwaitLateCloudSetup:
         )
 
         task = asyncio.create_task(asyncio.sleep(30))
-        orchestrator.main._register_late_cloud_setup("t1", task)
+        control_seams.register_late_cloud_setup("t1", task)
         try:
             await asyncio.wait_for(
-                orchestrator.main._await_late_cloud_setup("t1"), timeout=2
+                control_seams.await_late_cloud_setup("t1"), timeout=2
             )
         finally:
             task.cancel()
@@ -128,9 +122,9 @@ class TestAwaitLateCloudSetup:
             persisted["nc_session_folder"] = "sessions/t1"
 
         task = asyncio.create_task(_provision())
-        orchestrator.main._register_late_cloud_setup("t1", task)
+        control_seams.register_late_cloud_setup("t1", task)
 
-        await orchestrator.main._await_late_cloud_setup("t1")  # gives up early
+        await control_seams.await_late_cloud_setup("t1")  # gives up early
         assert persisted == {}
         assert not task.cancelled()
 
@@ -147,7 +141,7 @@ class TestRegistrySlotDiscipline:
             return None
 
         task = asyncio.create_task(_provision())
-        orchestrator.main._register_late_cloud_setup("t1", task)
+        control_seams.register_late_cloud_setup("t1", task)
         assert "t1" in orchestrator.main._late_cloud_setup_tasks
 
         await task
@@ -168,10 +162,10 @@ class TestRegistrySlotDiscipline:
             await asyncio.sleep(0.05)
 
         first = asyncio.create_task(_first())
-        orchestrator.main._register_late_cloud_setup("t1", first)
+        control_seams.register_late_cloud_setup("t1", first)
 
         second = asyncio.create_task(_second())
-        orchestrator.main._register_late_cloud_setup("t1", second)
+        control_seams.register_late_cloud_setup("t1", second)
 
         first_done.set()
         await first

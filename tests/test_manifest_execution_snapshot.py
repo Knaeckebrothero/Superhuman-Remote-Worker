@@ -1,5 +1,7 @@
 """Execution configuration is transactional, immutable and adapter-specific."""
 
+from tests import _b09_control_seams as control_seams
+
 import asyncio
 from contextlib import asynccontextmanager
 from copy import deepcopy
@@ -1017,7 +1019,10 @@ async def test_job_resume_uses_frozen_config_and_requires_capable_recipient(
     )
     monkeypatch.setattr(main.httpx, "AsyncClient", Client)
 
-    assert await main._resume_job_on_agent(job, agent) is recipient_supports_snapshot
+    assert (
+        await control_seams.resume_job_on_agent(job, agent)
+        is recipient_supports_snapshot
+    )
     if recipient_supports_snapshot:
         assert sent[0]["resolved_config"]["agent"]["llm"]["model"] == "admitted-model"
         assert sent[0]["resolved_config"]["prompts"]["persona"] == "admitted prompt"
@@ -1072,7 +1077,7 @@ async def test_resume_preflight_checks_frozen_policy_without_live_expert(monkeyp
         lambda **_: pytest.fail("resume preflight read live config"),
     )
     with pytest.raises(HTTPException) as denied:
-        await main._resume_job_internal(WORK, user={"id": USER}, job=job)
+        await control_seams.resume_job_internal(WORK, user={"id": USER}, job=job)
     assert denied.value.status_code == 403
     assert check.await_args.args[0]["llm"]["model"] == "admitted-model"
 

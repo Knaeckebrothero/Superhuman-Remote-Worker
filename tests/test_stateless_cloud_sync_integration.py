@@ -548,11 +548,14 @@ async def test_internal_workspace_payload_exposes_private_binding_generation():
             side_effect=lambda value, **_kwargs: value,
         ),
     ):
-        response = await orch_main._agent_get_thread_workspace_locked(
-            THREAD_ID,
-            presented_agent_id=AGENT_ID,
-            presented_runtime_generation=RUNTIME_GENERATION,
-            presented_attach_token=RUNTIME_ATTACH_TOKEN,
+        response = (
+            await orch_main.thread_workspace_delivery.agent_get_thread_workspace_locked(
+                THREAD_ID,
+                presented_agent_id=AGENT_ID,
+                presented_runtime_generation=RUNTIME_GENERATION,
+                presented_attach_token=RUNTIME_ATTACH_TOKEN,
+                dependencies=orch_main._thread_workspace_delivery_dependencies(),
+            )
         )
 
     assert response["workspace_generation"] == WORKSPACE_GENERATION
@@ -673,11 +676,14 @@ async def _internal_workspace_response_for_lite_thread(
             side_effect=lambda value, **_kwargs: value,
         ),
     ):
-        return await orch_main._agent_get_thread_workspace_locked(
-            THREAD_ID,
-            presented_agent_id=AGENT_ID if pinned else None,
-            presented_runtime_generation=RUNTIME_GENERATION if pinned else None,
-            presented_attach_token=RUNTIME_ATTACH_TOKEN if pinned else None,
+        return (
+            await orch_main.thread_workspace_delivery.agent_get_thread_workspace_locked(
+                THREAD_ID,
+                presented_agent_id=AGENT_ID if pinned else None,
+                presented_runtime_generation=RUNTIME_GENERATION if pinned else None,
+                presented_attach_token=RUNTIME_ATTACH_TOKEN if pinned else None,
+                dependencies=orch_main._thread_workspace_delivery_dependencies(),
+            )
         )
 
 

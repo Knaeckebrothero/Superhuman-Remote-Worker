@@ -1,5 +1,7 @@
 """Exact recipient/fingerprint gates for pinned session effects."""
 
+from tests import _b09_control_seams as control_seams
+
 import asyncio
 import json
 from types import SimpleNamespace
@@ -181,7 +183,7 @@ async def test_orchestrator_detach_sends_exact_bound_fingerprint(monkeypatch):
     monkeypatch.setattr(main, "postgres_db", db)
     monkeypatch.setattr(main.httpx, "AsyncClient", _Client)
 
-    assert await main._detach_agent_session(THREAD_ID, timeout=1) is True
+    assert await control_seams.detach_agent_session(THREAD_ID, timeout=1) is True
     assert observed == {
         "url": "http://10.42.0.17:8001/session/detach",
         "json": {"session_identity_fingerprint": binding.session_identity_fingerprint},
@@ -207,7 +209,7 @@ async def test_orchestrator_detach_never_dials_without_exact_binding(monkeypatch
     monkeypatch.setattr(main, "postgres_db", db)
     monkeypatch.setattr(main.httpx, "AsyncClient", client)
 
-    assert await main._detach_agent_session(THREAD_ID, timeout=1) is False
+    assert await control_seams.detach_agent_session(THREAD_ID, timeout=1) is False
     client.assert_not_called()
 
 

@@ -98,7 +98,7 @@ class TestAdminInfraGates:
     # ----- /api/sudo/rules family -----
     @pytest.mark.asyncio
     async def test_list_sudo_rules_non_admin_403(self, user_a, fake_db, fake_request):
-        from orchestrator.main import list_sudo_rules
+        from tests._b09_control_seams import list_sudo_rules
 
         with (
             _patch_caller_and_db(user_a, fake_db),
@@ -110,7 +110,8 @@ class TestAdminInfraGates:
 
     @pytest.mark.asyncio
     async def test_create_sudo_rule_non_admin_403(self, user_a, fake_db, fake_request):
-        from orchestrator.main import SudoRuleCreateRequest, create_sudo_rule
+        from orchestrator.schemas.job_controls import SudoRuleCreateRequest
+        from tests._b09_control_seams import create_sudo_rule
 
         body = SudoRuleCreateRequest(
             pattern="apt-get *", action="approve", priority=10, description="test"
@@ -125,7 +126,7 @@ class TestAdminInfraGates:
 
     @pytest.mark.asyncio
     async def test_delete_sudo_rule_non_admin_403(self, user_a, fake_db, fake_request):
-        from orchestrator.main import delete_sudo_rule
+        from tests._b09_control_seams import delete_sudo_rule
 
         with (
             _patch_caller_and_db(user_a, fake_db),
@@ -153,7 +154,7 @@ class TestAdminInfraGates:
     # ----- /api/vms -----
     @pytest.mark.asyncio
     async def test_list_vms_non_admin_403(self, user_a, fake_db, fake_request):
-        from orchestrator.main import list_vms
+        from tests._b09_control_seams import list_vms
 
         # The handler uses postgres_db.acquire() as a context manager; the
         # gate fires before that so we don't need a deeper mock.

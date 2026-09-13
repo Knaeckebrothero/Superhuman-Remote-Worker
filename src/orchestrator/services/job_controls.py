@@ -33,6 +33,12 @@ from shared.runtime.core.tool_policy import ToolPolicyError
 from shared.workspace_contract import resolve_workspace_contract
 
 
+def resume_reject_should_requeue(status_code: int) -> bool:
+    """Return whether a stale-ready agent rejection should re-enter dispatch."""
+
+    return status_code == 409
+
+
 @dataclass(frozen=True, slots=True)
 class JobControlDependencies:
     """Stateful application collaborators used by job controls."""
@@ -620,7 +626,7 @@ class JobControlOperations:
         other non-2xx is a real failure → 502. See
         knowledge-history/done/worker_pod_state_zombie_on_cancel.md.
         """
-        return status_code == 409
+        return resume_reject_should_requeue(status_code)
 
     async def _resume_job_internal(
         self,
@@ -2371,4 +2377,8 @@ class JobControlOperations:
     internal_resume_job = _internal_resume_job
 
 
-__all__ = ["JobControlDependencies", "JobControlOperations"]
+__all__ = [
+    "JobControlDependencies",
+    "JobControlOperations",
+    "resume_reject_should_requeue",
+]

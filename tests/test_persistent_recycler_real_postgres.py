@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests import _b09_control_seams as control_seams
+
 import asyncio
 import json
 import threading
@@ -2278,7 +2280,9 @@ async def test_permanent_agent_ack_hands_off_mounted_claim_to_owner_cleanup(db):
             orch_main, "_conclude_conference_if_any", AsyncMock(return_value=None)
         ),
         patch.object(
-            orch_main, "_thread_turn_in_flight", AsyncMock(return_value=False)
+            orch_main.thread_retirement_operations,
+            "thread_turn_in_flight",
+            AsyncMock(return_value=False),
         ),
     ):
         current = await db.get_thread(ids["thread"])
@@ -3182,7 +3186,9 @@ async def test_legacy_pre_registration_agent_pod_fails_closed_without_protocol(
             orch_main, "_conclude_conference_if_any", AsyncMock(return_value=None)
         ),
         patch.object(
-            orch_main, "_thread_turn_in_flight", AsyncMock(return_value=False)
+            orch_main.thread_retirement_operations,
+            "thread_turn_in_flight",
+            AsyncMock(return_value=False),
         ),
     ):
         result = await orch_main._end_thread_flow(
@@ -3562,7 +3568,9 @@ async def test_response_lost_agent_create_uses_retained_pod_and_pvc_fences(
             orch_main, "_conclude_conference_if_any", AsyncMock(return_value=None)
         ),
         patch.object(
-            orch_main, "_thread_turn_in_flight", AsyncMock(return_value=False)
+            orch_main.thread_retirement_operations,
+            "thread_turn_in_flight",
+            AsyncMock(return_value=False),
         ),
     ):
         result = await orch_main._end_thread_flow(
@@ -4448,7 +4456,9 @@ async def test_attach_abort_successor_can_end_before_reconcile(db, permanent):
             orch_main, "_conclude_conference_if_any", AsyncMock(return_value=None)
         ),
         patch.object(
-            orch_main, "_thread_turn_in_flight", AsyncMock(return_value=False)
+            orch_main.thread_retirement_operations,
+            "thread_turn_in_flight",
+            AsyncMock(return_value=False),
         ),
     ):
         assert (
@@ -5528,7 +5538,9 @@ async def test_soft_end_revokes_never_delivered_reader_before_zero_stage(
             orch_main, "_conclude_conference_if_any", AsyncMock(return_value=None)
         ),
         patch.object(
-            orch_main, "_thread_turn_in_flight", AsyncMock(return_value=False)
+            orch_main.thread_retirement_operations,
+            "thread_turn_in_flight",
+            AsyncMock(return_value=False),
         ),
     ):
         result = await orch_main._end_thread_flow(
@@ -5656,12 +5668,18 @@ async def test_soft_end_adopts_exact_review_after_reader_quiescence(db, manifest
             "publish_quiesced_retirement_existing_stage_receipt",
             AsyncMock(side_effect=_publish_existing),
         ) as publish_spy,
-        patch.object(orch_main, "_cleanup_pinned_thread_retirement", cleanup),
+        patch.object(
+            orch_main.PinnedRetirementOperations,
+            "cleanup_pinned_thread_retirement",
+            cleanup,
+        ),
         patch.object(
             orch_main, "_conclude_conference_if_any", AsyncMock(return_value=None)
         ),
         patch.object(
-            orch_main, "_thread_turn_in_flight", AsyncMock(return_value=False)
+            orch_main.thread_retirement_operations,
+            "thread_turn_in_flight",
+            AsyncMock(return_value=False),
         ),
         patch(
             "orchestrator.services.cloud_staging.stage.stage_thread_cloud_diff",
@@ -5891,13 +5909,15 @@ async def test_legacy_0185_live_authority_is_adopted_before_first_end(db, monkey
             AsyncMock(return_value=({"id": "owner"}, entry)),
         ),
         patch.object(
-            orch_main, "_thread_turn_in_flight", AsyncMock(return_value=False)
+            orch_main.thread_retirement_operations,
+            "thread_turn_in_flight",
+            AsyncMock(return_value=False),
         ),
         patch.object(
             orch_main, "_conclude_conference_if_any", AsyncMock(return_value=None)
         ),
     ):
-        result = await orch_main.end_thread(
+        result = await control_seams.end_thread(
             ids["thread"], SimpleNamespace(), permanent=False, force=True
         )
     assert result == {
@@ -5997,13 +6017,15 @@ async def test_pre_0198_warm_binding_is_adopted_before_actual_end(db, monkeypatc
             AsyncMock(return_value=({"id": "owner"}, entry)),
         ),
         patch.object(
-            orch_main, "_thread_turn_in_flight", AsyncMock(return_value=False)
+            orch_main.thread_retirement_operations,
+            "thread_turn_in_flight",
+            AsyncMock(return_value=False),
         ),
         patch.object(
             orch_main, "_conclude_conference_if_any", AsyncMock(return_value=None)
         ),
     ):
-        result = await orch_main.end_thread(
+        result = await control_seams.end_thread(
             ids["thread"], SimpleNamespace(), permanent=False, force=True
         )
     assert result["status"] == "ending"

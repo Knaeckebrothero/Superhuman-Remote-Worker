@@ -573,7 +573,11 @@ class TestOrchestratorInactiveCapabilityFence:
         with (
             patch.object(orch_main, "require_internal", AsyncMock()),
             patch.object(orch_main, "postgres_db", db),
-            patch.object(orch_main, "_end_thread_flow", end_flow),
+            patch.object(
+                orch_main.thread_retirement_operations.ThreadRetirementOperations,
+                "end_thread_flow",
+                end_flow,
+            ),
         ):
             request = MagicMock()
             request.headers = {
@@ -761,7 +765,11 @@ class TestOrchestratorInactiveCapabilityFence:
             patch.object(orch_main, "require_internal", AsyncMock()),
             patch.object(orch_main, "postgres_db", db),
             patch.object(orch_main, "_persistent_thread_recycler", recycler),
-            patch.object(orch_main, "_suspend_thread_resources", suspend_resources),
+            patch.object(
+                orch_main.thread_retirement_operations.ThreadRetirementOperations,
+                "suspend_thread_resources",
+                suspend_resources,
+            ),
         ):
             result = await agent_thread_status.update_thread_status(
                 "tid-drain-1",
@@ -830,7 +838,11 @@ class TestOrchestratorInactiveCapabilityFence:
         with (
             patch.object(orch_main, "require_internal", AsyncMock()),
             patch.object(orch_main, "postgres_db", db),
-            patch.object(orch_main, "_suspend_thread_resources", suspend_resources),
+            patch.object(
+                orch_main.thread_retirement_operations.ThreadRetirementOperations,
+                "suspend_thread_resources",
+                suspend_resources,
+            ),
             patch.object(orch_main, "_conclude_conference_if_any", conclude),
         ):
             result = await agent_thread_status.update_thread_status(

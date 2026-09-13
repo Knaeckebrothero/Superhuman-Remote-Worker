@@ -791,7 +791,7 @@ def _resume_thread_row(**overrides) -> dict:
 @pytest.mark.parametrize("execution_lane", ["stateless", "future-lane"])
 async def test_resume_refuses_unavailable_non_pinned_lane(execution_lane):
     """Malformed stateless and unknown lanes fail before lifecycle mutation."""
-    from orchestrator.main import resume_thread
+    from tests._b09_control_seams import resume_thread
 
     thread = _resume_thread_row(execution_lane=execution_lane)
     db = AsyncMock()
@@ -814,7 +814,7 @@ async def test_resume_refuses_unavailable_non_pinned_lane(execution_lane):
 @pytest.mark.asyncio
 async def test_stateless_sandbox_resume_skips_registered_agent_and_ensures_workspace():
     """A valid queue-lane resume is topology-neutral and restores only state."""
-    from orchestrator.main import resume_thread
+    from tests._b09_control_seams import resume_thread
 
     generation = "11111111-1111-4111-8111-111111111111"
     thread = _resume_thread_row(
@@ -896,9 +896,13 @@ async def test_stateless_sandbox_resume_skips_registered_agent_and_ensures_works
             "orchestrator.main._revalidate_thread_project_ids",
             AsyncMock(return_value=[]),
         ),
-        patch("orchestrator.main._thread_config_drift", AsyncMock(return_value=[])),
         patch(
-            "orchestrator.main._require_supported_protected_session_class", AsyncMock()
+            "orchestrator.main.thread_resume_operations.thread_config_drift",
+            AsyncMock(return_value=[]),
+        ),
+        patch(
+            "orchestrator.main.session_config_resolution.require_supported_protected_session_class",
+            AsyncMock(),
         ),
         patch("orchestrator.main.agent_provisioner", agent_provisioner),
         patch("orchestrator.main.persistent_provisioner", persistent_provisioner),
@@ -918,7 +922,7 @@ async def test_stateless_sandbox_resume_skips_registered_agent_and_ensures_works
 
 @pytest.mark.asyncio
 async def test_stateless_resume_refuses_retirement_marker_before_mutation():
-    from orchestrator.main import resume_thread
+    from tests._b09_control_seams import resume_thread
 
     thread = _resume_thread_row(
         execution_lane="stateless",
@@ -964,7 +968,10 @@ async def test_stateless_resume_refuses_retirement_marker_before_mutation():
             "orchestrator.main._revalidate_thread_project_ids",
             AsyncMock(return_value=[]),
         ),
-        patch("orchestrator.main._thread_config_drift", AsyncMock(return_value=[])),
+        patch(
+            "orchestrator.main.thread_resume_operations.thread_config_drift",
+            AsyncMock(return_value=[]),
+        ),
         pytest.raises(orchestrator.main.HTTPException) as exc,
     ):
         await resume_thread(_RESUME_THREAD_ID, object())
@@ -975,7 +982,7 @@ async def test_stateless_resume_refuses_retirement_marker_before_mutation():
 
 @pytest.mark.asyncio
 async def test_resume_cas_loss_to_retirement_fails_closed():
-    from orchestrator.main import resume_thread
+    from tests._b09_control_seams import resume_thread
 
     thread = _resume_thread_row(metadata={})
     db = MagicMock()
@@ -994,7 +1001,10 @@ async def test_resume_cas_loss_to_retirement_fails_closed():
             "orchestrator.main._revalidate_thread_project_ids",
             AsyncMock(return_value=[]),
         ),
-        patch("orchestrator.main._thread_config_drift", AsyncMock(return_value=[])),
+        patch(
+            "orchestrator.main.thread_resume_operations.thread_config_drift",
+            AsyncMock(return_value=[]),
+        ),
         pytest.raises(orchestrator.main.HTTPException) as exc,
     ):
         await resume_thread(_RESUME_THREAD_ID, object())
@@ -1005,7 +1015,7 @@ async def test_resume_cas_loss_to_retirement_fails_closed():
 @pytest.mark.asyncio
 async def test_resume_refetch_refuses_lane_changed_while_task_was_scheduled():
     """A pinned entry snapshot is not authority for the background bind."""
-    from orchestrator.main import resume_thread
+    from tests._b09_control_seams import resume_thread
 
     thread = _resume_thread_row(
         metadata={},
@@ -1047,7 +1057,10 @@ async def test_resume_refetch_refuses_lane_changed_while_task_was_scheduled():
             "orchestrator.main._revalidate_thread_project_ids",
             AsyncMock(return_value=[]),
         ),
-        patch("orchestrator.main._thread_config_drift", AsyncMock(return_value=[])),
+        patch(
+            "orchestrator.main.thread_resume_operations.thread_config_drift",
+            AsyncMock(return_value=[]),
+        ),
         patch("orchestrator.main._is_protected_cloud_mode_enabled", return_value=False),
         patch("orchestrator.main.agent_provisioner", provisioner),
         patch(
@@ -1055,7 +1068,10 @@ async def test_resume_refetch_refuses_lane_changed_while_task_was_scheduled():
         ),
         patch("orchestrator.main._find_idle_persistent_agent", find_idle),
         patch("orchestrator.main._send_session_attach", attach),
-        patch("orchestrator.main._await_late_cloud_setup", AsyncMock()),
+        patch(
+            "orchestrator.main.thread_resume_operations.await_late_cloud_setup",
+            AsyncMock(),
+        ),
         patch("orchestrator.main.ensure_session_workspace", ensure_workspace),
     ):
         result = await resume_thread(_RESUME_THREAD_ID, object())
@@ -1071,7 +1087,7 @@ async def test_resume_refetch_refuses_lane_changed_while_task_was_scheduled():
 @pytest.mark.asyncio
 async def test_resume_refetches_lane_after_failed_pool_reservation():
     """A warm-attach refusal cannot fall through after a concurrent flip."""
-    from orchestrator.main import resume_thread
+    from tests._b09_control_seams import resume_thread
 
     thread = _resume_thread_row(
         metadata={},
@@ -1122,9 +1138,13 @@ async def test_resume_refetches_lane_after_failed_pool_reservation():
             "orchestrator.main._revalidate_thread_project_ids",
             AsyncMock(return_value=[]),
         ),
-        patch("orchestrator.main._thread_config_drift", AsyncMock(return_value=[])),
         patch(
-            "orchestrator.main._require_supported_protected_session_class", AsyncMock()
+            "orchestrator.main.thread_resume_operations.thread_config_drift",
+            AsyncMock(return_value=[]),
+        ),
+        patch(
+            "orchestrator.main.session_config_resolution.require_supported_protected_session_class",
+            AsyncMock(),
         ),
         patch(
             "orchestrator.main._thread_has_knowledge_scope",
@@ -1144,7 +1164,10 @@ async def test_resume_refetches_lane_after_failed_pool_reservation():
             AsyncMock(return_value=idle),
         ),
         patch("orchestrator.main._send_session_attach", attach),
-        patch("orchestrator.main._await_late_cloud_setup", AsyncMock()),
+        patch(
+            "orchestrator.main.thread_resume_operations.await_late_cloud_setup",
+            AsyncMock(),
+        ),
         patch("orchestrator.main.ensure_session_workspace", AsyncMock()),
     ):
         result = await resume_thread(_RESUME_THREAD_ID, object())
@@ -1162,7 +1185,7 @@ async def test_resume_schedules_reengage_when_no_active_row():
     Slice A reconciler already revoked the grant (no active
     cloud_ro_mounts row) — otherwise a protected thread stays permanently
     mount-less after its first end/resume cycle."""
-    from orchestrator.main import resume_thread
+    from tests._b09_control_seams import resume_thread
 
     thread = _resume_thread_row()
     user = {"id": "user-1"}
@@ -1189,9 +1212,13 @@ async def test_resume_schedules_reengage_when_no_active_row():
             "orchestrator.main._revalidate_thread_project_ids",
             AsyncMock(return_value=[]),
         ),
-        patch("orchestrator.main._thread_config_drift", AsyncMock(return_value=[])),
         patch(
-            "orchestrator.main._require_supported_protected_session_class", AsyncMock()
+            "orchestrator.main.thread_resume_operations.thread_config_drift",
+            AsyncMock(return_value=[]),
+        ),
+        patch(
+            "orchestrator.main.session_config_resolution.require_supported_protected_session_class",
+            AsyncMock(),
         ),
         patch("orchestrator.main._is_protected_cloud_mode_enabled", return_value=True),
         patch("orchestrator.main._schedule_protected_engage") as schedule,
@@ -1219,7 +1246,7 @@ async def test_resume_schedules_reengage_when_no_active_row():
 async def test_resume_skips_reengage_when_active_row_present():
     """No re-engage when a live grant already covers this thread — resume
     must not spam a fresh reader/grant on every reconnect."""
-    from orchestrator.main import resume_thread
+    from tests._b09_control_seams import resume_thread
 
     thread = _resume_thread_row()
     user = {"id": "user-1"}
@@ -1246,9 +1273,13 @@ async def test_resume_skips_reengage_when_active_row_present():
             "orchestrator.main._revalidate_thread_project_ids",
             AsyncMock(return_value=[]),
         ),
-        patch("orchestrator.main._thread_config_drift", AsyncMock(return_value=[])),
         patch(
-            "orchestrator.main._require_supported_protected_session_class", AsyncMock()
+            "orchestrator.main.thread_resume_operations.thread_config_drift",
+            AsyncMock(return_value=[]),
+        ),
+        patch(
+            "orchestrator.main.session_config_resolution.require_supported_protected_session_class",
+            AsyncMock(),
         ),
         patch("orchestrator.main._is_protected_cloud_mode_enabled", return_value=True),
         patch("orchestrator.main._schedule_protected_engage") as schedule,
@@ -1270,7 +1301,7 @@ async def test_resume_skips_reengage_when_active_row_present():
 async def test_resume_skips_reengage_for_non_protected_thread():
     """Regression guard: an ordinary (non-protected) thread's resume must
     never touch the protected-engage registry."""
-    from orchestrator.main import resume_thread
+    from tests._b09_control_seams import resume_thread
 
     thread = _resume_thread_row(metadata={})
     user = {"id": "user-1"}
@@ -1297,9 +1328,13 @@ async def test_resume_skips_reengage_for_non_protected_thread():
             "orchestrator.main._revalidate_thread_project_ids",
             AsyncMock(return_value=[]),
         ),
-        patch("orchestrator.main._thread_config_drift", AsyncMock(return_value=[])),
         patch(
-            "orchestrator.main._require_supported_protected_session_class", AsyncMock()
+            "orchestrator.main.thread_resume_operations.thread_config_drift",
+            AsyncMock(return_value=[]),
+        ),
+        patch(
+            "orchestrator.main.session_config_resolution.require_supported_protected_session_class",
+            AsyncMock(),
         ),
         patch("orchestrator.main._is_protected_cloud_mode_enabled", return_value=True),
         patch("orchestrator.main._schedule_protected_engage") as schedule,

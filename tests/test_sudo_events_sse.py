@@ -1,6 +1,6 @@
 """F6 — per-user filtering on `GET /api/sudo/events` SSE stream.
 
-The endpoint is `main.sudo_sse_events`. We test the integration by:
+The endpoint is `control_seams.sudo_sse_events`. We test the integration by:
   1. Pre-loading the SSE queue with synthetic events
   2. Driving the handler with a `Request` mock whose `is_disconnected`
      flips True after the events have been consumed
@@ -79,7 +79,7 @@ class TestSudoSseFilter:
     async def test_thread_owner_sees_thread_event(
         self, user_a, thread_a, thread_b, fake_db
     ):
-        from orchestrator.main import sudo_sse_events
+        from tests._b09_control_seams import sudo_sse_events
 
         queue: asyncio.Queue = asyncio.Queue()
         await queue.put(
@@ -109,7 +109,7 @@ class TestSudoSseFilter:
     async def test_thread_owner_can_list_and_get_thread_sudo_request(
         self, user_a, thread_a, fake_db
     ):
-        from orchestrator.main import get_sudo_request, list_sudo_requests
+        from tests._b09_control_seams import get_sudo_request, list_sudo_requests
 
         row = {
             "id": "thread-sudo",
@@ -140,7 +140,7 @@ class TestSudoSseFilter:
     @pytest.mark.asyncio
     async def test_user_sees_only_own_jobs_events(self, user_a, job_a, job_b, fake_db):
         """user_a should see events for job_a (owned), not for job_b."""
-        from orchestrator.main import sudo_sse_events
+        from tests._b09_control_seams import sudo_sse_events
 
         queue: asyncio.Queue = asyncio.Queue()
         await queue.put(("new_request", {"id": "r1", "job_id": str(job_a["id"])}))
@@ -181,7 +181,7 @@ class TestSudoSseFilter:
     async def test_admin_sees_all_events_including_orphans(
         self, user_admin, job_a, job_b, fake_db
     ):
-        from orchestrator.main import sudo_sse_events
+        from tests._b09_control_seams import sudo_sse_events
 
         queue: asyncio.Queue = asyncio.Queue()
         await queue.put(("new_request", {"id": "r1", "job_id": str(job_a["id"])}))
@@ -219,7 +219,7 @@ class TestSudoSseFilter:
         self, user_a, job_a, job_b, fake_db
     ):
         """`request_decided` events now carry job_id (F6 fix to sudo_gate)."""
-        from orchestrator.main import sudo_sse_events
+        from tests._b09_control_seams import sudo_sse_events
 
         queue: asyncio.Queue = asyncio.Queue()
         await queue.put(

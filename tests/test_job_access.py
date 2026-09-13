@@ -1357,7 +1357,7 @@ class TestJobMutationGates:
     async def test_upgrade_job_to_vm_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from orchestrator.main import upgrade_job_to_vm
+        from tests._b09_control_seams import upgrade_job_to_vm
 
         # The gate runs before the body, so no downstream service patch needed —
         # the in-body postgres_db.get_job() call would itself fail the dud test
@@ -1443,7 +1443,7 @@ class TestJobMutationGates:
     async def test_delete_job_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from orchestrator.main import delete_job
+        from tests._b09_control_seams import delete_job
 
         with (
             _patch_caller_and_db(user_b, fake_db),
@@ -1461,7 +1461,7 @@ class TestJobMutationGates:
         """Plain project membership isn't enough — must be job owner OR
         project owner OR admin. user_b is a member of project_a here but
         only as 'editor', so the gate-pass should still be denied."""
-        from orchestrator.main import delete_job
+        from tests._b09_control_seams import delete_job
 
         # Make user_b a non-owner member of project_a so require_job_access
         # passes but the secondary role check fails.
@@ -1493,7 +1493,7 @@ class TestJobMutationGates:
         lifecycle reconciler can no longer reap the pod (no-bound-row is
         treated as in-flight provisioning). See
         knowledge-history/done/deleted_job_orphans_workspace_pod.md."""
-        from orchestrator.main import delete_job
+        from tests._b09_control_seams import delete_job
 
         calls: list[str] = []
 
@@ -1527,7 +1527,10 @@ class TestJobMutationGates:
 
         with (
             _patch_caller_and_db(user_a, fake_db),
-            patch("orchestrator.main._archive_and_cleanup_workspace", cleanup),
+            patch(
+                "orchestrator.main.thread_retirement_operations.ThreadRetirementOperations.archive_and_cleanup_workspace",
+                cleanup,
+            ),
             patch("orchestrator.main.snapshot_service", fake_snapshot),
             patch("orchestrator.main.gitea_client", fake_gitea),
             patch("orchestrator.main.vector_db", _make_dud("vector_db")),
@@ -1550,14 +1553,17 @@ class TestJobMutationGates:
         """A parent with surviving child rows can't be row-deleted (FK) — the
         endpoint must fail fast BEFORE tearing down the workspace, or the
         failed delete would leave the job alive with its pod gone."""
-        from orchestrator.main import delete_job
+        from tests._b09_control_seams import delete_job
 
         fake_db.has_child_jobs = AsyncMock(return_value=True)
         cleanup = AsyncMock()
 
         with (
             _patch_caller_and_db(user_a, fake_db),
-            patch("orchestrator.main._archive_and_cleanup_workspace", cleanup),
+            patch(
+                "orchestrator.main.thread_retirement_operations.ThreadRetirementOperations.archive_and_cleanup_workspace",
+                cleanup,
+            ),
             patch("orchestrator.main.gitea_client", _make_dud("gitea_client")),
             patch("orchestrator.main.vector_db", _make_dud("vector_db")),
         ):
@@ -1608,7 +1614,8 @@ class TestVmLifecycleGates:
     async def test_create_vm_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from orchestrator.main import VMCreateRequest, create_vm
+        from orchestrator.schemas.workspaces import VMCreateRequest
+        from tests._b09_control_seams import create_vm
 
         body = VMCreateRequest(
             job_id=str(job_a["id"]),
@@ -1626,7 +1633,7 @@ class TestVmLifecycleGates:
     async def test_get_vm_status_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from orchestrator.main import get_vm_status
+        from tests._b09_control_seams import get_vm_status
 
         with (
             _patch_caller_and_db(user_b, fake_db),
@@ -1640,7 +1647,7 @@ class TestVmLifecycleGates:
     async def test_delete_vm_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from orchestrator.main import delete_vm
+        from tests._b09_control_seams import delete_vm
 
         with (
             _patch_caller_and_db(user_b, fake_db),
@@ -1656,7 +1663,7 @@ class TestVmLifecycleGates:
     ):
         """Same shape as `delete_job` — plain editor membership must not
         be enough to delete the VM."""
-        from orchestrator.main import delete_vm
+        from tests._b09_control_seams import delete_vm
 
         original_role = fake_db.get_user_role_in_project
 

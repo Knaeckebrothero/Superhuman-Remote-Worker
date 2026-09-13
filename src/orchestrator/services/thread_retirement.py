@@ -50,6 +50,7 @@ class ThreadRetirementDependencies:
 
     store: Any
     agent_provisioner: Any
+    persistent_provisioner: Any
     container_provisioner: Any
     vm_provisioner: Any
     docker_provisioner: Any

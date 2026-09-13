@@ -11,7 +11,7 @@ wrong lane / assembly refused.
 
 import asyncio
 from copy import deepcopy
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
 from fastapi import HTTPException
@@ -708,8 +708,9 @@ async def test_bg_task_bundle_uses_cloud_only_builder(monkeypatch, refused):
         lease_token=7,
         pod_name=POD_NAME,
         pod_uid=POD_UID,
-        resolve_workspace=orch_main._resolve_background_push_workspace,
+        resolve_workspace=ANY,
     )
+    assert callable(builder.await_args.kwargs["resolve_workspace"])
     attach.assert_not_awaited()
 
 

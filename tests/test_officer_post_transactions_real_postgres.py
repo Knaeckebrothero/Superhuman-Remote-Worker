@@ -13,6 +13,7 @@ that depend on PostgreSQL row locks and rollback semantics:
 
 from __future__ import annotations
 
+
 import asyncio
 import json
 import time
@@ -3266,7 +3267,8 @@ async def test_database_funnel_strips_raw_claim_context_from_ordinary_jobs(db):
 @pytest.mark.parametrize("internal", [False, True], ids=["public", "internal"])
 async def test_http_creation_paths_cannot_persist_raw_claim_context(db, internal):
     import orchestrator.security.access as access_module
-    from orchestrator.main import JobCreate, create_job
+    from orchestrator.main import JobCreate
+    from tests._b09_control_seams import create_job
 
     user_id = uuid4()
     async with db.acquire() as conn:
@@ -3381,7 +3383,7 @@ async def test_completion_merge_can_record_server_owned_evidence_manifest(db):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("claimed", [False, True], ids=["ordinary", "claimed"])
 async def test_delete_response_reports_only_an_actual_durable_claim(db, claimed):
-    from orchestrator.main import delete_job
+    from tests._b09_control_seams import delete_job
 
     seed = await _seed_post(db)
     if claimed:
@@ -3417,7 +3419,7 @@ async def test_delete_response_reports_only_an_actual_durable_claim(db, claimed)
             "orchestrator.main.require_job_access", AsyncMock(return_value=(admin, job))
         ),
         patch(
-            "orchestrator.main._archive_and_cleanup_workspace",
+            "orchestrator.main.thread_retirement_operations.ThreadRetirementOperations.archive_and_cleanup_workspace",
             AsyncMock(return_value=[]),
         ),
         patch("orchestrator.main.gitea_client", gitea),

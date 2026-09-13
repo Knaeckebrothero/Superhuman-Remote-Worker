@@ -1158,7 +1158,11 @@ class TestInboundReplyRouteIntegration:
         with (
             patch.object(main, "COMPLETION_COMMANDS_ENABLED", False),
             patch.object(main, "postgres_db", db),
-            patch.object(main, "_internal_resume_job", AsyncMock(return_value=True)),
+            patch.object(
+                main.job_control_operations.JobControlOperations,
+                "internal_resume_job",
+                AsyncMock(return_value=True),
+            ),
             patch.object(inbound_reply_svc, "record_route_reply_resolution", record),
         ):
             strategy, _seq = await _reply(job["id"], "abc123", "the answer")
@@ -1177,7 +1181,11 @@ class TestInboundReplyRouteIntegration:
         with (
             patch.object(main, "COMPLETION_COMMANDS_ENABLED", False),
             patch.object(main, "postgres_db", db),
-            patch.object(main, "_internal_resume_job", AsyncMock(return_value=True)),
+            patch.object(
+                main.job_control_operations.JobControlOperations,
+                "internal_resume_job",
+                AsyncMock(return_value=True),
+            ),
             patch.object(inbound_reply_svc, "record_route_reply_resolution", record),
         ):
             await _reply(

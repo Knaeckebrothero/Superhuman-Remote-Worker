@@ -350,7 +350,7 @@ class TestListSudoRequests:
     async def test_with_job_id_gated_by_require_job_access(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from orchestrator.main import list_sudo_requests
+        from tests._b09_control_seams import list_sudo_requests
 
         fake_sudo_gate = MagicMock()
         fake_sudo_gate.list_requests = AsyncMock(
@@ -372,7 +372,7 @@ class TestListSudoRequests:
 
     @pytest.mark.asyncio
     async def test_with_job_id_owner_passes(self, user_a, job_a, fake_db, fake_request):
-        from orchestrator.main import list_sudo_requests
+        from tests._b09_control_seams import list_sudo_requests
 
         fake_sudo_gate = MagicMock()
         fake_sudo_gate.list_requests = AsyncMock(return_value=[{"id": "r1"}])
@@ -393,7 +393,7 @@ class TestListSudoRequests:
     async def test_no_job_id_admin_sees_all(
         self, user_admin, job_a, job_b, fake_db, fake_request
     ):
-        from orchestrator.main import list_sudo_requests
+        from tests._b09_control_seams import list_sudo_requests
 
         all_rows = [
             {"id": "r1", "job_id": str(job_a["id"])},
@@ -418,7 +418,7 @@ class TestListSudoRequests:
     async def test_no_job_id_non_admin_filters_to_visible(
         self, user_a, job_a, job_b, fake_db, fake_request
     ):
-        from orchestrator.main import list_sudo_requests
+        from tests._b09_control_seams import list_sudo_requests
 
         all_rows = [
             {"id": "r1", "job_id": str(job_a["id"])},  # accessible
@@ -449,7 +449,7 @@ class TestListSudoRequests:
 class TestGetSudoRequest:
     @pytest.mark.asyncio
     async def test_missing_404(self, user_a, fake_db, fake_request):
-        from orchestrator.main import get_sudo_request
+        from tests._b09_control_seams import get_sudo_request
 
         fake_sudo_gate = MagicMock()
         fake_sudo_gate.get_request = AsyncMock(return_value=None)
@@ -463,7 +463,7 @@ class TestGetSudoRequest:
 
     @pytest.mark.asyncio
     async def test_owner_passes(self, user_a, job_a, fake_db, fake_request):
-        from orchestrator.main import get_sudo_request
+        from tests._b09_control_seams import get_sudo_request
 
         fake_sudo_gate = MagicMock()
         fake_sudo_gate.get_request = AsyncMock(
@@ -478,7 +478,7 @@ class TestGetSudoRequest:
 
     @pytest.mark.asyncio
     async def test_cross_user_403(self, user_b, job_a, fake_db, fake_request):
-        from orchestrator.main import get_sudo_request
+        from tests._b09_control_seams import get_sudo_request
 
         fake_sudo_gate = MagicMock()
         fake_sudo_gate.get_request = AsyncMock(
@@ -494,7 +494,7 @@ class TestGetSudoRequest:
 
     @pytest.mark.asyncio
     async def test_admin_bypass(self, user_admin, job_a, fake_db, fake_request):
-        from orchestrator.main import get_sudo_request
+        from tests._b09_control_seams import get_sudo_request
 
         fake_sudo_gate = MagicMock()
         fake_sudo_gate.get_request = AsyncMock(
@@ -511,7 +511,7 @@ class TestGetSudoRequest:
     async def test_mcp_project_mismatch_403(
         self, user_admin, job_a, project_b, fake_db, fake_request
     ):
-        from orchestrator.main import get_sudo_request
+        from tests._b09_control_seams import get_sudo_request
 
         scoped = _scoped(user_admin, f"project:{project_b['id']}")
         fake_sudo_gate = MagicMock()

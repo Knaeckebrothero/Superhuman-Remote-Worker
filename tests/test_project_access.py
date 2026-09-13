@@ -818,7 +818,7 @@ class TestProjectMutationRoles:
         with (
             _patch_caller_and_db(user_b, fake_db),
             patch(
-                "orchestrator.main.create_job",
+                "orchestrator.main.job_lifecycle_routes.admit_job_request",
                 AsyncMock(
                     side_effect=AssertionError("create_job called past the gate")
                 ),
@@ -839,7 +839,7 @@ class TestProjectMutationRoles:
         with (
             _patch_caller_and_db(user_b, fake_db),
             patch(
-                "orchestrator.main.create_job",
+                "orchestrator.main.job_lifecycle_routes.admit_job_request",
                 AsyncMock(return_value={"id": "new-job"}),
             ),
         ):
@@ -1190,7 +1190,7 @@ class TestCreateProjectJobOnAnArchivedProject:
         with (
             _patch_caller_and_db(user_b, fake_db),
             patch(
-                "orchestrator.main.create_job",
+                "orchestrator.main.job_lifecycle_routes.admit_job_request",
                 AsyncMock(
                     side_effect=AssertionError("create_job called past the gate")
                 ),

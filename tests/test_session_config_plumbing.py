@@ -15,6 +15,8 @@ step 1 (2026-06-11):
   the workspace and pod are torn down (memory_bugs.md B11 addendum).
 """
 
+from tests import _b09_control_seams as control_seams
+
 import asyncio
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -1621,7 +1623,7 @@ class TestColdSessionDatasourceDelivery:
             ),
         ):
             with pytest.raises(HTTPException) as denied:
-                await orch_main._agent_get_thread_workspace_locked(
+                await control_seams.agent_get_thread_workspace_locked(
                     thread_id,
                     presented_agent_id=agent_a,
                     presented_runtime_generation=generation_a,
@@ -1827,7 +1829,7 @@ class TestColdSessionDatasourceDelivery:
             ),
         ):
             with pytest.raises(HTTPException) as denied:
-                await orch_main._agent_get_thread_workspace_locked(
+                await control_seams.agent_get_thread_workspace_locked(
                     thread_id,
                     presented_agent_id=agent_id,
                     presented_runtime_generation=generation,
@@ -2015,7 +2017,7 @@ class TestColdSessionDatasourceDelivery:
     def test_warm_resume_uses_canonical_thread_mount_projects(self):
         import inspect
 
-        source = inspect.getsource(orch_main.resume_thread)
+        source = inspect.getsource(orch_main.thread_resume_operations.resume_thread)
         assert "pids = await _thread_project_ids(tid)" in source
         assert 'pids = thread.get("project_ids")' not in source
 
@@ -2088,7 +2090,7 @@ class TestDetachAgentSession:
             patch.object(orch_main, "postgres_db", db),
             patch.object(orch_main.httpx, "AsyncClient", _FakeAsyncClient),
         ):
-            assert await orch_main._detach_agent_session("t1") is False
+            assert await control_seams.detach_agent_session("t1") is False
         assert _FakeAsyncClient.calls == []
 
     @pytest.mark.asyncio
@@ -2102,7 +2104,7 @@ class TestDetachAgentSession:
             patch.object(orch_main, "postgres_db", db),
             patch.object(orch_main.httpx, "AsyncClient", _FakeAsyncClient),
         ):
-            assert await orch_main._detach_agent_session("t1") is False
+            assert await control_seams.detach_agent_session("t1") is False
         assert _FakeAsyncClient.calls == []
 
     @pytest.mark.asyncio
@@ -2133,7 +2135,7 @@ class TestDetachAgentSession:
             patch.object(orch_main, "postgres_db", db),
             patch.object(orch_main.httpx, "AsyncClient", _FakeAsyncClient),
         ):
-            assert await orch_main._detach_agent_session(_ATTACH_THREAD_ID) is True
+            assert await control_seams.detach_agent_session(_ATTACH_THREAD_ID) is True
         assert _FakeAsyncClient.calls[0]["url"] == "http://10.0.0.2:8001/session/detach"
 
     @pytest.mark.asyncio
@@ -2148,7 +2150,7 @@ class TestDetachAgentSession:
             patch.object(orch_main, "postgres_db", db),
             patch.object(orch_main.httpx, "AsyncClient", _FakeAsyncClient),
         ):
-            assert await orch_main._detach_agent_session("t1") is False
+            assert await control_seams.detach_agent_session("t1") is False
 
     @pytest.mark.asyncio
     async def test_release_runs_detach_before_workspace_cleanup(self):
@@ -2156,11 +2158,11 @@ class TestDetachAgentSession:
         the workspace alive) before the workspace archive/cleanup step."""
         order: list = []
 
-        async def _detach(thread_id, timeout=150.0):
+        async def _detach(thread_id, timeout=150.0, **_kwargs):
             order.append("detach")
             return True
 
-        async def _archive(thread_id, entity_type, *, reclaim_volume=True):
+        async def _archive(thread_id, entity_type, *, reclaim_volume=True, **_kwargs):
             order.append("workspace")
 
         provisioner = SimpleNamespace(
@@ -2170,11 +2172,17 @@ class TestDetachAgentSession:
             ),
         )
         with (
-            patch.object(orch_main, "_detach_agent_session", _detach),
-            patch.object(orch_main, "_archive_and_cleanup_workspace", _archive),
+            patch.object(
+                orch_main.thread_retirement_operations, "detach_agent_session", _detach
+            ),
+            patch.object(
+                orch_main.thread_retirement_operations,
+                "archive_and_cleanup_workspace",
+                _archive,
+            ),
             patch.object(orch_main, "agent_provisioner", provisioner),
         ):
-            await orch_main._release_thread_resources("t1")
+            await control_seams.release_thread_resources("t1")
         assert order == ["detach", "workspace", "pod"]
 
 
@@ -2299,7 +2307,9 @@ class TestEndedSessionKeepsItsVolume:
                 AsyncMock(return_value=({"sub": "u1"}, thread)),
             ),
             patch.object(
-                orch_main, "_thread_turn_in_flight", AsyncMock(return_value=False)
+                orch_main.thread_retirement_operations,
+                "thread_turn_in_flight",
+                AsyncMock(return_value=False),
             ),
             patch.object(orch_main, "_conclude_conference_if_any", AsyncMock()),
             patch.object(orch_main, "postgres_db", db),
@@ -2341,7 +2351,7 @@ class TestEndedSessionKeepsItsVolume:
                 orch_main, "gitea_client", SimpleNamespace(is_initialized=False)
             ),
         ):
-            result = await orch_main.end_thread(
+            result = await control_seams.end_thread(
                 self.thread_id,
                 SimpleNamespace(),
                 permanent=permanent,
@@ -2441,7 +2451,9 @@ class TestEndedSessionKeepsItsVolume:
             ),
             patch.object(orch_main, "_conclude_conference_if_any", AsyncMock()),
             patch.object(
-                orch_main, "_release_thread_resources", AsyncMock()
+                orch_main.thread_retirement_operations,
+                "release_thread_resources",
+                AsyncMock(),
             ) as release,
             patch.object(orch_main, "postgres_db", db),
             patch.object(
@@ -2452,7 +2464,7 @@ class TestEndedSessionKeepsItsVolume:
             ),
             pytest.raises(HTTPException) as exc,
         ):
-            await orch_main.end_thread(
+            await control_seams.end_thread(
                 "t1", SimpleNamespace(), permanent=False, force=True
             )
 
@@ -2495,14 +2507,20 @@ class TestEndedSessionKeepsItsVolume:
                 AsyncMock(return_value=({"sub": "u1"}, initial)),
             ),
             patch.object(
-                orch_main, "_thread_turn_in_flight", AsyncMock(return_value=False)
+                orch_main.thread_retirement_operations,
+                "thread_turn_in_flight",
+                AsyncMock(return_value=False),
             ),
             patch.object(orch_main, "_conclude_conference_if_any", AsyncMock()),
-            patch.object(orch_main, "_release_thread_resources", release),
+            patch.object(
+                orch_main.thread_retirement_operations,
+                "release_thread_resources",
+                release,
+            ),
             patch.object(orch_main, "postgres_db", db),
             pytest.raises(HTTPException) as exc,
         ):
-            await orch_main.end_thread(
+            await control_seams.end_thread(
                 "t1", SimpleNamespace(), permanent=False, force=True
             )
 
@@ -2522,13 +2540,21 @@ class TestEndedSessionKeepsItsVolume:
         about the user's intent to keep their files."""
         captured: dict = {}
 
-        async def _archive(thread_id, entity_type, *, reclaim_volume=True):
+        async def _archive(thread_id, entity_type, *, reclaim_volume=True, **_kwargs):
             captured["entity_type"] = entity_type
             captured["reclaim_volume"] = reclaim_volume
 
         with (
-            patch.object(orch_main, "_detach_agent_session", AsyncMock()),
-            patch.object(orch_main, "_archive_and_cleanup_workspace", _archive),
+            patch.object(
+                orch_main.thread_retirement_operations,
+                "detach_agent_session",
+                AsyncMock(),
+            ),
+            patch.object(
+                orch_main.thread_retirement_operations,
+                "archive_and_cleanup_workspace",
+                _archive,
+            ),
             patch.object(
                 orch_main, "agent_provisioner", SimpleNamespace(is_available=False)
             ),
@@ -2536,7 +2562,7 @@ class TestEndedSessionKeepsItsVolume:
                 orch_main, "persistent_provisioner", SimpleNamespace(is_available=False)
             ),
         ):
-            await orch_main._release_thread_resources("t1")
+            await control_seams.release_thread_resources("t1")
 
         assert captured == {"entity_type": "threads", "reclaim_volume": False}
 
@@ -2544,12 +2570,20 @@ class TestEndedSessionKeepsItsVolume:
     async def test_release_forwards_an_explicit_reclaim(self):
         captured: dict = {}
 
-        async def _archive(thread_id, entity_type, *, reclaim_volume=True):
+        async def _archive(thread_id, entity_type, *, reclaim_volume=True, **_kwargs):
             captured["reclaim_volume"] = reclaim_volume
 
         with (
-            patch.object(orch_main, "_detach_agent_session", AsyncMock()),
-            patch.object(orch_main, "_archive_and_cleanup_workspace", _archive),
+            patch.object(
+                orch_main.thread_retirement_operations,
+                "detach_agent_session",
+                AsyncMock(),
+            ),
+            patch.object(
+                orch_main.thread_retirement_operations,
+                "archive_and_cleanup_workspace",
+                _archive,
+            ),
             patch.object(
                 orch_main, "agent_provisioner", SimpleNamespace(is_available=False)
             ),
@@ -2557,7 +2591,7 @@ class TestEndedSessionKeepsItsVolume:
                 orch_main, "persistent_provisioner", SimpleNamespace(is_available=False)
             ),
         ):
-            await orch_main._release_thread_resources("t1", reclaim_volume=True)
+            await control_seams.release_thread_resources("t1", reclaim_volume=True)
 
         assert captured["reclaim_volume"] is True
 
@@ -2595,7 +2629,7 @@ class TestEndedSessionKeepsItsVolume:
                     orch_main, "vm_provisioner", SimpleNamespace(is_available=False)
                 ),
             ):
-                await orch_main._archive_and_cleanup_workspace(
+                await control_seams.archive_and_cleanup_workspace(
                     "t1", entity_type="threads", reclaim_volume=reclaim
                 )
 
@@ -2636,7 +2670,7 @@ class TestEndedSessionKeepsItsVolume:
             ),
         ):
             with pytest.raises(RuntimeError, match="exact teardown is incomplete"):
-                await orch_main._archive_and_cleanup_workspace(
+                await control_seams.archive_and_cleanup_workspace(
                     "t1", entity_type="threads", reclaim_volume=False
                 )
 

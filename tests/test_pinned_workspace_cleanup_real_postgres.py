@@ -195,11 +195,12 @@ async def test_delivered_pinned_workspace_generation_can_ack_retirement(
     # contract. Preserve the config without constructing live provider clients.
     inject_credentials = AsyncMock(side_effect=lambda config, **_kwargs: config)
     monkeypatch.setattr(main, "_inject_thread_dispatch_credentials", inject_credentials)
-    payload = await main._agent_get_thread_workspace_locked(
+    payload = await main.thread_workspace_delivery.agent_get_thread_workspace_locked(
         owner.id,
         presented_agent_id=ids["agent"],
         presented_runtime_generation=str(thread["runtime_generation"]),
         presented_attach_token=ids["attach_token"],
+        dependencies=main._thread_workspace_delivery_dependencies(),
     )
     # Delivery materializes both the compatibility override and the canonical
     # resolved blob. Both credential lookups must retain the same recipient.

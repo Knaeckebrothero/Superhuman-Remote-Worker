@@ -708,7 +708,11 @@ async def test_exact_pinned_live_status_preserves_runtime_resources(status):
     with (
         patch.object(orchestrator_main, "require_internal", AsyncMock()),
         patch.object(orchestrator_main, "postgres_db", db),
-        patch.object(orchestrator_main, "_suspend_thread_resources", suspend_resources),
+        patch.object(
+            orchestrator_main.thread_retirement_operations.ThreadRetirementOperations,
+            "suspend_thread_resources",
+            suspend_resources,
+        ),
         patch.object(
             orchestrator_main, "_conclude_conference_if_any", conclude_conference
         ),

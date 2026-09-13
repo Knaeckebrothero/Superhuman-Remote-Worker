@@ -1,5 +1,7 @@
 """Generic work cannot enter reference-harness control or orphan recovery."""
 
+from tests import _b09_control_seams as control_seams
+
 from tests import b08_completion_helpers as b08_helpers
 
 from copy import deepcopy
@@ -124,21 +126,21 @@ async def test_legacy_mutations_refuse_generic_before_effects(monkeypatch, opera
         main, "require_thread_owner", AsyncMock(return_value=({"id": USER}, work))
     )
     if operation == "resume":
-        call = main._resume_job_internal(WORK, user={"id": USER}, job=work)
+        call = control_seams.resume_job_internal(WORK, user={"id": USER}, job=work)
     elif operation == "approve":
-        call = main._approve_job_internal(WORK, user={"id": USER}, job=work)
+        call = control_seams.approve_job_internal(WORK, user={"id": USER}, job=work)
     elif operation == "pause":
-        call = main.pause_job(None, WORK)
+        call = control_seams.pause_job(None, WORK)
     elif operation == "delete":
-        call = main.delete_job(None, WORK)
+        call = control_seams.delete_job(None, WORK)
     elif operation == "upgrade":
-        call = main._upgrade_job_to_vm_internal(WORK)
+        call = control_seams.upgrade_job_to_vm_internal(WORK)
     elif operation == "resume_without_vm":
-        call = main._resume_job_without_vm_internal(WORK)
+        call = control_seams.resume_job_without_vm_internal(WORK)
     elif operation == "complete":
         call = b08_helpers.complete_job_legacy(None, WORK, None, _authorized=True)
     elif operation == "session_resume":
-        call = main.resume_thread(WORK, None)
+        call = control_seams.resume_thread(WORK, None)
     else:
         call = job_assignment.assign_job_to_agent(
             None,
@@ -163,10 +165,10 @@ async def test_legacy_direct_delivery_and_internal_resume_leave_generic_alone(
     job = {"id": WORK, "execution_harness_adapter": "generic"}
     db = SimpleNamespace(get_job=AsyncMock(return_value=job))
     monkeypatch.setattr(main, "postgres_db", db)
-    assert await main._dispatch_job_to_agent(job, {"id": USER}) is False
-    assert await main._resume_job_on_agent(job, {"id": USER}) is False
-    assert await main._internal_resume_job(WORK, "feedback") is False
-    assert await main._initiate_pause(job) is None
+    assert await control_seams.dispatch_job_to_agent(job, {"id": USER}) is False
+    assert await control_seams.resume_job_on_agent(job, {"id": USER}) is False
+    assert await control_seams.internal_resume_job(WORK, "feedback") is False
+    assert await control_seams.initiate_pause(job) is None
 
 
 @pytest.mark.asyncio
@@ -180,9 +182,9 @@ async def test_descendant_cancel_uses_generic_controller(monkeypatch):
     monkeypatch.setattr(
         main, "_manifest_execution_service", lambda: SimpleNamespace(cancel=cancel)
     )
-    assert await main._cascade_cancel_to_children(USER) is True
+    assert await control_seams.cascade_cancel_to_children(USER) is True
     cancel.assert_awaited_once_with(WORK)
-    await main._cascade_pause_to_children(USER)
+    await control_seams.cascade_pause_to_children(USER)
 
 
 @pytest.fixture(scope="module")

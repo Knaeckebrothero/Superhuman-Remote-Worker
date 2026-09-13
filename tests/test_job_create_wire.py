@@ -22,6 +22,7 @@ import pytest
 from fastapi import FastAPI, HTTPException
 
 from orchestrator import main
+from orchestrator.routers import job_lifecycle as job_lifecycle_routes
 from orchestrator.services.default_experts import ExpertSelection
 
 
@@ -118,7 +119,10 @@ def wire(monkeypatch):
         "orchestrator.services.job_provisioning.provision_job_repo", provision
     )
     app = FastAPI()
-    app.add_api_route(PATH, main.create_job, methods=["POST"])
+    app.state.job_lifecycle_route_dependencies_factory = (
+        main._job_lifecycle_route_dependencies
+    )
+    app.add_api_route(PATH, job_lifecycle_routes.create_job, methods=["POST"])
     app.add_api_route(
         "/api/projects/{project_id}/jobs", main.create_project_job, methods=["POST"]
     )

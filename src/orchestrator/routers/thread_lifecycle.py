@@ -13,6 +13,9 @@ from orchestrator.schemas.thread_lifecycle import (
     ThreadRewindRequest,
 )
 
+end_router = APIRouter()
+resume_router = APIRouter()
+rewind_router = APIRouter()
 router = APIRouter()
 
 
@@ -64,7 +67,7 @@ def get_thread_lifecycle_dependencies(
     return request.app.state.thread_lifecycle_dependencies_factory()
 
 
-@router.delete("/api/persistent/threads/{thread_id}")
+@end_router.delete("/api/persistent/threads/{thread_id}")
 async def end_thread(
     thread_id: str,
     request: Request,
@@ -97,7 +100,7 @@ async def end_thread(
     )
 
 
-@router.post("/api/persistent/threads/{thread_id}/resume")
+@resume_router.post("/api/persistent/threads/{thread_id}/resume")
 async def resume_thread(
     thread_id: str,
     request: Request,
@@ -125,7 +128,7 @@ async def resume_thread(
     return await dependencies.resume.resume_thread(thread_id, user, thread, body)
 
 
-@router.post("/api/agents/threads/{thread_id}/rewind")
+@rewind_router.post("/api/agents/threads/{thread_id}/rewind")
 async def rewind_thread_detached(
     thread_id: str,
     request: Request,
@@ -152,10 +155,18 @@ async def rewind_thread_detached(
     )
 
 
+router.include_router(end_router)
+router.include_router(resume_router)
+router.include_router(rewind_router)
+
+
 __all__ = [
     "ThreadLifecycleRouteDependencies",
     "ThreadResumeOperations",
     "ThreadRetirementOperations",
     "get_thread_lifecycle_dependencies",
+    "end_router",
+    "resume_router",
+    "rewind_router",
     "router",
 ]

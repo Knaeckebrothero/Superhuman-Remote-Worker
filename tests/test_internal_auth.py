@@ -1081,7 +1081,7 @@ class TestPureInternalEndpoints:
 
     @pytest.mark.asyncio
     async def test_subjob_merge_without_key_401(self, fake_request, job_a):
-        from orchestrator.main import subjob_merge
+        from tests._b09_control_seams import subjob_merge
 
         with patch.object(access_module, "_INTERNAL_KEY", "secret"):
             with pytest.raises(HTTPException) as exc:
@@ -1090,7 +1090,7 @@ class TestPureInternalEndpoints:
 
     @pytest.mark.asyncio
     async def test_agent_release_job_without_key_401(self, fake_request, job_a):
-        from orchestrator.main import agent_release_job
+        from tests._b09_control_seams import agent_release_job
 
         with patch.object(access_module, "_INTERNAL_KEY", "secret"):
             with pytest.raises(HTTPException) as exc:
@@ -1109,7 +1109,7 @@ class TestDualCallableEndpoints:
         self, fake_request, job_a, fake_db
     ):
         """Agent path: valid X-Internal-Key + load job → skip user check."""
-        from orchestrator.main import cancel_job
+        from tests._b09_control_seams import cancel_job
 
         fake_request.headers = {"X-Internal-Key": "secret"}
         # Job_a status is "created" — cancel handler will reach the next
@@ -1139,7 +1139,7 @@ class TestDualCallableEndpoints:
         self, user_b, job_a, fake_db, fake_request
     ):
         """Cockpit path: no key, cross-user → 403 from require_job_access."""
-        from orchestrator.main import pause_job
+        from tests._b09_control_seams import pause_job
 
         fake_request.headers = {}
         with (
@@ -1159,7 +1159,8 @@ class TestDualCallableEndpoints:
         Agent jobs must bind identity through a thread/parent (or an
         authenticated MCP-forwarded user); a bare body user_id is rejected.
         """
-        from orchestrator.main import JobCreate, create_job
+        from orchestrator.main import JobCreate
+        from tests._b09_control_seams import create_job
 
         fake_request.headers = {"X-Internal-Key": "secret"}
         body = JobCreate(
@@ -1192,7 +1193,8 @@ class TestDualCallableEndpoints:
     ):
         """The shared internal key is present in agent pods and therefore can
         never grant an originless HTTP "system job" bypass."""
-        from orchestrator.main import JobCreate, create_job
+        from orchestrator.main import JobCreate
+        from tests._b09_control_seams import create_job
 
         fake_request.headers = {"X-Internal-Key": "secret"}
         body = JobCreate(description="originless internal attempt")
@@ -1224,7 +1226,8 @@ class TestDualCallableEndpoints:
     ):
         """A session agent cannot point a child at another project's native KB
         or repositories by submitting a different project_id."""
-        from orchestrator.main import JobCreate, create_job
+        from orchestrator.main import JobCreate
+        from tests._b09_control_seams import create_job
 
         fake_request.headers = {"X-Internal-Key": "secret"}
         scoped_thread = {**thread_a, "project_id": project_a["id"]}
@@ -1267,7 +1270,8 @@ class TestDualCallableEndpoints:
     ):
         """A valid thread principal still cannot attach another user's private
         datasource (including an external OKF KB) by guessing its UUID."""
-        from orchestrator.main import JobCreate, create_job
+        from orchestrator.main import JobCreate
+        from tests._b09_control_seams import create_job
 
         fake_request.headers = {"X-Internal-Key": "secret"}
         scoped_thread = {**thread_a, "project_id": project_a["id"]}
@@ -1308,7 +1312,8 @@ class TestDualCallableEndpoints:
         fake_db,
     ):
         """Transport trust permits reuse, not ambient connector selection."""
-        from orchestrator.main import JobCreate, create_job
+        from orchestrator.main import JobCreate
+        from tests._b09_control_seams import create_job
 
         fake_request.headers = {"X-Internal-Key": "secret"}
         ownerless_thread = {
@@ -1351,7 +1356,8 @@ class TestDualCallableEndpoints:
     ):
         """A child cannot retain a datasource after the parent's owner's
         current access was revoked; inheritance is selection, not authority."""
-        from orchestrator.main import JobCreate, create_job
+        from orchestrator.main import JobCreate
+        from tests._b09_control_seams import create_job
 
         fake_request.headers = {"X-Internal-Key": "secret"}
         fake_db.get_user = AsyncMock(return_value=user_a)
@@ -1393,7 +1399,8 @@ class TestDualCallableEndpoints:
     ):
         """Cockpit path: body.user_id is overwritten with caller.id (F2 pattern).
         A malicious body trying to attribute the job to user_b is sanitized."""
-        from orchestrator.main import JobCreate, create_job
+        from orchestrator.main import JobCreate
+        from tests._b09_control_seams import create_job
 
         fake_request.headers = {}
         body = JobCreate(
@@ -1422,7 +1429,8 @@ class TestDualCallableEndpoints:
     ):
         """A stale users.default_project_id cannot restore native KB/project
         scope after the user loses editor access."""
-        from orchestrator.main import JobCreate, create_job
+        from orchestrator.main import JobCreate
+        from tests._b09_control_seams import create_job
 
         fake_request.headers = {}
         fake_db.get_user = AsyncMock(
@@ -1451,7 +1459,8 @@ class TestDualCallableEndpoints:
         self, user_a, fake_db, fake_request
     ):
         """Public callers cannot self-declare subjobs or lifecycle runners."""
-        from orchestrator.main import JobCreate, create_job
+        from orchestrator.main import JobCreate
+        from tests._b09_control_seams import create_job
 
         fake_request.headers = {}
         fake_db.get_user = AsyncMock(

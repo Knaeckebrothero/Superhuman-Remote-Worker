@@ -1,5 +1,7 @@
 """Manual assignment must preserve the dispatcher's workspace preflight."""
 
+from tests import _b09_control_seams as control_seams
+
 from unittest.mock import AsyncMock, MagicMock
 from types import SimpleNamespace
 
@@ -70,8 +72,12 @@ def collaborators(monkeypatch):
         main.postgres_db, "queue_job_for_resume", AsyncMock(return_value=True)
     )
     monkeypatch.setattr(main, "_trigger_dispatch", MagicMock())
-    monkeypatch.setattr(main, "_dispatch_job_to_agent", AsyncMock(return_value=True))
-    monkeypatch.setattr(main, "_resume_job_on_agent", AsyncMock(return_value=True))
+    delivery = SimpleNamespace(
+        dispatch=AsyncMock(return_value=True),
+        resume=AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(main, "_job_delivery_operations", lambda: delivery)
+    return delivery
 
 
 @pytest.mark.asyncio
@@ -135,7 +141,7 @@ async def test_flag_on_live_workspace_claims_before_agent_post(
     main.postgres_db.claim_job_for_agent.side_effect = (
         lambda *_args, **_kwargs: order.append("claim") or True
     )
-    main._dispatch_job_to_agent.side_effect = (
+    collaborators.dispatch.side_effect = (
         lambda *_args, **_kwargs: order.append("post") or True
     )
 
@@ -176,7 +182,7 @@ async def test_manual_assign_waits_for_legacy_runtime_adoption_before_claim(
     prepare.assert_awaited_once_with(job)
     main.postgres_db.claim_job_for_agent.assert_not_awaited()
     main.postgres_db.get_agent.assert_not_awaited()
-    main._dispatch_job_to_agent.assert_not_awaited()
+    collaborators.dispatch.assert_not_awaited()
 
 
 class TestManualAssignWorkspacePreflight:
@@ -191,8 +197,8 @@ class TestManualAssignWorkspacePreflight:
 
         assert exc.value.status_code == 409
         main.postgres_db.get_agent.assert_not_awaited()
-        main._dispatch_job_to_agent.assert_not_awaited()
-        main._resume_job_on_agent.assert_not_awaited()
+        collaborators.dispatch.assert_not_awaited()
+        collaborators.resume.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_created_job_without_workspace_is_queued(self, collaborators):
@@ -207,7 +213,7 @@ class TestManualAssignWorkspacePreflight:
         )
         main.postgres_db.queue_job_for_resume.assert_not_awaited()
         main.postgres_db.get_agent.assert_not_awaited()
-        main._dispatch_job_to_agent.assert_not_awaited()
+        collaborators.dispatch.assert_not_awaited()
         main._trigger_dispatch.assert_called_once_with()
 
     @pytest.mark.asyncio
@@ -248,7 +254,7 @@ class TestManualAssignWorkspacePreflight:
             completion_commands_enabled=False,
             allow_failed=True,
         )
-        main._dispatch_job_to_agent.assert_awaited_once()
+        collaborators.dispatch.assert_awaited_once()
         main._trigger_dispatch.assert_not_called()
 
 
@@ -272,8 +278,8 @@ class TestAssignLaneChoice:
         result = await main.assign_job_to_agent(MagicMock(), JOB_ID, AGENT_ID)
 
         assert result["status"] == "assigned"
-        main._resume_job_on_agent.assert_awaited_once()
-        main._dispatch_job_to_agent.assert_not_awaited()
+        collaborators.resume.assert_awaited_once()
+        collaborators.dispatch.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_paused_never_started_job_uses_the_fresh_lane(
@@ -288,14 +294,14 @@ class TestAssignLaneChoice:
         result = await main.assign_job_to_agent(MagicMock(), JOB_ID, AGENT_ID)
 
         assert result["status"] == "assigned"
-        main._dispatch_job_to_agent.assert_awaited_once()
-        main._resume_job_on_agent.assert_not_awaited()
+        collaborators.dispatch.assert_awaited_once()
+        collaborators.resume.assert_not_awaited()
 
 
 class TestPinnedDispatchDefenseInDepth:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "helper_name", ["_dispatch_job_to_agent", "_resume_job_on_agent"]
+        "helper_name", ["dispatch_job_to_agent", "resume_job_on_agent"]
     )
     async def test_legacy_adoption_waits_before_agent_network(
         self, helper_name, monkeypatch
@@ -312,7 +318,7 @@ class TestPinnedDispatchDefenseInDepth:
         network = MagicMock(side_effect=AssertionError("agent I/O attempted"))
         monkeypatch.setattr(main.httpx, "AsyncClient", network)
 
-        assert await getattr(main, helper_name)(job, _agent()) is False
+        assert await getattr(control_seams, helper_name)(job, _agent()) is False
 
         prepare.assert_awaited_once_with(job)
         network.assert_not_called()
@@ -321,13 +327,13 @@ class TestPinnedDispatchDefenseInDepth:
     async def test_fresh_helper_refuses_stateless_job_before_network(self):
         job = _job("created", workspace_status="ready")
         job["execution_lane"] = "stateless"
-        assert await main._dispatch_job_to_agent(job, _agent()) is False
+        assert await control_seams.dispatch_job_to_agent(job, _agent()) is False
 
     @pytest.mark.asyncio
     async def test_resume_helper_refuses_stateless_job_before_network(self):
         job = _job("paused", workspace_status="ready")
         job["execution_lane"] = "stateless"
-        assert await main._resume_job_on_agent(job, _agent()) is False
+        assert await control_seams.resume_job_on_agent(job, _agent()) is False
 
     @pytest.mark.asyncio
     async def test_fresh_helper_refuses_redispatch_circuit_trip_before_network(self):
@@ -336,7 +342,7 @@ class TestPinnedDispatchDefenseInDepth:
             "state": "tripped",
             "unchanged_recoveries": 3,
         }
-        assert await main._dispatch_job_to_agent(job, _agent()) is False
+        assert await control_seams.dispatch_job_to_agent(job, _agent()) is False
 
     @pytest.mark.asyncio
     async def test_resume_helper_refuses_redispatch_circuit_trip_before_network(self):
@@ -345,4 +351,4 @@ class TestPinnedDispatchDefenseInDepth:
             "state": "tripped",
             "unchanged_recoveries": 3,
         }
-        assert await main._resume_job_on_agent(job, _agent()) is False
+        assert await control_seams.resume_job_on_agent(job, _agent()) is False

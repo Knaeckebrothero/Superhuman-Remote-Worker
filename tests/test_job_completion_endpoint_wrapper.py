@@ -29,6 +29,7 @@ from orchestrator.services import job_completion_commands as commands
 from orchestrator.services import completion as completion_service
 from orchestrator.services.completion_effect_policy import COMPLETION_EFFECT_PLAN
 from orchestrator.services.completion_finalizer import CompletionDispositionSuperseded
+from orchestrator.services.container_provisioner import WorkspaceCleanupOutcome
 
 
 JOB_ID = "11111111-2222-3333-4444-555555555555"
@@ -364,7 +365,9 @@ def _patch_normal_route_dependencies(
     )
     monkeypatch.setattr(orchestrator.main, "vector_db", None)
     monkeypatch.setattr(
-        orchestrator.main, "_archive_and_cleanup_workspace", workspace_cleanup
+        orchestrator.main.thread_retirement_operations.ThreadRetirementOperations,
+        "archive_and_cleanup_workspace",
+        workspace_cleanup,
     )
     monkeypatch.setattr(orchestrator.main, "maybe_wake_session", AsyncMock())
     monkeypatch.setattr(orchestrator.main, "_trigger_dispatch", MagicMock())
@@ -591,7 +594,9 @@ async def test_effect_runner_reconstructs_normal_result_without_repeating_effect
     )
     monkeypatch.setattr(orchestrator.main, "vector_db", None)
     monkeypatch.setattr(
-        orchestrator.main, "_archive_and_cleanup_workspace", workspace_cleanup
+        orchestrator.main.thread_retirement_operations.ThreadRetirementOperations,
+        "archive_and_cleanup_workspace",
+        workspace_cleanup,
     )
     monkeypatch.setattr(orchestrator.main, "maybe_wake_session", wake)
     monkeypatch.setattr(orchestrator.main, "_trigger_dispatch", dispatch)
@@ -1355,7 +1360,11 @@ async def test_flag_on_s23_auto_deny_uses_exact_finalizer_owner(
         AsyncMock(return_value="sudo-request-1"),
     )
     resume = AsyncMock(return_value={"status": "denied_vm_upgrade"})
-    monkeypatch.setattr(orchestrator.main, "_resume_job_without_vm_internal", resume)
+    monkeypatch.setattr(
+        orchestrator.main.job_control_operations.JobControlOperations,
+        "resume_job_without_vm_internal",
+        resume,
+    )
     body = orchestrator.main.JobCompleteRequest(
         should_stop=True,
         goal_achieved=False,
@@ -1759,7 +1768,7 @@ async def test_durable_recovery_delete_uses_exact_cleanup_intent(
     )
     prepare_cleanup = AsyncMock(return_value={"intent_generation": 7})
     reconcile_cleanup = AsyncMock(
-        return_value=orchestrator.main.WorkspaceCleanupOutcome(cleanup_state, 7)
+        return_value=WorkspaceCleanupOutcome(cleanup_state, 7)
     )
     monkeypatch.setattr(
         orchestrator.main.container_provisioner,
@@ -2224,7 +2233,9 @@ async def test_cancel_after_s17_supersedes_before_s36_without_settling_effect(
     workspace_cleanup = AsyncMock(return_value=["must not release"])
     monkeypatch.setattr(orchestrator.main, "postgres_db", database)
     monkeypatch.setattr(
-        orchestrator.main, "_archive_and_cleanup_workspace", workspace_cleanup
+        orchestrator.main.thread_retirement_operations.ThreadRetirementOperations,
+        "archive_and_cleanup_workspace",
+        workspace_cleanup,
     )
 
     with pytest.raises(CompletionDispositionSuperseded) as raised:
@@ -2255,7 +2266,9 @@ async def test_active_s36_marker_status_drift_parks_without_clearing_effect(
     workspace_cleanup = AsyncMock(return_value=["must not release"])
     monkeypatch.setattr(orchestrator.main, "postgres_db", database)
     monkeypatch.setattr(
-        orchestrator.main, "_archive_and_cleanup_workspace", workspace_cleanup
+        orchestrator.main.thread_retirement_operations.ThreadRetirementOperations,
+        "archive_and_cleanup_workspace",
+        workspace_cleanup,
     )
 
     output = await b08_helpers.run_completion_workspace_teardown(JOB_ID, runner)
@@ -2318,7 +2331,9 @@ async def test_flagged_vm_teardown_captures_replays_and_archives_exact_identity(
         orchestrator.main.vm_provisioner, "release_vm_captured", release
     )
     monkeypatch.setattr(
-        orchestrator.main, "_archive_and_cleanup_workspace", legacy_cleanup
+        orchestrator.main.thread_retirement_operations.ThreadRetirementOperations,
+        "archive_and_cleanup_workspace",
+        legacy_cleanup,
     )
 
     first = await b08_helpers.run_completion_workspace_teardown(JOB_ID, runner)
@@ -2422,7 +2437,9 @@ async def test_docker_vm_s36_keeps_durable_legacy_cleanup_without_identity_probe
     legacy_cleanup = AsyncMock(return_value=["docker vm released"])
     monkeypatch.setattr(orchestrator.main, "postgres_db", _RouteDB(job))
     monkeypatch.setattr(
-        orchestrator.main, "_archive_and_cleanup_workspace", legacy_cleanup
+        orchestrator.main.thread_retirement_operations.ThreadRetirementOperations,
+        "archive_and_cleanup_workspace",
+        legacy_cleanup,
     )
     monkeypatch.setattr(
         orchestrator.main.vm_provisioner,
@@ -2517,7 +2534,9 @@ async def test_hybrid_vm_and_kubernetes_s36_captures_and_releases_both(
     )
     legacy_cleanup = AsyncMock(side_effect=AssertionError("must stay UID fenced"))
     monkeypatch.setattr(
-        orchestrator.main, "_archive_and_cleanup_workspace", legacy_cleanup
+        orchestrator.main.thread_retirement_operations.ThreadRetirementOperations,
+        "archive_and_cleanup_workspace",
+        legacy_cleanup,
     )
 
     first = await b08_helpers.run_completion_workspace_teardown(JOB_ID, runner)
@@ -2631,7 +2650,9 @@ async def test_hybrid_s36_replacement_supersedes_and_preserves_other_names(
     )
     legacy_cleanup = AsyncMock(side_effect=AssertionError("must preserve successors"))
     monkeypatch.setattr(
-        orchestrator.main, "_archive_and_cleanup_workspace", legacy_cleanup
+        orchestrator.main.thread_retirement_operations.ThreadRetirementOperations,
+        "archive_and_cleanup_workspace",
+        legacy_cleanup,
     )
 
     output = await b08_helpers.run_completion_workspace_teardown(JOB_ID, runner)
@@ -3601,7 +3622,11 @@ async def test_curation_handoff_is_keyed_to_completion_command(
         "get_job",
         AsyncMock(return_value={"id": CURATOR_ID, "context": {}}),
     )
-    monkeypatch.setattr(orchestrator.main, "_internal_resume_job", queue)
+    monkeypatch.setattr(
+        orchestrator.main.job_control_operations.JobControlOperations,
+        "internal_resume_job",
+        queue,
+    )
 
     await b08_helpers.trigger_curation_final_pass(
         JOB_ID,
@@ -3645,7 +3670,11 @@ async def test_curation_handoff_reconciles_exact_command_without_requeue(
             }
         ),
     )
-    monkeypatch.setattr(orchestrator.main, "_internal_resume_job", queue)
+    monkeypatch.setattr(
+        orchestrator.main.job_control_operations.JobControlOperations,
+        "internal_resume_job",
+        queue,
+    )
     monkeypatch.setattr(orchestrator.main, "_trigger_dispatch", dispatch)
 
     await b08_helpers.trigger_curation_final_pass(

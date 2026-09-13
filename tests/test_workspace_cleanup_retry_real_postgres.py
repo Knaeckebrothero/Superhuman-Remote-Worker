@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests import _b09_control_seams as control_seams
+
 import asyncio
 import json
 from pathlib import Path
@@ -517,12 +519,12 @@ async def test_completed_job_cleanup_replays_captured_generation_after_pod_loss(
     monkeypatch.setattr(main, "postgres_db", db)
     monkeypatch.setattr(main, "container_provisioner", p)
     if failure is None:
-        actions = await main._archive_and_cleanup_workspace(str(job))
+        actions = await control_seams.archive_and_cleanup_workspace(str(job))
         assert actions == ["k8s workspace released"]
         assert resources == {}
     else:
         with pytest.raises(RuntimeError, match="exact teardown is incomplete"):
-            await main._archive_and_cleanup_workspace(str(job))
+            await control_seams.archive_and_cleanup_workspace(str(job))
         assert set(resources) == {"service"}
         p._core_api.delete_namespaced_service.assert_not_called()
     assert await _receipts(db, job) == before

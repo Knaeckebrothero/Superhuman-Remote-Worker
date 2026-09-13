@@ -16,6 +16,8 @@ See knowledge-base/knowledge/issues/job_resume_direct_path_skips_credential_inje
 
 from __future__ import annotations
 
+from tests import _b09_control_seams as control_seams
+
 from tests._expert_catalog import patch_service_method
 from orchestrator.services import expert_catalog as expert_catalog_module
 
@@ -33,6 +35,7 @@ os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
 
 import orchestrator.main  # noqa: E402
 from shared.runtime_actor import RuntimeActorContext  # noqa: E402
+from shared.runtime.core.tool_policy import ToolPolicyError  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -309,7 +312,7 @@ class TestResumeJobOnAgentInjection:
             worktree_path="/home/agent-host/workspace/.worktrees/job-1",
         )
 
-        assert await orchestrator.main._resume_job_on_agent(job, _agent()) is True
+        assert await control_seams.resume_job_on_agent(job, _agent()) is True
 
         remote = _posted_payload()["config_override"]["workspace"]["remote"]
         assert remote == {
@@ -342,7 +345,7 @@ class TestResumeJobOnAgentInjection:
             },
         )
 
-        assert await orchestrator.main._resume_job_on_agent(job, _agent()) is True
+        assert await control_seams.resume_job_on_agent(job, _agent()) is True
         remote = _posted_payload()["config_override"]["workspace"]["remote"]
         assert remote["key_path"] == "/run/secrets/ssh/id_ed25519"
 
@@ -350,7 +353,7 @@ class TestResumeJobOnAgentInjection:
     async def test_injected_credentials_reach_the_posted_payload(
         self, resume_collaborators
     ):
-        ok = await orchestrator.main._resume_job_on_agent(
+        ok = await control_seams.resume_job_on_agent(
             _job(project_id=PROJECT_ID), _agent()
         )
 
@@ -367,9 +370,7 @@ class TestResumeJobOnAgentInjection:
 
     @pytest.mark.asyncio
     async def test_kb_profile_follows_project_scope(self, resume_collaborators):
-        await orchestrator.main._resume_job_on_agent(
-            _job(project_id=PROJECT_ID), _agent()
-        )
+        await control_seams.resume_job_on_agent(_job(project_id=PROJECT_ID), _agent())
         assert (
             resume_collaborators.injector.await_args.kwargs["include_kb_profile"]
             is True
@@ -406,7 +407,7 @@ class TestResumeJobOnAgentInjection:
             AsyncMock(side_effect=lambda config, **_kwargs: config),
         )
 
-        ok = await orchestrator.main._resume_job_on_agent(
+        ok = await control_seams.resume_job_on_agent(
             _job(
                 config_name="developer",
                 config_override={
@@ -464,7 +465,7 @@ class TestResumeJobOnAgentInjection:
             ),
         )
 
-        ok = await orchestrator.main._resume_job_on_agent(
+        ok = await control_seams.resume_job_on_agent(
             _job(config_name="developer"), _agent()
         )
 
@@ -502,7 +503,7 @@ class TestResumeJobOnAgentInjection:
             AsyncMock(side_effect=lambda config, **_kwargs: config),
         )
 
-        ok = await orchestrator.main._resume_job_on_agent(
+        ok = await control_seams.resume_job_on_agent(
             _job(config_name="developer"), _agent()
         )
 
@@ -517,7 +518,7 @@ class TestResumeJobOnAgentInjection:
     async def test_kb_profile_off_without_project_or_kb_datasource(
         self, resume_collaborators
     ):
-        await orchestrator.main._resume_job_on_agent(_job(), _agent())
+        await control_seams.resume_job_on_agent(_job(), _agent())
         assert (
             resume_collaborators.injector.await_args.kwargs["include_kb_profile"]
             is False
@@ -532,7 +533,7 @@ class TestResumeJobOnAgentInjection:
             "_resolve_authorized_job_datasources",
             AsyncMock(return_value=[{"type": "kb", "id": "ds-1"}]),
         )
-        await orchestrator.main._resume_job_on_agent(_job(), _agent())
+        await control_seams.resume_job_on_agent(_job(), _agent())
         assert (
             resume_collaborators.injector.await_args.kwargs["include_kb_profile"]
             is True
@@ -540,7 +541,7 @@ class TestResumeJobOnAgentInjection:
 
     @pytest.mark.asyncio
     async def test_config_upload_id_passthrough(self, resume_collaborators):
-        await orchestrator.main._resume_job_on_agent(
+        await control_seams.resume_job_on_agent(
             _job(context={"config_upload_id": "upload-7"}), _agent()
         )
         assert _posted_payload()["config_upload_id"] == "upload-7"
@@ -549,12 +550,12 @@ class TestResumeJobOnAgentInjection:
     async def test_config_upload_id_absent_stays_off_the_wire(
         self, resume_collaborators
     ):
-        await orchestrator.main._resume_job_on_agent(_job(), _agent())
+        await control_seams.resume_job_on_agent(_job(), _agent())
         assert "config_upload_id" not in _posted_payload()
 
     @pytest.mark.asyncio
     async def test_queued_feedback_delivered_then_cleared(self, resume_collaborators):
-        ok = await orchestrator.main._resume_job_on_agent(
+        ok = await control_seams.resume_job_on_agent(
             _job(context={"queued_feedback": "fix the tests"}), _agent()
         )
 
@@ -574,7 +575,7 @@ class TestResumeJobOnAgentRejection:
         _FakeAsyncClient.next_status = 422
         _FakeAsyncClient.next_text = private_material
 
-        assert await orchestrator.main._resume_job_on_agent(_job(), _agent()) is False
+        assert await control_seams.resume_job_on_agent(_job(), _agent()) is False
 
         assert private_material not in caplog.text
         assert "status=422" in caplog.text
@@ -583,7 +584,7 @@ class TestResumeJobOnAgentRejection:
     async def test_409_demotes_stale_ready_agent(self, resume_collaborators):
         _FakeAsyncClient.next_status = 409
 
-        ok = await orchestrator.main._resume_job_on_agent(_job(), _agent())
+        ok = await control_seams.resume_job_on_agent(_job(), _agent())
 
         assert ok is False
         demote_sql = resume_collaborators.conn.execute.await_args.args[0]
@@ -594,7 +595,7 @@ class TestResumeJobOnAgentRejection:
     async def test_other_rejects_do_not_demote(self, resume_collaborators):
         _FakeAsyncClient.next_status = 500
 
-        ok = await orchestrator.main._resume_job_on_agent(_job(), _agent())
+        ok = await control_seams.resume_job_on_agent(_job(), _agent())
 
         assert ok is False
         resume_collaborators.conn.execute.assert_not_awaited()
@@ -603,7 +604,7 @@ class TestResumeJobOnAgentRejection:
     async def test_rejected_resume_keeps_queued_feedback(self, resume_collaborators):
         _FakeAsyncClient.next_status = 409
 
-        await orchestrator.main._resume_job_on_agent(
+        await control_seams.resume_job_on_agent(
             _job(context={"queued_feedback": "keep me"}), _agent()
         )
 
@@ -660,7 +661,11 @@ def endpoint_collaborators(monkeypatch, fake_conn):
     )
     monkeypatch.setattr(orchestrator.main, "_trigger_dispatch", MagicMock())
     delegate = AsyncMock(return_value=True)
-    monkeypatch.setattr(orchestrator.main, "_resume_job_on_agent", delegate)
+    monkeypatch.setattr(
+        orchestrator.main,
+        "_job_delivery_operations",
+        lambda: SimpleNamespace(resume=delegate),
+    )
     return SimpleNamespace(
         job=job,
         agent=agent,
@@ -695,7 +700,7 @@ class TestResumeEndpointDelegation:
             orchestrator.main.postgres_db, "shed_workspace_context", shed
         )
 
-        result = await orchestrator.main.resume_job(
+        result = await control_seams.resume_job(
             MagicMock(), JOB_ID, orchestrator.main.JobResumeRequest()
         )
 
@@ -738,7 +743,7 @@ class TestResumeEndpointDelegation:
             ),
         )
 
-        result = await orchestrator.main.resume_job(
+        result = await control_seams.resume_job(
             MagicMock(),
             JOB_ID,
             orchestrator.main.JobResumeRequest(feedback="reviewer correction"),
@@ -764,7 +769,7 @@ class TestResumeEndpointDelegation:
 
     @pytest.mark.asyncio
     async def test_fast_path_delegates_to_shared_resume(self, endpoint_collaborators):
-        result = await orchestrator.main.resume_job(
+        result = await control_seams.resume_job(
             MagicMock(), JOB_ID, orchestrator.main.JobResumeRequest()
         )
 
@@ -788,7 +793,7 @@ class TestResumeEndpointDelegation:
     async def test_feedback_is_merged_and_stamped_on_the_delegated_job(
         self, endpoint_collaborators
     ):
-        await orchestrator.main.resume_job(
+        await control_seams.resume_job(
             MagicMock(),
             JOB_ID,
             orchestrator.main.JobResumeRequest(feedback="try again"),
@@ -813,7 +818,7 @@ class TestResumeEndpointDelegation:
     async def test_declined_resume_falls_back_to_queue(self, endpoint_collaborators):
         endpoint_collaborators.delegate.return_value = False
 
-        result = await orchestrator.main.resume_job(
+        result = await control_seams.resume_job(
             MagicMock(), JOB_ID, orchestrator.main.JobResumeRequest()
         )
 
@@ -853,7 +858,7 @@ class TestRedispatchCircuitAcknowledgement:
             endpoint_collaborators.job,
         )
 
-        result = await orchestrator.main.resume_job(
+        result = await control_seams.resume_job(
             MagicMock(),
             JOB_ID,
             orchestrator.main.JobResumeRequest(feedback="retry deliberately"),
@@ -897,7 +902,7 @@ class TestRedispatchCircuitAcknowledgement:
             orchestrator.main, "authorize_runtime_actor_request", authorize
         )
 
-        result = await orchestrator.main.resume_job(
+        result = await control_seams.resume_job(
             MagicMock(), JOB_ID, orchestrator.main.JobResumeRequest()
         )
 
@@ -931,7 +936,7 @@ class TestRedispatchCircuitAcknowledgement:
         )
 
         with pytest.raises(HTTPException) as exc:
-            await orchestrator.main.resume_job(
+            await control_seams.resume_job(
                 MagicMock(), JOB_ID, orchestrator.main.JobResumeRequest()
             )
 
@@ -952,7 +957,7 @@ class TestRedispatchCircuitAcknowledgement:
         endpoint_collaborators.acknowledge_circuit.return_value = False
 
         with pytest.raises(HTTPException) as exc:
-            await orchestrator.main.resume_job(
+            await control_seams.resume_job(
                 MagicMock(), JOB_ID, orchestrator.main.JobResumeRequest()
             )
 
@@ -994,7 +999,7 @@ class TestResumeEndpointWorkspacelessJob:
 
     @pytest.mark.asyncio
     async def test_queues_instead_of_resuming_onto_an_agent(self, workspaceless):
-        result = await orchestrator.main.resume_job(
+        result = await control_seams.resume_job(
             MagicMock(), JOB_ID, orchestrator.main.JobResumeRequest()
         )
 
@@ -1005,7 +1010,7 @@ class TestResumeEndpointWorkspacelessJob:
     @pytest.mark.asyncio
     async def test_sheds_the_parked_vm_context(self, workspaceless):
         """Without this the dispatcher reads status='failed' and re-parks it."""
-        await orchestrator.main.resume_job(
+        await control_seams.resume_job(
             MagicMock(), JOB_ID, orchestrator.main.JobResumeRequest()
         )
 
@@ -1016,7 +1021,7 @@ class TestResumeEndpointWorkspacelessJob:
         workspaceless.job["config_override"] = {"workspace": {"backend": "sandbox"}}
         workspaceless.job["context"] = {"workspace_container": {"status": "deleted"}}
 
-        await orchestrator.main.resume_job(
+        await control_seams.resume_job(
             MagicMock(), JOB_ID, orchestrator.main.JobResumeRequest()
         )
 
@@ -1029,7 +1034,7 @@ class TestResumeEndpointWorkspacelessJob:
         The pre-flight returns before the endpoint's own feedback merge, so the
         feedback rides along on the queue write instead.
         """
-        await orchestrator.main.resume_job(
+        await control_seams.resume_job(
             MagicMock(),
             JOB_ID,
             orchestrator.main.JobResumeRequest(feedback="try again"),
@@ -1059,7 +1064,7 @@ class TestResumeEndpointWorkspacelessJob:
             }
         )
 
-        result = await orchestrator.main.resume_job(
+        result = await control_seams.resume_job(
             MagicMock(),
             JOB_ID,
             orchestrator.main.JobResumeRequest(feedback="continue after rebuild"),
@@ -1100,7 +1105,7 @@ class TestResumeEndpointWorkspacelessJob:
             },
         }
 
-        result = await orchestrator.main.resume_job(
+        result = await control_seams.resume_job(
             MagicMock(), JOB_ID, orchestrator.main.JobResumeRequest()
         )
 
@@ -1179,14 +1184,12 @@ class TestResumeEndpointGrantRecheck:
         NOT put the job back on an agent. Asserting the status code alone
         would still pass a fix that resumed the job first and merely
         returned the right code afterwards."""
-        grant_recheck_collaborators.resolve_config.side_effect = (
-            orchestrator.main.ToolPolicyError(
-                "tools.core: unsupported value None (NoneType)."
-            )
+        grant_recheck_collaborators.resolve_config.side_effect = ToolPolicyError(
+            "tools.core: unsupported value None (NoneType)."
         )
 
         with pytest.raises(HTTPException) as ei:
-            await orchestrator.main.resume_job(
+            await control_seams.resume_job(
                 MagicMock(), JOB_ID, orchestrator.main.JobResumeRequest()
             )
 
@@ -1209,7 +1212,7 @@ class TestResumeEndpointGrantRecheck:
             "connection reset by peer"
         )
 
-        result = await orchestrator.main.resume_job(
+        result = await control_seams.resume_job(
             MagicMock(), JOB_ID, orchestrator.main.JobResumeRequest()
         )
 
@@ -1232,7 +1235,7 @@ class TestResumeEndpointGrantRecheck:
         )
 
         with pytest.raises(HTTPException) as ei:
-            await orchestrator.main.resume_job(
+            await control_seams.resume_job(
                 MagicMock(), JOB_ID, orchestrator.main.JobResumeRequest()
             )
 
@@ -1244,7 +1247,7 @@ class TestResumeEndpointGrantRecheck:
     async def test_happy_path_still_resumes(self, grant_recheck_collaborators):
         """Fixture sanity baseline: when both collaborators pass, the PEP
         block is a no-op and the job resumes normally."""
-        result = await orchestrator.main.resume_job(
+        result = await control_seams.resume_job(
             MagicMock(), JOB_ID, orchestrator.main.JobResumeRequest()
         )
 
@@ -1274,7 +1277,7 @@ class TestResumeEndpointGrantRecheck:
         grant_recheck_collaborators.job["config_override"] = "{not valid json"
 
         with pytest.raises(HTTPException) as ei:
-            await orchestrator.main.resume_job(
+            await control_seams.resume_job(
                 MagicMock(), JOB_ID, orchestrator.main.JobResumeRequest()
             )
 
@@ -1308,7 +1311,7 @@ class TestResumeEndpointGrantRecheck:
         )
 
         with pytest.raises(HTTPException) as ei:
-            await orchestrator.main.resume_job(
+            await control_seams.resume_job(
                 MagicMock(), JOB_ID, orchestrator.main.JobResumeRequest()
             )
 
@@ -1334,7 +1337,7 @@ class TestResumePayloadGitRemote:
     ):
         job = _job(context={"git_remote_url": "http://srw-gitea:3000/srw/job-1.git"})
 
-        assert await orchestrator.main._resume_job_on_agent(job, _agent()) is True
+        assert await control_seams.resume_job_on_agent(job, _agent()) is True
 
         assert (
             _posted_payload()["git_remote_url"] == "http://srw-gitea:3000/srw/job-1.git"
@@ -1344,6 +1347,6 @@ class TestResumePayloadGitRemote:
     async def test_resume_payload_omits_git_remote_when_job_has_none(
         self, resume_collaborators
     ):
-        assert await orchestrator.main._resume_job_on_agent(_job(), _agent()) is True
+        assert await control_seams.resume_job_on_agent(_job(), _agent()) is True
 
         assert "git_remote_url" not in _posted_payload()

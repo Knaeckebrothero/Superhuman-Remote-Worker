@@ -487,7 +487,7 @@ def job_db():
 
 async def _create_job(db, request, body):
     import orchestrator.security.access as access_module
-    from orchestrator.main import create_job
+    from tests._b09_control_seams import create_job
 
     user = {"id": USER_ID, "is_admin": False}
     patches = [

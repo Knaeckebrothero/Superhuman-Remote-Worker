@@ -1,5 +1,7 @@
 """Server-owned repository datasource identity across runtime payload paths."""
 
+from tests import _b09_control_seams as control_seams
+
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -235,7 +237,7 @@ async def test_resume_payload_uses_resolved_repository_uuid():
         patch.object(orch_main.httpx, "AsyncClient", _Client),
         patch.object(orch_main, "COMPLETION_COMMANDS_ENABLED", False),
     ):
-        accepted = await orch_main._resume_job_on_agent(
+        accepted = await control_seams.resume_job_on_agent(
             job,
             {
                 "id": AGENT_ID,

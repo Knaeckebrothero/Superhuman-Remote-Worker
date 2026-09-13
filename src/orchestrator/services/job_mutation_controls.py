@@ -248,7 +248,7 @@ class JobControlOperations:
             agent_id=agent_id, job_id=job_id, require_idle=False
         )
         if target is None:
-            return False, None
+            return False, -1
         payload: dict[str, Any] = {
             "recipient": target.recipient.model_dump(mode="json")
         }
@@ -379,9 +379,11 @@ class JobControlOperations:
             agent_id = child.get("assigned_agent_id")
             if not agent_id:
                 return not require_positive_quiescence
-            acknowledged, _ = await self._signal(
+            acknowledged, status = await self._signal(
                 str(child["id"]), str(agent_id), "pause"
             )
+            if status == -1:
+                return False
             if not acknowledged and require_positive_quiescence:
                 return False
             if not self.commands_enabled:

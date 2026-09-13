@@ -1646,13 +1646,13 @@ class TestEndThreadReroute:
         db.settle_pinned_thread_retirement = AsyncMock(return_value=True)
         db.try_thread_advisory_lock = MagicMock(return_value=lock)
         monkeypatch.setattr(
-            orch_main,
-            "_pinned_retirement_is_current",
+            orch_main.PinnedRetirementOperations,
+            "pinned_retirement_is_current",
             AsyncMock(return_value=True),
         )
         monkeypatch.setattr(
-            orch_main,
-            "_cleanup_pinned_thread_retirement",
+            orch_main.PinnedRetirementOperations,
+            "cleanup_pinned_thread_retirement",
             AsyncMock(),
         )
 
@@ -1663,9 +1663,15 @@ class TestEndThreadReroute:
         """The officer branch of ``end_thread``'s stand-down IS decommission
         step 2-3-5 (officer_post.md §5) — reason 'retired' by default."""
         monkeypatch.setattr(
-            orch_main, "_thread_turn_in_flight", AsyncMock(return_value=False)
+            orch_main.thread_retirement_operations,
+            "thread_turn_in_flight",
+            AsyncMock(return_value=False),
         )
-        monkeypatch.setattr(orch_main, "_release_thread_resources", AsyncMock())
+        monkeypatch.setattr(
+            orch_main.thread_retirement_operations,
+            "release_thread_resources",
+            AsyncMock(),
+        )
         monkeypatch.setattr(orch_main, "_conclude_conference_if_any", AsyncMock())
         db.get_project_officer = AsyncMock(return_value=_post_row(thread_id=THREAD_ID))
         db.decommission_project_officer = AsyncMock(
@@ -1720,13 +1726,19 @@ class TestEndThreadReroute:
     @pytest.mark.asyncio
     async def test_authoritative_handoff_failure_blocks_the_end(self, db, monkeypatch):
         monkeypatch.setattr(
-            orch_main, "_thread_turn_in_flight", AsyncMock(return_value=False)
+            orch_main.thread_retirement_operations,
+            "thread_turn_in_flight",
+            AsyncMock(return_value=False),
         )
-        monkeypatch.setattr(orch_main, "_release_thread_resources", AsyncMock())
+        monkeypatch.setattr(
+            orch_main.thread_retirement_operations,
+            "release_thread_resources",
+            AsyncMock(),
+        )
         monkeypatch.setattr(orch_main, "_conclude_conference_if_any", AsyncMock())
         monkeypatch.setattr(
-            orch_main,
-            "_decommission_officer_post",
+            orch_main.officer_post_lifecycle_service,
+            "decommission_officer_post",
             AsyncMock(side_effect=RuntimeError("post table on fire")),
         )
         db.end_thread = AsyncMock()
@@ -1761,11 +1773,15 @@ class TestEndThreadReroute:
             }
         )
         monkeypatch.setattr(
-            orch_main, "_thread_turn_in_flight", AsyncMock(return_value=False)
+            orch_main.thread_retirement_operations,
+            "thread_turn_in_flight",
+            AsyncMock(return_value=False),
         )
         release = AsyncMock()
         conclude = AsyncMock()
-        monkeypatch.setattr(orch_main, "_release_thread_resources", release)
+        monkeypatch.setattr(
+            orch_main.thread_retirement_operations, "release_thread_resources", release
+        )
         monkeypatch.setattr(orch_main, "_conclude_conference_if_any", conclude)
         db.end_thread = AsyncMock()
         thread = _officer_thread(execution_lane="pinned")
@@ -1806,9 +1822,15 @@ class TestEndThreadReroute:
             }
         )
         monkeypatch.setattr(
-            orch_main, "_thread_turn_in_flight", AsyncMock(return_value=False)
+            orch_main.thread_retirement_operations,
+            "thread_turn_in_flight",
+            AsyncMock(return_value=False),
         )
-        monkeypatch.setattr(orch_main, "_release_thread_resources", AsyncMock())
+        monkeypatch.setattr(
+            orch_main.thread_retirement_operations,
+            "release_thread_resources",
+            AsyncMock(),
+        )
         monkeypatch.setattr(orch_main, "_conclude_conference_if_any", AsyncMock())
         db.end_thread = AsyncMock()
         thread = _officer_thread(execution_lane="pinned")
@@ -1832,9 +1854,15 @@ class TestEndThreadReroute:
     ):
         """Both public controls reach the same post/thread transaction."""
         monkeypatch.setattr(
-            orch_main, "_thread_turn_in_flight", AsyncMock(return_value=False)
+            orch_main.thread_retirement_operations,
+            "thread_turn_in_flight",
+            AsyncMock(return_value=False),
         )
-        monkeypatch.setattr(orch_main, "_release_thread_resources", AsyncMock())
+        monkeypatch.setattr(
+            orch_main.thread_retirement_operations,
+            "release_thread_resources",
+            AsyncMock(),
+        )
         monkeypatch.setattr(orch_main, "_conclude_conference_if_any", AsyncMock())
         db.get_or_create_project_officer = AsyncMock(
             return_value=_post_row(thread_id=THREAD_ID)
@@ -1974,12 +2002,22 @@ class TestEndThreadReroute:
     @pytest.mark.asyncio
     async def test_plain_session_end_skips_officer_hygiene(self, db, monkeypatch):
         monkeypatch.setattr(
-            orch_main, "_thread_turn_in_flight", AsyncMock(return_value=False)
+            orch_main.thread_retirement_operations,
+            "thread_turn_in_flight",
+            AsyncMock(return_value=False),
         )
-        monkeypatch.setattr(orch_main, "_release_thread_resources", AsyncMock())
+        monkeypatch.setattr(
+            orch_main.thread_retirement_operations,
+            "release_thread_resources",
+            AsyncMock(),
+        )
         monkeypatch.setattr(orch_main, "_conclude_conference_if_any", AsyncMock())
         hygiene = AsyncMock()
-        monkeypatch.setattr(orch_main, "_decommission_officer_post", hygiene)
+        monkeypatch.setattr(
+            orch_main.officer_post_lifecycle_service,
+            "decommission_officer_post",
+            hygiene,
+        )
         db.end_thread = AsyncMock()
         plain = {
             "id": THREAD_ID,

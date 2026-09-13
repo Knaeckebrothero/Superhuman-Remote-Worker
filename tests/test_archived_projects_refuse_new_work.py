@@ -228,7 +228,8 @@ class TestCreateJobRefusesArchivedProjects:
     ):
         """This is the path that matters: MCP and agent delegation live here,
         and they skip ``require_project_member`` entirely."""
-        from orchestrator.main import JobCreate, create_job
+        from orchestrator.main import JobCreate
+        from tests._b09_control_seams import create_job
 
         fake_request.headers = {
             "X-Internal-Key": "secret",
@@ -265,7 +266,8 @@ class TestCreateJobRefusesArchivedProjects:
     async def test_cockpit_caller_gets_the_same_refusal(
         self, user_a, archived, fake_db, fake_request
     ):
-        from orchestrator.main import JobCreate, create_job
+        from orchestrator.main import JobCreate
+        from tests._b09_control_seams import create_job
 
         fake_request.headers = {}
         body = JobCreate(
@@ -298,7 +300,8 @@ class TestCreateJobRefusesArchivedProjects:
     @pytest.mark.asyncio
     async def test_a_projectless_job_is_unaffected(self, user_a, fake_db, fake_request):
         """No project, no lifecycle question — and no extra DB round-trip."""
-        from orchestrator.main import JobCreate, create_job
+        from orchestrator.main import JobCreate
+        from tests._b09_control_seams import create_job
 
         fake_request.headers = {}
         user = dict(user_a)
@@ -540,7 +543,8 @@ class TestAgentSubjobFromAThreadOnAnArchivedProject:
     async def test_the_archived_409_is_not_flattened_into_the_generic_403(
         self, user_a, archived, fake_db, fake_request, thread_a
     ):
-        from orchestrator.main import JobCreate, create_job
+        from orchestrator.main import JobCreate
+        from tests._b09_control_seams import create_job
 
         fake_request.headers = {"X-Internal-Key": "secret"}
         thread_a["user_id"] = user_a["id"]
@@ -575,7 +579,8 @@ class TestAgentSubjobFromAThreadOnAnArchivedProject:
         self, fake_db, fake_request
     ):
         """The non-disclosure the wrapper exists for must survive intact."""
-        from orchestrator.main import JobCreate, create_job
+        from orchestrator.main import JobCreate
+        from tests._b09_control_seams import create_job
 
         fake_request.headers = {"X-Internal-Key": "secret"}
         body = JobCreate(description="originless internal attempt")

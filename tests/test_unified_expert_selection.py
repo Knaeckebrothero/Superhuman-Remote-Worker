@@ -324,7 +324,7 @@ def _application_default():
 
 
 async def _rest_create(db, fake_request, body, resolver):
-    from orchestrator.main import create_job
+    from tests._b09_control_seams import create_job
 
     patches = [
         patch("orchestrator.main.postgres_db", db),

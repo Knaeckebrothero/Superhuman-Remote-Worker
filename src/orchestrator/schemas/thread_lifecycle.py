@@ -4,13 +4,14 @@ from pydantic import BaseModel
 
 
 class ThreadResumeRequest(BaseModel):
-    """Optional resume body carrying accepted configuration-drift ids."""
+    """Optional body for POST /resume. ``acknowledge`` carries the drift item
+    ids the user accepted losing."""
 
     acknowledge: list[str] | None = None
 
 
 class ThreadRewindRequest(BaseModel):
-    """Detached-session rewind request."""
+    """Body for POST /api/agents/threads/{id}/rewind (detached sessions)."""
 
     message_id: str
     mode: str = "conversation"

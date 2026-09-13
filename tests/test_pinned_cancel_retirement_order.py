@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests import _b09_control_seams as control_seams
+
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +20,7 @@ from testcontainers.postgres import PostgresContainer
 
 from orchestrator.database.migrate import run_migrations
 from orchestrator.database.postgres import PostgresDB
+from orchestrator.routers import job_lifecycle as job_lifecycle_routes
 from orchestrator.services.completion_control import CompletionControl
 from tests.test_non_pinned_workspace_lifecycle_real_postgres import (
     _create_settled_authoritative_runtime,
@@ -52,7 +55,12 @@ async def _cancel_client(main, monkeypatch, store):
 
     monkeypatch.setattr(main, "require_internal_or_job_access", access)
     app = FastAPI()
-    app.add_api_route("/api/jobs/{job_id}/cancel", main.cancel_job, methods=["PUT"])
+    app.state.job_control_route_dependencies_factory = (
+        main._job_mutation_route_dependencies
+    )
+    app.add_api_route(
+        "/api/jobs/{job_id}/cancel", job_lifecycle_routes.cancel_job, methods=["PUT"]
+    )
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
@@ -95,13 +103,19 @@ async def test_root_cancel_publishes_terminal_authority_before_retirement(
     )
     main = _bind_runtime(monkeypatch, store, enabled)
 
-    async def cleanup(_):
+    async def cleanup(_operations, _job_id):
         assert row["status"] == "cancelled", "retirement needs terminal authority"
         order.append("retire")
 
-    monkeypatch.setattr(main, "_archive_and_cleanup_workspace", cleanup)
     monkeypatch.setattr(
-        main, "_cascade_cancel_to_children", AsyncMock(return_value=True)
+        main.thread_retirement_operations.ThreadRetirementOperations,
+        "archive_and_cleanup_workspace",
+        cleanup,
+    )
+    monkeypatch.setattr(
+        main.job_mutation_operations.JobControlOperations,
+        "cascade_cancel_to_children",
+        AsyncMock(return_value=True),
     )
     async with _cancel_client(main, monkeypatch, store) as client:
         response = await client.put(f"/api/jobs/{JOB_ID}/cancel")
@@ -128,8 +142,16 @@ async def test_root_cancel_cas_loser_does_not_retire_or_prune(
     main = _bind_runtime(monkeypatch, store, enabled)
     cleanup = AsyncMock()
     cascade = AsyncMock(return_value=True)
-    monkeypatch.setattr(main, "_archive_and_cleanup_workspace", cleanup)
-    monkeypatch.setattr(main, "_cascade_cancel_to_children", cascade)
+    monkeypatch.setattr(
+        main.thread_retirement_operations.ThreadRetirementOperations,
+        "archive_and_cleanup_workspace",
+        cleanup,
+    )
+    monkeypatch.setattr(
+        main.job_mutation_operations.JobControlOperations,
+        "cascade_cancel_to_children",
+        cascade,
+    )
     async with _cancel_client(main, monkeypatch, store) as client:
         response = await client.put(f"/api/jobs/{JOB_ID}/cancel")
     assert response.status_code == 400
@@ -160,12 +182,16 @@ async def test_descendant_cancellation_publishes_before_cleanup(monkeypatch, ena
     )
     main = _bind_runtime(monkeypatch, store, enabled)
 
-    async def cleanup(_):
+    async def cleanup(_operations, _job_id):
         assert row["status"] == "cancelled", "child retirement needs terminal authority"
         order.append("retire")
 
-    monkeypatch.setattr(main, "_archive_and_cleanup_workspace", cleanup)
-    assert await main._cascade_cancel_to_children(JOB_ID)
+    monkeypatch.setattr(
+        main.thread_retirement_operations.ThreadRetirementOperations,
+        "archive_and_cleanup_workspace",
+        cleanup,
+    )
+    assert await control_seams.cascade_cancel_to_children(JOB_ID)
     assert order == ["cancel", "retire"]
     store.linearize_pinned_cancel.assert_awaited_once_with(
         CHILD_ID, expected_status="pending_review", completion_commands_enabled=enabled
@@ -187,9 +213,13 @@ async def test_descendant_cas_loser_preserves_winner_workspace(
     main = _bind_runtime(monkeypatch, store, enabled)
     cleanup = AsyncMock()
     target = AsyncMock()
-    monkeypatch.setattr(main, "_archive_and_cleanup_workspace", cleanup)
+    monkeypatch.setattr(
+        main.thread_retirement_operations.ThreadRetirementOperations,
+        "archive_and_cleanup_workspace",
+        cleanup,
+    )
     monkeypatch.setattr(main, "_prepare_pinned_job_mutation_target", target)
-    assert await main._cascade_cancel_to_children(JOB_ID) is settled
+    assert await control_seams.cascade_cancel_to_children(JOB_ID) is settled
     cleanup.assert_not_awaited()
     target.assert_not_awaited()
     store.linearize_pinned_cancel.assert_awaited_once_with(
@@ -321,12 +351,14 @@ async def test_real_postgres_cancel_retry_keeps_checkpoint_until_retirement_succ
     args = _capture_args(runtime)
     main = _bind_runtime(monkeypatch, db, enabled)
     monkeypatch.setattr(
-        main, "_cascade_cancel_to_children", AsyncMock(return_value=True)
+        main.job_mutation_operations.JobControlOperations,
+        "cascade_cancel_to_children",
+        AsyncMock(return_value=True),
     )
     retirement_ready = False
     attempts = []
 
-    async def cleanup(owner_id):
+    async def cleanup(_operations, owner_id):
         # Use the real immutable cleanup intent guard, not a permissive mock.
         intent = await db.prepare_managed_repository_workspace_cleanup_intent(
             owner_id, **args
@@ -339,7 +371,11 @@ async def test_real_postgres_cancel_retry_keeps_checkpoint_until_retirement_succ
         if not retirement_ready:
             raise RuntimeError("controlled exact-runtime cleanup failure")
 
-    monkeypatch.setattr(main, "_archive_and_cleanup_workspace", cleanup)
+    monkeypatch.setattr(
+        main.thread_retirement_operations.ThreadRetirementOperations,
+        "archive_and_cleanup_workspace",
+        cleanup,
+    )
     async with _cancel_client(main, monkeypatch, db) as client:
         response = await client.put(f"/api/jobs/{job_id}/cancel")
         assert response.status_code == 503
@@ -372,11 +408,21 @@ async def test_stateless_root_keeps_queue_owned_cancellation(monkeypatch, enable
     main = _bind_runtime(monkeypatch, store, enabled)
     cleanup = AsyncMock()
     settle = AsyncMock(return_value=True)
-    monkeypatch.setattr(main, "_archive_and_cleanup_workspace", cleanup)
     monkeypatch.setattr(
-        main, "_cascade_cancel_to_children", AsyncMock(return_value=True)
+        main.thread_retirement_operations.ThreadRetirementOperations,
+        "archive_and_cleanup_workspace",
+        cleanup,
     )
-    monkeypatch.setattr(main, "_wait_for_stateless_cancel_settle", settle)
+    monkeypatch.setattr(
+        main.job_mutation_operations.JobControlOperations,
+        "cascade_cancel_to_children",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(
+        main.job_mutation_operations.JobControlOperations,
+        "wait_for_stateless_cancel_settle",
+        settle,
+    )
     async with _cancel_client(main, monkeypatch, store) as client:
         response = await client.put(f"/api/jobs/{JOB_ID}/cancel")
     assert response.status_code == 200, response.json()
@@ -405,8 +451,16 @@ async def test_real_postgres_root_claim_honors_completion_flag(
     main = _bind_runtime(monkeypatch, db, enabled)
     cleanup = AsyncMock()
     cascade = AsyncMock(return_value=True)
-    monkeypatch.setattr(main, "_archive_and_cleanup_workspace", cleanup)
-    monkeypatch.setattr(main, "_cascade_cancel_to_children", cascade)
+    monkeypatch.setattr(
+        main.thread_retirement_operations.ThreadRetirementOperations,
+        "archive_and_cleanup_workspace",
+        cleanup,
+    )
+    monkeypatch.setattr(
+        main.job_mutation_operations.JobControlOperations,
+        "cascade_cancel_to_children",
+        cascade,
+    )
     async with _cancel_client(main, monkeypatch, db) as client:
         response = await client.put(f"/api/jobs/{job_id}/cancel")
     if enabled:
@@ -467,9 +521,13 @@ async def test_pinned_cancel_signals_original_assignment_after_cas(
 
     client.post = AsyncMock(side_effect=signal)
     monkeypatch.setattr(main.httpx, "AsyncClient", Mock(return_value=client))
-    monkeypatch.setattr(main, "_archive_and_cleanup_workspace", AsyncMock())
+    monkeypatch.setattr(
+        main.thread_retirement_operations.ThreadRetirementOperations,
+        "archive_and_cleanup_workspace",
+        AsyncMock(),
+    )
     if descendant:
-        assert await main._cascade_cancel_to_children(JOB_ID)
+        assert await control_seams.cascade_cancel_to_children(JOB_ID)
     else:
         monkeypatch.setattr(
             main,
@@ -477,9 +535,11 @@ async def test_pinned_cancel_signals_original_assignment_after_cas(
             AsyncMock(return_value=(None, dict(row))),
         )
         monkeypatch.setattr(
-            main, "_cascade_cancel_to_children", AsyncMock(return_value=True)
+            main.job_mutation_operations.JobControlOperations,
+            "cascade_cancel_to_children",
+            AsyncMock(return_value=True),
         )
-        assert await main.cancel_job(Mock(), JOB_ID) == {"status": "cancelled"}
+        assert await control_seams.cancel_job(Mock(), JOB_ID) == {"status": "cancelled"}
     assert order == ["cancel", "signal"]
     target.assert_awaited_once_with(
         agent_id=original_agent, job_id=row["id"], require_idle=False
@@ -512,8 +572,12 @@ async def test_real_postgres_descendant_claim_honors_completion_flag(
     )
     main = _bind_runtime(monkeypatch, db, enabled)
     cleanup = AsyncMock()
-    monkeypatch.setattr(main, "_archive_and_cleanup_workspace", cleanup)
-    assert await main._cascade_cancel_to_children(root_id) is not enabled
+    monkeypatch.setattr(
+        main.thread_retirement_operations.ThreadRetirementOperations,
+        "archive_and_cleanup_workspace",
+        cleanup,
+    )
+    assert await control_seams.cascade_cancel_to_children(root_id) is not enabled
     child = await db.get_job(child_id)
     if enabled:
         assert child["status"] == "pending_review"
@@ -546,7 +610,7 @@ async def test_real_postgres_root_retry_revisits_cancelled_descendant(
     attempts = []
     child_retirement_ready = False
 
-    async def cleanup(owner_id):
+    async def cleanup(_operations, owner_id):
         intent = await db.prepare_managed_repository_workspace_cleanup_intent(
             owner_id, **args_by_owner[owner_id]
         )
@@ -558,7 +622,11 @@ async def test_real_postgres_root_retry_revisits_cancelled_descendant(
         if owner_id == child_id and not child_retirement_ready:
             raise RuntimeError("controlled descendant retirement failure")
 
-    monkeypatch.setattr(main, "_archive_and_cleanup_workspace", cleanup)
+    monkeypatch.setattr(
+        main.thread_retirement_operations.ThreadRetirementOperations,
+        "archive_and_cleanup_workspace",
+        cleanup,
+    )
     async with _cancel_client(main, monkeypatch, db) as client:
         first = await client.put(f"/api/jobs/{root_id}/cancel")
         assert first.status_code == 503, first.json()
