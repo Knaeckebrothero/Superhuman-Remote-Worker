@@ -21,11 +21,14 @@ from uuid import UUID
 from orchestrator.services.workspace_binding import remote_canvas_presentation_available
 from shared.backend_kinds import LITE_BACKENDS
 
-# Gitea setup writes these two keys for every tier, including virtual/none.
-# They describe a repository, not a provisioned SSH workspace. Every other
-# non-empty workspace_container key is treated as physical/future evidence and
-# fails closed until S2 is complete.
-_LITE_SAFE_WORKSPACE_CONTEXT_KEYS = frozenset({"git_remote_url", "repo_name"})
+# Gitea setup writes the repository keys for every tier, including
+# virtual/none.  Soft End writes the exact boolean ``volume_reclaimed`` outcome
+# after retiring a stateless workspace; it is retirement history, not a live
+# SSH workspace.  Every other non-empty workspace_container key is treated as
+# physical/future evidence and fails closed until S2 is complete.
+_LITE_SAFE_WORKSPACE_CONTEXT_KEYS = frozenset(
+    {"git_remote_url", "repo_name", "volume_reclaimed"}
+)
 _VIRTUAL_BINDING_KEYS = frozenset(
     {"generation", "kind", "backing_id", "ssh_host_key_fingerprint"}
 )
@@ -295,6 +298,11 @@ def stateless_workspace_check(thread: Any) -> tuple[str | None, str | None]:
     ):
         workspace_context = metadata["workspace_container"]
         if not isinstance(workspace_context, dict):
+            return backend, "workspace_context_malformed"
+        if (
+            "volume_reclaimed" in workspace_context
+            and type(workspace_context["volume_reclaimed"]) is not bool
+        ):
             return backend, "workspace_context_malformed"
         if set(workspace_context) - _LITE_SAFE_WORKSPACE_CONTEXT_KEYS:
             return backend, "workspace_context_present"

@@ -339,6 +339,10 @@ def test_classifier_refuses_creation_mode_restore_intent_mismatch(
             "workspace_context_malformed",
         ),
         (
+            _metadata("none", workspace_container={"volume_reclaimed": "false"}),
+            "workspace_context_malformed",
+        ),
+        (
             _metadata(
                 "virtual",
                 _workspace_binding={
@@ -388,6 +392,7 @@ def test_classifier_refuses_creation_mode_restore_intent_mismatch(
         "vm-malformed",
         "workspace-materialized",
         "workspace-malformed",
+        "settled-volume-outcome-malformed",
         "remote-binding",
         "binding-malformed",
         "virtual-binding-malformed",
