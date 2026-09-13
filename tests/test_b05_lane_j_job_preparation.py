@@ -3137,6 +3137,18 @@ LATE_BINDING_TABLE = [
     ),
     (
         _workspace_authority_deps,
+        "handle_scholar_completion",
+        "b08_helpers.handle_scholar_completion",
+        _DIRECT,
+    ),
+    (
+        _workspace_authority_deps,
+        "handle_delegation_child_completion",
+        "b08_helpers.handle_delegation_child_completion",
+        _DIRECT,
+    ),
+    (
+        _workspace_authority_deps,
         "resolve_inherited_workspace",
         "_resolve_subjob_inherited_workspace",
         _DIRECT,
@@ -3360,8 +3372,6 @@ LATE_BINDING_TABLE = [
 # Nested dependency objects; their own fields are proven through their factory.
 _NESTED_FIELDS = {
     (_start_bundle_deps, "workspace_runtime"),
-    (_workspace_authority_deps, "handle_scholar_completion"),
-    (_workspace_authority_deps, "handle_delegation_child_completion"),
 }
 
 
@@ -3387,6 +3397,9 @@ class TestLateBoundResolution:
         sentinel = type("Sentinel", (Exception,), {})
         owner = main
         *parents, attribute = main_name.split(".")
+        if parents and parents[0] == "b08_helpers":
+            owner = b08_helpers
+            parents = parents[1:]
         for parent in parents:
             owner = getattr(owner, parent)
         monkeypatch.setattr(owner, attribute, sentinel)
