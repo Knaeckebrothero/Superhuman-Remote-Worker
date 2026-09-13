@@ -428,6 +428,8 @@ k8s_custom_deploy(
     deps=[
         'deployment/values-local.yaml',
         'deployment/values-tilt.yaml',
+        'scripts/tilt-helm-apply.sh',
+        'scripts/tilt-image-digest.py',
     ],
     image_deps=[img[0] for img in _srw_images],
 )

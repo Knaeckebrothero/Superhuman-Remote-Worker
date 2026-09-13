@@ -150,6 +150,26 @@ failed-init case, and verifies cleanup. It changes no existing policies.
 This network gate does not by itself prove that a particular guest image can
 install packages; also exercise that image's real preparation recipe.
 
+On local k3d, after passing that network gate, set `network.podFirewall`,
+`network.enabled` and `network.enforcementVerified` to `true` in the preparation
+values and deploy through Tilt. Then run the complete MCP/harness acceptance
+with actual package installation:
+
+```bash
+python scripts/workspace-preparation-srw-k3d-gate.py --online-package \
+  --output /tmp/srw-prepared-online.json
+```
+
+This mode requires an Ubuntu-compatible base without the `hello` package. It
+installs the package during preparation and requires the real guest SSH tool to
+execute it before accepting completion, including cache reuse and retained-disk
+handoff. It also exercises failed and cancelled builds. Without the option, the
+gate requires offline preparation and uses its self-contained prepared tool.
+Tilt replaces saved MCP/preparer pins with the digest of its freshly pushed
+image, using Tilt's local registry address. The controller therefore does not
+need to resolve k3d's node-side registry hostname. Ordinary Helm installations
+retain their explicit digest pins.
+
 For installations relying solely on an independently verified CNI,
 `scripts/workspace-preparation-network-gate.py` remains the policy-only check.
 Its generated policy permits cluster DNS and public HTTP/HTTPS, excluding
