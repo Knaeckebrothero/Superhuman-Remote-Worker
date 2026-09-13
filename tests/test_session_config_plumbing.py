@@ -42,6 +42,7 @@ from orchestrator.services.cloud.protected_reader_authority import (
 from orchestrator.services.cloud_staging.source_identity import (
     ProtectedMountSourceIdentity,
 )
+from orchestrator.services.pinned_retirement import PinnedRetirementOperations
 from agent.api.persistent_app import _load_expert_config
 from shared.runtime.core.tool_policy import (
     ToolPolicyError,
@@ -2303,22 +2304,27 @@ class TestEndedSessionKeepsItsVolume:
             patch.object(orch_main, "_conclude_conference_if_any", AsyncMock()),
             patch.object(orch_main, "postgres_db", db),
             patch.object(
-                orch_main,
+                PinnedRetirementOperations,
+                "pinned_retirement_is_current",
+                AsyncMock(return_value=True),
+            ),
+            patch.object(
+                PinnedRetirementOperations,
                 "_pinned_retirement_is_current",
                 AsyncMock(return_value=True),
             ),
             patch.object(
-                orch_main,
+                PinnedRetirementOperations,
                 "_reconcile_workspace_provision_intent_for_retirement",
                 AsyncMock(return_value=False),
             ),
             patch.object(
-                orch_main,
+                PinnedRetirementOperations,
                 "_stop_captured_retirement_agent",
                 AsyncMock(),
             ),
             patch.object(
-                orch_main,
+                PinnedRetirementOperations,
                 "_reconcile_agent_workspace_claim_for_retirement",
                 AsyncMock(),
             ),
