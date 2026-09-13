@@ -13044,7 +13044,9 @@ class PostgresDB:
         Kubernetes/VM deletion acknowledgements are control-plane facts, not
         proof that a partitioned node or guest stopped using a delivered
         deploy key. The provisioner records this receipt only after an exact
-        endpoint retirement plus an independent zero scan. A later ambiguous
+        endpoint retirement plus an independent zero scan, or authenticated
+        cancellation evidence that preparation never issued a workspace source
+        together with exact runtime absence. A later ambiguous
         delete response may replay only when the receipt still matches the
         server-owned runtime generation in the same owner row.
         """

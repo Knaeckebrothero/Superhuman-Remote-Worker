@@ -3144,6 +3144,48 @@ class VMController:
 
         return web.json_response({"status": "ok"})
 
+    async def _cancel_preparation(self, value):
+        """Serialize non-issuance evidence with VM creation and runtime absence."""
+        from kubernetes.client.exceptions import ApiException
+        from shared.workspace_preparation import validate_request
+
+        preparation = validate_request(value)
+        entity_id = preparation["allocationId"]
+        async with self._lifecycle_lock_for(entity_id):
+            result = await self._workspace_preparation().cancel_with_receipt(
+                preparation
+            )
+            if result.get("workspaceNeverIssued") is not True:
+                return result
+            name = f"agent-vm-{entity_id}"
+            for plural in (KUBEVIRT_PLURAL, KUBEVIRT_VMI_PLURAL):
+                try:
+                    await asyncio.to_thread(
+                        self.k8s_client.get_namespaced_custom_object,
+                        group=KUBEVIRT_GROUP,
+                        version=KUBEVIRT_VERSION,
+                        namespace=VM_NAMESPACE,
+                        plural=plural,
+                        name=name,
+                    )
+                except ApiException as exc:
+                    if exc.status != 404:
+                        raise
+                else:
+                    return {**result, "workspaceNeverIssued": False}
+            if self.core_api is None:
+                return {**result, "workspaceNeverIssued": False}
+            pods = await asyncio.to_thread(
+                self.core_api.list_namespaced_pod,
+                namespace=VM_NAMESPACE,
+                label_selector=f"vm.kubevirt.io/name={name}",
+            )
+            items = getattr(pods, "items", None)
+            return {
+                **result,
+                "workspaceNeverIssued": isinstance(items, list) and not items,
+            }
+
     async def http_preparation(self, request):
         from aiohttp import web
 
@@ -3166,7 +3208,7 @@ class VMController:
                 source, waiting = await service.prepare(payload["preparation"])
                 result = {"source": source, "waiting": waiting}
             elif action == "cancel":
-                result = {"cancelled": await service.cancel(payload["preparation"])}
+                result = await self._cancel_preparation(payload["preparation"])
             else:
                 scope = payload["scope"]
                 if (

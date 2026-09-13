@@ -76,6 +76,7 @@ class VMWorkspacePreparation:
                 request,
                 {
                     "phase": "Pending",
+                    "workspace_source_issued": False,
                     "expires_at": now() + self.settings.wait_budget + 300,
                 },
             )
@@ -129,9 +130,22 @@ class VMWorkspacePreparation:
                     expected=artifact.state["pvc_uid"],
                 )
                 await self.store.save(artifact, {**artifact.state, "last_used": now()})
-                if allocation.state["phase"] != "Allocated":
+                if (
+                    allocation.state["phase"] != "Allocated"
+                    or allocation.state.get("workspace_source_issued") is not True
+                ):
                     await self.store.save(
-                        allocation, {**allocation.state, "phase": "Cloning"}
+                        allocation,
+                        {
+                            **allocation.state,
+                            "phase": "Allocated"
+                            if allocation.state["phase"] == "Allocated"
+                            else "Cloning",
+                            # Persist before returning a disk to a VM creator.
+                            # Cancellation cannot turn a handed-out source into
+                            # proof that no workspace ever existed.
+                            "workspace_source_issued": True,
+                        },
                     )
             return self._result(allocation, artifact)
 
@@ -609,15 +623,52 @@ class VMWorkspacePreparation:
                 )
 
     async def cancel(self, value):
+        return (await self.cancel_with_receipt(value))["cancelled"]
+
+    async def cancel_with_receipt(self, value):
+        """Fence future source delivery and report durable non-issuance proof."""
         request = validate_request(value)
         async with self.lock:
             allocation = await self.store.ensure(
                 allocation_name(request),
                 "allocation",
                 request,
-                {"phase": "Pending"},
+                {"phase": "Pending", "workspace_source_issued": False},
             )
-            return await self._abandon(allocation, "Cancelled", "BuildCancelled")
+            cancelled = await self._abandon(allocation, "Cancelled", "BuildCancelled")
+            never_issued = False
+            if cancelled and not any(
+                allocation.state.get(key) for key in ("rootdisk", "rootdisk_uid")
+            ):
+                issued = allocation.state.get("workspace_source_issued")
+                if issued is False:
+                    never_issued = True
+                elif issued is None and allocation.state.get("artifact"):
+                    # Older records did not track source issuance. A matching
+                    # terminal builder with no success receipt could never have
+                    # produced a Ready source. Unknown/missing artifacts and
+                    # every previously successful build remain unproven.
+                    artifact = await self.store.get(allocation.state["artifact"])
+                    never_issued = bool(
+                        artifact
+                        and artifact.uid == allocation.state.get("artifact_uid")
+                        and artifact.state.get("phase") == "Failed"
+                        and artifact.state.get("terminal") is True
+                        and "receipt" in artifact.state
+                        and artifact.state.get("receipt") is None
+                        and type(artifact.state.get("exit_code")) is int
+                        and artifact.state.get("error")
+                        in {"BuildFailed", "BuildCancelled"}
+                    )
+                    if never_issued:
+                        await self.store.save(
+                            allocation,
+                            {**allocation.state, "workspace_source_issued": False},
+                        )
+            return {
+                "cancelled": cancelled,
+                "workspaceNeverIssued": never_issued,
+            }
 
     async def _abandon(self, allocation, phase, error):
         await self.store.save(

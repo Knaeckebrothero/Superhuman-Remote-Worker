@@ -1329,6 +1329,118 @@ class VMProvisioner:
             )
             return False
 
+    async def _retire_unallocated_preparation(
+        self, entity_id, entity_type, identity, probe
+    ) -> bool:
+        """Record zero only for a fenced preparation that never issued a disk."""
+        from shared.workspace_preparation import validate_request
+
+        generation = identity.provision_generation
+
+        def fully_absent(observed):
+            return bool(
+                observed.disposition == "absent"
+                and observed.rootdisk_identity_known
+                and observed.identity is not None
+                and observed.identity.provision_generation == generation
+                and observed.identity.vm_uid is None
+                and observed.identity.rootdisk_pvc_uid is None
+            )
+
+        if (
+            not self._db
+            or identity.vm_uid is not None
+            or identity.rootdisk_pvc_uid is not None
+            or not fully_absent(probe)
+        ):
+            return False
+
+        async def current_request():
+            row = (
+                await self._db.get_job(entity_id)
+                if entity_type == "job"
+                else await self._db.get_thread(entity_id)
+            )
+            terminal = (
+                {"completed", "failed", "cancelled"}
+                if entity_type == "job"
+                else {"ended"}
+            )
+            if not row or row.get("status") not in terminal:
+                return None
+            state = row.get("context" if entity_type == "job" else "metadata") or {}
+            if isinstance(state, str):
+                state = json.loads(state)
+            vm = state.get("vm") or {}
+            if (
+                vm.get("provision_generation") != generation
+                or vm.get("identity_authenticated") is not False
+                or any(
+                    vm.get(key) is not None
+                    for key in (
+                        "vm_uid",
+                        "rootdisk_pvc_uid",
+                        "_runtime_incarnation",
+                        "identity_provision_generation",
+                        "ssh_host",
+                        "ssh_port",
+                        "ssh_host_key_fingerprint",
+                        "ssh_registration_id",
+                        "initialization_receipt",
+                    )
+                )
+            ):
+                return None
+            try:
+                request = validate_request(vm.get("preparation_request"))
+            except (ValueError, TypeError, KeyError):
+                return None
+            if request["allocationId"] != entity_id or request["ownerKind"] != (
+                "job" if entity_type == "job" else "session"
+            ):
+                return None
+            return request
+
+        request = await current_request()
+        if (
+            request is None
+            or not await self._db.claim_managed_repository_workspace_retirement(
+                entity_id,
+                owner_kind=entity_type,
+                scope="vm",
+                provisioner="vm",
+                runtime_incarnation=generation,
+            )
+        ):
+            return False
+        result = await self.preparation_operation("cancel", {"preparation": request})
+        if (
+            result.get("cancelled") is not True
+            or result.get("workspaceNeverIssued") is not True
+        ):
+            return False
+        if await current_request() != request or not fully_absent(
+            await self._probe_vm_teardown_identity(entity_id, generation)
+        ):
+            return False
+        if not await self._db.record_managed_repository_workspace_process_zero(
+            entity_id,
+            owner_kind=entity_type,
+            scope="vm",
+            provisioner="vm",
+            runtime_incarnation=generation,
+        ):
+            return False
+        return await self._set_context_if_generation(
+            entity_type,
+            entity_id,
+            generation,
+            {
+                "status": "deleted",
+                "preparation_cancelled_revision": request["revision"],
+            },
+        )
+
     async def release_vm_captured(
         self,
         job_id: str,
@@ -1385,6 +1497,10 @@ class VMProvisioner:
                     runtime_incarnation=generation,
                 )
             )
+            if not contained:
+                contained = await self._retire_unallocated_preparation(
+                    job_id, entity_type, identity, probe
+                )
             if contained:
                 await self._record_retained_detach(job_id, binding)
             return VMTeardownResult(
