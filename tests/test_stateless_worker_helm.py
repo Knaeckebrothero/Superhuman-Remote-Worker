@@ -169,6 +169,31 @@ def test_completion_status_reorder_requires_completion_commands() -> None:
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
+def test_completion_control_settings_change_orchestrator_rollout_checksum() -> None:
+    def checksum(*settings: str) -> str:
+        deployment = _only_kind(
+            _render(*settings, show_only="templates/orchestrator/deployment.yaml"),
+            "Deployment",
+        )
+        return deployment["spec"]["template"]["metadata"]["annotations"][
+            "checksum/completion-control-settings"
+        ]
+
+    disabled = checksum()
+    commands = checksum("orchestrator.completionCommandsEnabled=true")
+    reordered = checksum(
+        "orchestrator.completionCommandsEnabled=true",
+        "orchestrator.completionStatusReorderEnabled=true",
+    )
+    delayed = checksum(
+        "orchestrator.completionCommandsEnabled=true",
+        "orchestrator.completionFinalizerInlineDelaySeconds=15",
+    )
+
+    assert len({disabled, commands, reordered, delayed}) == 4
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
 def test_generic_pool_opens_sessions_without_opening_worker_admission() -> None:
     documents = _render(
         "agent.stateless.enabled=true",

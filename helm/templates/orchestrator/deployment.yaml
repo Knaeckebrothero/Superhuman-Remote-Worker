@@ -39,6 +39,10 @@ spec:
         # controlled enable/disable therefore deterministically converges every
         # replica before operators rely on the new policy.
         checksum/officer-auto-pull-release: {{ dict "officerAutoPullReleaseEnabled" (.Values.orchestrator.officerAutoPullReleaseEnabled | default false) | toJson | sha256sum | quote }}
+        # Completion/control policy is read once at process startup. Hash the
+        # exact ConfigMap inputs so mode and finalizer changes replace every
+        # orchestrator replica without relying on the optional Reloader.
+        checksum/completion-control-settings: {{ dict "commandsEnabled" (.Values.orchestrator.completionCommandsEnabled | default false) "statusReorderEnabled" (.Values.orchestrator.completionStatusReorderEnabled | default false) "finalizerInlineDelaySeconds" (.Values.orchestrator.completionFinalizerInlineDelaySeconds | default 0) | toJson | sha256sum | quote }}
         # Native admission reads these values at startup. Operator changes must
         # replace the process even when the optional Reloader is disabled.
         checksum/manifest-hosting: {{ toJson .Values.manifestHosting | sha256sum | quote }}
