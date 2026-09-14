@@ -208,6 +208,96 @@ class TestLoadPayload:
 
 class TestSeedApiKeys:
     @pytest.mark.asyncio
+    async def test_seed_logs_do_not_disclose_config_identifiers(
+        self, caplog, monkeypatch
+    ):
+        """Configured provider and environment names must not reach seed logs."""
+        missing_provider = "canary-secret-provider-missing"
+        missing_env = "CANARY_SECRET_ENV_REFERENCE"
+        already_provider = "canary-secret-provider-already"
+        matching_provider = "canary-secret-provider-matching"
+        fresh_provider = "canary-secret-provider-fresh"
+        reconciled_provider = "canary-secret-provider-reconciled"
+        monkeypatch.delenv(missing_env, raising=False)
+
+        with caplog.at_level("INFO", logger="orchestrator.seed.llm_config"):
+            missing = await seed(
+                _fake_db(),
+                {
+                    "systemApiKeys": [
+                        {"provider": missing_provider, "apiKeyEnv": missing_env}
+                    ]
+                },
+            )
+            already = await seed(
+                _fake_db(existing_api_keys=[{"provider": already_provider}]),
+                {"systemApiKeys": [{"provider": already_provider, "apiKey": "key"}]},
+            )
+            matching = await seed(
+                _fake_db(
+                    existing_api_keys=[
+                        {
+                            "provider": matching_provider,
+                            "source": "helm",
+                            "helm_value_hash": value_hash(
+                                {"api_key": "key", "label": None}
+                            ),
+                        }
+                    ]
+                ),
+                {
+                    "systemApiKeys": [
+                        {
+                            "provider": matching_provider,
+                            "apiKey": "key",
+                            "reconcile": True,
+                        }
+                    ]
+                },
+            )
+            fresh = await seed(
+                _fake_db(),
+                {"systemApiKeys": [{"provider": fresh_provider, "apiKey": "key"}]},
+            )
+            reconciled = await seed(
+                _fake_db(
+                    existing_api_keys=[
+                        {"provider": reconciled_provider, "source": "ui"}
+                    ]
+                ),
+                {
+                    "systemApiKeys": [
+                        {
+                            "provider": reconciled_provider,
+                            "apiKey": "key",
+                            "reconcile": True,
+                        }
+                    ]
+                },
+            )
+
+        assert missing.api_keys_seeded == []
+        assert already.api_keys_skipped == [already_provider]
+        assert matching.api_keys_skipped == [matching_provider]
+        assert fresh.api_keys_seeded == [fresh_provider]
+        assert reconciled.reverted == [("systemApiKeys", reconciled_provider)]
+        for identifier in (
+            missing_provider,
+            missing_env,
+            already_provider,
+            matching_provider,
+            fresh_provider,
+            reconciled_provider,
+        ):
+            assert identifier not in caplog.text
+        assert "secret not resolved" in caplog.text
+        assert "admin edit reverted" in caplog.text
+        assert "already present" in caplog.text
+        assert "matches the declared value" in caplog.text
+        assert "seeded system" in caplog.text
+        assert "reconciled system" in caplog.text
+
+    @pytest.mark.asyncio
     async def test_inserts_missing_provider(self):
         db = _fake_db()
         payload = {
