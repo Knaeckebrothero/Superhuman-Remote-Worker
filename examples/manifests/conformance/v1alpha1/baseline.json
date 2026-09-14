@@ -1,0 +1,816 @@
+{
+  "apiVersion": "srw/v1alpha1",
+  "sourceRevision": "5809c97f549f45f226984da300ddda9850cb2174",
+  "documents": [
+    {
+      "apiVersion": "srw/v1alpha1",
+      "kind": "Expert",
+      "metadata": {
+        "name": "portable-worker",
+        "scope": {
+          "kind": "Catalog",
+          "name": "shared"
+        },
+        "tags": [
+          "worker",
+          "conformance"
+        ],
+        "labels": {
+          "team": "development"
+        }
+      },
+      "spec": {
+        "runtime": {
+          "image": "example.invalid/custom-harness:1",
+          "config": {
+            "$extends": "a-literal-harness-setting",
+            "tools": [
+              "custom_read_file",
+              "tool-not-in-the-image"
+            ],
+            "optional": null,
+            "values": [
+              true,
+              false,
+              null,
+              12,
+              0.5,
+              "yes",
+              "012",
+              "2026-09-13"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "apiVersion": "srw/v1alpha1",
+      "kind": "WorkspaceTemplate",
+      "metadata": {
+        "name": "portable-workspace",
+        "scope": {
+          "kind": "Catalog",
+          "name": "shared"
+        }
+      },
+      "spec": {
+        "backend": "sandbox",
+        "environment": {
+          "image": "example.invalid/ssh-workspace:1"
+        },
+        "resources": {
+          "cpu": 2,
+          "memory": "4Gi",
+          "storage": "20Gi"
+        },
+        "initialize": [
+          {
+            "command": [
+              "mkdir",
+              "-p",
+              "project"
+            ]
+          }
+        ],
+        "retention": "Retain"
+      }
+    },
+    {
+      "apiVersion": "srw/v1alpha1",
+      "kind": "Connector",
+      "metadata": {
+        "name": "portable-source",
+        "scope": {
+          "kind": "Account",
+          "name": "personal"
+        }
+      },
+      "spec": {
+        "driver": "srw.env/v1",
+        "config": {
+          "env": {
+            "REPOSITORY_URL": "https://example.invalid/source.git"
+          }
+        },
+        "credentials": {
+          "REPOSITORY_TOKEN": {
+            "secretRef": {
+              "name": "source-access",
+              "key": "token"
+            }
+          }
+        },
+        "access": "ReadOnly"
+      }
+    },
+    {
+      "apiVersion": "srw/v1alpha1",
+      "kind": "Project",
+      "metadata": {
+        "name": "portable-team",
+        "scope": {
+          "kind": "Account",
+          "name": "personal"
+        }
+      },
+      "spec": {
+        "resources": {
+          "experts": {
+            "engineer": {
+              "ref": {
+                "name": "portable-worker",
+                "scope": {
+                  "kind": "Catalog",
+                  "name": "shared"
+                }
+              }
+            }
+          },
+          "workspaces": {
+            "development": {
+              "ref": {
+                "name": "portable-workspace",
+                "scope": {
+                  "kind": "Catalog",
+                  "name": "shared"
+                }
+              }
+            }
+          },
+          "connectors": {
+            "source": {
+              "ref": {
+                "name": "portable-source",
+                "scope": {
+                  "kind": "Account",
+                  "name": "personal"
+                }
+              }
+            }
+          }
+        },
+        "defaults": {
+          "expert": "engineer",
+          "workspace": "development",
+          "connectors": [
+            "source"
+          ]
+        }
+      }
+    },
+    {
+      "apiVersion": "srw/v1alpha1",
+      "kind": "Job",
+      "metadata": {
+        "name": "portable-assignment",
+        "scope": {
+          "kind": "Project",
+          "name": "portable-team"
+        }
+      },
+      "spec": {
+        "task": {
+          "text": "Check the supplied repository",
+          "data": {
+            "ticket": 17,
+            "optional": null
+          }
+        },
+        "execution": {},
+        "completion": {
+          "mode": "ProcessExit"
+        },
+        "retry": {
+          "maxAttempts": 1
+        },
+        "timeoutSeconds": 60
+      }
+    }
+  ],
+  "preview": {
+    "apiVersion": "srw/v1alpha1",
+    "operation": "preview",
+    "resolution": "bundle",
+    "admissionReady": false,
+    "documents": [
+      {
+        "apiVersion": "srw/v1alpha1",
+        "kind": "Expert",
+        "metadata": {
+          "name": "portable-worker",
+          "scope": {
+            "kind": "Catalog",
+            "name": "shared"
+          },
+          "tags": [
+            "worker",
+            "conformance"
+          ],
+          "labels": {
+            "team": "development"
+          }
+        },
+        "spec": {
+          "runtime": {
+            "image": "example.invalid/custom-harness:1",
+            "config": {
+              "$extends": "a-literal-harness-setting",
+              "tools": [
+                "custom_read_file",
+                "tool-not-in-the-image"
+              ],
+              "optional": null,
+              "values": [
+                true,
+                false,
+                null,
+                12,
+                0.5,
+                "yes",
+                "012",
+                "2026-09-13"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "apiVersion": "srw/v1alpha1",
+        "kind": "WorkspaceTemplate",
+        "metadata": {
+          "name": "portable-workspace",
+          "scope": {
+            "kind": "Catalog",
+            "name": "shared"
+          }
+        },
+        "spec": {
+          "backend": "sandbox",
+          "environment": {
+            "image": "example.invalid/ssh-workspace:1"
+          },
+          "resources": {
+            "cpu": 2,
+            "memory": "4Gi",
+            "storage": "20Gi"
+          },
+          "initialize": [
+            {
+              "command": [
+                "mkdir",
+                "-p",
+                "project"
+              ]
+            }
+          ],
+          "retention": "Retain"
+        }
+      },
+      {
+        "apiVersion": "srw/v1alpha1",
+        "kind": "Connector",
+        "metadata": {
+          "name": "portable-source",
+          "scope": {
+            "kind": "Account",
+            "name": "personal"
+          }
+        },
+        "spec": {
+          "driver": "srw.env/v1",
+          "config": {
+            "env": {
+              "REPOSITORY_URL": "https://example.invalid/source.git"
+            }
+          },
+          "credentials": {
+            "REPOSITORY_TOKEN": {
+              "secretRef": {
+                "name": "source-access",
+                "key": "token"
+              }
+            }
+          },
+          "access": "ReadOnly"
+        }
+      },
+      {
+        "apiVersion": "srw/v1alpha1",
+        "kind": "Project",
+        "metadata": {
+          "name": "portable-team",
+          "scope": {
+            "kind": "Account",
+            "name": "personal"
+          }
+        },
+        "spec": {
+          "resources": {
+            "experts": {
+              "engineer": {
+                "ref": {
+                  "name": "portable-worker",
+                  "scope": {
+                    "kind": "Catalog",
+                    "name": "shared"
+                  }
+                }
+              }
+            },
+            "workspaces": {
+              "development": {
+                "ref": {
+                  "name": "portable-workspace",
+                  "scope": {
+                    "kind": "Catalog",
+                    "name": "shared"
+                  }
+                }
+              }
+            },
+            "connectors": {
+              "source": {
+                "ref": {
+                  "name": "portable-source",
+                  "scope": {
+                    "kind": "Account",
+                    "name": "personal"
+                  }
+                }
+              }
+            }
+          },
+          "defaults": {
+            "expert": "engineer",
+            "workspace": "development",
+            "connectors": [
+              "source"
+            ]
+          }
+        }
+      },
+      {
+        "apiVersion": "srw/v1alpha1",
+        "kind": "Job",
+        "metadata": {
+          "name": "portable-assignment",
+          "scope": {
+            "kind": "Project",
+            "name": "portable-team"
+          }
+        },
+        "spec": {
+          "task": {
+            "text": "Check the supplied repository",
+            "data": {
+              "ticket": 17,
+              "optional": null
+            }
+          },
+          "execution": {},
+          "completion": {
+            "mode": "ProcessExit"
+          },
+          "retry": {
+            "maxAttempts": 1
+          },
+          "timeoutSeconds": 60
+        }
+      }
+    ],
+    "resolved": [
+      {
+        "apiVersion": "srw/v1alpha1",
+        "kind": "Expert",
+        "metadata": {
+          "name": "portable-worker",
+          "scope": {
+            "kind": "Catalog",
+            "name": "shared"
+          },
+          "tags": [
+            "worker",
+            "conformance"
+          ],
+          "labels": {
+            "team": "development"
+          }
+        },
+        "spec": {
+          "runtime": {
+            "image": "example.invalid/custom-harness:1",
+            "config": {
+              "$extends": "a-literal-harness-setting",
+              "tools": [
+                "custom_read_file",
+                "tool-not-in-the-image"
+              ],
+              "optional": null,
+              "values": [
+                true,
+                false,
+                null,
+                12,
+                0.5,
+                "yes",
+                "012",
+                "2026-09-13"
+              ]
+            },
+            "pullPolicy": "IfNotPresent"
+          }
+        }
+      },
+      {
+        "apiVersion": "srw/v1alpha1",
+        "kind": "WorkspaceTemplate",
+        "metadata": {
+          "name": "portable-workspace",
+          "scope": {
+            "kind": "Catalog",
+            "name": "shared"
+          }
+        },
+        "spec": {
+          "backend": "sandbox",
+          "environment": {
+            "image": "example.invalid/ssh-workspace:1",
+            "pullPolicy": "IfNotPresent",
+            "cache": "Reuse"
+          },
+          "resources": {
+            "cpu": 2,
+            "memory": "4Gi",
+            "storage": "20Gi"
+          },
+          "initialize": [
+            {
+              "command": [
+                "mkdir",
+                "-p",
+                "project"
+              ]
+            }
+          ],
+          "retention": "Retain"
+        }
+      },
+      {
+        "apiVersion": "srw/v1alpha1",
+        "kind": "Connector",
+        "metadata": {
+          "name": "portable-source",
+          "scope": {
+            "kind": "Account",
+            "name": "personal"
+          }
+        },
+        "spec": {
+          "driver": "srw.env/v1",
+          "config": {
+            "env": {
+              "REPOSITORY_URL": "https://example.invalid/source.git"
+            }
+          },
+          "credentials": {
+            "REPOSITORY_TOKEN": {
+              "secretRef": {
+                "name": "source-access",
+                "key": "token",
+                "scope": {
+                  "kind": "Account",
+                  "name": "personal"
+                }
+              }
+            }
+          },
+          "access": "ReadOnly"
+        }
+      },
+      {
+        "apiVersion": "srw/v1alpha1",
+        "kind": "Project",
+        "metadata": {
+          "name": "portable-team",
+          "scope": {
+            "kind": "Account",
+            "name": "personal"
+          }
+        },
+        "spec": {
+          "resources": {
+            "experts": {
+              "engineer": {
+                "inline": {
+                  "runtime": {
+                    "image": "example.invalid/custom-harness:1",
+                    "config": {
+                      "$extends": "a-literal-harness-setting",
+                      "tools": [
+                        "custom_read_file",
+                        "tool-not-in-the-image"
+                      ],
+                      "optional": null,
+                      "values": [
+                        true,
+                        false,
+                        null,
+                        12,
+                        0.5,
+                        "yes",
+                        "012",
+                        "2026-09-13"
+                      ]
+                    },
+                    "pullPolicy": "IfNotPresent"
+                  }
+                }
+              }
+            },
+            "workspaces": {
+              "development": {
+                "inline": {
+                  "backend": "sandbox",
+                  "environment": {
+                    "image": "example.invalid/ssh-workspace:1",
+                    "pullPolicy": "IfNotPresent",
+                    "cache": "Reuse"
+                  },
+                  "resources": {
+                    "cpu": 2,
+                    "memory": "4Gi",
+                    "storage": "20Gi"
+                  },
+                  "initialize": [
+                    {
+                      "command": [
+                        "mkdir",
+                        "-p",
+                        "project"
+                      ]
+                    }
+                  ],
+                  "retention": "Retain"
+                }
+              }
+            },
+            "connectors": {
+              "source": {
+                "inline": {
+                  "driver": "srw.env/v1",
+                  "config": {
+                    "env": {
+                      "REPOSITORY_URL": "https://example.invalid/source.git"
+                    }
+                  },
+                  "credentials": {
+                    "REPOSITORY_TOKEN": {
+                      "secretRef": {
+                        "name": "source-access",
+                        "key": "token",
+                        "scope": {
+                          "kind": "Account",
+                          "name": "personal"
+                        }
+                      }
+                    }
+                  },
+                  "access": "ReadOnly"
+                }
+              }
+            }
+          },
+          "defaults": {
+            "expert": "engineer",
+            "workspace": "development",
+            "connectors": [
+              "source"
+            ]
+          }
+        }
+      },
+      {
+        "apiVersion": "srw/v1alpha1",
+        "kind": "Job",
+        "metadata": {
+          "name": "portable-assignment",
+          "scope": {
+            "kind": "Project",
+            "name": "portable-team"
+          }
+        },
+        "spec": {
+          "task": {
+            "text": "Check the supplied repository",
+            "data": {
+              "ticket": 17,
+              "optional": null
+            }
+          },
+          "execution": {
+            "expert": {
+              "inline": {
+                "runtime": {
+                  "image": "example.invalid/custom-harness:1",
+                  "config": {
+                    "$extends": "a-literal-harness-setting",
+                    "tools": [
+                      "custom_read_file",
+                      "tool-not-in-the-image"
+                    ],
+                    "optional": null,
+                    "values": [
+                      true,
+                      false,
+                      null,
+                      12,
+                      0.5,
+                      "yes",
+                      "012",
+                      "2026-09-13"
+                    ]
+                  },
+                  "pullPolicy": "IfNotPresent"
+                }
+              }
+            },
+            "workspace": {
+              "template": {
+                "inline": {
+                  "backend": "sandbox",
+                  "environment": {
+                    "image": "example.invalid/ssh-workspace:1",
+                    "pullPolicy": "IfNotPresent",
+                    "cache": "Reuse"
+                  },
+                  "resources": {
+                    "cpu": 2,
+                    "memory": "4Gi",
+                    "storage": "20Gi"
+                  },
+                  "initialize": [
+                    {
+                      "command": [
+                        "mkdir",
+                        "-p",
+                        "project"
+                      ]
+                    }
+                  ],
+                  "retention": "Retain"
+                }
+              }
+            },
+            "connectors": {
+              "source": {
+                "inline": {
+                  "driver": "srw.env/v1",
+                  "config": {
+                    "env": {
+                      "REPOSITORY_URL": "https://example.invalid/source.git"
+                    }
+                  },
+                  "credentials": {
+                    "REPOSITORY_TOKEN": {
+                      "secretRef": {
+                        "name": "source-access",
+                        "key": "token",
+                        "scope": {
+                          "kind": "Account",
+                          "name": "personal"
+                        }
+                      }
+                    }
+                  },
+                  "access": "ReadOnly"
+                }
+              }
+            }
+          },
+          "completion": {
+            "mode": "ProcessExit"
+          },
+          "retry": {
+            "maxAttempts": 1
+          },
+          "timeoutSeconds": 60
+        }
+      }
+    ],
+    "dependencies": [
+      {
+        "document": 4,
+        "path": "/spec/resources/experts/engineer",
+        "kind": "Expert",
+        "scope": {
+          "kind": "Catalog",
+          "name": "shared"
+        },
+        "name": "portable-worker",
+        "revision": "sha256:51f9495180fa0d387cb0c0041d32e2e23aa4fb32a3c5041022ba56a78ccd3341"
+      },
+      {
+        "document": 4,
+        "path": "/spec/resources/workspaces/development",
+        "kind": "WorkspaceTemplate",
+        "scope": {
+          "kind": "Catalog",
+          "name": "shared"
+        },
+        "name": "portable-workspace",
+        "revision": "sha256:8a60ffb5860fbf1ce261319f05e1de36c514f93a454de3c717e41e1e0607745d"
+      },
+      {
+        "document": 4,
+        "path": "/spec/resources/connectors/source",
+        "kind": "Connector",
+        "scope": {
+          "kind": "Account",
+          "name": "personal"
+        },
+        "name": "portable-source",
+        "revision": "sha256:c2db512c487e8faee25f3713c7ffc378458e86f7d15708513b17e378bcc780b1"
+      },
+      {
+        "document": 5,
+        "path": "/spec/execution/expert",
+        "kind": "Expert",
+        "scope": {
+          "kind": "Catalog",
+          "name": "shared"
+        },
+        "name": "portable-worker",
+        "revision": "sha256:51f9495180fa0d387cb0c0041d32e2e23aa4fb32a3c5041022ba56a78ccd3341"
+      },
+      {
+        "document": 5,
+        "path": "/spec/execution/workspace/template",
+        "kind": "WorkspaceTemplate",
+        "scope": {
+          "kind": "Catalog",
+          "name": "shared"
+        },
+        "name": "portable-workspace",
+        "revision": "sha256:8a60ffb5860fbf1ce261319f05e1de36c514f93a454de3c717e41e1e0607745d"
+      },
+      {
+        "document": 5,
+        "path": "/spec/execution/connectors/source",
+        "kind": "Connector",
+        "scope": {
+          "kind": "Account",
+          "name": "personal"
+        },
+        "name": "portable-source",
+        "revision": "sha256:c2db512c487e8faee25f3713c7ffc378458e86f7d15708513b17e378bcc780b1"
+      }
+    ],
+    "defaults": [
+      {
+        "document": 5,
+        "path": "/spec/execution/expert",
+        "project": {
+          "kind": "Project",
+          "scope": {
+            "kind": "Account",
+            "name": "personal"
+          },
+          "name": "portable-team"
+        }
+      },
+      {
+        "document": 5,
+        "path": "/spec/execution/workspace",
+        "project": {
+          "kind": "Project",
+          "scope": {
+            "kind": "Account",
+            "name": "personal"
+          },
+          "name": "portable-team"
+        }
+      },
+      {
+        "document": 5,
+        "path": "/spec/execution/connectors",
+        "project": {
+          "kind": "Project",
+          "scope": {
+            "kind": "Account",
+            "name": "personal"
+          },
+          "name": "portable-team"
+        }
+      }
+    ],
+    "pendingChecks": [
+      "resourceAuthorization",
+      "backendAvailability",
+      "imageResolution",
+      "credentialDelivery",
+      "workspaceInstances",
+      "projectActivation"
+    ],
+    "effects": []
+  }
+}

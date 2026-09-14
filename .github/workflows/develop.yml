@@ -844,7 +844,7 @@ jobs:
             .dockerignore docker/Dockerfile.mcp)
           VM_CONTROLLER_PATHS=(src/vm_controller/ src/shared/__init__.py
             src/shared/vm_lifecycle_auth.py src/shared/workspace_initialization.py src/shared/vm_workspace_storage.py src/shared/workspace_preparation.py
-            src/shared/workspace_preparation_settings.py pyproject.toml
+            src/shared/workspace_preparation_settings.py src/shared/workspace_preparation_network.py pyproject.toml
             .dockerignore docker/Dockerfile.vm-controller
             scripts/check_kubernetes_sdk_auth.py requirements/ scripts/lock_dependencies.py)
           # docker/browser-exec is COPY'd into the workspace image at build time
@@ -858,8 +858,8 @@ jobs:
             docker/assert-browser-stack.sh
             .playwright-version .dockerignore)
 
-          VM_PREPARER_PATHS=(src/vm_controller/__init__.py src/vm_controller/preparation_builder.py
-            src/shared/__init__.py src/shared/workspace_initialization.py src/shared/workspace_preparation.py
+          VM_PREPARER_PATHS=(src/vm_controller/__init__.py src/vm_controller/preparation_builder.py src/vm_controller/preparation_firewall.py
+            src/shared/__init__.py src/shared/workspace_initialization.py src/shared/workspace_preparation.py src/shared/workspace_preparation_network.py
             pyproject.toml .dockerignore docker/Dockerfile.vm-preparer)
           VM_PREPARER_SHA=$(last_input_sha "${VM_PREPARER_PATHS[@]}")
           VM_PREPARER=$(image_missing vm-preparer "$VM_PREPARER_SHA")

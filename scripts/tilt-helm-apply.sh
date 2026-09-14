@@ -123,10 +123,12 @@ for ((i = 0; i < image_count; i++)); do
     img_var="TILT_IMAGE_${i}"
     repo_key_var="TILT_IMAGE_KEY_REPO_${i}"
     tag_key_var="TILT_IMAGE_KEY_TAG_${i}"
+    digest_key_var="TILT_IMAGE_KEY_DIGEST_${i}"
 
     img="${!img_var:-}"
     repo_key="${!repo_key_var:-}"
     tag_key="${!tag_key_var:-}"
+    digest_key="${!digest_key_var:-}"
 
     if [[ -z "$img" || -z "$repo_key" || -z "$tag_key" ]]; then
         echo "srw-preflight: image slot $i is incompletely wired (img='$img' repo_key='$repo_key' tag_key='$tag_key')" >&2
@@ -134,6 +136,15 @@ for ((i = 0; i < image_count; i++)); do
     fi
 
     flags+=(--set "${repo_key}=${img%:*}" --set "${tag_key}=${img##*:}")
+    # An overlay's old digest wins over a fresh tag in these chart helpers.
+    # Replace it with the exact image Tilt pushed. The controller cannot assume
+    # that k3d's node-side registry hostname also resolves inside a Pod.
+    if [[ -n "$digest_key" ]]; then
+        image_map_var="TILT_IMAGE_MAP_${i}"
+        image_map="${!image_map_var:?Tilt image map is required for a digest pin}"
+        digest="$(python3 "$(dirname -- "${BASH_SOURCE[0]}")/tilt-image-digest.py" "$image_map" "$img")"
+        flags+=(--set-string "${digest_key}=${digest}")
+    fi
 done
 
 # --- apply -------------------------------------------------------------------

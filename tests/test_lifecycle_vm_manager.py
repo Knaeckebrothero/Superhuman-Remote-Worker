@@ -1892,3 +1892,31 @@ class TestKeptDiskSweep:
         await mgr.reap_orphans()
 
         provisioner.release_vm_captured.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_preparing_dispatchable_job_never_takes_teardown_claim(monkeypatch):
+    """An unavailable identity probe must not park unrelated VM preparation."""
+    row = {
+        "id": "c7d46b72-57f5-4dbd-af5a-255f8f981654",
+        "status": "created",
+        "execution_lane": "pinned",
+        "unassigned": True,
+        "freeze_free": True,
+        "context": {"vm": {"status": "waiting_preparation"}},
+    }
+    manager, provisioner, _, _, db = _make_manager(
+        job_rows=[row], completion_commands_enabled=True
+    )
+    provisioner.capture_vm_teardown_identity.side_effect = RuntimeError(
+        "probe unavailable"
+    )
+    monkeypatch.setattr(manager, "reap_orphans", AsyncMock(return_value=0))
+    await InstanceLifecycleReconciler([manager]).tick()
+    provisioner.capture_vm_teardown_identity.assert_not_awaited()
+    provisioner.delete_vm_captured.assert_not_awaited()
+    conn = db.acquire.return_value.__aenter__.return_value
+    assert not any(
+        "UPDATE jobs" in call.args[0] and "_completion_control_claim" in call.args[0]
+        for call in conn.fetchrow.await_args_list
+    )

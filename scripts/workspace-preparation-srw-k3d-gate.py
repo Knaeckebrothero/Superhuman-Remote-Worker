@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Verify prepared VM Jobs through local MCP and the deployed SRW harness.
 
-Requires a coherent k3d-srw deployment with offline preparation enabled. Creates
-owned resources, an expiring user-scoped MCP token and a deterministic provider.
+Requires a coherent k3d-srw deployment with preparation enabled. The default is
+offline; --online-package requires verified online preparation with Pod firewall.
+Creates owned resources, an expiring user-scoped MCP token and a deterministic provider.
 The provider requires a successful run_command result from the prepared guest.
 Mutations are never replayed after a transport failure. Evidence is allowlisted;
 tokens, credentials and arbitrary HTTP/agent response bodies are never printed.
@@ -20,6 +21,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import shlex
 import ssl
 from uuid import UUID, uuid4
 
@@ -43,11 +45,12 @@ DEFAULT_BASE = (
 )
 
 
-def preparation_identity():
+def preparation_identity(*, online_package=False):
     """Inspect admission and controller settings before creating a fixture."""
     shared = [
         "src/shared/workspace_preparation.py",
         "src/shared/workspace_preparation_settings.py",
+        "src/shared/workspace_preparation_network.py",
         "src/shared/workspace_initialization.py",
         "src/shared/vm_workspace_storage.py",
     ]
@@ -70,6 +73,7 @@ print(json.dumps({{
  'files':{{f:hashlib.sha256(Path('/app',f).read_bytes()).hexdigest() for f in {files!r}}},
  'enabled':p.enabled,'diskSize':p.disk_size,'builderImage':p.builder_image,
  'networkEnabled':p.network_enabled,
+ 'podFirewall':p.pod_firewall,'networkPolicyRevision':p.network_policy_revision,
  'authenticated':bool(os.getenv('VM_LIFECYCLE_HMAC_SECRET')),
  'mode':os.getenv('VM_MODE'),
  'persistentRootdisk':os.getenv('VM_PERSISTENT_ROOTDISK','false').lower()=='true'
@@ -107,7 +111,12 @@ print(json.dumps({{
             data["enabled"] and data["authenticated"] and data["persistentRootdisk"],
             "Preparation hosting prerequisites are missing for " + role + ".",
         )
-        require(not data["networkEnabled"], "This gate requires offline preparation.")
+        require(
+            data["networkEnabled"] == online_package,
+            "Preparation network mode differs from the requested gate mode.",
+        )
+        if online_package:
+            require(data["podFirewall"], "Online package gate requires Pod firewall.")
     require(
         admission["mode"] == "same-cluster",
         "Preparation requires same-cluster admission.",
@@ -115,7 +124,13 @@ print(json.dumps({{
     require(
         all(
             admission[k] == controller[k]
-            for k in ("diskSize", "builderImage", "networkEnabled")
+            for k in (
+                "diskSize",
+                "builderImage",
+                "networkEnabled",
+                "podFirewall",
+                "networkPolicyRevision",
+            )
         ),
         "Preparation admission and controller capabilities disagree.",
     )
@@ -124,7 +139,9 @@ print(json.dumps({{
         "controllerSourceFilesMatched": len(controller_paths),
         "diskSize": admission["diskSize"],
         "builderImage": admission["builderImage"],
-        "networkEnabled": False,
+        "networkEnabled": admission["networkEnabled"],
+        "podFirewall": admission["podFirewall"],
+        "networkPolicyRevision": admission["networkPolicyRevision"],
     }
 
 
@@ -187,12 +204,37 @@ def mcp_call(token, name, arguments, *, expect_json=True):
         ) from None
 
 
-def preparation_recipe(prefix, base_image, *, retention="Delete"):
+def preparation_recipe(prefix, base_image, *, retention="Delete", online_package=False):
     require(
         prefix.startswith("cutover-")
         and prefix.endswith("-")
         and all(c.isalnum() or c == "-" for c in prefix),
         "Invalid owned preparation prefix.",
+    )
+    tool = ["#!/bin/sh", "set -eu"]
+    preparation = ["set -eu", "install -d -m 0755 /opt/srw-preparation-gate"]
+    if online_package:
+        preparation.extend(
+            [
+                "if command -v hello >/dev/null 2>&1; then exit 23; fi",
+                "apt-get -o Acquire::Retries=2 update",
+                "DEBIAN_FRONTEND=noninteractive apt-get -y --no-install-recommends install hello",
+                "test \"$(hello)\" = 'Hello, world!'",
+                "dpkg-query -W -f='${Version}\\n' hello > /opt/srw-preparation-gate/package-version",
+            ]
+        )
+        # The deterministic provider calls this executable over the real SSH
+        # tool before accepting completion, including cache hits and handoff.
+        tool.append("test \"$(hello)\" = 'Hello, world!'")
+    tool.append("printf '%s\\n' srw-prepared-tool-v1")
+    preparation.extend(
+        [
+            "printf %s "
+            + shlex.quote("\n".join(tool) + "\n")
+            + " > /usr/local/bin/srw-cache-check",
+            "chmod 0755 /usr/local/bin/srw-cache-check",
+            f"printf '%s\\n' '{prefix}' >> /opt/srw-preparation-gate/build-count",
+        ]
     )
     return {
         "backend": "vm",
@@ -207,15 +249,7 @@ def preparation_recipe(prefix, base_image, *, retention="Delete"):
                     "command": [
                         "sh",
                         "-c",
-                        "\n".join(
-                            [
-                                "set -eu",
-                                "install -d -m 0755 /opt/srw-preparation-gate",
-                                "printf '#!/bin/sh\\nprintf \"srw-prepared-tool-v1\\\\n\"\\n' > /usr/local/bin/srw-cache-check",
-                                "chmod 0755 /usr/local/bin/srw-cache-check",
-                                f"printf '%s\\n' '{prefix}' >> /opt/srw-preparation-gate/build-count",
-                            ]
-                        ),
+                        "\n".join(preparation),
                     ]
                 }
             ],
@@ -240,9 +274,13 @@ def preparation_recipe(prefix, base_image, *, retention="Delete"):
 
 
 class PreparedSmoke(smoke_module.Smoke):
-    def __init__(self, *args, base_image, **kwargs):
+    def __init__(
+        self, *args, base_image, online_package=False, sudo_version=False, **kwargs
+    ):
         super().__init__(*args, **kwargs)
         self.base_image = base_image
+        self.online_package = online_package
+        self.sudo_version = sudo_version
         self.token = None
         self.cache_uids = set()
         self.instance_uids = set()
@@ -330,7 +368,7 @@ asyncio.run(run())
 
     def exercise(self, case, *, binding=None, retention="Delete"):
         self.evidence["stage"] = "job-" + case
-        run_id = self.prefix + "job-" + case
+        run_id = self.prefix + "job-" + ("sudo-" if self.sudo_version else "") + case
         self.fixture.arm(run_id, "prepared-workspace-job", 100)
         worker = smoke_module.authored_expert(self.prefix, self.image, self.model)
         worker["spec"]["runtime"]["config"]["config"]["tools"]["shell"] = [
@@ -348,7 +386,10 @@ asyncio.run(run())
                     "annotations": {cutover.OWNER_LABEL: self.prefix},
                 },
                 "spec": preparation_recipe(
-                    self.prefix, self.base_image, retention=retention
+                    self.prefix,
+                    self.base_image,
+                    retention=retention,
+                    online_package=self.online_package,
                 ),
             }
             self.mcp_apply(template)
@@ -709,7 +750,17 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-image", default=DEFAULT_BASE)
     parser.add_argument("--fixture-image")
+    parser.add_argument(
+        "--online-package",
+        action="store_true",
+        help="Install Ubuntu's hello package during preparation and require it in every guest shell proof",
+    )
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--sudo-version",
+        action="store_true",
+        help="Require a top-level sudo version query in each VM shell proof; no privileged command is executed",
+    )
     args = parser.parse_args(argv)
     require(
         image_reference(args.base_image)[2].startswith("sha256:"),
@@ -724,6 +775,8 @@ def main(argv=None):
         "status": "failed",
         "baseImage": args.base_image,
         "provider": "deterministic fixture; real SRW harness and SSH tools",
+        "onlinePackage": "hello" if args.online_package else None,
+        "sudoVersionQuery": args.sudo_version,
     }
     admin = fixture = smoke = None
     with httpx.Client(
@@ -734,7 +787,9 @@ def main(argv=None):
     ) as client:
         try:
             evidence["deployment"] = cutover.deployed_identity()
-            evidence["preparationHosting"] = preparation_identity()
+            evidence["preparationHosting"] = preparation_identity(
+                online_package=args.online_package
+            )
             evidence["agents"] = smoke_module.deployed_agents()
             image = cutover.remote_json(
                 "import json; from orchestrator.services.manifest_experts import installed_srw_image; print(json.dumps(installed_srw_image()))"
@@ -767,7 +822,14 @@ def main(argv=None):
                 model,
             )
             smoke = PreparedSmoke(
-                client, prefix, image, fixture, admin, base_image=args.base_image
+                client,
+                prefix,
+                image,
+                fixture,
+                admin,
+                base_image=args.base_image,
+                online_package=args.online_package,
+                sudo_version=args.sudo_version,
             )
             smoke.gate.login()
             fixture.create(fixture_image)

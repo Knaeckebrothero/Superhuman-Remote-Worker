@@ -12,7 +12,10 @@
 {{- fail "vmController.preparation requires lifecycle authentication" -}}
 {{- end -}}
 {{- if and $p.network.enabled (not $p.network.enforcementVerified) -}}
-{{- fail "Online VM preparation requires network.enforcementVerified after testing the CNI policy" -}}
+{{- fail "Online VM preparation requires network.enforcementVerified after testing builder network isolation" -}}
+{{- end -}}
+{{- if and $p.network.podFirewall $p.network.additionalEgress -}}
+{{- fail "Preparation Pod firewall does not support network.additionalEgress" -}}
 {{- end -}}
 {{- end -}}
 {{- $image := printf "%s:%s" $p.image.repository $p.image.tag -}}
@@ -34,4 +37,7 @@ VM_PREPARATION_IMAGE_PULL_SECRETS: {{ $pullSecrets | toJson | quote }}
 VM_PREPARATION_NETWORK_ENABLED: {{ $p.network.enabled | quote }}
 VM_PREPARATION_NETWORK_ISOLATION_VERIFIED: {{ $p.network.enforcementVerified | quote }}
 VM_PREPARATION_NETWORK_POLICY_REVISION: {{ $p.network | toJson | sha256sum | quote }}
+VM_PREPARATION_POD_FIREWALL: {{ $p.network.podFirewall | default false | quote }}
+VM_PREPARATION_BLOCKED_CIDRS: {{ $p.network.blockedCidrs | toJson | quote }}
+VM_PREPARATION_ADDITIONAL_EGRESS: {{ $p.network.additionalEgress | toJson | quote }}
 {{- end -}}

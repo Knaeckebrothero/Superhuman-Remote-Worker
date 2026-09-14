@@ -3,6 +3,9 @@
 The implemented resource API is `srw/v1alpha1`. The candidate first release
 contains the core below; this is not a stable `srw/v1` compatibility declaration.
 The [manifest guide](README.md) describes the contract and executable examples.
+The [compatibility contract](compatibility.md) records supported adapter/backend
+combinations, retry semantics, version handling and upgrade/rollback boundaries.
+Its portable alpha fixtures preserve resolution behavior from published develop.
 
 | Area | Implemented core | Current boundary |
 | --- | --- | --- |
@@ -14,7 +17,82 @@ The [manifest guide](README.md) describes the contract and executable examples.
 | Tags and labels | Common metadata on all five kinds, including version-checked metadata edits on admitted Jobs | Metadata does not grant permissions, select resources or trigger execution. A Job metadata edit preserves its admitted specification, dependencies and execution identity. |
 | Clients | Canonical API, thin resource CLI and MCP operations, including workspace-cache management | The broader operational CLI and distributable team packages remain extensions. |
 
-## Integrated implementation
+## Release-contract candidate — 2026-09-14
+
+The next candidate builds on published `develop` at `5809c97f5`. It adds the
+alpha compatibility contract and frozen fixtures, rejects unsupported Connector
+drivers before SRW Job admission, and checks reap eligibility before acquiring
+cleanup authority for a preparing workspace. Its optional preparation Pod
+firewall closes the observed K3s startup gap without changing node networking.
+Tilt also supplies verified fresh MCP/preparer image digests, so a saved local
+pin cannot silently select an older builder. Workspace delivery now preserves its
+SRW sudo policy, and a later failed attachment cannot erase an existing retained
+disk's successful initialization status.
+
+The [release verification record](verification/release-contract-2026-09-14.json)
+captures these candidate checks:
+
+- Full Python regression at `a000c8d39`: **31,047 passed, 179 skipped**, with
+  `PYTHONSAFEPATH=1`, eight bounded file workers and no fail-fast flag. Captured
+  runtime inputs stayed unchanged. Ruff, import contracts, both inventories, both
+  Helm lint profiles and that candidate's CI pipeline passed. The subsequent
+  raw-key shell correction also has 336 focused passing tests. The [real SSH/tmux gate](verification/k3d-shell-pane-loss-2026-09-14.json)
+  passed: closed-tab isolation, whole-session failure and stale-token refusal,
+  followed by exact cleanup. This is not a VM-recovery or RunQueue admission gate.
+- Local upgrade, rollback and candidate restore preserved six stored resources,
+  versions, resolved contents, identical reapply and JSON/YAML exports. This is
+  a same-schema rollback result with no pending firewall-enabled preparations,
+  not a general database downgrade guarantee.
+- The [ordinary SRW Job/Session smoke](verification/k3d-final-shell-srw-adapter-2026-09-14.json)
+  passed all seven workloads and cleanup after the final shell rollout; running
+  agent Pod source hashes match the tested backend.
+- The complete MCP/VM/harness preparation sequence passed in both
+  [offline](verification/k3d-pod-firewall-prepared-srw-2026-09-14.json) and
+  [online](verification/k3d-online-prepared-srw-2026-09-14.json) modes. Each run
+  covered cold preparation, independent cache reuse, retained allocation and
+  handoff, failed preparation and running-builder cancellation. Every successful
+  Job required real guest SSH output. Online proof also required execution of
+  the package downloaded during preparation. Owned workloads, retained disks,
+  artifacts and credentials retired; scope-local base imports follow cache TTL.
+  The final [online sudo/retention rerun](verification/k3d-online-sudo-retained-srw-2026-09-14.json)
+  passed all six cases at `18f730436`; every successful Job also ran a top-level
+  `sudo --version` query, which executes no privileged command.
+- The production firewall Pod construction passed 17 local k3d cases and 85
+  cases across all five main-cluster nodes, including positive controls,
+  private-destination denial from startup, IPv6 denial and failed-init
+  containment. A separate online libguestfs package install and independent
+  read-only disk inspection passed. These checks do not certify generic hosting.
+
+These are candidate results, not a main-dev rollout. Main dev still runs chart
+`0.0.999`, revision 971, with offline preparation. That revision only increased
+the VM-controller memory limit after an observed OOM. PRs
+[#127](https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/pull/127) and
+[#128](https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/pull/128) require
+the normal review and release process before the new profile can be enabled
+there.
+
+The [real-provider development exercise](verification/srw-development-2026-09-14.json)
+produced [PR #129](https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/pull/129):
+stdin support for local manifest validation, preview and export. An MCP-admitted
+MiniMax-M3 Job used a prepared VM, implemented the functional change, and built
+the full nested SRW stack with k3d/Tilt. Supervisor review corrected documentation
+and a stopped-reader test; the functional CLI implementation is still the
+agent's. The final commit `67f0a9ea7`, exported patch and running orchestrator
+source agree. All 55 focused tests and Ruff pass. Independent inspection verified
+eight ready Deployments, seven ready StatefulSets, verified-TLS health and
+authenticated manifest validation. The Job reached `pending_review` normally.
+
+This establishes a supervised development workflow. It does not establish
+unattended recovery or complete cleanup: earlier attempts exposed the runtime
+edges above and a retained reservation stranded by controller transport loss.
+The final Job finished before guest cluster/registry cleanup; its VM retired,
+but its instance still reports Attached. At the recorded check all test VMs/VMIs
+were absent, all three retained disks were preserved, the earlier paused attempt
+was cancelled and Detached, and the failed handoff remained Reserved. Preserve
+those review/recovery handles until supported retirement finishes. The real
+provider evidence is separate from the deterministic gates above.
+
+## Integrated implementation — previous baseline
 
 Integration merge `c0c443e03` combines the workspace-preparation candidate through
 `bdd5968df` with published `develop` at `a116c4682`, including its completion-workflow
@@ -53,7 +131,7 @@ the combined source and its new local acceptance results. The earlier
 the separate `a116c4682` rollout at chart `0.0.998`; it is historical evidence for
 that parent revision.
 
-## Acceptance status — 2026-09-13
+## Previous baseline acceptance — 2026-09-13
 
 The combined revision `c0c443e03` is deployed on local `k3d-srw` through Tilt CI.
 Deployed source checks match the merged checkout, including the completion
@@ -110,8 +188,10 @@ retained allocation and handoff, failed preparation, running-builder cancellatio
 and exact cleanup. The four successful Jobs required real harness/guest shell
 output. The sample cold Job took 16m43s; its cache-hit counterpart took 4m29s.
 All 15 deployments and public health checks passed after cleanup.
-The main-cluster startup network-policy test failed, so online preparation stays
-disabled. Verify startup network enforcement before enabling package downloads.
+The policy-only main-cluster startup test failed. The newer preparation Pod
+firewall passed the candidate checks above, but online preparation stays disabled
+on main until its chart, orchestrator, controller and builder are deployed
+together and the installation settings are updated through Fleet.
 
 Keep `srw/v1alpha1` until supported backend behavior, migration/rollback handling
 and version compatibility guarantees have been reviewed. Changing a version

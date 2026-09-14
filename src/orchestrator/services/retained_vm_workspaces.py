@@ -203,7 +203,7 @@ async def record_detached(db, job_id, binding):
     """Called after process retirement AND exact VM/VMI/launcher absence."""
     await db.execute(
         """UPDATE srw_workspace_instances i SET execution_id=NULL,status='Detached',
-        initialized=COALESCE(j.context->'vm'->'initialization_receipt'->>'phase','')='Succeeded',updated_at=now()
+        initialized=i.initialized OR COALESCE(j.context->'vm'->'initialization_receipt'->>'phase','')='Succeeded',updated_at=now()
         FROM srw_execution_specs s JOIN jobs j ON s.work_kind='Job' AND s.work_id=j.id
         WHERE i.execution_id=s.id AND s.work_id=$1 AND i.id=$2 AND i.generation=$3
         AND i.status IN ('Reserved','Attached') AND i.pvc_uid IS NOT NULL AND j.status IN ('completed','failed','cancelled')""",

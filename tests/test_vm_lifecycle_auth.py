@@ -390,6 +390,7 @@ def test_controller_shared_inputs_trigger_tilt_and_ci_rebuilds():
         "src/shared/workspace_initialization.py",
         "src/shared/workspace_preparation.py",
         "src/shared/workspace_preparation_settings.py",
+        "src/shared/workspace_preparation_network.py",
         "src/shared/vm_workspace_storage.py",
     }
     assert {
@@ -452,6 +453,7 @@ def test_controller_copied_protocol_imports_without_other_packages(tmp_path):
         "vm_workspace_storage.py",
         "workspace_initialization.py",
         "workspace_preparation.py",
+        "workspace_preparation_network.py",
         "workspace_preparation_settings.py",
     ]
     script = """

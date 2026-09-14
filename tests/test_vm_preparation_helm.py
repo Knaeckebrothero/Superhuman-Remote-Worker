@@ -134,3 +134,41 @@ def test_disabling_admission_keeps_existing_builder_policy_and_cleanup_authority
     assert any(
         r["resources"] == ["pods"] and "delete" in r["verbs"] for r in role["rules"]
     )
+
+
+def test_pod_firewall_profile_is_shared_by_admission_and_controller():
+    docs = render(*ENABLED, "vmController.preparation.network.podFirewall=true")
+    config = next(
+        d["data"]
+        for d in docs
+        if d["kind"] == "ConfigMap" and "VM_PREPARATION_ENABLED" in d.get("data", {})
+    )
+    controller = next(
+        d
+        for d in docs
+        if d["kind"] == "Deployment"
+        and d["metadata"]["name"].endswith("-vm-controller")
+    )
+    env = {
+        v["name"]: v.get("value")
+        for v in controller["spec"]["template"]["spec"]["containers"][0]["env"]
+    }
+    assert (
+        config["VM_PREPARATION_POD_FIREWALL"]
+        == env["VM_PREPARATION_POD_FIREWALL"]
+        == "true"
+    )
+    assert config["VM_PREPARATION_BLOCKED_CIDRS"] == env["VM_PREPARATION_BLOCKED_CIDRS"]
+    assert (
+        config["VM_PREPARATION_ADDITIONAL_EGRESS"]
+        == env["VM_PREPARATION_ADDITIONAL_EGRESS"]
+        == "[]"
+    )
+    invalid = render(
+        *ENABLED,
+        "vmController.preparation.network.podFirewall=true",
+        "vmController.preparation.network.additionalEgress[0].ports[0].port=22",
+        check=False,
+    )
+    assert invalid.returncode != 0
+    assert "does not support network.additionalEgress" in invalid.stderr

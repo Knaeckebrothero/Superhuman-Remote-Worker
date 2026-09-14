@@ -6,6 +6,7 @@ import os
 import re
 
 from shared.workspace_preparation import image_reference
+from shared.workspace_preparation_network import DEFAULT_BLOCKED_CIDRS, firewall_policy
 
 
 def disk_bytes(value):
@@ -30,6 +31,8 @@ class PreparationSettings:
     cache_ttl: int = 7 * 86400
     network_enabled: bool = False
     network_policy_revision: str = "offline"
+    pod_firewall: bool = False
+    blocked_cidrs: tuple = DEFAULT_BLOCKED_CIDRS
     registry_hosts: tuple = ("ghcr.io", "docker.io", "quay.io")
     insecure_registry_hosts: tuple = ()
     token_hosts: tuple = ("ghcr.io", "auth.docker.io", "quay.io")
@@ -39,6 +42,18 @@ class PreparationSettings:
     def wait_budget(self):
         # Queue, base import, clone, builder, then bounded handoff.
         return 3 * self.import_timeout + self.build_timeout + 300
+
+    @property
+    def firewall(self):
+        if not self.pod_firewall:
+            return None
+        return firewall_policy(
+            {
+                "version": 1,
+                "networkEnabled": self.network_enabled,
+                "blockedCidrs": list(self.blocked_cidrs),
+            }
+        )
 
     @classmethod
     def from_environment(cls):
@@ -65,6 +80,11 @@ class PreparationSettings:
             == "true",
             network_policy_revision=os.getenv(
                 "VM_PREPARATION_NETWORK_POLICY_REVISION", "offline"
+            ),
+            pod_firewall=os.getenv("VM_PREPARATION_POD_FIREWALL", "false").lower()
+            == "true",
+            blocked_cidrs=sequence(
+                "VM_PREPARATION_BLOCKED_CIDRS", DEFAULT_BLOCKED_CIDRS
             ),
             registry_hosts=sequence(
                 "VM_PREPARATION_REGISTRY_HOSTS", cls.registry_hosts
@@ -99,4 +119,17 @@ class PreparationSettings:
                 raise ValueError(
                     "Online preparation requires verified builder network isolation."
                 )
+            if value.pod_firewall:
+                value.firewall
+                if (
+                    json.loads(os.getenv("VM_PREPARATION_ADDITIONAL_EGRESS", "[]"))
+                    != []
+                ):
+                    raise ValueError(
+                        "Preparation Pod firewall does not support additional egress rules."
+                    )
+                if not re.fullmatch(r"[0-9a-f]{64}", value.network_policy_revision):
+                    raise ValueError(
+                        "Preparation Pod firewall requires a versioned network policy."
+                    )
         return value

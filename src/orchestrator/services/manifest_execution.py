@@ -103,6 +103,11 @@ class ManifestExecutionService:
         datasource_ids, policy_revisions = [], {}
         for connector in execution["connectors"].values():
             value = connector["inline"]
+            if adapter == "srw/v1" and value["driver"] != "srw.datasource/v1":
+                raise HTTPException(
+                    422,
+                    "Connector driver is not installed for the SRW harness adapter; use srw.datasource/v1 with an authorized datasource.",
+                )
             if value["driver"] == "srw.datasource/v1":
                 if adapter != "srw/v1":
                     raise HTTPException(
