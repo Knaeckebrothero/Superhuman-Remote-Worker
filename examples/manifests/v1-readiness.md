@@ -69,13 +69,28 @@ the VM-controller memory limit after an observed OOM. PRs
 [#127](https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/pull/127) and
 [#128](https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/pull/128) require
 the normal review and release process before the new profile can be enabled
-there. Real-provider self-development remains unaccepted: earlier attempts
-exposed a false sudo freeze, a stranded retained reservation after controller
-transport loss, and raw keys to a closed tab triggering workspace recovery.
-The retained disks and failure evidence are preserved. Actual agent-authored
-revisions were recovered verbatim and pass 48 focused tests; a fresh Job is
-addressing the remaining review and full nested k3d/Tilt acceptance. Those
-results are separate from the deterministic gates above.
+there.
+
+The [real-provider development exercise](verification/srw-development-2026-09-14.json)
+produced [PR #129](https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/pull/129):
+stdin support for local manifest validation, preview and export. An MCP-admitted
+MiniMax-M3 Job used a prepared VM, implemented the functional change, and built
+the full nested SRW stack with k3d/Tilt. Supervisor review corrected documentation
+and a stopped-reader test; the functional CLI implementation is still the
+agent's. The final commit `67f0a9ea7`, exported patch and running orchestrator
+source agree. All 55 focused tests and Ruff pass. Independent inspection verified
+eight ready Deployments, seven ready StatefulSets, verified-TLS health and
+authenticated manifest validation. The Job reached `pending_review` normally.
+
+This establishes a supervised development workflow. It does not establish
+unattended recovery or complete cleanup: earlier attempts exposed the runtime
+edges above and a retained reservation stranded by controller transport loss.
+The final Job finished before guest cluster/registry cleanup; its VM retired,
+but its instance still reports Attached. At the recorded check all test VMs/VMIs
+were absent, all three retained disks were preserved, the earlier paused attempt
+was cancelled and Detached, and the failed handoff remained Reserved. Preserve
+those review/recovery handles until supported retirement finishes. The real
+provider evidence is separate from the deterministic gates above.
 
 ## Integrated implementation — previous baseline
 

@@ -124,15 +124,16 @@
     "reason": "The candidate requires an approving review under the develop branch rule; no bypass used. Main only received the separate VM-controller memory increase."
   },
   "protectedResources": {
+    "observedAt": "2026-09-14T02:51:47.828378+00:00",
     "main": {
       "protectedCount": 239,
       "allPreserved": true,
       "missingOrReplaced": [],
       "currentCounts": {
-        "VirtualMachine": 4,
-        "VirtualMachineInstance": 4,
+        "DataVolume": 10,
         "PersistentVolumeClaim": 236,
-        "DataVolume": 10
+        "VirtualMachine": 2,
+        "VirtualMachineInstance": 2
       }
     },
     "k3d-srw": {
@@ -140,16 +141,15 @@
       "allPreserved": true,
       "missingOrReplaced": [],
       "currentCounts": {
-        "PersistentVolumeClaim": 12,
-        "DataVolume": 2
+        "DataVolume": 2,
+        "PersistentVolumeClaim": 12
       }
-    },
-    "observedAt": "2026-09-14T00:56:05.583846+00:00"
+    }
   },
   "limitations": [
     "Authored API remains srw/v1alpha1; this is not a stable srw/v1 declaration.",
     "Preparation network probes do not certify generic image hosting.",
-    "Full real-provider development acceptance is incomplete; preserve failed/paused attempts and retained recovery handles.",
+    "Supervised real-provider code and nested-stack acceptance passed; retained retirement and guest cleanup remain incomplete.",
     "Main has not deployed the candidate and keeps offline preparation.",
     "The VM remote-operation protocol remains disabled on main; no forward-only activation was performed for recovery."
   ],
@@ -177,7 +177,7 @@
       }
     ]
   },
-  "recordedAt": "2026-09-14T01:21:57.456132+00:00",
+  "recordedAt": "2026-09-14T02:56:47.774110+00:00",
   "developmentToolSource": "36e6262ea6ef5789e54d749ebd79b5261a9f09f3",
   "developmentToolTests": {
     "passed": 104,
@@ -243,7 +243,7 @@
   },
   "developmentAssignment": {
     "provider": "MiniMax-M3",
-    "status": "not accepted",
+    "status": "functional change and nested stack accepted with supervisor review; cleanup incomplete",
     "scope": "Agent-authored manifest CLI stdin support plus a complete nested SRW k3d/Tilt stack. Real-provider evidence is separate from deterministic fixture gates.",
     "attempts": [
       {
@@ -258,14 +258,14 @@
       },
       {
         "jobID": "2bfe0152-232f-4f2d-ba32-0c3d18bd7bcc",
-        "status": "paused",
-        "result": "Raw keys to a closed tab triggered workspace recovery. A replacement VM preserves the disk, but the Job remains paused; nested Tilt did not finish."
+        "status": "cancelled",
+        "result": "Raw-key workspace recovery paused the Job. Supported cancellation returned 503, then its VM/VMI retired and the original retained disk became Detached."
       },
       {
         "jobID": "7e83006c-85f6-4435-b0ee-6493369b42fb",
-        "status": "processing",
+        "status": "pending_review",
         "readyAt": "2026-09-14T00:53:28.198793+00:00",
-        "result": "Fresh prepared VM and explicit stateless shell mode; agent handling remaining code review and full stack."
+        "result": "Final reviewed CLI commit, byte-exact patch, 55 focused tests, full nested Tilt, eight Deployments/seven StatefulSets and verified-TLS authenticated validation passed. VM/VMI retired; public instance status remains Attached and guest cleanup was not completed."
       }
     ],
     "recoveredAgentSource": {
@@ -274,18 +274,22 @@
       "focusedTests": 48,
       "ruff": "passed",
       "method": "Exact-identity read-only SFTP of actual source files; original exported patch was stale. Files preserved verbatim without a supervisor replacement implementation.",
-      "acceptance": "Remaining review corrections and complete nested-stack proof required."
+      "acceptance": "Historical verbatim recovery input; final reviewed result is commit 67f0a9ea725a323180f233af0203d752729c9418, with unchanged functional CLI AST and supervisor test/docs corrections."
     },
     "protectedRecoveryInstances": [
       "5d9fcf4e-fa1a-4964-8a38-b9b4c6ca6f3a",
-      "99b73d9f-9ddc-487d-8ace-f37d62a71599"
-    ]
+      "99b73d9f-9ddc-487d-8ace-f37d62a71599",
+      "b333e4ff-5db0-4109-bcb6-e13b6b0b5cdd"
+    ],
+    "record": "srw-development-2026-09-14.json",
+    "sha256": "f668d2aca18ca8f613fddcc2ea3c8a0c02938c664fbc9a756d2e06d47b4227b7"
   },
   "mainHealth": {
     "deployments": 15,
     "allCurrentAndReady": true,
     "scope": "After memory-only Helm revision 971; not a runtime candidate rollout.",
-    "afterHelmRevision": 971
+    "afterHelmRevision": 971,
+    "observedAt": "2026-09-14T02:51:47.828378+00:00"
   },
   "shellCorrection": {
     "source": "a000c8d3936f25e3d99aa89e5968eea9dcfaabd6",
