@@ -225,6 +225,20 @@ python -m shared.manifests preview examples/manifests/*.yaml
 python -m shared.manifests export examples/manifests/*.yaml --output-format json
 ```
 
+Pass `-` as a file argument to read UTF-8 YAML or JSON from stdin; a single
+`-` may be mixed with file paths in argument order. Multiple `-` arguments
+are rejected before stdin is read, oversized or invalid UTF-8 input exits
+non-zero with no traceback, and the existing 1 MiB / 100-document /
+parser-contract limits still apply. When the pipe begins with `[` or `{`,
+the CLI parses the input as JSON so the JSON bundles emitted by
+`export --output-format json` round-trip through `validate -` without an
+intermediate format conversion. For example:
+
+```bash
+cat examples/manifests/resources.yaml \
+  | python -m shared.manifests validate -
+```
+
 For resources without explicit metadata scope, provide both `--scope-kind Account`
 and `--scope-name personal` (or the intended Project/Catalog scope). Validation
 permits omitted scope; preview/export must resolve it. A Project itself requires
