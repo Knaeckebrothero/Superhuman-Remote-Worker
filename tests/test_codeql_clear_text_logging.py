@@ -452,15 +452,21 @@ async def test_malformed_seed_field_names_cannot_leak_secrets(caplog):
     assert "apiKey" in _messages(caplog)
 
 
-def test_cloud_missing_secret_diagnostics_use_known_names_only():
-    from orchestrator.services.cloud.config import missing_secret_diagnostics
+def test_missing_cloud_secret_warning_keeps_context_without_custom_reference(caplog):
+    from orchestrator.services.cloud.config import warn_main_cloud_missing_secret_config
 
-    assert missing_secret_diagnostics(
-        [
-            {"field": "admin_password", "env_var": "NEXTCLOUD_ADMIN_PASSWORD"},
-            {"field": "agent_password", "env_var": "SECRET-AS-MALFORMED-REF"},
-        ]
-    ) == ["NEXTCLOUD_ADMIN_PASSWORD", "agent_password via credentials_ref"]
+    secret_reference = "VAULT_REF_WITH_SECRET_VALUE"
+    with caplog.at_level(logging.WARNING):
+        warn_main_cloud_missing_secret_config(
+            [{"field": "agent_password", "env_var": secret_reference}],
+            logger=logging.getLogger("test.main-cloud"),
+        )
+
+    emitted = _messages(caplog)
+    assert secret_reference not in emitted
+    assert "active main cloud backend" in emitted
+    assert "required secret environment configuration" in emitted
+    assert "Helm/Vault" in emitted
 
 
 @pytest.mark.asyncio
