@@ -36312,15 +36312,20 @@ class PostgresDB:
                     # exact actor makes the thread active before that life has
                     # received any input.  Admission belongs to the
                     # agent/Pod tuple below, not to the thread-wide status,
-                    # which also reflects work completed by older lives.
-                    admitted_input = await conn.fetchval(
+                    # which also reflects work completed by older lives.  Once
+                    # that active life owns even queued input, however, the
+                    # input is unfinished work rather than the created-life
+                    # exception and must keep retirement pending.
+                    used_input = await conn.fetchval(
                         "SELECT EXISTS (SELECT 1 FROM thread_input_deliveries "
                         "WHERE thread_id=$1::uuid AND owner_agent_id=$2::uuid "
                         "AND owner_pod_uid=$3 "
-                        "AND state IN ('admitted','settled'))",
+                        "AND (state IN ('admitted','settled') "
+                        "OR ($4::boolean AND state='queued')))",
                         parsed_thread,
                         parsed_agent,
                         expected_agent_pod_uid,
+                        str(row["status"] or "") == "active",
                     )
                     admitted_control = await conn.fetchval(
                         "SELECT EXISTS (SELECT 1 FROM thread_control_requests "
@@ -36328,7 +36333,7 @@ class PostgresDB:
                         parsed_thread,
                         parsed_generation,
                     )
-                    if admitted_input or admitted_control:
+                    if used_input or admitted_control:
                         return None
                 context = row["runtime_retirement_context"]
                 context = {} if context is None else context
