@@ -1127,6 +1127,71 @@ async def test_unscoped_unknown_route_and_invalid_correlation_are_globally_visib
     assert overview["unscoped_unexpected_calls"] == 2
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="the global provider counter does not retain safe per-request diagnostics",
+)
+async def test_each_unscoped_rejection_has_one_sanitized_diagnostic(
+    control: httpx.AsyncClient,
+    inference: httpx.AsyncClient,
+) -> None:
+    secret = "DO-NOT-RETAIN-UNSCOPED-CONTENT"
+
+    absent = await inference.post(
+        "/v1/embeddings",
+        json={"model": EMBEDDING_MODEL_ID, "input": secret},
+    )
+    assert absent.status_code == 409
+    assert absent.json()["error"]["type"] == "run_correlation_required"
+
+    await arm(control, "unscoped-a")
+    await arm(control, "unscoped-b")
+    ambiguous = await inference.post(
+        "/v1/embeddings",
+        json={"model": EMBEDDING_MODEL_ID, "input": secret},
+    )
+    assert ambiguous.status_code == 409
+    assert ambiguous.json()["error"]["type"] == "run_correlation_required"
+
+    unarmed = await inference.post(
+        "/v1/embeddings",
+        json={
+            "model": EMBEDDING_MODEL_ID,
+            "input": f"E2E-unscoped-missing {secret}",
+        },
+    )
+    assert unarmed.status_code == 409
+    assert unarmed.json()["error"]["type"] == "scenario_not_armed"
+
+    overview_text = (await control.get("/control/scenarios")).text
+    assert secret not in overview_text
+    overview = json.loads(overview_text)
+    assert overview["unscoped_unexpected_calls"] == 3
+    assert overview["unscoped_calls_truncated"] == 0
+    calls = overview["unscoped_calls"]
+    assert [call["sequence"] for call in calls] == [1, 2, 3]
+    assert [call["correlation_id"] for call in calls] == [
+        "unscoped:1",
+        "unscoped:2",
+        "unscoped:3",
+    ]
+    assert [call["outcome"] for call in calls] == [
+        "run_correlation_required_no_active_scenario",
+        "run_correlation_required_multiple_active_scenarios",
+        "scenario_not_armed",
+    ]
+    assert all(call["endpoint"] == "embeddings" for call in calls)
+    assert all(call["model"] == EMBEDDING_MODEL_ID for call in calls)
+    assert all(call["stream"] is False for call in calls)
+    assert calls[0]["correlation_run_ids"] == []
+    assert calls[0]["active_run_ids"] == []
+    assert calls[1]["correlation_run_ids"] == []
+    assert calls[1]["active_run_ids"] == ["unscoped-a", "unscoped-b"]
+    assert calls[2]["correlation_run_ids"] == ["unscoped-missing"]
+    assert calls[2]["active_run_ids"] == ["unscoped-a", "unscoped-b"]
+    assert all(call["observed_at"].endswith("Z") for call in calls)
+
+
 async def test_control_state_never_retains_prompts_tool_arguments_or_headers(
     control: httpx.AsyncClient,
     inference: httpx.AsyncClient,
