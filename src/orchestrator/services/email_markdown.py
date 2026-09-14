@@ -75,9 +75,9 @@ _HEADINGS = {
 _HEADING_FALLBACK = ("15px", "21px", "14px 0 6px 0")
 
 # Every pattern below scans a line of an untrusted, model-authored body, so each
-# is written to stay linear: no two adjacent parts may match the same character,
-# and nothing that can fail follows a run these patterns have to re-partition.
-_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})\s*(?:[^\s`]+\s*)?$")
+# is written to stay linear. The tilde lookahead requires the entire delimiter
+# run, so a failing info string cannot repartition tildes between both groups.
+_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,}(?!~))\s*(?:[^\s`]+\s*)?$")
 # An ATX closing run ("## Done ##") is trimmed by _atx_text rather than by a
 # "(.*?)\s*#*\s*$" tail, which offered three ways to split the same whitespace.
 _HEADING_RE = re.compile(r"^ {0,3}(#{1,6})\s+(.*)")
@@ -89,12 +89,14 @@ _QUOTE_RE = re.compile(r"^ {0,3}>[ \t]?(.*)$")
 _UL_RE = re.compile(r"^( *)([-*+])[ \t]+(.*)")
 _OL_RE = re.compile(r"^( *)(\d{1,9})[.)][ \t]+(.*)")
 _SAFE_SCHEME_RE = re.compile(r"^(?:https?://|mailto:)", re.IGNORECASE)
-# "[label](dest)". Neither the label nor the destination may contain "[", so a
-# run of unclosed openers costs each attempt only the distance to the next one
-# instead of a scan of the whole remaining text. A "[" is not legal unescaped in
-# a URL and a label's own brackets were already cut short by the "]" terminator.
-_LINK_RE = re.compile(
-    r"\[([^\[\]\n]*)\]\([ \t]*<?([^)\s<>\[]+)>?(?:[ \t]+&quot;[^)\n]*&quot;)?[ \t]*\)"
+# Candidate labels stop at another opener. Destination scanning also stops at
+# an opener, except for a single bracketed IPv6 authority after an HTTP scheme.
+# Titles are handled by _sub_links, which caches their closing delimiters.
+_LINK_OPEN_RE = re.compile(r"\[([^\[\]\n]*)\]\(")
+_LINK_DEST_RE = re.compile(
+    r"(?:https?://(?:[^/@\s<>\[\]()]+@)?\[[^\[\]\s()<>]+\][^)\s<>\[]*"
+    r"|[^)\s<>\[]+)",
+    re.IGNORECASE,
 )
 
 # Nesting past this renders as flat paragraphs -- see _parse_blocks.
@@ -443,59 +445,102 @@ def _inline(text: str) -> str:
         text,
     )
     text = html.escape(text, quote=True)
-    text = _LINK_RE.sub(
-        lambda m: keep(_anchor(html.unescape(m.group(2)), _emphasis(m.group(1)))),
+    text = _sub_links(
         text,
+        lambda label, url: keep(_anchor(html.unescape(url), _emphasis(label))),
     )
     text = _BARE_URL_RE.sub(_bare_url(keep), text)
     text = _emphasis(text)
     return _restore(text.replace("\n", "<br>"), tokens)
 
 
-def _sub_code_spans(text: str, render) -> str:
-    """Replace `` `code` `` spans, matching each run of backticks to the next run
-    of the same length.
+def _sub_links(text: str, render) -> str:
+    """Replace links without rescanning an unterminated title per opener.
 
-    The pattern this replaces, ``(`+)([\\s\\S]+?)\\1``, restarts a lazy scan of
-    the whole remaining text at every backtick run that never finds its partner,
-    which is quadratic in the number of runs. One left-to-right pass costs the
-    same on ordinary input and cannot be made to backtrack.
+    Labels and destinations scan only as far as the next candidate. Titles can
+    contain brackets, so their next closing parenthesis/newline is cached as
+    candidates advance. A long shared trailing whitespace run is trimmed once
+    per closing parenthesis. Failed outer links still allow valid inner links.
     """
-    if "`" not in text:
-        return text
     out: list[str] = []
-    i = 0
+    copied = 0
+    next_close = next_newline = -2  # -2: not searched; -1: no remaining delimiter
+    title_end = -1
     length = len(text)
-    while i < length:
-        start = text.find("`", i)
-        if start < 0:
-            out.append(text[i:])
-            break
-        run = start
-        while run < length and text[run] == "`":
-            run += 1
-        width = run - start
-        # The closing run must be exactly `width` backticks, as in CommonMark.
-        search = run
-        close = -1
-        while search < length:
-            candidate = text.find("`" * width, search)
-            if candidate < 0:
-                break
-            end = candidate
-            while end < length and text[end] == "`":
-                end += 1
-            if end - candidate == width:
-                close = candidate
-                break
-            search = end
-        if close < 0:
-            out.append(text[i:run])
-            i = run
+    for opening in _LINK_OPEN_RE.finditer(text):
+        if opening.start() < copied:
             continue
-        out.append(text[i:start])
-        out.append(render(text[run:close]))
-        i = close + width
+        pos = opening.end()
+        while pos < length and text[pos] in " \t":
+            pos += 1
+        if pos < length and text[pos] == "<":
+            pos += 1
+        destination = _LINK_DEST_RE.match(text, pos)
+        if destination is None:
+            continue
+        pos = destination.end()
+        if pos < length and text[pos] == ">":
+            pos += 1
+        separator = pos
+        while pos < length and text[pos] in " \t":
+            pos += 1
+        if pos < length and text[pos] == ")":
+            end = pos + 1
+        elif pos > separator and text.startswith("&quot;", pos):
+            content = pos + len("&quot;")
+            if next_close == -2 or (next_close >= 0 and next_close < content):
+                next_close = text.find(")", content)
+                title_end = next_close
+                while title_end > content and text[title_end - 1] in " \t":
+                    title_end -= 1
+            if next_newline == -2 or (next_newline >= 0 and next_newline < content):
+                next_newline = text.find("\n", content)
+            if (
+                next_close < 0
+                or (next_newline >= 0 and next_newline < next_close)
+                or title_end - len("&quot;") < content
+                or not text.startswith("&quot;", title_end - len("&quot;"))
+            ):
+                continue
+            end = next_close + 1
+        else:
+            continue
+        out.append(text[copied : opening.start()])
+        out.append(render(opening.group(1), destination.group()))
+        copied = end
+    out.append(text[copied:])
+    return "".join(out)
+
+
+def _sub_code_spans(text: str, render) -> str:
+    """Match backtick runs to the next run of exactly the same width.
+
+    Index runs once, then map each one to its next same-width partner in a
+    reverse pass. Unmatched widths never rescan the remaining runs or text.
+    Both passes and the emitted slices cost O(len(text)) total.
+    """
+    runs = [(match.start(), match.end()) for match in re.finditer(r"`+", text)]
+    following: list[int | None] = [None] * len(runs)
+    by_width: dict[int, int] = {}
+    for index in range(len(runs) - 1, -1, -1):
+        start, end = runs[index]
+        width = end - start
+        following[index] = by_width.get(width)
+        by_width[width] = index
+    out: list[str] = []
+    copied = index = 0
+    while index < len(runs):
+        partner = following[index]
+        if partner is None:
+            index += 1
+            continue
+        start, end = runs[index]
+        close_start, close_end = runs[partner]
+        out.append(text[copied:start])
+        out.append(render(text[end:close_start]))
+        copied = close_end
+        index = partner + 1
+    out.append(text[copied:])
     return "".join(out)
 
 

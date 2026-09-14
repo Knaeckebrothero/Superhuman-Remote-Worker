@@ -24,7 +24,15 @@ _FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n?(.*)$", re.DOTALL)
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 # Standard markdown link: [text](target). Images ![...] are excluded by the
 # negative lookbehind.
-_MD_LINK_RE = re.compile(r"(?<!\!)\[[^\]]*\]\(([^)]+)\)")
+# Stop at the next opener, except for one bracketed IPv6 authority. Both this
+# scanner and the wikilink scanner run on every body; either can otherwise
+# reintroduce quadratic work on the same repeated "[[" input.
+_MD_LINK_RE = re.compile(
+    r"(?<!\!)\[[^\[\]]*\]\(("
+    r"https?://(?:[^/@\s\[\]()]+@)?\[[^\[\]\s()]+\][^)\[]*"
+    r"|[^)\[]+)\)",
+    re.IGNORECASE,
+)
 # Obsidian wikilink: [[target]], [[target|alias]], [[target#anchor]]. The
 # negative lookbehind drops ![[...]] embeds (images/transclusions), mirroring
 # the markdown rule above. This vault is an Obsidian vault — wikilinks are the

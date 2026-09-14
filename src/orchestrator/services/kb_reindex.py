@@ -184,9 +184,9 @@ _CONFIDENCE_MAX = 20
 
 # The trailing "\s*$" is gone: a lazy "(.+?)" followed by an optional whitespace
 # run gave the engine a fresh way to split every trailing space on a hostile
-# line. "." already stops at the newline, so the title is trimmed at the call
-# site instead -- the same shape knowledge/gardener.py:_H1_RE already uses.
-_H1_RE = re.compile(r"^#\s+(.+)$", re.MULTILINE)
+# line. The final anchor is unnecessary too: "." already stops at a newline.
+# Trim title whitespace at the call site instead.
+_H1_RE = re.compile(r"^#\s+(.+)", re.MULTILINE)
 
 
 def normalize_root_path(root_path: Optional[str]) -> str:

@@ -241,3 +241,92 @@ class TestRepositoryUrls:
     def test_scheme_marker_run_is_linear(self) -> None:
         # "://([^:]+):[^@]+@": each "://" rescanned the tail for an "@".
         assert_fast(GitManager._mask_url_static, "://a" * (HOSTILE // 4))
+
+
+@pytest.mark.parametrize(
+    "case", ["tilde_fence", "quoted_links", "code_widths", "gardener_links"]
+)
+def test_remaining_hostile_shapes_have_bounded_growth(case):
+    """A subprocess bounds a regression's runtime instead of hanging pytest.
+
+    The 100ms floor absorbs timer noise on fast fixed implementations; the
+    ratios distinguish repeated scans once timings become significant.
+    """
+    import json
+    import subprocess
+    import sys
+    import textwrap
+
+    script = textwrap.dedent("""
+        import json, sys, time
+        from orchestrator.services import email_markdown as em
+        case = sys.argv[1]
+        samples = []
+        for n in ([100, 200, 400] if case == 'code_widths' else [25000, 50000, 100000]):
+            if case == 'tilde_fence':
+                text = '~' * n + '`'
+                fn = em._FENCE_RE.match
+            elif case == 'quoted_links':
+                text = '[](! "' * n
+                fn = em._inline
+            elif case == 'gardener_links':
+                from shared.runtime.knowledge import gardener
+                text = '[[' * n
+                fn = gardener._internal_link_targets
+            else:
+                text = ''.join('`' * i + 'x' for i in range(1, n)) + 'a' * (n*n)
+                fn = lambda text: em._sub_code_spans(text, lambda inner: inner)
+            start = time.perf_counter()
+            fn(text)
+            samples.append([len(text), time.perf_counter() - start])
+        print(json.dumps(samples))
+    """)
+    result = subprocess.run(
+        [sys.executable, "-c", script, case],
+        text=True,
+        capture_output=True,
+        timeout=12,
+        check=True,
+    )
+    samples = json.loads(result.stdout)
+    assert samples[-1][0] >= 100000
+    for (size_before, before), (size_after, after) in zip(samples, samples[1:]):
+        assert after < 3.0, samples
+        assert after <= max(0.1, before * (size_after / size_before) * 1.5), samples
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://[::1]:3000/",
+        "https://[2001:db8::1]/notes",
+        "https://user:pw@[::1]/notes",
+    ],
+)
+def test_ipv6_links_remain_rendered_and_speakable(url):
+    md = f"[dashboard]({url})"
+    assert gardener.external_url_map([{"path": "note.md", "text": md}]) == {
+        url: ["note.md"]
+    }
+    assert f'href="{url}"' in em._inline(md)
+    assert tts._strip_markdown_for_speech(md) == "dashboard"
+    assert "chart" not in tts._strip_markdown_for_speech(f"![chart]({url})")
+
+
+def test_link_titles_can_contain_brackets_without_rescanning():
+    assert ">guide</a>" in em._inline('[guide](https://example.com "notes [draft]")')
+    assert ">inner</a>" in em._inline("[broken]( nope [inner](https://example.com)")
+    assert ">later</a>" in em._inline(
+        '[bad](https://bad "unterminated\n[later](https://example.com)'
+    )
+
+
+def test_code_span_widths_match_exactly_and_preserve_unmatched_runs():
+    assert (
+        em._sub_code_spans("`a``b` and ``c`d``", lambda inner: "[" + inner + "]")
+        == "[a``b] and [c`d]"
+    )
+    assert (
+        em._sub_code_spans("```x ``y`z`` and `done`", lambda inner: "[" + inner + "]")
+        == "```x [y`z] and [done]"
+    )
