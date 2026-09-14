@@ -24,13 +24,24 @@ _FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n?(.*)$", re.DOTALL)
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 # Standard markdown link: [text](target). Images ![...] are excluded by the
 # negative lookbehind.
-_MD_LINK_RE = re.compile(r"(?<!\!)\[[^\]]*\]\(([^)]+)\)")
+# Stop at the next opener, except for one bracketed IPv6 authority. Both this
+# scanner and the wikilink scanner run on every body; either can otherwise
+# reintroduce quadratic work on the same repeated "[[" input.
+_MD_LINK_RE = re.compile(
+    r"(?<!\!)\[[^\[\]]*\]\(("
+    r"https?://(?:[^/@\s\[\]()]+@)?\[[^\[\]\s()]+\][^)\[]*"
+    r"|[^)\[]+)\)",
+    re.IGNORECASE,
+)
 # Obsidian wikilink: [[target]], [[target|alias]], [[target#anchor]]. The
 # negative lookbehind drops ![[...]] embeds (images/transclusions), mirroring
 # the markdown rule above. This vault is an Obsidian vault — wikilinks are the
 # dominant link syntax, so a parser that only knew _MD_LINK_RE saw a small
 # fraction of the real graph.
-_WIKILINK_RE = re.compile(r"(?<!\!)\[\[([^\]]+)\]\]")
+# "[" is excluded from the target as well as "]": a body full of unclosed "[["
+# openers otherwise made every one of them rescan the rest of the text for a
+# closing "]]", which is quadratic. No wikilink target contains a bracket.
+_WIKILINK_RE = re.compile(r"(?<!\!)\[\[([^\]\[]+)\]\]")
 # ATX heading anywhere in the body.
 _HEADING_RE = re.compile(r"^#{1,6}\s", re.MULTILINE)
 

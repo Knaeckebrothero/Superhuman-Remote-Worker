@@ -44,7 +44,11 @@ OVERLAP_RATIO = 0.12
 # raise via env for providers with roomier limits.
 DEFAULT_MAX_EMBED_BATCH = int(os.getenv("EMBEDDING_MAX_BATCH", "64"))
 
-_HEADING_LINE_RE = re.compile(r"^(#{1,6})\s+(.*)$")
+# No trailing "$": it is redundant for the single lines _split_sections feeds in
+# ("." already stops at a newline), and it was the only thing that could fail
+# after "\s+" -- the ambiguity between that run and "(.*)" is what the scanner
+# flagged.
+_HEADING_LINE_RE = re.compile(r"^(#{1,6})\s+(.*)")
 _PARAGRAPH_SPLIT_RE = re.compile(r"\n\s*\n")
 
 
