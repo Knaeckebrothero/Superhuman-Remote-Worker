@@ -893,17 +893,10 @@ class TestCompletionControlLifecycleOwnership:
     """A claimed human control and the generic reaper never share a resource."""
 
     @pytest.mark.asyncio
-    async def test_processing_job_reap_probe_releases_its_control_claim(
+    async def test_processing_job_reap_does_not_acquire_a_control_claim(
         self, monkeypatch
     ):
-        """A busy workspace must not retain a claim merely because it is dirty.
-
-        The reaper acquires its claim before the final reapability check.  The
-        Kubernetes snapshot-containment guard therefore has to respect that
-        same predicate; otherwise every processing job with a live workspace
-        retains a two-hour ``lifecycle_workspace_reap`` claim and prevents
-        dispatch-lease recovery.
-        """
+        """A busy workspace must not acquire teardown authority or block recovery."""
 
         monkeypatch.delenv("WORKSPACE_IMAGE", raising=False)
         pod = _make_pod(
@@ -942,8 +935,9 @@ class TestCompletionControlLifecycleOwnership:
         snapshot.capture_vm_snapshot.assert_not_awaited()
         container.delete_workspace_with_outcome.assert_not_awaited()
         conn = db.acquire.return_value.__aenter__.return_value
-        assert any(
-            "- '_completion_control_claim'" in str(call.args[0])
+        assert not any(
+            "UPDATE jobs" in str(call.args[0])
+            and "_completion_control_claim" in str(call.args[0])
             for call in conn.fetchrow.await_args_list
         )
 

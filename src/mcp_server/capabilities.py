@@ -124,6 +124,14 @@ def _mutation(
 
 
 _READ_CAPABILITIES = (
+    _read("manifest_validate", "POST /api/manifests/validate"),
+    _read("manifest_preview", "POST /api/manifests/preview"),
+    _read("manifest_list", "GET /api/resources"),
+    _read("manifest_get", "GET /api/resources/{resource_id}"),
+    _read(
+        "manifest_export",
+        "GET /api/resources/{resource_id} + POST /api/manifests/export",
+    ),
     _read("list_jobs", "GET /api/jobs"),
     _read("get_job", "GET /api/jobs/{job_id}"),
     _read("get_audit_trail", "GET /api/jobs/{job_id}/audit"),
@@ -236,6 +244,23 @@ _READ_CAPABILITIES = (
 )
 
 _MUTATION_CAPABILITIES = (
+    _mutation(
+        "manifest_apply",
+        "POST /api/manifests/apply",
+        "creates/updates authorized resources; Job admission may launch an image and external work",
+        authorization="approved user; account/project edit grants, dependency access and execution admission enforced",
+        destructive=True,
+        idempotent=True,
+        open_world=True,
+    ),
+    _mutation(
+        "manifest_delete",
+        "DELETE /api/resources/{resource_id}?expected_version",
+        "deletes an authorized resource at the observed version; active/managed dependencies can block deletion",
+        authorization="approved user; resource owner/project editor and dependency guards enforced",
+        destructive=True,
+        idempotent=True,
+    ),
     _mutation(
         "approve_job",
         "POST /api/jobs/{job_id}/approve",

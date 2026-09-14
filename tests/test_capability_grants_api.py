@@ -36,6 +36,12 @@ which must still fire, in order, before any stripping — see the tests below
 that pin each gate closing without the other.
 """
 
+from tests._expert_catalog import catalogue_service, catalogue_route
+from orchestrator.routers import expert_catalog as expert_routes
+from orchestrator.schemas import expert_catalog as expert_schemas
+from orchestrator.services import expert_authoring as expert_authoring_module
+
+
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -45,6 +51,7 @@ import pytest
 from fastapi import HTTPException
 
 import orchestrator.main as m
+from orchestrator.services import grant_enforcement
 
 _UID = "11111111-1111-1111-1111-111111111111"
 
@@ -68,8 +75,10 @@ def test_violations_detail_lists_keys():
 @pytest.mark.asyncio
 async def test_enforce_save_grants_admin_bypasses():
     # Admin short-circuits before any DB call (no mock needed).
-    await m._enforce_save_grants(
-        {"tools": {"shell": ["ls"]}}, user={"id": _UID, "is_admin": True}
+    await grant_enforcement.enforce_save_grants(
+        {"tools": {"shell": ["ls"]}},
+        user={"id": _UID, "is_admin": True},
+        dependencies=m._grant_enforcement_dependencies(),
     )
 
 
@@ -82,8 +91,12 @@ async def test_enforce_save_grants_raises_422_for_ungranted(monkeypatch):
     fake.get_projects_for_user = AsyncMock(return_value=[])
     monkeypatch.setattr(m, "postgres_db", fake)
     with pytest.raises(HTTPException) as ei:
-        await m._enforce_save_grants(
-            {"tools": {"shell": ["ls"]}}, user={"id": _UID, "is_admin": False}
+        await grant_enforcement.enforce_save_grants(
+            {"tools": {"shell": ["ls"]}},
+            user={"id": _UID, "is_admin": False},
+            # Built after the store is swapped, the way the composition root
+            # builds it per call.
+            dependencies=m._grant_enforcement_dependencies(),
         )
     assert ei.value.status_code == 422 and "shell_tools" in str(ei.value.detail)
 
@@ -328,7 +341,9 @@ async def test_duplicate_expert_strips_an_ungranted_tool_and_reports_it(monkeypa
     # Kill switch ON: this test isolates the grants half, not the switch.
     monkeypatch.setattr(m, "_user_experts_enabled", AsyncMock(return_value=True))
 
-    result = await m.duplicate_expert(MagicMock(), str(uuid4()))
+    result = await catalogue_route(expert_routes.duplicate_expert)(
+        MagicMock(), str(uuid4())
+    )
 
     assert result == {"id": "forked-id", "dropped": ["shell_tools"]}
     fake.create_expert.assert_awaited_once()
@@ -384,7 +399,9 @@ async def test_duplicate_expert_still_forks_when_the_gate_allows(monkeypatch):
     monkeypatch.setattr(m, "user_visible_project_ids", AsyncMock(return_value=[]))
     monkeypatch.setattr(m, "_user_experts_enabled", AsyncMock(return_value=True))
 
-    result = await m.duplicate_expert(MagicMock(), str(uuid4()))
+    result = await catalogue_route(expert_routes.duplicate_expert)(
+        MagicMock(), str(uuid4())
+    )
 
     assert result == {**forked_row, "dropped": []}
     fake.create_expert.assert_awaited_once()
@@ -439,7 +456,9 @@ async def test_duplicate_expert_holder_of_the_grant_gets_an_unmodified_copy(
         grant_rows=[{"key": "shell_tools", "value_json": True}],
     )
 
-    result = await m.duplicate_expert(MagicMock(), str(uuid4()))
+    result = await catalogue_route(expert_routes.duplicate_expert)(
+        MagicMock(), str(uuid4())
+    )
 
     assert result["dropped"] == []
     assert fake.create_expert.await_args.kwargs["config"] == config
@@ -468,7 +487,9 @@ async def test_duplicate_expert_admin_copier_bypasses_and_reports_nothing_droppe
         is_admin=True,
     )
 
-    result = await m.duplicate_expert(MagicMock(), str(uuid4()))
+    result = await catalogue_route(expert_routes.duplicate_expert)(
+        MagicMock(), str(uuid4())
+    )
 
     assert result["dropped"] == []
     assert fake.create_expert.await_args.kwargs["config"] == config
@@ -508,7 +529,7 @@ async def test_duplicate_expert_safety_recheck_fires_when_the_strip_map_misses(
     )
 
     with pytest.raises(HTTPException) as ei:
-        await m.duplicate_expert(MagicMock(), str(uuid4()))
+        await catalogue_route(expert_routes.duplicate_expert)(MagicMock(), str(uuid4()))
 
     assert ei.value.status_code == 422
     assert "shell_tools" in ei.value.detail
@@ -547,7 +568,9 @@ async def test_duplicate_expert_scholar_end_to_end_for_a_default_grants_user(
     # project-level grant" premise is visible, not incidental.
     monkeypatch.setattr(m, "user_visible_project_ids", AsyncMock(return_value=[]))
 
-    result = await m.duplicate_expert(MagicMock(), "scholar")
+    result = await catalogue_route(expert_routes.duplicate_expert)(
+        MagicMock(), "scholar"
+    )
 
     assert set(result["dropped"]) == {"shell_tools", "delegation"}
     stored = fake.create_expert.await_args.kwargs["config"]
@@ -605,7 +628,9 @@ async def test_previously_refused_shipped_experts_now_fork_for_default_grants(
     monkeypatch.setattr(m, "_user_experts_enabled", AsyncMock(return_value=True))
     monkeypatch.setattr(m, "user_visible_project_ids", AsyncMock(return_value=[]))
 
-    result = await m.duplicate_expert(MagicMock(), expert_id)
+    result = await catalogue_route(expert_routes.duplicate_expert)(
+        MagicMock(), expert_id
+    )
 
     assert set(result["dropped"]) == _PREVIOUSLY_REFUSED_SHIPPED_EXPERTS[expert_id]
     stored = fake.create_expert.await_args.kwargs["config"]
@@ -684,7 +709,7 @@ def _fork_env(
     )
     if personal_defaults_ok is not None:
         monkeypatch.setattr(
-            m,
+            expert_authoring_module,
             "personal_defaults_allowed",
             AsyncMock(return_value=personal_defaults_ok),
         )
@@ -722,8 +747,10 @@ async def test_fork_my_expert_default_strips_a_bundled_source_and_reports_it(
     """
     fake = _fork_env(monkeypatch, grant_rows=[])
 
-    result = await m.fork_my_expert_default(
-        MagicMock(), "worker", m.ExpertDefaultForkRequest(expert_id="scholar")
+    result = await catalogue_route(expert_routes.fork_my_expert_default)(
+        MagicMock(),
+        "worker",
+        expert_schemas.ExpertDefaultForkRequest(expert_id="scholar"),
     )
 
     assert set(result["dropped"]) == {"shell_tools", "delegation"}
@@ -745,7 +772,7 @@ async def test_fork_my_expert_default_strips_a_db_source_and_reports_it(monkeypa
     strip-and-report outcome, proving the fix covers both branches."""
     fake = _fork_env(monkeypatch, grant_rows=[])
     monkeypatch.setattr(
-        m,
+        expert_authoring_module,
         "resolve_root_expert",
         AsyncMock(
             return_value=_db_selection(
@@ -754,8 +781,8 @@ async def test_fork_my_expert_default_strips_a_db_source_and_reports_it(monkeypa
         ),
     )
 
-    result = await m.fork_my_expert_default(
-        MagicMock(), "session", m.ExpertDefaultForkRequest()
+    result = await catalogue_route(expert_routes.fork_my_expert_default)(
+        MagicMock(), "session", expert_schemas.ExpertDefaultForkRequest()
     )
 
     assert result["dropped"] == ["shell_tools"]
@@ -776,11 +803,13 @@ async def test_fork_my_expert_default_holder_of_the_grant_gets_an_unmodified_for
         monkeypatch, grant_rows=[{"key": "shell_tools", "value_json": True}]
     )
     monkeypatch.setattr(
-        m, "resolve_root_expert", AsyncMock(return_value=_db_selection(config))
+        expert_authoring_module,
+        "resolve_root_expert",
+        AsyncMock(return_value=_db_selection(config)),
     )
 
-    result = await m.fork_my_expert_default(
-        MagicMock(), "session", m.ExpertDefaultForkRequest()
+    result = await catalogue_route(expert_routes.fork_my_expert_default)(
+        MagicMock(), "session", expert_schemas.ExpertDefaultForkRequest()
     )
 
     assert result["dropped"] == []
@@ -806,11 +835,11 @@ async def test_fork_my_expert_default_403s_when_personal_defaults_are_disabled(
     resolve_mock = AsyncMock(
         return_value=_db_selection({"tools": {"shell": ["run_command"]}})
     )
-    monkeypatch.setattr(m, "resolve_root_expert", resolve_mock)
+    monkeypatch.setattr(expert_authoring_module, "resolve_root_expert", resolve_mock)
 
     with pytest.raises(HTTPException) as ei:
-        await m.fork_my_expert_default(
-            MagicMock(), "worker", m.ExpertDefaultForkRequest()
+        await catalogue_route(expert_routes.fork_my_expert_default)(
+            MagicMock(), "worker", expert_schemas.ExpertDefaultForkRequest()
         )
 
     assert ei.value.status_code == 403
@@ -837,14 +866,14 @@ async def test_fork_my_expert_default_403s_when_the_kill_switch_is_off(monkeypat
     """
     fake = _fork_env(monkeypatch, personal_defaults_ok=True, kill_switch_on=False)
     monkeypatch.setattr(
-        m,
+        expert_authoring_module,
         "resolve_root_expert",
         AsyncMock(return_value=_db_selection({"tools": {"shell": ["run_command"]}})),
     )
 
     with pytest.raises(HTTPException) as ei:
-        await m.fork_my_expert_default(
-            MagicMock(), "worker", m.ExpertDefaultForkRequest()
+        await catalogue_route(expert_routes.fork_my_expert_default)(
+            MagicMock(), "worker", expert_schemas.ExpertDefaultForkRequest()
         )
 
     assert ei.value.status_code == 403
@@ -873,8 +902,10 @@ async def test_fork_my_expert_default_safety_recheck_fires_when_the_strip_map_mi
     fake = _fork_env(monkeypatch, grant_rows=[])
 
     with pytest.raises(HTTPException) as ei:
-        await m.fork_my_expert_default(
-            MagicMock(), "worker", m.ExpertDefaultForkRequest(expert_id="scholar")
+        await catalogue_route(expert_routes.fork_my_expert_default)(
+            MagicMock(),
+            "worker",
+            expert_schemas.ExpertDefaultForkRequest(expert_id="scholar"),
         )
 
     assert ei.value.status_code == 422
@@ -909,8 +940,10 @@ async def test_fork_my_expert_default_actually_sets_the_personal_default(
     before = await fake.get_user_expert_default(user_id=_UID, expert_type="worker")
     assert before is None
 
-    result = await m.fork_my_expert_default(
-        MagicMock(), "worker", m.ExpertDefaultForkRequest(expert_id="scholar")
+    result = await catalogue_route(expert_routes.fork_my_expert_default)(
+        MagicMock(),
+        "worker",
+        expert_schemas.ExpertDefaultForkRequest(expert_id="scholar"),
     )
 
     after = await fake.get_user_expert_default(user_id=_UID, expert_type="worker")
@@ -940,12 +973,14 @@ async def test_fork_my_expert_default_admin_bypasses_and_reports_nothing_dropped
     # real config.yaml (as `tools.shell` already has once: `cancel_command`
     # joined `run_command` there since this file's other admin-bypass test
     # was last touched).
-    expected = m._validate_expert_fragment(
-        m._bundled_expert_bundle("scholar")["config"]
+    expected = catalogue_service().validate_expert_fragment(
+        catalogue_service().bundled_expert_bundle("scholar")["config"]
     )
 
-    result = await m.fork_my_expert_default(
-        MagicMock(), "worker", m.ExpertDefaultForkRequest(expert_id="scholar")
+    result = await catalogue_route(expert_routes.fork_my_expert_default)(
+        MagicMock(),
+        "worker",
+        expert_schemas.ExpertDefaultForkRequest(expert_id="scholar"),
     )
 
     assert result["dropped"] == []
@@ -984,10 +1019,10 @@ async def test_previously_refused_shipped_experts_now_fork_as_default(
     """
     fake = _fork_env(monkeypatch, grant_rows=[])
 
-    result = await m.fork_my_expert_default(
+    result = await catalogue_route(expert_routes.fork_my_expert_default)(
         MagicMock(),
         _SHIPPED_EXPERT_TYPE[expert_id],
-        m.ExpertDefaultForkRequest(expert_id=expert_id),
+        expert_schemas.ExpertDefaultForkRequest(expert_id=expert_id),
     )
 
     assert set(result["dropped"]) == _PREVIOUSLY_REFUSED_SHIPPED_EXPERTS[expert_id]

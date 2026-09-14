@@ -149,3 +149,29 @@ async def test_bad_mac_audit_is_sampled_and_pre_auth_rate_limited():
 
     assert db.get_thread.await_count == vm_guest_auth._PREAUTH_REQUESTS_PER_MINUTE
     assert vm_guest_auth.log_security_event.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("attached", [True, False])
+async def test_retained_guest_token_requires_current_workspace_ownership(attached):
+    db = AsyncMock()
+    db.get_thread.return_value = None
+    row = job_row(status="ready")
+    row["context"]["vm"]["workspace_storage"] = {
+        "uid": OTHER_ID,
+        "generation": 1,
+        "pvc_uid": None,
+        "owner_id": JOB_ID,
+        "owner_kind": "job",
+    }
+    db.get_job.return_value = row
+    db.fetchval.return_value = attached
+    token = guest_token(SECRET.encode(), "job", JOB_ID, GENERATION)
+    if attached:
+        assert (
+            await require_vm_guest(request_with(token), db, JOB_ID)
+        ).entity_id == JOB_ID
+    else:
+        with pytest.raises(HTTPException) as denied:
+            await require_vm_guest(request_with(token), db, JOB_ID)
+        assert denied.value.status_code == 401

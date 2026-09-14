@@ -120,6 +120,9 @@
     "hide": "Hide Canvas",
     "skipToCanvas": "Skip to Canvas",
     "newContent": "New Canvas content waiting",
+    "workspaceFile": {
+      "notPresented": "{{path}} is a file in this session's workspace. Ask the agent to present it on the Canvas."
+    },
     "returnToChat": "Return to chat",
     "resize": "Resize chat and Canvas",
     "empty": "The agent has not presented anything yet.",
@@ -345,6 +348,7 @@
     "rename": "Rename",
     "copy": "Copy",
     "copied": "Copied",
+    "copyFailed": "Couldn't copy to clipboard",
     "never": "Never",
     "default": "default",
     "noKey": "(no key)"
@@ -369,6 +373,15 @@
   "nav": {
     "cockpit": "Cockpit",
     "builder": "Builder",
+    "modeChat": "Chat",
+    "modeJobs": "Jobs",
+    "modeProjects": "Projects",
+    "newChat": "New chat",
+    "searchSessions": "Search sessions",
+    "clearFilter": "Clear filter",
+    "noSessionsYet": "No sessions yet",
+    "noMatches": "No matches",
+    "seeAllSessions": "See all sessions",
     "sessions": "Sessions",
     "jobs": "Jobs",
     "review": "Job Review",
@@ -382,9 +395,18 @@
     "workbench": "Workbench",
     "settings": "Settings",
     "logout": "Logout",
-    "admin": "admin",
+    "admin": "Admin",
+    "more": "More",
+    "apiKeys": "API keys",
+    "sshKeys": "SSH keys",
     "collapseSidebar": "Collapse sidebar",
-    "openSidebar": "Open sidebar"
+    "openSidebar": "Open sidebar",
+    "resizeSidebar": "Resize sidebar",
+    "recency": {
+      "today": "Today",
+      "yesterday": "Yesterday",
+      "earlier": "Earlier"
+    }
   },
   "grants": {
     "lockedShort": "Requires a capability grant",
@@ -847,6 +869,8 @@
       "scopeLabel": "Usage scope",
       "scopeNoSubjobs": "This job has no sub-jobs, so both figures are the same.",
       "scopeSubtree": "Incl. sub-jobs",
+      "showLess": "Show less",
+      "showMore": "Show more",
       "showSubjobRows": "Show {{count}} hidden as rows",
       "showSubjobRowsHint": "Adds sub-jobs to the origin filter, so they appear in the list.",
       "subjobs": "Sub-jobs ({{count}})",
@@ -857,9 +881,9 @@
       "subagentsTranscript": "Transcript",
       "subagentsStatuses": {
         "queued": "Queued",
+        "parked": "Parked",
         "running": "Running",
         "completed": "Completed",
-        "parked": "Parked",
         "interrupted": "Interrupted",
         "capped": "Capped",
         "error": "Error",
@@ -875,6 +899,51 @@
     }
   },
   "admin": {
+    "helm": {
+      "badge": "Helm",
+      "badgeDrift": "Helm · overridden",
+      "tooltip": "Declared with reconcile: true in the deployment's Helm values. Edits made here are reverted on the next helm upgrade.",
+      "tooltipDrift": "Edited here after Helm applied it. The next helm upgrade reverts this row to the declared value.",
+      "confirmOverride": "This row is managed by Helm (reconcile: true in the deployment values). Your change will be reverted on the next helm upgrade unless the values are updated too. Continue?"
+    },
+    "nav": {
+      "models": "Models",
+      "users": "Users",
+      "config": "Configuration",
+      "grants": "Grants",
+      "usage": "Usage",
+      "capacity": "Capacity"
+    },
+    "capacity": {
+      "title": "Capacity",
+      "desc": "What the stateless pool and its autoscaler see right now: executors, runnable demand, and units parked after a failure.",
+      "executors": "Executors",
+      "ready": "ready",
+      "busy": "busy",
+      "queued": "Queued",
+      "sessions": "sessions",
+      "batches": "batches",
+      "oldestQueued": "Oldest queued",
+      "desired": "Desired replicas",
+      "floor": "floor",
+      "reserve": "reserve",
+      "parked": "Parked units",
+      "none": "Nothing is parked.",
+      "unpark": "Unpark",
+      "unparked": "Unit re-queued.",
+      "unparkFailed": "Unpark failed.",
+      "loadFailed": "Could not load capacity.",
+      "observedAt": "Observed {{time}}",
+      "colTitle": "Session",
+      "colOwner": "Owner",
+      "colKind": "Kind",
+      "colReason": "Reason",
+      "colParkedAt": "Parked",
+      "colAttempts": "Attempts",
+      "colPending": "Pending input",
+      "yes": "yes",
+      "no": "no"
+    },
     "config": {
       "messages": {
         "saveEmpty": "Nothing to save — pick a config key and enter a value.",
@@ -983,7 +1052,8 @@
           "tts": "Text-to-speech",
           "search": "Search (primary)",
           "fetch": "Web fetch",
-          "search_fallback": "Search fallback"
+          "search_fallback": "Search fallback",
+          "rerank": "Rerank (memory recall ordering)"
         }
       }
     },
@@ -1005,8 +1075,14 @@
     "title": "Settings",
     "appearance": {
       "title": "Appearance",
-      "desc": "Choose between light and dark mode, or follow your system setting. The choice is saved on this device.",
-      "themeLabel": "Theme"
+      "desc": "Choose between light and dark mode, or follow your system setting, and pick the accent colour. Both choices are saved on this device.",
+      "themeLabel": "Theme",
+      "accentLabel": "Accent",
+      "accents": {
+        "tyrian": "Tyrian purple",
+        "porphyry": "Porphyry red",
+        "graphite": "Graphite"
+      }
     },
     "language": {
       "title": "Language",
@@ -1189,6 +1265,7 @@
       "permissionAutoAccept": "Auto-accept",
       "permissionAutonomous": "Autonomous",
       "workspaceBackend": "Default Workspace",
+      "workspaceRecommendation": "This Expert recommends {{tier}}. You can choose another workspace.",
       "workspaceBackendHint": "Where new sessions keep their files. Virtual starts in seconds and can be upgraded to a container mid-session; Container has full shell and git from the start but takes longer to provision.",
       "workspaceVirtual": "Virtual — instant, cloud file storage",
       "workspaceSandbox": "Container — full shell & git, slower start",
@@ -1245,41 +1322,86 @@
       "webConnectorDesc": "Add this URL as a custom MCP connector. OAuth login is handled automatically — no token or credentials needed.",
       "webConnectorHint": "Works with any MCP client that supports OAuth 2.1 (Authorization Code + PKCE). Leave the Client ID and Client Secret fields empty — the server handles registration automatically."
     },
-    "codex": {
-      "title": "Codex Proxy",
-      "desc": "Manage the Codex OAuth proxy for ChatGPT subscription-backed models",
-      "checking": "Checking proxy...",
+    "subscriptions": {
+      "title": "AI Subscriptions",
+      "desc": "Connect subscription accounts through the shared proxy. Models are registered separately in Admin → Models.",
+      "checking": "Checking proxy…",
       "connected": "Connected",
-      "notConnected": "Not connected",
+      "notConnected": "No account connected",
       "notEnabled": "Proxy not enabled",
-      "disabledTitle": "Codex proxy isn't enabled",
-      "disabledDesc": "This deployment isn't running the Codex OAuth proxy, so ChatGPT subscription-backed models aren't available. To enable it, set the following in your Helm values overlay, redeploy, then reload this page:",
+      "modelsAvailable": "{{count}} model(s) advertised",
       "refreshStatus": "Refresh status",
       "disconnect": "Disconnect",
-      "availableModels": "Available Models",
-      "waiting": "Waiting for OAuth...",
-      "connectAccount": "Connect ChatGPT Account",
-      "completeSignIn": "Complete sign-in",
-      "step1": "Sign in with your OpenAI account in the tab that just opened.",
-      "step2": "After sign-in, the browser will try to redirect to localhost and show an error — this is expected.",
-      "step3": "Copy the full URL from your browser's address bar.",
-      "step4": "Paste it below and click Complete Login.",
-      "callbackPlaceholder": "Paste callback URL here...",
-      "submitting": "Submitting...",
-      "completeLogin": "Complete Login",
-      "portForwardHint": "If you have kubectl port-forward active, login will complete automatically.",
+      "connect": "Connect",
+      "cancel": "Cancel sign-in",
+      "dismiss": "Dismiss",
+      "addTitle": "Add a subscription",
+      "connectedCount": "{{count}} connected",
+      "unverified": "Not live-verified",
+      "disabledTitle": "The subscription proxy isn't enabled",
+      "disabledDesc": "This deployment isn't running the subscription proxy, so subscription-backed models aren't available. To enable it, set the following in your Helm values overlay, redeploy, then reload this page:",
+      "providers": {
+        "openai-codex": "OpenAI · ChatGPT / Codex",
+        "anthropic-claude-code": "Anthropic · Claude Code",
+        "google-antigravity": "Google · Antigravity",
+        "xai-grok-build": "xAI · Grok Build",
+        "kimi-code": "Moonshot · Kimi Code"
+      },
+      "flows": {
+        "browser": "Sign in through your browser, then paste the callback URL if the redirect doesn't reach this server.",
+        "device": "Open the verification link and enter the code shown here."
+      },
+      "states": {
+        "connected": "Connected",
+        "pending": "Awaiting authorization",
+        "refreshing": "Refreshing token",
+        "cooldown": "Temporarily rate-limited",
+        "error": "Error",
+        "disabled": "Disabled",
+        "unknown": "Unknown"
+      },
+      "scope": {
+        "installation": "Shared"
+      },
+      "browser": {
+        "step1": "Sign in with the provider in the tab that just opened:",
+        "openLink": "open the sign-in page",
+        "step2": "After sign-in the browser redirects to localhost and may show an error — that is expected on a remote deployment.",
+        "step3": "Copy the complete URL from the address bar and paste it below.",
+        "callbackPlaceholder": "Paste the callback URL here…",
+        "complete": "Complete sign-in",
+        "remoteHint": "If the redirect reaches the proxy directly, the sign-in completes on its own and you can ignore this field."
+      },
+      "device": {
+        "step1": "Open the verification page:",
+        "step2": "Enter this code:",
+        "step3": "Approve the request, then leave this page open until it reports Connected.",
+        "expires": "The code expires at {{time}}."
+      },
+      "login": {
+        "pending": "Waiting for {{provider}} authorization…",
+        "verifying": "Authorization reported complete — confirming the credential…",
+        "connected": "{{provider}} connected.",
+        "failed": "{{provider}} sign-in failed.",
+        "cancelled": "{{provider}} sign-in cancelled."
+      },
       "usage": {
+        "check": "Check usage",
+        "toggle": "Usage",
+        "unavailable": "Usage unavailable",
         "title": "Usage limits",
         "session": "Current session",
         "weekly": "Weekly limit",
         "resetsIn": "Resets in {{time}}",
         "limitReached": "Limit reached",
-        "disclaimer": "The proxy doesn't expose usage: ChatGPT meters proxy-routed requests as 'extra usage' outside these windows, so these bars don't reflect usage through the proxy yet."
+        "disclaimer": "Reported by the provider for this account. The proxy does not meter usage itself, so requests routed through it may be counted differently."
       },
       "errors": {
-        "urlMissingParams": "URL is missing required parameters. Please paste the complete URL from your browser address bar.",
-        "invalidUrl": "Invalid URL. Please paste the complete URL from your browser address bar.",
-        "completeFailed": "Failed to complete login. Please try again."
+        "startFailed": "Could not start the sign-in. Check that the proxy is reachable.",
+        "completeFailed": "Could not complete the sign-in. Please try again.",
+        "timeout": "The sign-in timed out before it was approved.",
+        "credential_not_persisted": "The provider reported success but no credential was stored. Try connecting again.",
+        "authorization_failed": "The provider rejected the authorization."
       }
     },
     "cloud": {
@@ -1574,20 +1696,17 @@
       "filesButton": "Files",
       "filesTooltip": "Open session files in Cloud",
       "gitButton": "Git",
-      "gitTooltip": "View workspace in Gitea",
       "ideButton": "IDE",
-      "ideActiveTooltip": "Open workspace in IDE",
       "ideLoadingTooltip": "Workspace starting...",
       "citationsButton": "Citations",
-      "citationsTooltip": "Show this session's citations",
       "moreActions": "More actions",
+      "copySessionId": "Copy session ID {{id}}",
       "disconnect": "Disconnect",
       "disconnecting": "Disconnecting…",
       "projectFilesButton": "Project files",
       "projectFilesTooltip": "Open the {{name}} project folder in your cloud",
       "sessionFilesButton": "Session files",
-      "sshButton": "SSH",
-      "sshTooltip": "Connect to this session's workspace over SSH"
+      "sshButton": "SSH"
     },
     "ssh": {
       "intro": "Connect to this session's workspace with your own terminal, editor or IDE.",
@@ -1624,8 +1743,6 @@
       "statusUnknown": "Unknown"
     },
     "status": {
-      "temp": "temp {{value}}",
-      "turn": "Turn {{count}}",
       "agentQuiet": "Working — no output for {{seconds}}s",
       "cloudSyncOff": "Cloud sync off",
       "cloudSyncOffTooltip": "Cloud sync could not start for this session. The workspace may be missing files from the cloud, and changes won't be saved back to it."
@@ -1655,6 +1772,23 @@
       "foldMore": "+{{count}} more",
       "foldFailed": "⚠ {{count}} failed",
       "parked": "This turn stopped after repeated executor failures and needs operator intervention."
+    },
+    "queue": {
+      "waiting": "Waiting for an available agent…",
+      "busy": "Our systems are busier than usual — this may take a few minutes. You can leave this page; the reply will be here when you return.",
+      "elapsed": "Waiting for {{time}}"
+    },
+    "parked": {
+      "title": "This message couldn't be processed",
+      "retry": "Retry",
+      "retrying": "Re-queuing…",
+      "retryFailed": "Retry was refused ({{code}})",
+      "reason": {
+        "attachFailed": "The agent couldn't pick this session back up.",
+        "shutdownCancelled": "The reply was interrupted by maintenance.",
+        "stopped": "The session stopped before this message was handled.",
+        "generic": "The session hit a problem it can't clear on its own — an administrator has to release it before this message can run."
+      }
     },
     "queued": {
       "notSent": "Not sent",
@@ -1783,7 +1917,11 @@
       "connectorsFailed": "Default connectors could not be loaded.",
       "connectorsRetry": "Retry",
       "connectorsCount": "Default connectors ({{count}})",
-      "defaultsFailed": "Your default project and connectors could not be loaded. Retry before sending."
+      "defaultsFailed": "Your session defaults could not be loaded. Retry before sending.",
+      "recoveryTitle": "Your chat could not start",
+      "recoveryBody": "Your messages have not been sent. Adjust the options below, then retry.",
+      "workspaceDefault": "Use project or account default",
+      "retrySend": "Retry sending"
     },
     "ended": {
       "eyebrow": "Resumable",
@@ -1833,7 +1971,11 @@
     "control": {
       "backpressure": "Too many session setting changes are waiting. Try again shortly.",
       "admissionFailed": "The session setting could not be changed. Try again.",
-      "ownerRejected": "The serving agent rejected this session setting. Reload and try again."
+      "ownerRejected": "The serving agent rejected this session setting. Reload and try again.",
+      "unavailable": "This control is not available in this session.",
+      "applyFailed": "The session settings could not be applied.",
+      "applyTimeout": "The session did not confirm the settings change. Reopen the settings to see what is in effect.",
+      "appliedNextTurn": "Session settings updated: {{summary}} — applies from the next response."
     },
     "workspaceOffer": {
       "title": "Workspace upgrade requested",
@@ -1861,6 +2003,9 @@
       "sessionStarting": "Type your message while the session starts...",
       "stopping": "Stopping...",
       "working": "Agent is working...",
+      "queued": "Waiting for an available agent…",
+      "parked": "This message needs a retry",
+      "parkedBlocked": "Blocked until an administrator clears it",
       "reconnecting": "Disconnected — reconnecting…",
       "uploading": "Uploading attachments…",
       "default": "Type a message... (Enter to send, Shift+Enter for newline)",
@@ -2242,7 +2387,8 @@
       "mcp": "MCP Server",
       "kubeconfig": "Kubeconfig",
       "ssh_key": "SSH Key",
-      "generic_file": "File"
+      "generic_file": "File",
+      "credentials": "Credentials"
     },
     "catalog": {
       "search": "Search connectors…",
@@ -2450,7 +2596,9 @@
       "emailUnattendedSendLabel": "Send approval",
       "emailUnattendedSendToggle": "Send without human approval",
       "emailUnattendedSendHint": "Requires the admin-granted email_autonomous_send permission — the server rejects this otherwise. When off, direct sending is refused; the planned human-approval queue is not available yet, so use Draft.",
-      "emailNotPublishableHint": "Email connectors cannot be published — mailboxes stay private to their owner."
+      "emailNotPublishableHint": "Email connectors cannot be published — mailboxes stay private to their owner.",
+      "optCredentials": "Credentials (environment variables)",
+      "credentialsEnvHint": "Available to workspace scripts and browser login forms. Add or replace variables; blank values keep existing credentials. Once attached, this connector stays for the session. Agent output is not filtered. Expiration is controlled by your provider."
     },
     "publishDialog": {
       "title": "Publish connector?",
@@ -2718,7 +2866,6 @@
     "timeNow": "now"
   },
   "jobReview": {
-    "title": "Job Review",
     "empty": {
       "selectJob": "Select a job to review",
       "notFound": "Job not found",
@@ -3024,7 +3171,9 @@
       "unavailableLive": "This attached connector is no longer authorized or in scope. Detach it before continuing.",
       "unavailableBadge": "Unavailable",
       "notReady": "Not fully indexed yet — the agent may see incomplete results.",
-      "lockedLive": "Knowledge bases can't be changed during a session"
+      "lockedLive": "Knowledge bases can't be changed during a session",
+      "credentialsLocked": "Credentials stay attached for this session",
+      "credentialsUnavailable": "This credential connector is no longer available. End this session and start another to change its connectors."
     },
     "execution": {
       "group": "Execution",
@@ -3126,6 +3275,9 @@
         "predicted": "Predicted, not measured",
         "unknown": "The resolved toolset could not be read"
       },
+      "rosterTitle": "Subagents this expert can delegate to",
+      "rosterDefault": "(default)",
+      "rosterEmpty": "This expert has no subagent roster, so delegate_agent has nothing to run — every call will return an error. Add a roster to the expert under Subagents.",
       "unknownCategory": "This cockpit build has no description for this category."
     },
     "toolCategories": {
@@ -3962,6 +4114,8 @@
       "error": "Error",
       "summary": "Summary",
       "requestType": "Request",
+      "requestId": "Request ID",
+      "expiresAt": "Expires",
       "vm": "VM",
       "user": "User",
       "cwd": "CWD",

@@ -3,10 +3,16 @@
 Small, shared experts an expert's roster can reference by name. One directory
 per entry, same layout and schema as a bundled expert:
 
+Each `config.yaml` is an `srw/v1alpha1` Expert manifest. The roster snippets
+below are **SRW harness private configuration**, written inside
+`spec.runtime.config.config` with `spec.runtime.adapter: srw/v1`. They describe
+delegation within that harness process. A generic harness image cannot be
+inserted into an SRW in-process roster; use a separate manifest execution for it.
+
 ```
 config/subagents/
 └── explorer/
-    ├── config.yaml     # $extends: expert_base — the same schema as config/experts/*
+    ├── config.yaml     # Expert manifest; private leaf has $extends: expert_base
     └── persona.txt     # prompt files next to the config, resolved like an expert's
 ```
 

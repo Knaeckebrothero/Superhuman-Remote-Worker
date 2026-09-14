@@ -18,6 +18,11 @@ Tests share the 3-user fixture from ``conftest.py``. Non-admin caller
 service mocks are wired to fail loudly if the gate doesn't fire.
 """
 
+from tests._expert_catalog import catalogue_route
+from orchestrator.routers import expert_catalog as expert_routes
+from orchestrator.services import expert_catalog as expert_catalog_module
+
+
 from contextlib import ExitStack
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -93,7 +98,7 @@ class TestAdminInfraGates:
     # ----- /api/sudo/rules family -----
     @pytest.mark.asyncio
     async def test_list_sudo_rules_non_admin_403(self, user_a, fake_db, fake_request):
-        from orchestrator.main import list_sudo_rules
+        from tests._b09_control_seams import list_sudo_rules
 
         with (
             _patch_caller_and_db(user_a, fake_db),
@@ -105,7 +110,8 @@ class TestAdminInfraGates:
 
     @pytest.mark.asyncio
     async def test_create_sudo_rule_non_admin_403(self, user_a, fake_db, fake_request):
-        from orchestrator.main import SudoRuleCreateRequest, create_sudo_rule
+        from orchestrator.schemas.job_controls import SudoRuleCreateRequest
+        from tests._b09_control_seams import create_sudo_rule
 
         body = SudoRuleCreateRequest(
             pattern="apt-get *", action="approve", priority=10, description="test"
@@ -120,7 +126,7 @@ class TestAdminInfraGates:
 
     @pytest.mark.asyncio
     async def test_delete_sudo_rule_non_admin_403(self, user_a, fake_db, fake_request):
-        from orchestrator.main import delete_sudo_rule
+        from tests._b09_control_seams import delete_sudo_rule
 
         with (
             _patch_caller_and_db(user_a, fake_db),
@@ -133,20 +139,22 @@ class TestAdminInfraGates:
     # ----- /api/experts/reload -----
     @pytest.mark.asyncio
     async def test_reload_experts_non_admin_403(self, user_a, fake_db, fake_request):
-        from orchestrator.main import reload_experts
-
         with (
             _patch_caller_and_db(user_a, fake_db),
-            patch("orchestrator.main._scan_experts", _exploding("_scan_experts")),
+            patch.object(
+                expert_catalog_module.ExpertCatalogService,
+                "scan_experts",
+                _exploding("_scan_experts"),
+            ),
         ):
             with pytest.raises(HTTPException) as exc:
-                await reload_experts(fake_request)
+                await catalogue_route(expert_routes.reload_experts)(fake_request)
         assert exc.value.status_code == 403
 
     # ----- /api/vms -----
     @pytest.mark.asyncio
     async def test_list_vms_non_admin_403(self, user_a, fake_db, fake_request):
-        from orchestrator.main import list_vms
+        from tests._b09_control_seams import list_vms
 
         # The handler uses postgres_db.acquire() as a context manager; the
         # gate fires before that so we don't need a deeper mock.

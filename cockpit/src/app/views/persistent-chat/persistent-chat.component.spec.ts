@@ -18,6 +18,10 @@ import {
     HEADER_LEFT_RESERVE_PX,
     isMicMode,
     isNearBottom,
+    formatQueueWait,
+    queueWaitTier,
+    QUEUE_BUSY_AFTER_MS,
+    QUEUE_ELAPSED_AFTER_MS,
     isRewindCommand,
     isStartupBannerVisible,
     loadDraft,
@@ -85,6 +89,29 @@ describe('isStartupBannerVisible', () => {
     it('hides the banner once the session is no longer starting', () => {
         expect(isStartupBannerVisible(false, 3)).toBe(false);
         expect(isStartupBannerVisible(false, 0)).toBe(false);
+    });
+});
+
+describe('queueWaitTier', () => {
+    it('is fresh under the 10 s attention limit', () => {
+        expect(queueWaitTier(0)).toBe('fresh');
+        expect(queueWaitTier(QUEUE_BUSY_AFTER_MS - 1)).toBe('fresh');
+    });
+
+    it('escalates to busy at 10 s and long at 60 s', () => {
+        expect(queueWaitTier(QUEUE_BUSY_AFTER_MS)).toBe('busy');
+        expect(queueWaitTier(QUEUE_ELAPSED_AFTER_MS - 1)).toBe('busy');
+        expect(queueWaitTier(QUEUE_ELAPSED_AFTER_MS)).toBe('long');
+        expect(queueWaitTier(10 * 60_000)).toBe('long');
+    });
+});
+
+describe('formatQueueWait', () => {
+    it('renders m:ss and clamps negatives', () => {
+        expect(formatQueueWait(0)).toBe('0:00');
+        expect(formatQueueWait(83_400)).toBe('1:23');
+        expect(formatQueueWait(-5)).toBe('0:00');
+        expect(formatQueueWait(3_599_000)).toBe('59:59');
     });
 });
 
@@ -490,6 +517,44 @@ describe('approveAndAutoAccept', () => {
         const host = {chat} as unknown as PersistentChatComponent;
         PersistentChatComponent.prototype.approveAndAutoAccept.call(host);
         expect(calls).toEqual(['setMode:auto_accept', 'approveAll']);
+    });
+});
+
+/**
+ * F3: the rail (SessionListService) has its own copy of the thread list and
+ * only refreshes it on NavigationEnd — a rename is an in-place mutation with
+ * no navigation, so nothing else ever tells the rail about it. Same .call()
+ * convention as approveAndAutoAccept above: onRenameSession only ever
+ * touches this.chat, this.sessionList, this.toast and this.errors.
+ */
+describe('onRenameSession', () => {
+    function makeHost(renameThread: () => Promise<void>) {
+        const renameLocal = vi.fn();
+        const danger = vi.fn();
+        const host = {
+            chat: {renameThread},
+            sessionList: {renameLocal},
+            toast: {danger},
+            errors: {translate: (_e: unknown, fallback?: string) => fallback},
+        } as unknown as PersistentChatComponent;
+        return {host, renameLocal, danger};
+    }
+
+    it('patches the rail copy of the thread after a successful rename', async () => {
+        const {host, renameLocal} = makeHost(() => Promise.resolve());
+
+        await PersistentChatComponent.prototype.onRenameSession.call(host, 'thread-1', 'New title');
+
+        expect(renameLocal).toHaveBeenCalledWith('thread-1', 'New title');
+    });
+
+    it('leaves the rail untouched and toasts when the rename PATCH fails', async () => {
+        const {host, renameLocal, danger} = makeHost(() => Promise.reject(new Error('boom')));
+
+        await PersistentChatComponent.prototype.onRenameSession.call(host, 'thread-1', 'New title');
+
+        expect(renameLocal).not.toHaveBeenCalled();
+        expect(danger).toHaveBeenCalledWith('errors.sessions.renameFailed');
     });
 });
 

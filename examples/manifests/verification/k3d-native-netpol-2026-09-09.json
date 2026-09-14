@@ -1,0 +1,159 @@
+{
+  "result": "failed",
+  "context": "k3d-srw",
+  "k3sVersion": "v1.31.5+k3s1",
+  "namespaceRemoved": "srw-native-gate-4a2cd8ee4550",
+  "scope": "Immediate cold-start probes under a preexisting namespace-wide ingress/egress deny already enforced for an existing witness. No additive egress allow selected the denied probes. Positive controls reached the same fixture before and after. No CNI/node configuration changes.",
+  "networkStartupEvidence": {
+    "baselineUID": "5cadeda8-154a-4172-922e-0bdec8b8af94",
+    "baselineCreationTime": "2026-09-09T08:19:43+00:00",
+    "baselineSelector": {},
+    "baselineIngress": [],
+    "baselineEgress": [],
+    "witness": {
+      "startedAtUnix": 1788941989.6916158,
+      "allowedConnections": 0,
+      "firstAllowedMs": null,
+      "lastAllowedMs": null,
+      "blockedConnections": 30,
+      "lastAttemptBlocked": true,
+      "establishedSurvived": false
+    },
+    "samples": [
+      {
+        "podName": "srw-run-2ab3dcb4a4274128a99b252b6997bab5-a1",
+        "podUID": "fedb1f24-8a70-4749-b8b7-5284ca04f6e4",
+        "startedAtUnix": 1788942002.2040656,
+        "allowedConnections": 0,
+        "firstAllowedMs": null,
+        "lastAllowedMs": null,
+        "blockedConnections": 38,
+        "lastAttemptBlocked": true,
+        "establishedSurvived": false
+      },
+      {
+        "podName": "srw-run-ba4261de114f4f73a9a6905def967f9a-a1",
+        "podUID": "583934ca-db84-40de-86a5-becffd53085d",
+        "startedAtUnix": 1788942002.1745555,
+        "allowedConnections": 0,
+        "firstAllowedMs": null,
+        "lastAllowedMs": null,
+        "blockedConnections": 38,
+        "lastAttemptBlocked": true,
+        "establishedSurvived": false
+      },
+      {
+        "podName": "srw-run-76ead4139cbe4bb092378cb060f2c0c3-a1",
+        "podUID": "439261cc-5444-47f9-8d47-69e459c9b260",
+        "startedAtUnix": 1788942001.9698317,
+        "allowedConnections": 1,
+        "firstAllowedMs": 112.3,
+        "lastAllowedMs": 112.3,
+        "blockedConnections": 38,
+        "lastAttemptBlocked": true,
+        "establishedSurvived": true
+      },
+      {
+        "podName": "srw-run-7de19a37d5924021a92b6f0d013ded35-a1",
+        "podUID": "e7986196-b87a-431b-ad32-acd66e11d351",
+        "startedAtUnix": 1788942002.433241,
+        "allowedConnections": 0,
+        "firstAllowedMs": null,
+        "lastAllowedMs": null,
+        "blockedConnections": 38,
+        "lastAttemptBlocked": true,
+        "establishedSurvived": false
+      },
+      {
+        "podName": "srw-run-a87d5e5c33c54f1dabfdad6c7a2a6ce0-a1",
+        "podUID": "10bc81d7-13b8-4f40-92cb-ce63f24d2e58",
+        "startedAtUnix": 1788942002.3719175,
+        "allowedConnections": 1,
+        "firstAllowedMs": 906.2,
+        "lastAllowedMs": 906.2,
+        "blockedConnections": 38,
+        "lastAttemptBlocked": true,
+        "establishedSurvived": true
+      },
+      {
+        "podName": "srw-run-70a08fba001247088e6345458e6003b1-a1",
+        "podUID": "52a344a2-a722-4d76-bf89-102d5de3ce2a",
+        "startedAtUnix": 1788942002.2641928,
+        "allowedConnections": 0,
+        "firstAllowedMs": null,
+        "lastAllowedMs": null,
+        "blockedConnections": 38,
+        "lastAttemptBlocked": true,
+        "establishedSurvived": false
+      },
+      {
+        "podName": "srw-run-6a5c5c9691024c62911b1c9ef2982196-a1",
+        "podUID": "277ce5a7-7f9b-4a87-8889-ad4c7e48ed08",
+        "startedAtUnix": 1788942002.3326802,
+        "allowedConnections": 0,
+        "firstAllowedMs": null,
+        "lastAllowedMs": null,
+        "blockedConnections": 38,
+        "lastAttemptBlocked": true,
+        "establishedSurvived": false
+      },
+      {
+        "podName": "srw-run-a5737facc5384b0986088b5d85ccaa28-a1",
+        "podUID": "83feb7ab-fc73-4a13-bec2-b8b028ddc83a",
+        "startedAtUnix": 1788942002.3219092,
+        "allowedConnections": 0,
+        "firstAllowedMs": null,
+        "lastAllowedMs": null,
+        "blockedConnections": 38,
+        "lastAttemptBlocked": true,
+        "establishedSurvived": false
+      },
+      {
+        "podName": "srw-run-02b491660f9e4da68a57408d0bb3518e-a1",
+        "podUID": "40653091-9d63-4ac9-b72f-63a4d765976e",
+        "startedAtUnix": 1788942002.0621912,
+        "allowedConnections": 1,
+        "firstAllowedMs": 53.2,
+        "lastAllowedMs": 53.2,
+        "blockedConnections": 38,
+        "lastAttemptBlocked": true,
+        "establishedSurvived": true
+      },
+      {
+        "podName": "srw-run-6674f60bb757405e9047469216c63aae-a1",
+        "podUID": "3bb0ce22-cfca-4a07-9805-d3f91f18e677",
+        "startedAtUnix": 1788942002.2742813,
+        "allowedConnections": 1,
+        "firstAllowedMs": 905.0,
+        "lastAllowedMs": 905.0,
+        "blockedConnections": 38,
+        "lastAttemptBlocked": true,
+        "establishedSurvived": true
+      },
+      {
+        "podName": "srw-run-2c3edc10a05d4f6289305c391ed5a198-a1",
+        "podUID": "eff312e9-ea39-413b-b0a0-751b5fcca80a",
+        "startedAtUnix": 1788942002.423399,
+        "allowedConnections": 0,
+        "firstAllowedMs": null,
+        "lastAllowedMs": null,
+        "blockedConnections": 38,
+        "lastAttemptBlocked": true,
+        "establishedSurvived": false
+      },
+      {
+        "podName": "srw-run-a6df69c21f724456bee3dfef29f38d60-a1",
+        "podUID": "b93e2e9a-5d64-4bbe-81c3-bcf195c73519",
+        "startedAtUnix": 1788942002.3767931,
+        "allowedConnections": 1,
+        "firstAllowedMs": 905.1,
+        "lastAllowedMs": 905.1,
+        "blockedConnections": 38,
+        "lastAttemptBlocked": true,
+        "establishedSurvived": true
+      }
+    ],
+    "leakedSamples": 5,
+    "establishedConnectionsSurvived": 5
+  }
+}

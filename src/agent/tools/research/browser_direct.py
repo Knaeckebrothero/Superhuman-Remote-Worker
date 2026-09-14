@@ -181,19 +181,30 @@ def create_browser_direct_tools(context: ToolContext) -> List[Any]:
         return _page_state_to_text(result)
 
     @tool
-    async def browser_type(ref: int, text: str, clear: bool = True) -> str:
+    async def browser_type(
+        ref: int,
+        text: Optional[str] = None,
+        clear: bool = True,
+        env_var: Optional[str] = None,
+    ) -> str:
         """Type text into an input field.
 
         Args:
             ref: Element reference number of the input field
-            text: Text to type
+            text: Literal text to type; omit when using env_var
             clear: Clear existing content first (default True)
+            env_var: Workspace environment variable to fill without copying its
+                value into the tool call, e.g. TAX_PASSWORD. Use exactly one of
+                text or env_var. Output is not filtered for credentials.
 
         Returns:
             Updated page state after typing
         """
+        if (text is None) == (env_var is None):
+            return "Browser error: supply exactly one of text or env_var"
+        input_args = {"env_var": env_var} if env_var is not None else {"text": text}
         result = await _run_action(
-            context, "type", ref=ref, text=text, clear=clear, **_state_args()
+            context, "type", ref=ref, clear=clear, **input_args, **_state_args()
         )
         return _page_state_to_text(result)
 

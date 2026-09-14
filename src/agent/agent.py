@@ -626,6 +626,7 @@ class UniversalAgent:
                 base_url=aux_config.base_url,
                 api_key=aux_config.api_key,
                 provider=aux_config.provider,
+                extra_headers=aux_config.extra_headers,
                 temperature=aux_config.temperature,
                 top_p=model_settings.get("top_p"),
                 top_k=model_settings.get("top_k"),
@@ -2969,12 +2970,12 @@ class UniversalAgent:
                 authored_llm_keys,
                 load_and_merge_config,
                 load_agent_config_from_dict,
-                resolve_config_path,
+                resolve_bundled_config_path,
             )
 
             expert_name = metadata["config_name"]
             try:
-                config_path, deployment_dir = resolve_config_path(expert_name)
+                config_path, deployment_dir = resolve_bundled_config_path(expert_name)
                 logger.info(f"Loading expert config '{expert_name}' from {config_path}")
                 merged_config_data = load_and_merge_config(config_path)
 
@@ -3486,12 +3487,10 @@ class UniversalAgent:
 
         # G2: reattached remote workspace (PVC reattach on crash-recovery). The
         # working tree already lives on the REMOTE backend root, so the
-        # local-path gates below would miss it and clone/initialize() would
-        # `rm -rf {backend.root}/*` (core/workspace.py:295/313) — wiping the
-        # volume we just got back. Detect a real working tree on the backend
+        # local-path gates below would miss it. Detect a real working tree on the backend
         # (`.git`; a fresh/empty PVC has none, so first dispatch still
         # initializes) and PRESERVE it: attach a git handle to the existing repo
-        # — no clone, no rm -rf — then resume on the intact files. Gated on
+        # and resume on the intact files. Gated on
         # `resume`, so any content present belongs to THIS job's continuation
         # (PVCs are owner-keyed by UUID).
         # See knowledge-base/knowledge/features/workspace_pvc_branch_a_implementation.md (G2 / Phase 2).
@@ -3963,6 +3962,7 @@ class UniversalAgent:
         from agent.core.datasource_setup import (
             clone_repository_datasources,
             inject_workspace_facts,
+            install_workspace_credentials,
             process_credential_files,
             process_datasources,
         )
@@ -3971,6 +3971,7 @@ class UniversalAgent:
             self._job_metadata.get("datasources", []) if self._job_metadata else []
         )
         ws = self._workspace_manager
+        install_workspace_credentials(ds_configs, ws)
 
         # Repository datasources clone onto the workspace backend — never
         # locally in the agent pod (the subprocess git-clone branch was

@@ -18,6 +18,7 @@ tests/test_queue_job_for_resume.py.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -29,6 +30,8 @@ from agent.tools.core.job import (
     get_final_phase_data,
     seed_final_phase_data,
 )
+from orchestrator.database.postgres import CompletionDecisionBlocked
+from orchestrator.services import verification_workflow
 from tests._tool_invoke import invoke_tool
 
 JOB_ID = "job-journal-test"
@@ -357,10 +360,7 @@ class TestRecordCompletionDecisionImpl:
         return db
 
     async def _call(self, db, **overrides):
-        from orchestrator.main import _record_completion_decision_impl
-
         kwargs = dict(
-            postgres_db=db,
             job_id="j1",
             tool_call_id="call-1",
             summary="Done.",
@@ -369,7 +369,35 @@ class TestRecordCompletionDecisionImpl:
             notes=None,
         )
         kwargs.update(overrides)
-        return await _record_completion_decision_impl(**kwargs)
+        dependencies = verification_workflow.VerificationDependencies(
+            store=db,
+            transaction=verification_workflow.VerificationTransactionPorts(
+                revalidate_datasource_selection=AsyncMock(return_value=([], {})),
+                datasource_selection_provenance=AsyncMock(return_value={}),
+                resolve_workspace_contract=MagicMock(
+                    return_value=SimpleNamespace(assigned_backend="sandbox")
+                ),
+                deep_merge_dicts=MagicMock(
+                    side_effect=lambda left, right: left | right
+                ),
+                is_lite_config_override=MagicMock(return_value=False),
+            ),
+            effects=verification_workflow.VerificationEffectPorts(
+                forge=SimpleNamespace(is_initialized=False),
+                notifier=MagicMock(),
+                prepare_job_repository_authority=AsyncMock(),
+                trigger_dispatch=MagicMock(),
+                maybe_wake_session=AsyncMock(),
+                kick_session_wake_drain=MagicMock(),
+                trigger_curation_final_pass=AsyncMock(),
+                set_target_to_autonomy_status=AsyncMock(return_value="completed"),
+                escalate_target=AsyncMock(return_value="pending_review"),
+                internal_resume_job=AsyncMock(return_value=True),
+            ),
+        )
+        return await verification_workflow.record_completion_decision(
+            **kwargs, dependencies=dependencies
+        )
 
     @pytest.mark.asyncio
     async def test_missing_tool_call_id_is_400(self):
@@ -454,11 +482,10 @@ class TestRecordCompletionDecisionImpl:
     @pytest.mark.asyncio
     async def test_durable_subagent_barrier_is_a_typed_useful_409(self):
         from fastapi import HTTPException
-        from orchestrator import main
 
         db = self._db({"id": "j1", "status": "processing"})
         db.set_completion_decision = AsyncMock(
-            side_effect=main.CompletionDecisionBlocked(
+            side_effect=CompletionDecisionBlocked(
                 live_subagents=2,
                 queued_subagent_replies=1,
             )

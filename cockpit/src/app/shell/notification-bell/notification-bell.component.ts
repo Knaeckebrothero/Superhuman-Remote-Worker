@@ -14,7 +14,7 @@ import { AppIconComponent } from '../../ui/icon';
       (click)="goToInbox()"
       [title]="tooltipText()"
     >
-      <app-icon size="lg">inbox</app-icon>
+      <app-icon size="lg">notifications</app-icon>
       @if (actionCenter.badgeCount() > 0) {
         <span class="badge">{{ actionCenter.badgeCount() > 99 ? '99+' : actionCenter.badgeCount() }}</span>
       }
@@ -24,6 +24,11 @@ import { AppIconComponent } from '../../ui/icon';
     :host {
       position: relative;
       display: inline-flex;
+      /* Fixed-size icon control: never let the rail header's flexbox shrink
+         this to make room for a sibling (that's what happened before Task
+         10's fix round 1 — the collapse button absorbed the whole deficit
+         because nothing in the row opted out of default flex-shrink: 1). */
+      flex: none;
     }
 
     .bell-btn {
@@ -58,6 +63,22 @@ import { AppIconComponent } from '../../ui/icon';
       font-weight: 700;
       line-height: 16px;
       text-align: center;
+    }
+
+    /* Mobile tap target (Task 8's 44px convention, applied here in Task 10
+       now that the rail header is this button's home). .rail-new/.rail-item
+       reach 44px through padding alone because they're full-width rows; this
+       is a square icon button, so padding would just push the icon
+       off-center as the box grows. Force both dimensions and re-center
+       instead. */
+    @media (max-width: 768px) {
+      .bell-btn {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 44px;
+        min-height: 44px;
+      }
     }
   `],
 })

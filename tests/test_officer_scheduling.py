@@ -13,6 +13,9 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+
+from orchestrator.services import project_loop_advance
+from orchestrator.services.project_loop_spawn import ProjectLoopDependencies
 from pydantic import ValidationError
 
 _REPO = Path(__file__).resolve().parents[1]
@@ -103,91 +106,125 @@ def _job_row(status="completed"):
     return {"id": JOB_ID, "status": status, "project_id": PROJECT_ID}
 
 
-@pytest.fixture
-def patched_main(monkeypatch):
-    import orchestrator.main
+def _deps(**over) -> ProjectLoopDependencies:
+    """The loop engine's one dependency object, built from mocks."""
+    fields = dict(
+        store=AsyncMock(),
+        vector_store=None,
+        notifier=AsyncMock(),
+        gitea_client=MagicMock(),
+        main_cloud_router=MagicMock(),
+        trigger_dispatch=MagicMock(),
+        kick_officer_event_drain=MagicMock(),
+        enforce_dispatch_grants=AsyncMock(),
+        reindex_project_kb=AsyncMock(),
+        completion_commands_enabled=lambda: False,
+        completion_sweep_router=MagicMock(),
+    )
+    fields.update(over)
+    return ProjectLoopDependencies(**fields)
 
+
+@pytest.fixture
+def patched_engine(monkeypatch):
+    """Stub the advance's own collaborators and hand back its dependency object.
+
+    Every one of these names is resolved through
+    ``orchestrator.services.project_loop_advance``'s module namespace, so the
+    patch has to land there; ``kick_officer_event_drain`` is a dependency
+    field instead, which is why it arrives on ``deps``.
+    """
     db = SimpleNamespace()
     db.claim_project_loop_stage_barrier = AsyncMock(return_value=True)
     db.get_loop_stage_member_statuses = AsyncMock(return_value={JOB_ID: "completed"})
     db.update_project_loop = AsyncMock(return_value=_loop_row())
-    monkeypatch.setattr(orchestrator.main, "postgres_db", db)
-    monkeypatch.setattr(orchestrator.main, "_record_loop_job_outcome", AsyncMock())
-    monkeypatch.setattr(orchestrator.main, "_notify_loop_user_questions", AsyncMock())
+    monkeypatch.setattr(project_loop_advance, "record_loop_job_outcome", AsyncMock())
+    monkeypatch.setattr(project_loop_advance, "notify_loop_user_questions", AsyncMock())
     monkeypatch.setattr(
-        orchestrator.main, "notify_officer", AsyncMock(return_value=True)
+        project_loop_advance, "notify_officer", AsyncMock(return_value=True)
     )
-    monkeypatch.setattr(orchestrator.main, "_kick_officer_event_drain", MagicMock())
     monkeypatch.setattr(
-        orchestrator.main, "_loop_cooldown_park_until", AsyncMock(return_value=None)
+        project_loop_advance, "loop_cooldown_park_until", AsyncMock(return_value=None)
     )
-    monkeypatch.setattr(orchestrator.main, "_rotate_loop_to_next_stage", AsyncMock())
-    return orchestrator.main, db
+    monkeypatch.setattr(project_loop_advance, "rotate_loop_to_next_stage", AsyncMock())
+    return project_loop_advance, db, _deps(store=db)
 
 
 class TestOfficerAdvanceBranch:
     @pytest.mark.asyncio
-    async def test_officer_loop_wakes_instead_of_rotating(self, patched_main):
-        main, db = patched_main
-        await main._advance_loop_member(_job_row(), {}, [], loop=_loop_row(), ctx={})
+    async def test_officer_loop_wakes_instead_of_rotating(self, patched_engine):
+        adv, db, deps = patched_engine
+        await adv.advance_loop_member(
+            _job_row(), {}, [], loop=_loop_row(), ctx={}, dependencies=deps
+        )
         # Pointers cleared + failure bookkeeping, no stop/rotate/park.
         db.update_project_loop.assert_awaited_once()
         kwargs = db.update_project_loop.await_args.kwargs
         assert kwargs["current_stage_jobs"] == []
         assert kwargs["current_job_id"] is None
-        main._rotate_loop_to_next_stage.assert_not_awaited()
-        main._loop_cooldown_park_until.assert_not_awaited()
+        adv.rotate_loop_to_next_stage.assert_not_awaited()
+        adv.loop_cooldown_park_until.assert_not_awaited()
         # Exactly one officer wake, keyed on the turn.
-        main.notify_officer.assert_awaited_once()
-        args, kwargs = main.notify_officer.await_args
+        adv.notify_officer.assert_awaited_once()
+        args, kwargs = adv.notify_officer.await_args
         assert args[1] == PROJECT_ID
         assert kwargs["source"] == "loop"
         assert kwargs["dedup_key"] == f"{LOOP_ID[:8]}:3"
-        main._kick_officer_event_drain.assert_called_once()
+        deps.kick_officer_event_drain.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_iterations_never_decrement(self, patched_main):
-        main, db = patched_main
-        await main._advance_loop_member(
-            _job_row(), {}, [], loop=_loop_row(remaining_iterations=1), ctx={}
+    async def test_iterations_never_decrement(self, patched_engine):
+        adv, db, deps = patched_engine
+        await adv.advance_loop_member(
+            _job_row(),
+            {},
+            [],
+            loop=_loop_row(remaining_iterations=1),
+            ctx={},
+            dependencies=deps,
         )
         kwargs = db.update_project_loop.await_args.kwargs
         assert "remaining_iterations" not in kwargs
         assert "status" not in kwargs  # never stopped by the branch
 
     @pytest.mark.asyncio
-    async def test_turn_failure_bookkeeping_survives(self, patched_main):
-        main, db = patched_main
+    async def test_turn_failure_bookkeeping_survives(self, patched_engine):
+        adv, db, deps = patched_engine
         db.get_loop_stage_member_statuses = AsyncMock(return_value={JOB_ID: "failed"})
-        await main._advance_loop_member(
+        await adv.advance_loop_member(
             _job_row(status="failed"),
             {"error": "boom"},
             [],
             loop=_loop_row(consecutive_failures=1),
             ctx={},
+            dependencies=deps,
         )
         kwargs = db.update_project_loop.await_args.kwargs
         assert kwargs["consecutive_failures"] == 2
         assert kwargs["last_error"] == "boom"
         # A failing turn still NEVER stops an officer loop — judgment does.
         assert "status" not in kwargs
-        main.notify_officer.assert_awaited_once()
+        adv.notify_officer.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_barrier_loss_means_no_wake(self, patched_main):
-        main, db = patched_main
+    async def test_barrier_loss_means_no_wake(self, patched_engine):
+        adv, db, deps = patched_engine
         db.claim_project_loop_stage_barrier = AsyncMock(return_value=False)
-        await main._advance_loop_member(_job_row(), {}, [], loop=_loop_row(), ctx={})
-        main.notify_officer.assert_not_awaited()
+        await adv.advance_loop_member(
+            _job_row(), {}, [], loop=_loop_row(), ctx={}, dependencies=deps
+        )
+        adv.notify_officer.assert_not_awaited()
         db.update_project_loop.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_standard_loop_still_rotates(self, patched_main):
-        main, db = patched_main
+    async def test_standard_loop_still_rotates(self, patched_engine):
+        adv, db, deps = patched_engine
         monkey_loop = _loop_row(scheduling="standard")
-        await main._advance_loop_member(_job_row(), {}, [], loop=monkey_loop, ctx={})
-        main._rotate_loop_to_next_stage.assert_awaited_once()
-        main.notify_officer.assert_not_awaited()
+        await adv.advance_loop_member(
+            _job_row(), {}, [], loop=monkey_loop, ctx={}, dependencies=deps
+        )
+        adv.rotate_loop_to_next_stage.assert_awaited_once()
+        adv.notify_officer.assert_not_awaited()
 
 
 # =============================================================================

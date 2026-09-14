@@ -27,6 +27,8 @@ These tests exercise the real functions with a mocked ``postgres_db``.
 
 from __future__ import annotations
 
+from tests import b08_completion_helpers as b08_helpers
+
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
@@ -35,6 +37,7 @@ import pytest
 
 import tests.conftest  # noqa: F401 — applies license/crypto/env shims + sys.path
 import orchestrator.main as main
+from shared.backend_kinds import LITE_BACKENDS
 
 
 READY_CONTAINER = {
@@ -566,8 +569,16 @@ class TestFailSubjobUnblocksParent:
         scholar = AsyncMock()
         delegation = AsyncMock()
         monkeypatch.setattr(main.postgres_db, "update_job_status", update)
-        monkeypatch.setattr(main, "_handle_scholar_completion", scholar)
-        monkeypatch.setattr(main, "_handle_delegation_child_completion", delegation)
+        monkeypatch.setattr(
+            main.subjob_completion_operations,
+            "handle_scholar_completion",
+            scholar,
+        )
+        monkeypatch.setattr(
+            main.subjob_completion_operations,
+            "handle_delegation_child_completion",
+            delegation,
+        )
 
         await main._fail_subjob_and_unblock_parent(job, "cannot inherit")
 
@@ -648,7 +659,7 @@ class TestScholarMaterializationFailure:
         monkeypatch.setattr(main, "_trigger_dispatch", dispatch)
 
         with pytest.raises(DatasourceMaterializationAuthorizationError):
-            await main._spawn_scholar_subjob(job, "worker", {}, {})
+            await b08_helpers.spawn_scholar_subjob(job, "worker", {}, {})
 
         assert [call.kwargs["status"] for call in update_status.await_args_list] == [
             "waiting",
@@ -669,7 +680,7 @@ def _dispatch_would_refuse(config_override: dict | None) -> bool:
     """Replica of the backstop condition in _dispatch_job_to_agent."""
     ws_final = (config_override or {}).get("workspace", {})
     backend_final = ws_final.get("backend")
-    return backend_final not in main.LITE_BACKENDS and not ws_final.get("remote")
+    return backend_final not in LITE_BACKENDS and not ws_final.get("remote")
 
 
 class TestDispatchBackstopPredicate:

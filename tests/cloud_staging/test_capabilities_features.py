@@ -5,9 +5,10 @@ key mirroring ``_is_protected_cloud_mode_enabled()`` in BOTH the admin and
 non-admin response branches — the Cockpit toggle gate for the protected
 cloud session-create checkbox reads this.
 
-Follows the ExitStack pattern in tests/cloud_staging/test_apply_endpoints.py:
-``import main`` (conftest puts orchestrator/ on sys.path), patch its module
-globals, and call the endpoint coroutine directly.
+The handler moved into ``orchestrator.routers.user_administration`` (R1.B02),
+so the cases call it with ``main._user_administration_dependencies()``. That
+factory resolves the feature-flag callables per invocation, which is why
+patching them on ``orchestrator.main`` still reaches the endpoint.
 """
 
 from contextlib import ExitStack
@@ -16,6 +17,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 import orchestrator.main
+from orchestrator.routers import user_administration as user_administration_routes
 
 
 def _patch_capabilities(
@@ -64,7 +66,10 @@ class TestCapabilitiesFeatures:
     async def test_admin_features_flag_on(self, user_admin, fake_request):
         stack = _patch_capabilities(user=user_admin, flag=True)
         with stack:
-            result = await orchestrator.main.my_capabilities(fake_request)
+            result = await user_administration_routes.my_capabilities(
+                fake_request,
+                dependencies=orchestrator.main._user_administration_dependencies(),
+            )
         assert result["is_admin"] is True
         assert result["features"] == {
             "protected_cloud": True,
@@ -76,7 +81,10 @@ class TestCapabilitiesFeatures:
     async def test_admin_features_flag_off(self, user_admin, fake_request):
         stack = _patch_capabilities(user=user_admin, flag=False)
         with stack:
-            result = await orchestrator.main.my_capabilities(fake_request)
+            result = await user_administration_routes.my_capabilities(
+                fake_request,
+                dependencies=orchestrator.main._user_administration_dependencies(),
+            )
         assert result["is_admin"] is True
         assert result["features"] == {
             "protected_cloud": False,
@@ -88,7 +96,10 @@ class TestCapabilitiesFeatures:
     async def test_non_admin_features_flag_on(self, user_a, fake_request):
         stack = _patch_capabilities(user=user_a, flag=True)
         with stack:
-            result = await orchestrator.main.my_capabilities(fake_request)
+            result = await user_administration_routes.my_capabilities(
+                fake_request,
+                dependencies=orchestrator.main._user_administration_dependencies(),
+            )
         assert result["is_admin"] is False
         assert result["features"] == {
             "protected_cloud": True,
@@ -100,7 +111,10 @@ class TestCapabilitiesFeatures:
     async def test_non_admin_features_flag_off(self, user_a, fake_request):
         stack = _patch_capabilities(user=user_a, flag=False)
         with stack:
-            result = await orchestrator.main.my_capabilities(fake_request)
+            result = await user_administration_routes.my_capabilities(
+                fake_request,
+                dependencies=orchestrator.main._user_administration_dependencies(),
+            )
         assert result["is_admin"] is False
         assert result["features"] == {
             "protected_cloud": False,
@@ -118,7 +132,10 @@ class TestCapabilitiesFeatures:
             datasource_scope_flag=True,
         )
         with stack:
-            result = await orchestrator.main.my_capabilities(fake_request)
+            result = await user_administration_routes.my_capabilities(
+                fake_request,
+                dependencies=orchestrator.main._user_administration_dependencies(),
+            )
 
         assert result["features"]["datasource_scope_auto_attach_v1"] is True
 

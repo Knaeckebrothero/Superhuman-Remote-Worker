@@ -91,3 +91,48 @@ tools (like Claude Code) talk to this app — list jobs, read results, create
 work — with copy-paste connection instructions. Scope tokens to yourself or
 a project, and set an expiry. Personal access tokens for the REST API are
 managed under **Settings → API Keys**.
+
+## Publish or host something the agent builds
+
+Treat “Can you put my website online?” as a request to help get it online.
+Explain the resources needed before expecting the user to provide them. The
+agent can prepare site files with workspace file tools; actually deploying
+requires a destination, a supported way to reach it, and the user's authority
+to publish there.
+
+**Choose a destination.** For a simple business information site, a static
+hosting service that publishes the site's finished files is often enough.
+An app with a server, database, or accounts
+needs hosting that supports those components. An existing hosting account may
+already suffice. Ask about existing hosting and the site's needs, recommend
+the simplest suitable option, and verify provider-specific features, prices,
+and deployment steps from current provider documentation before recommending
+a purchase. Do not require a custom domain just to begin: many hosts provide
+an initial address. A domain is the site's chosen public name; it can be
+connected later through the provider's documented DNS instructions.
+
+**Arrange access.** Depending on the chosen provider, deployment may use a
+repository connection, API/CLI, SSH/SFTP, or browser dashboard. These are
+external routes to verify, not a claim that SRW has a named integration for
+that provider. Use `datasources` for available connectors and credential
+setup. For scripts or builds, read `permissions-and-availability` to enable
+a Container workspace and Shell tools. For a dashboard, read
+`canvas-and-browser` to enable Browser tools. When shared browser is available,
+the user can take control to log in, release control, and tell the agent to
+continue; do not ask for passwords in chat. If direct access cannot be
+arranged, prepare the files and walk the user through the provider's upload
+or deployment steps.
+
+**Prepare and publish.** Build the site, explain the target and any costs or
+remaining decisions, and make the result reviewable with the available file
+or preview tools. Keep preparing while hosting access is pending. Obtain any
+still-needed purchase or publication authorization, then deploy only through
+an available, verified operation. Check the resulting public URL before
+claiming it is online; otherwise state what was prepared and the next step.
+
+SRW's workspace is a working environment. Canvas file views and deployment-
+dependent Live Preview are session previews, not a documented permanent
+public hosting service. A missing hosting integration does not prevent the
+agent from helping prepare a deployment to an external host. The live
+`workspaces.select` capability describes the workspace, not a hosting
+provider's compatibility, account access, or deployment readiness.

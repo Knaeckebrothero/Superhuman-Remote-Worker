@@ -117,24 +117,92 @@ def submit_one(task: dict, args, replicate: int) -> str:
     return job_id
 
 
-def server_payload(tasks: list[dict], args: argparse.Namespace) -> dict:
-    """Build the inline v1 server spec without retaining a tasks-file link."""
+def caller_id() -> str:
+    """The token owner's user id, for project creation."""
+    me = get("/api/auth/me")
+    user = me.get("user") or me
+    uid = user.get("id")
+    if not uid:
+        raise SystemExit(f"could not resolve caller id from /api/auth/me: {me}")
+    return str(uid)
 
-    arm: dict = {
-        "name": args.arm,
-        "config_override": {},
-        "model": args.model,
-    }
-    if args.config_name:
-        arm["config_name"] = args.config_name
-    if args.expert_id:
-        arm["expert_id"] = args.expert_id
+
+def create_arm_projects(run_id: str, arms: list[str], uid: str) -> dict[str, str]:
+    """One throwaway project per arm so project-scoped memory and KB notes
+    never cross arms (bench/README.md "Two-arm runs"; BenchArmSpec.project_id).
+    Returns {arm_name: project_id}."""
+    projects: dict[str, str] = {}
+    for arm in arms:
+        data = post(
+            "/api/projects",
+            {
+                "name": f"bench-{run_id}-{arm}",
+                "description": (
+                    f"Job Bench run '{run_id}', arm '{arm}'. Throwaway bench "
+                    "project — one per arm so project-scoped memory and KB "
+                    "notes never couple the A/B treatments."
+                ),
+                "goal": f"Job Bench run '{run_id}', arm '{arm}'",
+                "user_id": uid,
+            },
+        )
+        project = data.get("project") or data
+        pid = project.get("id") or project.get("project_id")
+        if not pid:
+            raise RuntimeError(f"no project id in create response: {data}")
+        projects[arm] = str(pid)
+    return projects
+
+
+def server_payload(
+    tasks: list[dict],
+    args: argparse.Namespace,
+    arm_projects: dict[str, str] | None = None,
+) -> dict:
+    """Build the inline v1 server spec without retaining a tasks-file link.
+
+    ``arm_projects`` maps an arm name to the project it runs in (see
+    ``create_arm_projects``); arms without an entry inherit the run project.
+    """
+
+    arm_names = [
+        a.strip() for a in (getattr(args, "arms", None) or "").split(",") if a.strip()
+    ]
+    if arm_names:
+        # One arm per bundled config: the arm name IS the config_name, so the
+        # report's per-task x arm table reads as "developer vs engineer". The
+        # arm's config_name overrides the task's, so the same task set serves
+        # every arm.
+        arms = [
+            {
+                "name": name,
+                "config_name": name,
+                "config_override": {},
+                "model": args.model,
+            }
+            for name in arm_names
+        ]
+        for arm in arms:
+            pid = (arm_projects or {}).get(arm["name"])
+            if pid:
+                arm["project_id"] = pid
+    else:
+        arm: dict = {
+            "name": args.arm,
+            "config_override": {},
+            "model": args.model,
+        }
+        if args.config_name:
+            arm["config_name"] = args.config_name
+        if args.expert_id:
+            arm["expert_id"] = args.expert_id
+        arms = [arm]
     payload = {
         "name": args.run_id,
         "tasks": tasks,
         "replicates": args.replicates,
         "max_in_flight": args.max_in_flight,
-        "arms": [arm],
+        "arms": arms,
     }
     if args.project_id:
         payload["project_id"] = args.project_id
@@ -156,6 +224,23 @@ def main():
     ap.add_argument(
         "--expert-id",
         help="server mode: arm-level DB-backed expert UUID",
+    )
+    ap.add_argument(
+        "--arms",
+        help=(
+            "server mode: comma-separated bundled config names, one arm each "
+            "(arm name = config name; the arm overrides each task's config_name); "
+            "exclusive with --config-name/--expert-id"
+        ),
+    )
+    ap.add_argument(
+        "--isolate-arms",
+        action="store_true",
+        help=(
+            "server mode with --arms: create one throwaway project per arm "
+            "(bench-<run-id>-<arm>) so project-scoped memory never couples the "
+            "treatments; skipped on --dry-run"
+        ),
     )
     ap.add_argument("--project-id", default=None)
     ap.add_argument("--max-in-flight", type=int, default=2)
@@ -183,7 +268,17 @@ def main():
             )
         if args.config_name and args.expert_id:
             raise SystemExit("pass --config-name or --expert-id, not both")
-        payload = server_payload(tasks, args)
+        if args.arms and (args.config_name or args.expert_id):
+            raise SystemExit("pass --arms or --config-name/--expert-id, not both")
+        if args.isolate_arms and not args.arms:
+            raise SystemExit("--isolate-arms needs --arms")
+        arm_projects: dict[str, str] | None = None
+        if args.isolate_arms and not args.dry_run:
+            arm_names = [a.strip() for a in args.arms.split(",") if a.strip()]
+            arm_projects = create_arm_projects(args.run_id, arm_names, caller_id())
+            for arm, pid in arm_projects.items():
+                print(f"  arm {arm:12s} project {pid}")
+        payload = server_payload(tasks, args, arm_projects=arm_projects)
         if args.dry_run:
             print(json.dumps(payload, indent=2))
             return

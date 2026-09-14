@@ -3,6 +3,7 @@ import {takeUntilDestroyed} from '@angular/core/rxjs-interop';
 import {ActivatedRoute, NavigationEnd, Router, RouterOutlet} from '@angular/router';
 import {filter} from 'rxjs';
 import {SidebarComponent} from './shell/sidebar/sidebar.component';
+import {SidebarResizerComponent} from './shell/sidebar-resizer/sidebar-resizer.component';
 import {AppToastContainerComponent} from './ui/toast';
 import {ComponentRegistryService} from './core/services/component-registry.service';
 import {ViewportService} from './core/services/viewport.service';
@@ -43,6 +44,7 @@ import {AppIconComponent} from './ui/icon';
   imports: [
     RouterOutlet,
     SidebarComponent,
+    SidebarResizerComponent,
     AppToastContainerComponent,
     EmptyCatalogBannerComponent,
     ReadinessGateBannerComponent,
@@ -57,6 +59,11 @@ import {AppIconComponent} from './ui/icon';
     <div class="app-container">
       @if (showSidebar()) {
         <app-sidebar [class.collapsed]="sidebar.collapsed()" />
+      }
+      <!-- Sits in the seam between the two, as a zero-width flex item — see
+           the component for why the handle isn't inside the rail. -->
+      @if (showSidebarResizer()) {
+        <app-sidebar-resizer />
       }
       @if (showMobileBackdrop()) {
         <div class="sidebar-backdrop" (click)="sidebar.collapse()"></div>
@@ -219,6 +226,13 @@ export class App implements OnInit {
     () => !this.canvasPopoutRoute() &&
       this.userService.isAuthenticated() &&
       this.userService.isApproved(),
+  );
+
+  /** The rail is only resizable where it's a rail: below 768px it's an
+   *  overlay drawer at a fixed width, and a collapsed rail has no edge to
+   *  drag. */
+  readonly showSidebarResizer = computed(
+    () => this.showSidebar() && !this.viewport.isMobile() && !this.sidebar.collapsed(),
   );
 
   readonly showMobileBackdrop = computed(

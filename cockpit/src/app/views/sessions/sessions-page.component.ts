@@ -9,6 +9,7 @@ import {conferenceLauncherCommands} from '../../core/officer/conference';
 import {PersistentChatService} from '../../core/services/persistent-chat.service';
 import {classifyResumeError} from '../../core/services/resume-error';
 import {ModelService} from '../../core/services/model.service';
+import {SessionListService} from '../../core/services/session-list.service';
 import {AppToastService} from '../../ui/toast';
 import {ErrorMessageService} from '../../core/services/error-message.service';
 import {UserService} from '../../core/services/user.service';
@@ -55,16 +56,11 @@ interface Project {
         AppDialogComponent,
     ],
     template: `
-    <div class="page-toggle">
-      <app-sidebar-toggle />
-    </div>
     <div class="sessions-page">
       <div class="page-header">
-        <h2>{{ 'sessions.title' | transloco }}</h2>
-        <div class="header-actions">
-          <app-button variant="primary" size="sm" (clicked)="goToCreate()">
-            <app-icon size="sm">add</app-icon> {{ 'sessions.newSession' | transloco }}
-          </app-button>
+        <div class="header-left">
+          <app-sidebar-toggle />
+          <h2>{{ 'sessions.title' | transloco }}</h2>
         </div>
       </div>
 
@@ -282,15 +278,6 @@ interface Project {
       background: var(--app-bg);
     }
 
-    .page-toggle {
-      padding: 8px 12px;
-      flex-shrink: 0;
-    }
-
-    .page-toggle:not(:has(.sidebar-toggle)) {
-      display: none;
-    }
-
     .sessions-page {
       max-width: var(--content-max-width);
       margin: 0 auto;
@@ -304,16 +291,17 @@ interface Project {
       margin-bottom: 20px;
     }
 
+    .header-left {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
     .page-header h2 {
       font-size: 18px;
       font-weight: 600;
       color: var(--text-primary, var(--text-primary));
       margin: 0;
-    }
-
-    .header-actions {
-      display: flex;
-      gap: 8px;
     }
 
     /* Active session banner */
@@ -394,7 +382,7 @@ interface Project {
       border-radius: var(--radius-control);
       background: var(--danger-tint);
       border: 1px solid var(--danger-tint);
-      color: var(--danger-color);
+      color: var(--danger);
       font-size: 12px;
     }
 
@@ -579,6 +567,7 @@ export class SessionsPageComponent implements OnInit {
     readonly modelService = inject(ModelService);
     readonly chat = inject(PersistentChatService);
     private readonly transloco = inject(TranslocoService);
+    private readonly sessionList = inject(SessionListService);
 
     threads = signal<Thread[]>([]);
     projects = signal<Project[]>([]);
@@ -622,24 +611,22 @@ export class SessionsPageComponent implements OnInit {
 
     async loadThreads(): Promise<void> {
         this.loading.set(true);
-        try {
-            const data = await firstValueFrom(
-                this.http.get<{ threads: Thread[] }>(`${environment.apiUrl}/persistent/threads`)
-            );
-            this.threads.set(
-                (data.threads || [])
-                    // The server filters children, but keep the mutation-heavy
-                    // session controls fail-closed against an older/cached list.
-                    .filter(thread => thread.kind !== 'subagent')
-                    .map(thread =>
-                        thread.runtime_retirement_pending === true
-                            ? { ...thread, status: 'ending' as const }
-                            : thread,
-                    ),
-            );
-        } catch (e) {
-            // Silent — sessions not available
-        }
+        // No try/catch: SessionListService.refresh() never rejects — both its
+        // success and failure paths resolve, updating its own signals either
+        // way (a failed fetch leaves sessionList.threads() as whatever it
+        // already had, so re-reading it below is safe on either outcome).
+        await this.sessionList.refresh();
+        this.threads.set(
+            this.sessionList.threads()
+                // The server filters children, but keep the mutation-heavy
+                // session controls fail-closed against an older/cached list.
+                .filter(thread => thread.kind !== 'subagent')
+                .map(thread =>
+                    thread.runtime_retirement_pending === true
+                        ? { ...thread, status: 'ending' as const }
+                        : thread,
+                ),
+        );
         this.loading.set(false);
     }
 
@@ -716,15 +703,21 @@ export class SessionsPageComponent implements OnInit {
     async onRenameThread(thread: Thread, title: string): Promise<void> {
         const previous = thread.title;
         // Optimistic: update the card immediately, revert if the PATCH fails.
+        // This page's own `threads` is a filtered/mapped snapshot of
+        // SessionListService, not a computed over it (see loadThreads), so it
+        // doesn't pick up sessionList.renameLocal below for free — both need
+        // the explicit update, and both revert together on failure.
         this.threads.update((list) =>
             list.map((t) => (t.id === thread.id ? {...t, title} : t)),
         );
+        this.sessionList.renameLocal(thread.id, title);
         try {
             await this.chat.renameThread(thread.id, title);
         } catch (e) {
             this.threads.update((list) =>
                 list.map((t) => (t.id === thread.id ? {...t, title: previous} : t)),
             );
+            this.sessionList.renameLocal(thread.id, previous);
             this.toast.danger(this.errors.translate(e, 'errors.sessions.renameFailed'));
         }
     }
@@ -861,10 +854,6 @@ export class SessionsPageComponent implements OnInit {
         } catch (e2: any) {
             this.toast.danger(this.errors.translate(e2, 'errors.sessions.deleteFailed'));
         }
-    }
-
-    goToCreate(): void {
-        this.router.navigate(['/sessions/new']);
     }
 
     goToDraft(): void {

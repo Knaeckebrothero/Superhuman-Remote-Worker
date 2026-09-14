@@ -92,6 +92,7 @@ class JobAdmissionConfig:
     request_config_override: dict[str, Any] | None
     requested_workspace_backend: str | None
     root_creation: bool
+    workspace_selection: dict[str, Any] | None = None
 
 
 async def prepare_job_admission_config(
@@ -210,7 +211,11 @@ async def prepare_job_admission_config(
         # finishing in-flight work is not new work.
         if project_is_archived(project):
             raise HTTPException(status_code=409, detail=PROJECT_ARCHIVED_DETAIL)
-        project_default_override = project.get("default_config_override")
+        project_default_override = (
+            None
+            if project.get("manifest_composed")
+            else project.get("default_config_override")
+        )
         if project_default_override:
             # asyncpg may return JSONB as a string — parse it
             if isinstance(project_default_override, str):
@@ -244,9 +249,16 @@ async def prepare_job_admission_config(
                 explicit_expert_id=explicit_expert_id,
                 is_admin=bool((principal or {}).get("is_admin")),
             )
+            from orchestrator.services.manifest_runtime_ownership import (
+                require_srw_expert_configuration,
+            )
+
+            require_srw_expert_configuration(selection.expert)
             resolved_expert_id = str(selection.expert["id"])
             config_name = "worker_base"
-            if selection.project_override:
+            if selection.project_override and not (project or {}).get(
+                "manifest_composed"
+            ):
                 config_override = deep_merge_dicts(
                     config_override or {}, selection.project_override
                 )
@@ -284,6 +296,42 @@ async def prepare_job_admission_config(
             config_override or {}, request_config_override
         )
 
+    workspace_selection = None
+    workspace_supplied = "workspace" in job.model_fields_set
+    if workspace_supplied and not root_creation:
+        raise HTTPException(
+            422,
+            "Child jobs inherit their parent workspace; select it on the root execution.",
+        )
+    if root_creation and (
+        workspace_supplied or (project or {}).get("manifest_composed")
+    ):
+        from orchestrator.services.manifest_workspace_selection import (
+            select_execution_workspace,
+        )
+        from shared.runtime.core.workspace_selection import bind_execution_workspace
+
+        if not effective_user_id:
+            raise HTTPException(422, "Workspace selection requires an execution owner.")
+        workspace_config, workspace_selection = await select_execution_workspace(
+            dependencies.store,
+            scope.principal or {"id": str(effective_user_id)},
+            project_id=project_id,
+            role="worker",
+            workspace=job.workspace,
+            supplied=workspace_supplied,
+            # Duplicate-selection validation concerns authored request fields;
+            # an inherited legacy Project backend must yield to this choice.
+            config_override=request_config_override
+            if workspace_supplied
+            else config_override,
+        )
+        config_override = bind_execution_workspace(
+            config_override or {}, workspace_config
+        )
+        if workspace_supplied:
+            requested_workspace_backend = workspace_config["backend"]
+
     return JobAdmissionConfig(
         context=context,
         project_id=project_id,
@@ -293,4 +341,5 @@ async def prepare_job_admission_config(
         request_config_override=request_config_override,
         requested_workspace_backend=requested_workspace_backend,
         root_creation=root_creation,
+        workspace_selection=workspace_selection,
     )

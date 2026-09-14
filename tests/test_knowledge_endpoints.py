@@ -1,8 +1,18 @@
-"""Tests for orchestrator knowledge endpoints (orchestrator/main.py).
+"""Tests for orchestrator knowledge endpoints.
 
-Tests replicate endpoint logic directly rather than importing from
-orchestrator.main, which requires database and service dependencies
-that aren't available in the test environment.
+Everything above ``TestMaterializeEndpointIndexesInline`` REPLICATES the
+endpoint logic locally rather than importing it: the Pydantic models, the lazy
+``_get_knowledge_graph`` singleton, ``HTTPException`` and six handler bodies
+are all copies kept in this file. They therefore pin the shape those handlers
+were written to, not the shipped code — the production owners are
+``orchestrator.services.knowledge_operations`` (handlers),
+``orchestrator.schemas.knowledge`` (models) and
+``orchestrator.services.knowledge_projection.KnowledgeGraphHandle`` (the
+singleton), and ``tests/test_knowledge_access.py`` plus
+``tests/test_knowledge_router_wire.py`` are what exercise those for real.
+
+``TestMaterializeEndpointIndexesInline`` is the exception: it drives the real
+``orchestrator.routers.knowledge.materialize_knowledge_note``.
 
 Covers sections 16.1–16.9 of persistent_agent_tests.md:
   - _get_knowledge_graph() (lazy singleton)
@@ -1142,13 +1152,55 @@ class TestDeleteKnowledgeNote:
         assert exc_info.value.status_code == 500
 
 
+def _materialize_deps():
+    """Router dependencies for the real materialize endpoint.
+
+    ``require_internal`` is stubbed here for the same reason the old test
+    patched ``main.require_internal``: these cases are about the inline
+    indexer the endpoint hands the materialiser, not about the
+    ``X-Internal-Key`` gate (``tests/test_kb_materialize.py`` owns that).
+    """
+    from orchestrator.routers.knowledge import KnowledgeDependencies
+    from orchestrator.services.kb_task_registry import KbDatasourceTaskRegistry
+    from orchestrator.services.knowledge_index import KnowledgeIndexDependencies
+    from orchestrator.services.knowledge_operations import (
+        KnowledgeOperationDependencies,
+    )
+
+    import logging
+    from types import SimpleNamespace
+
+    log = logging.getLogger("tests.knowledge_endpoints")
+    store, vector, gitea = AsyncMock(), MagicMock(), MagicMock()
+    return KnowledgeDependencies(
+        store=store,
+        operations=KnowledgeOperationDependencies(
+            store=store,
+            vector_db=vector,
+            gitea_client=gitea,
+            logger=log,
+            graph=SimpleNamespace(get=lambda: None),
+            knowledge_index=KnowledgeIndexDependencies(
+                store=store,
+                vector_db=vector,
+                gitea_client=gitea,
+                logger=log,
+                tasks=KbDatasourceTaskRegistry(),
+                inject_system_kb_embedding_profile=AsyncMock(return_value=None),
+            ),
+        ),
+        require_internal=AsyncMock(return_value=None),
+    )
+
+
 class TestMaterializeEndpointIndexesInline:
     """The endpoint must hand the materialiser an indexer, or nothing is
     searchable until the next sweep — the whole point of Slice A."""
 
     @pytest.mark.asyncio
     async def test_endpoint_passes_a_store_and_embedding_service(self):
-        import orchestrator.main as main
+        from orchestrator.routers.knowledge import materialize_knowledge_note
+        from orchestrator.schemas.knowledge import KnowledgeMaterializeRequest
 
         captured = {}
 
@@ -1158,21 +1210,22 @@ class TestMaterializeEndpointIndexesInline:
 
         svc = MagicMock()
         with (
-            patch.object(
-                main, "_build_kb_embedding_service", AsyncMock(return_value=svc)
+            patch(
+                "orchestrator.services.knowledge_index.build_kb_embedding_service",
+                AsyncMock(return_value=svc),
             ),
             patch(
                 "orchestrator.services.kb_materialize.materialize_knowledge_note",
                 _fake_materialize,
             ),
-            patch.object(main, "require_internal", AsyncMock(return_value=None)),
         ):
-            result = await main.materialize_knowledge_note(
+            result = await materialize_knowledge_note(
                 request=MagicMock(),
                 project_id="1a387b4d-0000-0000-0000-000000000000",
-                body=main.KnowledgeMaterializeRequest(
+                body=KnowledgeMaterializeRequest(
                     slug="a-note", content="---\nid: a-note\n---\n# A\n"
                 ),
+                dependencies=_materialize_deps(),
             )
 
         assert result["indexed"] is True
@@ -1181,7 +1234,8 @@ class TestMaterializeEndpointIndexesInline:
 
     @pytest.mark.asyncio
     async def test_no_embedding_service_still_commits(self):
-        import orchestrator.main as main
+        from orchestrator.routers.knowledge import materialize_knowledge_note
+        from orchestrator.schemas.knowledge import KnowledgeMaterializeRequest
 
         captured = {}
 
@@ -1194,21 +1248,22 @@ class TestMaterializeEndpointIndexesInline:
             }
 
         with (
-            patch.object(
-                main, "_build_kb_embedding_service", AsyncMock(return_value=None)
+            patch(
+                "orchestrator.services.knowledge_index.build_kb_embedding_service",
+                AsyncMock(return_value=None),
             ),
             patch(
                 "orchestrator.services.kb_materialize.materialize_knowledge_note",
                 _fake_materialize,
             ),
-            patch.object(main, "require_internal", AsyncMock(return_value=None)),
         ):
-            result = await main.materialize_knowledge_note(
+            result = await materialize_knowledge_note(
                 request=MagicMock(),
                 project_id="1a387b4d-0000-0000-0000-000000000000",
-                body=main.KnowledgeMaterializeRequest(
+                body=KnowledgeMaterializeRequest(
                     slug="a-note", content="---\nid: a-note\n---\n# A\n"
                 ),
+                dependencies=_materialize_deps(),
             )
 
         assert result["status"] == "committed"
@@ -1218,7 +1273,8 @@ class TestMaterializeEndpointIndexesInline:
     @pytest.mark.asyncio
     async def test_embedding_service_resolution_error_still_commits(self):
         """A misconfigured embedding backend must degrade, not 500 the write."""
-        import orchestrator.main as main
+        from orchestrator.routers.knowledge import materialize_knowledge_note
+        from orchestrator.schemas.knowledge import KnowledgeMaterializeRequest
 
         captured = {}
 
@@ -1231,23 +1287,22 @@ class TestMaterializeEndpointIndexesInline:
             }
 
         with (
-            patch.object(
-                main,
-                "_build_kb_embedding_service",
+            patch(
+                "orchestrator.services.knowledge_index.build_kb_embedding_service",
                 AsyncMock(side_effect=RuntimeError("catalog unavailable")),
             ),
             patch(
                 "orchestrator.services.kb_materialize.materialize_knowledge_note",
                 _fake_materialize,
             ),
-            patch.object(main, "require_internal", AsyncMock(return_value=None)),
         ):
-            result = await main.materialize_knowledge_note(
+            result = await materialize_knowledge_note(
                 request=MagicMock(),
                 project_id="1a387b4d-0000-0000-0000-000000000000",
-                body=main.KnowledgeMaterializeRequest(
+                body=KnowledgeMaterializeRequest(
                     slug="a-note", content="---\nid: a-note\n---\n# A\n"
                 ),
+                dependencies=_materialize_deps(),
             )
 
         assert result["status"] == "committed"

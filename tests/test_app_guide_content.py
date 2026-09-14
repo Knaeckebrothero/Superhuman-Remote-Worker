@@ -8,6 +8,10 @@ live session control group gains a tool.
 
 from __future__ import annotations
 
+from shared.runtime.core.srw_manifest_config import (
+    srw_config_fragment as _srw_config_fragment,
+)
+
 from pathlib import Path
 from typing import get_args
 
@@ -46,22 +50,20 @@ def test_guide_requires_outcome_level_coverage_and_honest_combination_gaps():
     assert (
         "documented components are not proof that srw supports combining them" in body
     )
-    assert "call `index` only, state an explicit guide gap, and stop" in body
-    assert "do not load the nearest topic to manufacture a setup" in body
+    assert "state an explicit guide gap for the built-in route" in body
+    assert "continue with step 6" in body
+    assert "do not load the nearest topic to manufacture a supported" in body
     assert "it is not a catch-all place to search for a feature absent" in body
     assert "enterprise identity administration terms such as sso, scim, saml" in body
     assert "are not project-group or datasource workflows" in body
-    assert "state the guide gap and stop" in body
+    assert "identify the administrator or integration check needed" in body
     assert "route to `memory-and-knowledge`" in body
     assert "the currently proven path requires a **container workspace**" in body
     assert "virtual and none cannot host it" in body
     assert "the guide does not document this exact workflow" in body
     assert "is covered by the `automations` limitation row" in body
     assert "load `automations` and explain the connector boundary" in body
-    assert (
-        "a schedule, connector, prompt, expert, or permission documented separately"
-        in body
-    )
+    assert "connector, prompt, expert, or permission documented separately" in body
 
 
 def test_guide_separates_stable_how_to_from_dynamic_capability_checks():
@@ -151,7 +153,11 @@ def test_focused_guides_keep_metadata_contracts():
         "canvas-and-browser": {
             "guide_id": "canvas.present-and-browse",
             "content_type": "how_to",
-            "capability_ids": {"canvas.files", "canvas.browser"},
+            "capability_ids": {
+                "canvas.files",
+                "canvas.browser",
+                "workspaces.select",
+            },
             "journey_ids": {"canvas.present-file", "canvas.share-browser"},
         },
         "experts": {
@@ -260,7 +266,9 @@ def test_experts_guide_covers_current_bundled_roster_and_selection_rules():
     _, body = _focused_topic("experts")
 
     for config_path in sorted((_ROOT / "config" / "experts").glob("*/config.yaml")):
-        config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        config = _srw_config_fragment(
+            yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        )
         expert_type = (
             "session" if config.get("$extends") == "session_base" else "worker"
         )
@@ -448,8 +456,11 @@ def test_permissions_guide_keeps_current_policy_and_workspace_boundaries():
         assert f"| **{tier}**" in body
     assert "workspace changes are upgrade-only" in body
     for group in (
+        "browser",
+        "shell",
         "canvas",
-        "fleet management",
+        "job control",
+        "job inspection",
         "experts & skills",
         "automations & loops",
     ):

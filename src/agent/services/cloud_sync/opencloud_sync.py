@@ -212,33 +212,54 @@ class OpenCloudWorkspaceSync(WorkspaceSyncBase):
         local_path: str,
         *,
         before_write: Optional[Callable[[], Awaitable[None]]] = None,
-    ) -> None:
+        if_match: Optional[str] = None,
+        if_none_match: bool = False,
+    ) -> Optional[str]:
+        from agent.services.cloud_sync.nextcloud_sync import _conditional_put
+
         async def _run():
             client = await self._dav()
             return await asyncio.to_thread(
-                client.upload_sync,
-                remote_path=rel_path,
-                local_path=local_path,
+                _conditional_put, client, rel_path, local_path, if_match, if_none_match
             )
 
-        await self._with_401_retry(_run, before_attempt=before_write)
+        return await self._with_401_retry(_run, before_attempt=before_write)
 
     async def _delete_remote_file(
         self,
         rel_path: str,
         *,
         before_write: Optional[Callable[[], Awaitable[None]]] = None,
+        if_match: Optional[str] = None,
     ) -> None:
+        from agent.services.cloud_sync.nextcloud_sync import _conditional_delete
+
         async def _run():
             client = await self._dav()
             try:
-                return await asyncio.to_thread(client.clean, rel_path)
+                return await asyncio.to_thread(
+                    _conditional_delete, client, rel_path, if_match
+                )
             except Exception as exc:
                 if not self._marker_missing(exc):
                     raise
                 return None
 
         await self._with_401_retry(_run, before_attempt=before_write)
+
+    async def _remote_etag(self, rel_path: str) -> Optional[str]:
+        async def _run():
+            client = await self._dav()
+            try:
+                return await asyncio.to_thread(client.info, rel_path)
+            except Exception as exc:
+                if self._marker_missing(exc):
+                    return None
+                raise
+
+        info = await self._with_401_retry(_run)
+        etag = (info or {}).get("etag") if isinstance(info, dict) else None
+        return str(etag) if etag else None
 
     async def _list_remote_files(self, rel_dir: str = "") -> list[dict]:
         async def _run():

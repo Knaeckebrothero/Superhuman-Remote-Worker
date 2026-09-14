@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+
 import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -20,6 +21,7 @@ from testcontainers.postgres import PostgresContainer
 
 from orchestrator.database.migrate import run_migrations
 from orchestrator.database.postgres import PostgresDB
+from orchestrator.routers import job_lifecycle as job_lifecycle_routes
 
 
 MIGRATIONS = (
@@ -82,11 +84,24 @@ async def client(stores, monkeypatch):
     monkeypatch.setattr(main, "postgres_db", app_db)
     monkeypatch.setattr(main, "vector_db", vector_db)
     monkeypatch.setattr(main, "require_job_access", access)
-    monkeypatch.setattr(main, "_archive_and_cleanup_workspace", AsyncMock())
-    monkeypatch.setattr(main, "_resolve_job_notifications", AsyncMock())
+    monkeypatch.setattr(
+        main.thread_retirement_operations.ThreadRetirementOperations,
+        "archive_and_cleanup_workspace",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        main.job_freeze_notification_service,
+        "resolve_job_notifications",
+        AsyncMock(),
+    )
     monkeypatch.setattr(main, "snapshot_service", SimpleNamespace(is_available=False))
     app = FastAPI()
-    app.add_api_route("/api/jobs/{job_id}", main.delete_job, methods=["DELETE"])
+    app.state.job_control_route_dependencies_factory = (
+        main._job_mutation_route_dependencies
+    )
+    app.add_api_route(
+        "/api/jobs/{job_id}", job_lifecycle_routes.delete_job, methods=["DELETE"]
+    )
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as http:

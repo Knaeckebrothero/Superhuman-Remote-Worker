@@ -22,3 +22,10 @@ LEADER_ID = 0x5352575F4C454144
 # is safe without the lock (documented dual-leader window); the lock only
 # avoids duplicate sweep work.
 RUN_QUEUE_REAPER_ID = 0x5352575F52454150
+
+# Session-scoped stateless pod-deletion-cost reconciler lock — the leader-gated
+# loop that stamps `controller.kubernetes.io/pod-deletion-cost` on
+# `srw/class=agent-stateless` pods from run_queue lease state
+# (services/stateless_pod_deletion_cost.py). "SRW_DELC" packed into int64.
+# Patches are idempotent, so the lock only avoids duplicate reconcile work.
+STATELESS_DELETION_COST_ID = 0x5352575F44454C43

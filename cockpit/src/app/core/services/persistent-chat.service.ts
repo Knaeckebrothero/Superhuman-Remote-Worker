@@ -34,6 +34,7 @@ import {
 } from '../models/turn.model';
 import { TranslocoService } from '@jsverse/transloco';
 import { ApiService } from './api.service';
+import type { SessionQueueState } from '../models/api.model';
 import { ErrorMessageService } from './error-message.service';
 import { IndexedDbService } from './indexed-db.service';
 import { NotificationService } from './notification.service';
@@ -409,8 +410,67 @@ export interface CompactionProgressState {
   startedAt: number;
 }
 
+/** Transport a control verb travels over for the current session, as
+ *  DECLARED by `/connection` (`controls`). `unavailable` = the server did not
+ *  advertise the verb, so the Cockpit renders it disabled and never queues it.
+ *  Dispatching by declaration rather than by inferring a lane from
+ *  `control_socket` is what stopped `config.update` from vanishing into an
+ *  outbox on queue-served sessions (issue:
+ *  live_settings_silently_dropped_on_stateless_sessions). */
+export type ControlTransport = 'websocket' | 'rest' | 'unavailable';
+type ControlCapabilityMap = Record<string, 'websocket' | 'rest'>;
+
+/** Verbs that have a REST transport on a socketless session under the legacy
+ *  (pre-`controls`) contract: the three durable-inbox verbs, plus
+ *  `config.update`, whose owner PATCH (Slice C) predates `controls` and whose
+ *  connected-gate passes on a session that binds no agent. Only consulted when
+ *  an older orchestrator omits `controls`; a declaration always wins. */
+const LEGACY_SOCKETLESS_REST_VERBS = new Set([
+  'config.update',
+  'mode.set',
+  'narration.set',
+  'workspace.undo',
+]);
+/** Verbs the legacy contract carried over the direct socket on a pinned
+ *  session. Same fallback role as above. */
+const LEGACY_SOCKET_VERBS = new Set([
+  'config.update',
+  'compact',
+  'archive',
+  'rewind',
+  'undo',
+  'upgrade-to-workspace',
+  'approve',
+  'deny',
+]);
+
+/** How long a `config.update` sent over the socket may wait for its
+ *  `config.changed` ack (or matching error frame) before the pane rolls the
+ *  edit back and says so. The agent applies a live update in well under a
+ *  second; a swap that compacts first can take longer, hence the slack. */
+const CONFIG_UPDATE_ACK_TIMEOUT_MS = 30_000;
+
+/** Outcome of one `updateConfig` request — resolved, never rejected, so a
+ *  caller can always settle its own optimistic state. */
+export type ConfigUpdateOutcome =
+  | {
+      ok: true;
+      requestId: string;
+      transport: 'websocket' | 'rest';
+      /** The fragment the server accepted (REST: the redacted persisted
+       *  fragment; socket: the echoed `applied` fragment). */
+      applied: Record<string, unknown>;
+      /** `now` = the running session rebuilt itself; `next_turn` = persisted,
+       *  picked up by the next claim (queue-served sessions). */
+      effective: 'now' | 'next_turn' | 'next_attach';
+    }
+  | { ok: false; requestId: string; transport: ControlTransport; message: string };
+
 /** Lane-free control-socket discovery. The server may carry additional
  * execution details, but the Cockpit discriminates only on transport. */
+/** Poll cadence for the durable queue block while a send awaits a claim. */
+export const QUEUE_POLL_MS = 5_000;
+
 type ConnectionPayload =
   | {
       state: 'ready';
@@ -420,6 +480,8 @@ type ConnectionPayload =
       expires_at: number;
       pinned_runtime_generation_contract: 1;
       session_runtime_generation: string;
+      controls?: ControlCapabilityMap;
+      queue?: SessionQueueState | null;
     }
   | {
       state: 'ready';
@@ -429,6 +491,8 @@ type ConnectionPayload =
       expires_at: null;
       pinned_runtime_generation_contract: 1;
       session_runtime_generation: string;
+      controls?: ControlCapabilityMap;
+      queue?: SessionQueueState | null;
     };
 
 /** Server-aggregated token telemetry riding the durable `session.state`
@@ -650,6 +714,57 @@ export class PersistentChatService {
     effect(() => {
       this.threadTransport.setAgentTurnActive(this.isStreaming());
     });
+
+    // Stamp the start of an awaiting stretch and tick a 1 s clock while it
+    // lasts. Keyed off isAwaitingTurn so every path that zeroes
+    // pendingTurnCount also ends the stretch; the ticker never runs idle.
+    effect(() => {
+      const awaiting = this.isAwaitingTurn();
+      untracked(() => {
+        if (!awaiting) {
+          this._stopAwaitingClock();
+          return;
+        }
+        const now = Date.now();
+        if (this.awaitingSince() === null) this.awaitingSince.set(now);
+        this.awaitingNow.set(now);
+        if (this.awaitingTicker === null) {
+          this.awaitingTicker = setInterval(() => this.awaitingNow.set(Date.now()), 1000);
+        }
+      });
+    });
+    this.destroyRef.onDestroy(() => this._stopAwaitingClock());
+
+    // While a send awaits a claim, poll the durable queue block so a unit
+    // that gets parked (or a reload that lost the accept) is rendered from
+    // the server's truth rather than process-local state. A parked verdict
+    // ends the awaiting stretch and so the poll.
+    //
+    // The same poll also runs while the "Starting session" card is up on a
+    // thread that exists. That card yields on `sessionReady`, which no
+    // durable read flips on its own: if `/connection` is still polling behind
+    // a not-yet-ready protected-cloud runtime, nothing else would ever tell
+    // this tab that the queued first turn already ran to completion, and the
+    // card would outlive the answer (see
+    // _reconcileReadinessFromDurableState). The poll costs one 5 s REST read
+    // per startup and stops the moment readiness lands, from this path or
+    // any other.
+    effect(() => {
+      const awaiting = this.isAwaitingTurn();
+      // `isStartingSession` also covers the pre-thread create, where
+      // _pollQueueState no-ops for want of a thread id.
+      const startingSession = this.isStartingSession();
+      untracked(() => {
+        if (!awaiting && !startingSession) {
+          this._stopQueuePoll();
+          return;
+        }
+        if (this.queuePollTimer === null) {
+          this.queuePollTimer = setInterval(() => void this._pollQueueState(), QUEUE_POLL_MS);
+        }
+      });
+    });
+    this.destroyRef.onDestroy(() => this._stopQueuePoll());
 
     // Invariant: "Stopping…" (isInterrupting) only makes sense while a turn
     // is actually streaming. Whenever streaming ends — turn completed, the
@@ -1017,7 +1132,128 @@ export class PersistentChatService {
   /** True while an accepted send waits for its turn to start — drives the
    *  working placeholder, spinner and dots so a queued input is visibly
    *  alive instead of apparently swallowed. */
-  readonly isAwaitingTurn = computed(() => this.pendingTurnCount() > 0 && !this.isStreaming());
+  /**
+   * The thread's durable run_queue block (accept response, /connection, or the
+   * awaiting poll), thread-stamped like `usage`: a value from another thread
+   * reads as null. `parked` means the input was accepted but nothing can claim
+   * it until it is retried — never rendered as "waiting".
+   */
+  private readonly _queueState = signal<{ threadId: string; queue: SessionQueueState } | null>(null);
+  readonly queueState = computed<SessionQueueState | null>(() => {
+    const q = this._queueState();
+    if (!q || q.threadId == null) return null;
+    return q.threadId === this.threadId() ? q.queue : null;
+  });
+  readonly isParked = computed(() => this.queueState()?.state === 'parked');
+  /** A send is accepted and durably queued, but no agent has claimed it and
+   *  the unit is not parked — the only state that shows the waiting bubble. */
+  readonly isAwaitingTurn = computed(
+    () => this.pendingTurnCount() > 0 && !this.isStreaming() && !this.isParked(),
+  );
+  /**
+   * When the current awaiting stretch began (ms epoch); null while not
+   * awaiting. Derived from isAwaitingTurn by a constructor effect, so every
+   * pendingTurnCount reset (turn.started, terminal frames, teardown, thread
+   * switch) ends the stretch without each site knowing. Feeds the queued
+   * bubble's "busier than usual" escalation and elapsed counter — never a
+   * queue position (deliberate: depth is not user-facing information).
+   */
+  readonly awaitingSince = signal<number | null>(null);
+  private readonly awaitingNow = signal(Date.now());
+  private awaitingTicker: ReturnType<typeof setInterval> | null = null;
+  private queuePollTimer: ReturnType<typeof setInterval> | null = null;
+  /** Milliseconds spent in the current awaiting stretch; 0 when not awaiting.
+   *  Advances once a second, and only while awaiting. */
+  readonly awaitingElapsedMs = computed(() => {
+    const since = this.awaitingSince();
+    return since === null ? 0 : Math.max(0, this.awaitingNow() - since);
+  });
+
+  private _stopAwaitingClock(): void {
+    if (this.awaitingTicker !== null) {
+      clearInterval(this.awaitingTicker);
+      this.awaitingTicker = null;
+    }
+    if (this.awaitingSince() !== null) this.awaitingSince.set(null);
+  }
+
+  private _applyQueueState(threadId: string, queue: SessionQueueState | null | undefined): void {
+    if (!queue || typeof queue !== 'object' || typeof queue.state !== 'string') return;
+    this._queueState.set({ threadId, queue });
+    this._reconcileReadinessFromDurableState();
+  }
+
+  /**
+   * How many durable transcript rows this tab has for the open thread,
+   * thread-stamped like `usage` / `_queueState` so another thread's count
+   * reads as 0. Counts rows the server (or the append-only cache) actually
+   * has — never the optimistic bubble a send paints before it is accepted.
+   * Feeds `_reconcileReadinessFromDurableState`.
+   */
+  private readonly _durableMessages = signal<{ threadId: string; count: number } | null>(null);
+  private readonly durableMessageCount = computed(() => {
+    const seen = this._durableMessages();
+    if (!seen) return 0;
+    return seen.threadId === this.threadId() ? seen.count : 0;
+  });
+
+  private _recordDurableMessages(threadId: string, count: number): void {
+    const seen = this._durableMessages();
+    // Never let a narrower read (an `?after=` refresh that returned nothing)
+    // shrink what a wider one already established for the same thread.
+    if (seen?.threadId === threadId && seen.count >= count) return;
+    this._durableMessages.set({ threadId, count });
+    this._reconcileReadinessFromDurableState();
+  }
+
+  private _stopQueuePoll(): void {
+    if (this.queuePollTimer !== null) {
+      clearInterval(this.queuePollTimer);
+      this.queuePollTimer = null;
+    }
+  }
+
+  private async _pollQueueState(): Promise<void> {
+    const tid = this.threadId();
+    if (!tid) return;
+    let queue: SessionQueueState | null = null;
+    try {
+      queue = await firstValueFrom(this.api.getThreadQueue(tid));
+    } catch {
+      // A failed poll is not news: the accept response / /connection already
+      // seeded the state, and the next tick retries. Never let a timer throw.
+      return;
+    }
+    if (this.threadId() !== tid) return;
+    this._applyQueueState(tid, queue);
+  }
+
+  /**
+   * Owner retry of a parked unit: POST /queue/retry, then show the normal
+   * waiting state (the unit is queued again; a claim lands as turn.started).
+   * A refusal (stop markers, claim-loss hold, not parked) is toasted with the
+   * server's code and leaves the parked bubble in place.
+   */
+  async retryParked(): Promise<'ok' | 'refused'> {
+    const tid = this.threadId();
+    if (!tid) return 'refused';
+    const outcome = await firstValueFrom(this.api.retryThreadQueue(tid));
+    if (this.threadId() !== tid) return 'refused';
+    if (outcome.kind === 'ok') {
+      this._applyQueueState(tid, {
+        state: outcome.state || 'queued',
+        park_reason: null,
+        parked_at: null,
+        retryable: false,
+        attempts: 0,
+        pending_input: true,
+      });
+      this.pendingTurnCount.update((c) => Math.max(c, 1));
+      return 'ok';
+    }
+    this.toast.danger(this.transloco.translate('chat.parked.retryFailed', { code: outcome.code }));
+    return 'refused';
+  }
   /**
    * Single-flight guard for _flushOutbox — one POST in flight **per thread**,
    * not per tab. `turn_id` is per-thread, so two different threads can never
@@ -1111,15 +1347,16 @@ export class PersistentChatService {
   // owner's defaults (knowledge-base/knowledge/features/instant_landing_session.md). Distinct
   // from the composer's persisted text "draft" (localStorage).
   readonly isDraftSession = signal(false);
-  // Default project prefetched on draft entry; attached to the create body
-  // if it resolved by first-send time (best-effort).
+  // Resolve the default project and session admission before enabling Send.
   private draftProjectIds: string[] | null = null;
   /** Stable, reviewable default selection for the landing draft. Null while
-   * the default-project/eligibility context is unresolved. */
+   * the default-project/workspace context is unresolved. */
   readonly draftDatasourceIds = signal<string[] | null>(null);
   readonly draftDefaultsLoading = signal(false);
   readonly draftDefaultsError = signal(false);
   readonly draftConnectorsEnabled = signal(true);
+  /** Empty means follow the project/account defaults, including workspace recipes. */
+  readonly draftWorkspaceBackend = signal('');
   private draftDefaultsGeneration = 0;
   private creatingFromDraft = false;
 
@@ -1221,6 +1458,23 @@ export class PersistentChatService {
   // ready state, not a failed WebSocket open; remember it so focus/SSE
   // recovery and user actions cannot restart the reconnect ladder.
   private controlSocket: 'unknown' | 'websocket' | 'none' = 'unknown';
+  /** The `/connection` control declaration, stamped with the thread it
+   *  describes so a stale map can never answer for the next session
+   *  (singleton-state rule: stamp, don't just reset). null = not resolved
+   *  yet, or an older orchestrator that omits `controls`. */
+  private controlCapabilities: { threadId: string; controls: ControlCapabilityMap } | null =
+    null;
+  /** Socket-sent config updates awaiting their `config.changed` ack (or a
+   *  matching error frame), keyed by request_id. Settled by the frame
+   *  reducer, by the ack timeout, or by disconnect(). */
+  private readonly pendingConfigUpdates = new Map<
+    string,
+    {
+      threadId: string;
+      resolve: (outcome: ConfigUpdateOutcome) => void;
+      timer: ReturnType<typeof setTimeout>;
+    }
+  >();
   private controlWsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private controlWsReconnectAttempt = 0;
   private controlWsLastMessageAt = 0;
@@ -1924,8 +2178,9 @@ export class PersistentChatService {
     this.error.set(null);
     this.creatingFromDraft = false;
     this.draftConnectorsEnabled.set(true);
+    this.draftWorkspaceBackend.set('');
     this.isDraftSession.set(true);
-    // Resolve the default project and eligible connector defaults as one
+    // Resolve the default project and compatible connector defaults as one
     // fail-closed context. The composer remains usable for drafting, but
     // Send is disabled until the user has seen this stable preselection.
     void this.retryDraftDefaults();
@@ -1950,23 +2205,29 @@ export class PersistentChatService {
       if (generation !== this.draftDefaultsGeneration || !this.isDraftSession()) return;
       const defaultProject = projects.find((project) => project.is_default);
       this.draftProjectIds = defaultProject ? [defaultProject.id] : [];
-      if (this.capabilities.datasourceScopeAutoAttachAvailable()) {
-        const eligible = await firstValueFrom(
-          this.api.getEligibleDatasources(this.draftProjectIds),
-        );
-        if (generation !== this.draftDefaultsGeneration || !this.isDraftSession()) return;
-        this.draftDatasourceIds.set(
-          eligible.filter((ds) => ds.default_selected).map((ds) => ds.id),
-        );
+      const body = this.draftCreationContext();
+      if (this.capabilities.datasourceScopeAutoAttachAvailable() && this.draftConnectorsEnabled()) {
+        body['use_datasource_defaults'] = true;
       } else {
-        // Loading, failed, or absent rollout capability: no implicit
-        // connector selection. The explicit draft array remains [].
-        this.draftDatasourceIds.set([]);
+        // An opt-out or unavailable rollout capability is an explicit empty
+        // selection, even if the server enables defaults on omission.
+        body['datasource_ids'] = [];
       }
-    } catch {
+      // Admission resolves the workspace before selecting implicit defaults.
+      // Keep the reviewed IDs explicit at create so later auto-attach edits
+      // cannot add a connector the user did not see here.
+      const preview = await firstValueFrom(
+        this.http.post<{project_ids: string[]; workspace_backend: string; datasource_ids: string[]}>(
+          `${environment.apiUrl}/persistent/threads/preview`, body,
+        ),
+      );
+      if (generation !== this.draftDefaultsGeneration || !this.isDraftSession()) return;
+      this.draftProjectIds = preview.project_ids;
+      this.draftDatasourceIds.set(preview.datasource_ids);
+    } catch (err) {
       if (generation !== this.draftDefaultsGeneration || !this.isDraftSession()) return;
       this.draftDefaultsError.set(true);
-      this.error.set(this.transloco.translate('chat.draft.defaultsFailed'));
+      this.error.set(this.errors.translate(err, 'chat.draft.defaultsFailed'));
     } finally {
       if (generation === this.draftDefaultsGeneration) {
         this.draftDefaultsLoading.set(false);
@@ -1976,6 +2237,28 @@ export class PersistentChatService {
 
   setDraftConnectorsEnabled(enabled: boolean): void {
     this.draftConnectorsEnabled.set(enabled);
+    void this.retryDraftDefaults();
+  }
+
+  setDraftWorkspaceBackend(backend: string | null): void {
+    if (!['', 'virtual', 'sandbox', 'vm', 'none'].includes(backend ?? '')) return;
+    this.draftWorkspaceBackend.set(backend ?? '');
+    void this.retryDraftDefaults();
+  }
+
+  private draftCreationContext(): Record<string, any> {
+    const body: Record<string, any> = {};
+    if (this.draftProjectIds?.length) body['project_ids'] = this.draftProjectIds;
+    const backend = this.draftWorkspaceBackend();
+    if (backend) body['config_override'] = {workspace: {backend}};
+    return body;
+  }
+
+  /** Retry the retained queue without appending a second copy of its message. */
+  async retryDraftSession(): Promise<void> {
+    const first = this.outbox()[0];
+    if (!this.isDraftSession() || !first || first.threadId) return;
+    await this._createFromDraftSession(first.displayContent);
   }
 
   /**
@@ -1994,9 +2277,9 @@ export class PersistentChatService {
     )
       return;
     this.creatingFromDraft = true;
+    const generation = this.draftDefaultsGeneration;
     this.isDraftSession.set(false);
-    const body: Record<string, any> = { title: draftTitleFrom(firstMessage) };
-    if (this.draftProjectIds?.length) body['project_ids'] = this.draftProjectIds;
+    const body: Record<string, any> = {...this.draftCreationContext(), title: draftTitleFrom(firstMessage)};
     body['datasource_ids'] = this.draftConnectorsEnabled() ? (this.draftDatasourceIds() ?? []) : [];
     try {
       await this.createAndConnect(body);
@@ -2004,9 +2287,11 @@ export class PersistentChatService {
       // createAndConnect surfaced the error state and re-showed the
       // queued bubbles; re-enter draft so the next send retries the
       // create with the same outbox.
-      if (this.threadId() === null) this.isDraftSession.set(true);
+      if (generation === this.draftDefaultsGeneration && this.threadId() === null) {
+        this.isDraftSession.set(true);
+      }
     } finally {
-      this.creatingFromDraft = false;
+      if (generation === this.draftDefaultsGeneration) this.creatingFromDraft = false;
     }
   }
 
@@ -2028,6 +2313,7 @@ export class PersistentChatService {
     this.threadId.set(null);
     this.usage.set(null);
     this.isCreating.set(true);
+    this.error.set(null);
     this.connectionState.set('connecting');
     this.startupPhase.set('creating');
     // A VM-backed create pays a cold KubeVirt boot — flag it up front so the
@@ -2059,6 +2345,7 @@ export class PersistentChatService {
         this.isCreating.set(false);
         this.connectionState.set('error');
         this.startupPhase.set(null);
+        this.error.set(this.errors.translate(e, 'errors.sessions.createFailed'));
         // The reset at the top of createAndConnect wiped the optimistic
         // bubbles; re-show any queued sends on the error screen so the user
         // doesn't have a silently-retained outbox with no visible messages.
@@ -2164,6 +2451,7 @@ export class PersistentChatService {
         this.dispatch({ type: 'load_history', threadId, turns: historyToTurns(cached) });
         this.resetWindow();
         this.historyLoaded.set(true);
+        this._recordDurableMessages(threadId, cached.length);
       }
 
       // 2. Refresh from the server. With a cache, fetch only what's newer
@@ -2193,6 +2481,7 @@ export class PersistentChatService {
         const merged = mergeMessagesById(cached, fetched);
         this.dispatch({ type: 'load_history', threadId, turns: historyToTurns(merged) });
         this.resetWindow();
+        this._recordDurableMessages(threadId, merged.length);
       }
       this.historyLoaded.set(true);
     } catch {
@@ -2953,6 +3242,7 @@ export class PersistentChatService {
       const connection = await this._resolveConnection(threadId, openingGeneration);
       if (!this._controlPlaneAllowed(threadId, openingGeneration)) return;
       if (!this._acceptBindingRecoveryConnection(threadId, connection)) return;
+      this._applyQueueState(threadId, connection.queue ?? null);
       // GET /connection only returns 200 after the orchestrator has a
       // bound agent and the agent's /ready probe passes. That REST
       // readiness is enough to unblock the composer; the control WS
@@ -3128,6 +3418,10 @@ export class PersistentChatService {
     this.sessionRuntimeGeneration = exactRuntimeContract
       ? this._canonicalRuntimeGeneration(connection.session_runtime_generation)
       : null;
+    this.controlCapabilities =
+      connection?.controls && typeof connection.controls === 'object'
+        ? { threadId, controls: { ...connection.controls } }
+        : null;
     if (!this._connectionHasWebSocket(connection)) {
       this.controlSocket = 'none';
       this.controlWsReconnectAttempt = 0;
@@ -3136,10 +3430,84 @@ export class PersistentChatService {
         this.controlWsReconnectTimer = null;
       }
       this._stopControlWsWatchdog();
+      // Anything queued while the transport was still unknown was waiting
+      // for a socket this session will never have. Fail it now, loudly —
+      // the old behaviour left such frames in the outbox forever.
+      this._failQueuedControls(threadId);
       return;
     }
     this.controlSocket = 'websocket';
     this._installControlWs(threadId, connection.ws_url);
+  }
+
+  /** The transport a control verb has on the CURRENT session.
+   *
+   *  Answers from the `/connection` declaration when there is one. Without
+   *  it (an orchestrator predating `controls`) the answer is derived from the
+   *  legacy contract, which is exactly what such a server implements; and
+   *  before `/connection` resolved at all the verb is assumed socket-bound,
+   *  so it queues and is either flushed or failed once the transport is
+   *  known (see `_installControlTransport`). */
+  controlTransport(verb: string): ControlTransport {
+    const threadId = this.threadId();
+    const declared = this.controlCapabilities;
+    if (declared && threadId && declared.threadId === threadId) {
+      return declared.controls[verb] ?? 'unavailable';
+    }
+    if (this.controlSocket === 'none') {
+      return LEGACY_SOCKETLESS_REST_VERBS.has(verb) ? 'rest' : 'unavailable';
+    }
+    // Pinned (or not yet resolved): the scalars ride REST on both lanes;
+    // everything else is a socket verb, including `config.update`, whose
+    // pinned owner PATCH is refused while an agent is bound.
+    if (verb === 'mode.set' || verb === 'narration.set') return 'rest';
+    return 'websocket';
+  }
+
+  /** Drop every control frame queued for `threadId` and tell the user. Runs
+   *  when `/connection` resolves to a socketless session: the frames were
+   *  queued under the pre-resolution assumption of a socket. */
+  private _failQueuedControls(threadId: string): void {
+    const queued = this.controlOutbox.filter((item) => item.threadId === threadId);
+    if (queued.length === 0) return;
+    this.controlOutbox = this.controlOutbox.filter((item) => item.threadId !== threadId);
+    for (const item of queued) {
+      let requestId: string | undefined;
+      try {
+        requestId = JSON.parse(item.frame)?.request_id;
+      } catch {
+        requestId = undefined;
+      }
+      if (requestId) {
+        this._settlePendingConfigUpdate(requestId, {
+          ok: false,
+          requestId,
+          transport: 'unavailable',
+          message: this.transloco.translate('chat.control.unavailable'),
+        });
+      }
+    }
+    this.error.set(this.transloco.translate('chat.control.unavailable'));
+  }
+
+  private _settlePendingConfigUpdate(requestId: string, outcome: ConfigUpdateOutcome): boolean {
+    const pending = this.pendingConfigUpdates.get(requestId);
+    if (!pending) return false;
+    clearTimeout(pending.timer);
+    this.pendingConfigUpdates.delete(requestId);
+    pending.resolve(outcome);
+    return true;
+  }
+
+  private _settleAllPendingConfigUpdates(message: string): void {
+    for (const requestId of Array.from(this.pendingConfigUpdates.keys())) {
+      this._settlePendingConfigUpdate(requestId, {
+        ok: false,
+        requestId,
+        transport: 'websocket',
+        message,
+      });
+    }
   }
 
   private _connectionHasWebSocket(
@@ -3251,6 +3619,7 @@ export class PersistentChatService {
       const connection = await this._fetchConnection(threadId);
       if (!this._controlPlaneAllowed(threadId, openingGeneration)) return;
       if (!this._acceptBindingRecoveryConnection(threadId, connection)) return;
+      this._applyQueueState(threadId, connection.queue ?? null);
       if (this._connectionHasWebSocket(connection) || this.sessionSnapshotLoaded) {
         this.markSessionReady();
       }
@@ -3567,16 +3936,29 @@ export class PersistentChatService {
     this.durableControlError = null;
   }
 
-  /** Send a control-plane command. If the WS isn't open, queue the frame and
-   *  open one; the send goes out as soon as the connection establishes. */
-  private _sendControl(data: Record<string, unknown>): void {
+  /** Send a control-plane command over the session socket. If the WS isn't
+   *  open, queue the frame and open one; the send goes out as soon as the
+   *  connection establishes.
+   *
+   *  Returns false — and surfaces an error — when the verb has no socket
+   *  transport on this session. That branch used to queue the frame for a
+   *  socket a queue-served session never opens, which is how every settings
+   *  edit on such a session silently vanished. A verb with no transport is
+   *  refused here, at the one choke point, so a caller nobody rerouted fails
+   *  visibly instead of quietly. */
+  private _sendControl(data: Record<string, unknown>): boolean {
     const threadId = this.threadId();
-    if (!threadId || !this._controlPlaneAllowed(threadId)) return;
+    if (!threadId || !this._controlPlaneAllowed(threadId)) return false;
+    const verb = typeof data['method'] === 'string' ? (data['method'] as string) : '';
+    if (this.controlTransport(verb) !== 'websocket') {
+      this.error.set(this.transloco.translate('chat.control.unavailable'));
+      return false;
+    }
     const frame = JSON.stringify(data);
     if (this.controlWs?.readyState === WebSocket.OPEN) {
       try {
         this.controlWs.send(frame);
-        return;
+        return true;
       } catch {
         // Socket died between the readyState read and the write. Fall
         // through and queue rather than losing the command.
@@ -3595,6 +3977,7 @@ export class PersistentChatService {
       this.controlOutbox.shift();
     }
     this._ensureControlWs();
+    return true;
   }
 
   /** Drain frames queued for `threadId` over a freshly-opened socket.
@@ -3778,6 +4161,11 @@ export class PersistentChatService {
     // (onclose → _scheduleControlWsReconnect) never routes through
     // disconnect(), so an ordinary drop-and-reconnect still delivers.
     this.controlOutbox = [];
+    this.controlCapabilities = null;
+    // A config update still awaiting its socket ack belongs to the thread
+    // being left; settle it as not-applied so the pane can roll back rather
+    // than wait on a frame that will now never arrive here.
+    this._settleAllPendingConfigUpdates(this.transloco.translate('chat.control.applyFailed'));
     // Interrupt retries carry an exact thread + turn target. Never let a
     // pending browser timer cross navigation even though a request that
     // already committed remains safely durable on its original thread.
@@ -4164,6 +4552,9 @@ export class PersistentChatService {
   async sendMessage(content: string): Promise<boolean> {
     const trimmed = content.trim();
     const queued = this.pendingAttachments();
+    if (this.isDraftSession() && (
+      this.draftDefaultsLoading() || this.draftDefaultsError() || this.draftDatasourceIds() === null
+    )) return false;
 
     // Soft End has already closed runtime admission but has not yet settled
     // into a resumable lifecycle. Never queue a message that could leak into
@@ -4715,12 +5106,15 @@ export class PersistentChatService {
     const sentGeneration = this.sessionRuntimeGeneration;
     const sentControlEpoch = this.controlWsOpeningGeneration;
     try {
-      await firstValueFrom(
-        this.http.post<{ accepted: boolean; turn_id: number }>(
+      const accepted = await firstValueFrom(
+        this.http.post<{ accepted: boolean; turn_id: number; queue?: SessionQueueState | null }>(
           `${environment.apiUrl}/persistent/threads/${tid}/input`,
           { content },
         ),
       );
+      // The accept carries the unit's durable state: a `parked` unit took the
+      // input but nothing can claim it — render that, never "waiting".
+      this._applyQueueState(tid, accepted?.queue ?? null);
       // Accepted — the reply must now stream over SSE. Arm the one-shot
       // kickstart so a dead receive path self-heals (covers the direct
       // send and the queued-flush path, both of which route through here).
@@ -4832,8 +5226,12 @@ export class PersistentChatService {
         this._sendControl({ method: 'compact', focus: arg });
         return true;
       case '/done':
-        this._sendControl({ method: 'archive' });
-        this._systemMessage('Ending session...');
+        // _sendControl refuses (and says so) when this session has no
+        // socket transport for the verb — don't announce an end that was
+        // never dispatched.
+        if (this._sendControl({ method: 'archive' })) {
+          this._systemMessage('Ending session...');
+        }
         return true;
       case '/auto':
         this.setMode('auto_accept');
@@ -5212,18 +5610,43 @@ export class PersistentChatService {
     this._sendDurableControl({ method: 'narration.set', mode });
   }
 
-  /** Update session config (model, temperature, etc.) at runtime.
+  /** Update session config (model, temperature, tools, etc.) at runtime.
    *
-   * `datasourceIds` (Slice B) rides the same frame as a sibling key: the
+   * `datasourceIds` (Slice B) rides the same request as a sibling key: the
    * desired FULL datasource selection (undefined = no change, [] = detach
-   * all) — the agent forwards it on the grant-checked internal PATCH and
-   * re-wires connections/tools at the next turn boundary.
+   * all) — authorized and persisted server-side, re-wired at the next turn
+   * boundary.
    *
-   * Returns the request_id sent with the frame; the agent echoes it on
-   * the matching `config.changed` ack (or `error` frame), so callers with
-   * several in-flight updates can correlate outcomes. */
-  updateConfig(config: Record<string, unknown>, datasourceIds?: string[]): string {
+   * Dispatches by the session's declared transport for `config.update`:
+   *
+   * - `websocket` (pinned sessions): the frame goes to the agent, which
+   *   persists through the orchestrator and rebuilds itself live; the
+   *   returned promise settles on the echoed `config.changed` ack, on a
+   *   matching error frame, or on the ack timeout.
+   * - `rest` (queue-served sessions): the owner PATCH persists the fragment
+   *   at admission and the next claim's attach picks it up; the promise
+   *   settles on the HTTP response, and the transcript stamp the socket ack
+   *   would have journaled is written locally.
+   * - `unavailable`: settles `ok: false` immediately and surfaces the error.
+   *
+   * Always resolves (never rejects) so the caller can settle its own
+   * optimistic state either way — Replicache's speculative-then-authoritative
+   * shape: apply locally, confirm or revert on the authoritative answer. */
+  updateConfig(
+    config: Record<string, unknown>,
+    datasourceIds?: string[],
+  ): Promise<ConfigUpdateOutcome> {
     const requestId = crypto.randomUUID();
+    const threadId = this.threadId();
+    const transport = this.controlTransport('config.update');
+    if (!threadId || transport === 'unavailable') {
+      const message = this.transloco.translate('chat.control.unavailable');
+      if (threadId) this.error.set(message);
+      return Promise.resolve({ ok: false, requestId, transport, message });
+    }
+    if (transport === 'rest') {
+      return this._updateConfigOverRest(threadId, requestId, config, datasourceIds);
+    }
     const frame: Record<string, unknown> = {
       method: 'config.update',
       config,
@@ -5232,8 +5655,87 @@ export class PersistentChatService {
     if (datasourceIds !== undefined) {
       frame['datasource_ids'] = datasourceIds;
     }
-    this._sendControl(frame);
-    return requestId;
+    return new Promise<ConfigUpdateOutcome>((resolve) => {
+      const timer = setTimeout(() => {
+        const message = this.transloco.translate('chat.control.applyTimeout');
+        if (this._settlePendingConfigUpdate(requestId, { ok: false, requestId, transport, message })) {
+          if (this.threadId() === threadId) this.error.set(message);
+        }
+      }, CONFIG_UPDATE_ACK_TIMEOUT_MS);
+      this.pendingConfigUpdates.set(requestId, { threadId, resolve, timer });
+      if (!this._sendControl(frame)) {
+        this._settlePendingConfigUpdate(requestId, {
+          ok: false,
+          requestId,
+          transport,
+          message: this.transloco.translate('chat.control.unavailable'),
+        });
+      }
+    });
+  }
+
+  /** The socketless half of `updateConfig`: `PATCH /api/persistent/threads/
+   *  {id}/config` (the Slice C owner endpoint, whose connected-gate passes by
+   *  construction on a session that binds no agent). */
+  private async _updateConfigOverRest(
+    threadId: string,
+    requestId: string,
+    config: Record<string, unknown>,
+    datasourceIds?: string[],
+  ): Promise<ConfigUpdateOutcome> {
+    const body: Record<string, unknown> = { config_override: config };
+    if (datasourceIds !== undefined) body['datasource_ids'] = datasourceIds;
+    try {
+      const response = await firstValueFrom(
+        this.http.patch<{
+          status: string;
+          config_override?: Record<string, unknown>;
+          datasource_ids?: string[] | null;
+          effective?: 'next_turn' | 'next_attach';
+        }>(`${environment.apiUrl}/persistent/threads/${threadId}/config`, body),
+      );
+      if (this.threadId() !== threadId) {
+        // Persisted on the old thread; nothing to paint here.
+        return { ok: true, requestId, transport: 'rest', applied: {}, effective: 'next_turn' };
+      }
+      const applied = (response?.config_override ?? config) as Record<string, unknown>;
+      // Mirror what the socket ack would have done to the live chips.
+      const llm = applied['llm'] as Record<string, unknown> | undefined;
+      if (typeof llm?.['model'] === 'string' && llm['model']) {
+        this.modelName.set(llm['model'] as string);
+      }
+      if (typeof llm?.['temperature'] === 'number') {
+        this.temperature.set(llm['temperature'] as number);
+      }
+      const stamp = describeAppliedConfig(applied);
+      if (datasourceIds !== undefined) stamp.push('connectors updated');
+      if (stamp.length) {
+        this._systemMessage(
+          this.transloco.translate('chat.control.appliedNextTurn', {
+            summary: stamp.join(' · '),
+          }),
+        );
+      }
+      return {
+        ok: true,
+        requestId,
+        transport: 'rest',
+        applied,
+        effective: response?.effective ?? 'next_turn',
+      };
+    } catch (err: any) {
+      const detail = err?.error?.detail;
+      const detailText =
+        typeof detail === 'string'
+          ? detail
+          : typeof detail?.message === 'string'
+            ? detail.message
+            : '';
+      const headline = this.transloco.translate('chat.control.applyFailed');
+      const message = this.sanitizeError(detailText ? `${headline}: ${detailText}` : headline);
+      if (this.threadId() === threadId) this.error.set(message);
+      return { ok: false, requestId, transport: 'rest', message };
+    }
   }
 
   /** Rewind the session to just before an earlier user message.
@@ -5322,6 +5824,12 @@ export class PersistentChatService {
    * is deliberate for the same reason: accepting from the pane while the card
    * is live has to dismiss it too. */
   upgradeWorkspace(tier: 'sandbox' | 'vm', opts: { thenContinue?: boolean } = {}): void {
+    if (this.controlTransport('upgrade-to-workspace') !== 'websocket') {
+      // No transport on this session (queue-served sessions have none yet):
+      // refuse before arming the in-progress state, and say so.
+      this.error.set(this.transloco.translate('chat.control.unavailable'));
+      return;
+    }
     this.pendingWorkspaceOffer.set(null);
     this.continueAfterUpgrade.set(opts.thenContinue === true);
     this._sendControl({ method: 'upgrade-to-workspace', target_tier: tier });
@@ -5531,6 +6039,8 @@ export class PersistentChatService {
         // awaiting state. Clamped: a turn can start without a tracked
         // accept (other tab, injected input, reload mid-queue).
         this.pendingTurnCount.update((c) => Math.max(0, c - 1));
+        // A live turn means the unit is leased: any parked/queued block is stale.
+        this._queueState.set(null);
         const turnId = String(params['turn_id'] ?? makeLocalId('turn'));
         const pendingInterrupt = this.pendingInterruptRequest;
         const pendingWasActive =
@@ -5935,6 +6445,18 @@ export class PersistentChatService {
           this._systemMessage(
             `Session settings updated: ${stamp.join(' · ')} — applies from the next response.`,
           );
+        }
+        // The ack the socket path awaits (P0.3 request_id echo) — the
+        // caller's optimistic state is confirmed here, not at send time.
+        const ackRequestId = params['request_id'] as string | undefined;
+        if (ackRequestId) {
+          this._settlePendingConfigUpdate(ackRequestId, {
+            ok: true,
+            requestId: ackRequestId,
+            transport: 'websocket',
+            applied: applied ?? {},
+            effective: 'now',
+          });
         }
         break;
       }
@@ -6369,7 +6891,19 @@ export class PersistentChatService {
         // generic headline.
         const detail = params['detail'] as string | undefined;
         const message = params['message'] as string;
-        this.error.set(this.sanitizeError(detail ? `${message}: ${detail}` : message));
+        const sanitized = this.sanitizeError(detail ? `${message}: ${detail}` : message);
+        this.error.set(sanitized);
+        // A config.update the agent refused (grant denial, fit-ladder
+        // rejection, invalid override) settles its caller so the pane can
+        // roll the edit back instead of showing a value the session never took.
+        if (errorRequestId) {
+          this._settlePendingConfigUpdate(errorRequestId, {
+            ok: false,
+            requestId: errorRequestId,
+            transport: 'websocket',
+            message: sanitized,
+          });
+        }
         break;
       }
     }
@@ -6507,6 +7041,41 @@ export class PersistentChatService {
       return msg.slice(0, 240) + '…';
     }
     return msg;
+  }
+
+  /**
+   * Readiness observed from durable state instead of the lifecycle stream.
+   *
+   * `sessionReady` is otherwise only ever flipped by a *live* signal: the
+   * agent's `session.state` welcome frame, an SSE `ready` frame the snapshot
+   * cursor did not already cover, or `/connection` resolving — and on a
+   * socketless (queue-served) session that last path additionally requires
+   * the durable `/state` read of the *same* connect to have succeeded
+   * (`sessionSnapshotLoaded`). Any interleaving where those don't line up —
+   * a `/state` that failed, a `/connection` still polling behind a
+   * not-yet-ready protected-cloud runtime, a replayed `ready` suppressed as
+   * covered-by-snapshot — leaves the start panel up over a session that has
+   * already answered. See
+   * knowledge-base/knowledge/issues/session_start_panel_never_yields_to_a_completed_first_turn.md
+   *
+   * Durable evidence settles it: a thread that has transcript rows AND whose
+   * run-queue unit reached `done` has demonstrably run a turn to completion,
+   * so the session is admissible whatever the client saw. Both facts already
+   * ride payloads this service fetches (`GET …/messages`, and the `queue`
+   * block on `/connection`, `POST …/input` and `GET …/queue`) — nothing new
+   * is asked of the server. The pinned lane has no unit (`queue` is null
+   * there), so this is a queue-served-lane repair by construction, and
+   * `markSessionReady` still owns every retirement/ownership guard.
+   */
+  private _reconcileReadinessFromDurableState(): void {
+    if (this.sessionReady()) return;
+    // Only `done` proves a completed turn. `queued`/`leased` are in flight,
+    // `parked` is stalled, `none` never enqueued — none of them is evidence.
+    if (this.queueState()?.state !== 'done') return;
+    // Yield the panel only once the transcript the queue is talking about is
+    // actually on screen; otherwise the user trades a spinner for a blank.
+    if (this.durableMessageCount() <= 0) return;
+    this.markSessionReady();
   }
 
   /** Mark the session as ready and flush any pending message. */

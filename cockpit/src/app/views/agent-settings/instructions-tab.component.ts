@@ -1,6 +1,7 @@
 import {Component, computed, input, output, signal} from '@angular/core';
 import {FormsModule} from '@angular/forms';
 import {AppSpinnerComponent} from '../../ui/spinner';
+import {AppButtonComponent} from '../../ui/button';
 
 /**
  * Instructions tab: full-height markdown textarea with clear and reset actions.
@@ -10,7 +11,7 @@ import {AppSpinnerComponent} from '../../ui/spinner';
 @Component({
   selector: 'app-instructions-tab',
   standalone: true,
-  imports: [FormsModule, AppSpinnerComponent],
+  imports: [FormsModule, AppSpinnerComponent, AppButtonComponent],
   template: `
     <div class="instructions-container">
       <div class="instructions-header">
@@ -31,20 +32,10 @@ import {AppSpinnerComponent} from '../../ui/spinner';
 
       <div class="instructions-actions">
         @if (content()) {
-          <button
-            type="button"
-            class="btn-text"
-            (click)="clearContent()"
-            [disabled]="disabled()"
-          >Clear</button>
+          <app-button variant="ghost" size="sm" [disabled]="disabled()" (clicked)="clearContent()">Clear</app-button>
         }
         @if (hasExpertDefault()) {
-          <button
-            type="button"
-            class="btn-text"
-            (click)="resetToExpert()"
-            [disabled]="disabled() || loadingExpert()"
-          >Reset to expert default</button>
+          <app-button variant="ghost" size="sm" [disabled]="disabled() || loadingExpert()" (clicked)="resetToExpert()">Reset to expert default</app-button>
         }
       </div>
     </div>
@@ -94,23 +85,6 @@ import {AppSpinnerComponent} from '../../ui/spinner';
     .instructions-actions {
       display: flex;
       gap: 12px;
-    }
-    .btn-text {
-      padding: 4px 0;
-      border: none;
-      background: none;
-      color: var(--accent-color, var(--accent-color));
-      font-size: 12px;
-      cursor: pointer;
-      text-decoration: underline;
-      text-underline-offset: 2px;
-    }
-    .btn-text:hover {
-      opacity: 0.8;
-    }
-    .btn-text:disabled {
-      opacity: 0.5;
-      cursor: not-allowed;
     }
   `],
 })

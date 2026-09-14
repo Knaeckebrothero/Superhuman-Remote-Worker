@@ -167,6 +167,14 @@ async def require_vm_guest(
         and bool(generation)
         and vm.get("status") not in _INACTIVE_VM_STATUSES
     )
+    if eligible and entity_type == "job" and vm.get("workspace_storage") is not None:
+        from orchestrator.services.retained_vm_workspaces import (
+            guest_attachment_is_current,
+        )
+
+        eligible = await guest_attachment_is_current(
+            db, entity_id, vm["workspace_storage"]
+        )
     comparison_generation = generation if isinstance(generation, str) else None
     comparison_generation = comparison_generation or _DUMMY_GENERATION
 

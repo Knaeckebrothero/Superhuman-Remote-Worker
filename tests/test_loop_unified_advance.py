@@ -1,8 +1,8 @@
 """Unified loop engine, Phase 1 (knowledge-base/knowledge/features/loop_unified_engine.md).
 
 Every turn — width 1 included — is barrier-tracked in ``current_stage_jobs``:
-``_writeback_loop_stage`` writes the membership plus the width-1 display
-mirror, ``_advance_project_loop`` routes every member through the atomic
+``writeback_loop_stage`` writes the membership plus the width-1 display
+mirror, ``advance_project_loop`` routes every member through the atomic
 barrier, the winner threads its own job + context into the rotate (so the
 campaign step fires from the barrier path), and stop-writes clear BOTH
 pointer columns. The legacy single-job rotate path is gone.
@@ -12,11 +12,50 @@ from __future__ import annotations
 
 import uuid
 from contextlib import ExitStack
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from orchestrator.services.project_loop_advance import (
+    advance_project_loop,
+    resume_project_loop,
+    rotate_loop_to_next_stage,
+    spawn_campaign_member,
+)
+from orchestrator.services.project_loop_spawn import (
+    ProjectLoopDependencies,
+    spawn_loop_job,
+    spawn_loop_stage,
+    writeback_loop_stage,
+)
+
 LOOP_ID = "105a6f98-134c-4077-b7e1-6d08916650d7"
+
+
+def _deps(**over) -> ProjectLoopDependencies:
+    """The loop engine's one dependency object, built from mocks.
+
+    ``main._project_loop_dependencies()`` binds these fields to the live
+    application globals; the suite binds them to mocks and a test overrides
+    only the field it actually steers.
+    """
+    fields = dict(
+        store=AsyncMock(),
+        vector_store=None,
+        notifier=AsyncMock(),
+        gitea_client=MagicMock(),
+        main_cloud_router=MagicMock(),
+        trigger_dispatch=MagicMock(),
+        kick_officer_event_drain=MagicMock(),
+        enforce_dispatch_grants=AsyncMock(),
+        reindex_project_kb=AsyncMock(),
+        # Mirrors ``COMPLETION_COMMANDS_ENABLED``'s default: this file
+        # exercises the direct advance, not the durable-command route.
+        completion_commands_enabled=lambda: False,
+        completion_sweep_router=MagicMock(),
+    )
+    fields.update(over)
+    return ProjectLoopDependencies(**fields)
 
 
 def _job(*, role: str = "scholar", status: str = "completed", **ctx_over) -> dict:
@@ -58,18 +97,16 @@ class TestWritebackLoopStage:
     @pytest.mark.asyncio
     async def test_width1_writes_membership_and_display_mirror(self):
         db = AsyncMock()
-        with patch("orchestrator.main.postgres_db", db):
-            from orchestrator.main import _writeback_loop_stage
-
-            await _writeback_loop_stage(
-                LOOP_ID,
-                jobs=[{"id": "job-1"}],
-                seq_index=1,
-                remaining=4,
-                total=2,
-                consecutive=0,
-                last_error=None,
-            )
+        await writeback_loop_stage(
+            LOOP_ID,
+            jobs=[{"id": "job-1"}],
+            seq_index=1,
+            remaining=4,
+            total=2,
+            consecutive=0,
+            last_error=None,
+            dependencies=_deps(store=db),
+        )
         kw = db.update_project_loop.call_args.kwargs
         assert kw["current_stage_jobs"] == ["job-1"]
         assert kw["current_job_id"] == "job-1"
@@ -78,18 +115,16 @@ class TestWritebackLoopStage:
     @pytest.mark.asyncio
     async def test_fanout_writes_membership_with_null_mirror(self):
         db = AsyncMock()
-        with patch("orchestrator.main.postgres_db", db):
-            from orchestrator.main import _writeback_loop_stage
-
-            await _writeback_loop_stage(
-                LOOP_ID,
-                jobs=[{"id": "a"}, {"id": "b"}],
-                seq_index=0,
-                remaining=4,
-                total=3,
-                consecutive=0,
-                last_error=None,
-            )
+        await writeback_loop_stage(
+            LOOP_ID,
+            jobs=[{"id": "a"}, {"id": "b"}],
+            seq_index=0,
+            remaining=4,
+            total=3,
+            consecutive=0,
+            last_error=None,
+            dependencies=_deps(store=db),
+        )
         kw = db.update_project_loop.call_args.kwargs
         assert kw["current_stage_jobs"] == ["a", "b"]
         assert kw["current_job_id"] is None
@@ -109,30 +144,34 @@ def _advance_db(loop: dict, jobs: list[dict], *, barrier: bool = True) -> AsyncM
     return db
 
 
+_ADV = "orchestrator.services.project_loop_advance"
+_SPAWN = "orchestrator.services.project_loop_spawn"
+
+
 def _advance_patches(
     stack: ExitStack,
     db: AsyncMock,
     *,
     rotate: AsyncMock | None,
     notify: AsyncMock | None = None,
-):
-    stack.enter_context(patch("orchestrator.main.postgres_db", db))
+) -> ProjectLoopDependencies:
+    """Stub the advance's own collaborators and return its dependency object.
+
+    ``record_loop_job_outcome`` / ``notify_loop_*`` / ``rotate_loop_to_next_stage``
+    are resolved through ``project_loop_advance``'s module namespace, so the
+    patch has to land there — patching them on ``main`` would be inert.
+    """
     stack.enter_context(
         patch(
-            "orchestrator.main._record_loop_job_outcome",
+            f"{_ADV}.record_loop_job_outcome",
             AsyncMock(return_value=("no-changes", None)),
         )
     )
-    stack.enter_context(
-        patch("orchestrator.main._notify_loop_user_questions", AsyncMock())
-    )
-    stack.enter_context(
-        patch("orchestrator.main._notify_loop_event", notify or AsyncMock())
-    )
+    stack.enter_context(patch(f"{_ADV}.notify_loop_user_questions", AsyncMock()))
+    stack.enter_context(patch(f"{_ADV}.notify_loop_event", notify or AsyncMock()))
     if rotate is not None:
-        stack.enter_context(
-            patch("orchestrator.main._rotate_loop_to_next_stage", rotate)
-        )
+        stack.enter_context(patch(f"{_ADV}.rotate_loop_to_next_stage", rotate))
+    return _deps(store=db)
 
 
 class TestUnifiedAdvance:
@@ -143,10 +182,8 @@ class TestUnifiedAdvance:
         db = _advance_db(loop, [job])
         rotate = AsyncMock()
         with ExitStack() as stack:
-            _advance_patches(stack, db, rotate=rotate)
-            from orchestrator.main import _advance_project_loop
-
-            await _advance_project_loop(job, {}, [])
+            deps = _advance_patches(stack, db, rotate=rotate)
+            await advance_project_loop(job, {}, [], dependencies=deps)
         db.claim_project_loop_stage_barrier.assert_awaited_once_with(LOOP_ID, job["id"])
         kw = rotate.await_args.kwargs
         assert kw["completed_job"] is job
@@ -162,10 +199,8 @@ class TestUnifiedAdvance:
         db = _advance_db(loop, [member, stray])
         rotate = AsyncMock()
         with ExitStack() as stack:
-            _advance_patches(stack, db, rotate=rotate)
-            from orchestrator.main import _advance_project_loop
-
-            await _advance_project_loop(stray, {}, [])
+            deps = _advance_patches(stack, db, rotate=rotate)
+            await advance_project_loop(stray, {}, [], dependencies=deps)
         db.claim_project_loop_stage_barrier.assert_not_awaited()
         rotate.assert_not_awaited()
 
@@ -178,10 +213,8 @@ class TestUnifiedAdvance:
         db = _advance_db(loop, [job])
         rotate = AsyncMock()
         with ExitStack() as stack:
-            _advance_patches(stack, db, rotate=rotate)
-            from orchestrator.main import _advance_project_loop
-
-            await _advance_project_loop(job, {}, [])
+            deps = _advance_patches(stack, db, rotate=rotate)
+            await advance_project_loop(job, {}, [], dependencies=deps)
         db.claim_project_loop_stage_barrier.assert_not_awaited()
         rotate.assert_not_awaited()
 
@@ -192,10 +225,8 @@ class TestUnifiedAdvance:
         db = _advance_db(loop, [job], barrier=False)
         rotate = AsyncMock()
         with ExitStack() as stack:
-            _advance_patches(stack, db, rotate=rotate)
-            from orchestrator.main import _advance_project_loop
-
-            await _advance_project_loop(job, {}, [])
+            deps = _advance_patches(stack, db, rotate=rotate)
+            await advance_project_loop(job, {}, [], dependencies=deps)
         rotate.assert_not_awaited()
         db.update_project_loop.assert_not_awaited()
 
@@ -210,10 +241,8 @@ class TestUnifiedAdvance:
         db = _advance_db(loop, [job])
         rotate = AsyncMock()
         with ExitStack() as stack:
-            _advance_patches(stack, db, rotate=rotate)
-            from orchestrator.main import _advance_project_loop
-
-            await _advance_project_loop(job, {}, [])
+            deps = _advance_patches(stack, db, rotate=rotate)
+            await advance_project_loop(job, {}, [], dependencies=deps)
         rotate.assert_not_awaited()
         kw = db.update_project_loop.call_args.kwargs
         assert kw["status"] == "completed" and kw["stop_reason"] == "budget"
@@ -227,10 +256,8 @@ class TestUnifiedAdvance:
         db = _advance_db(loop, [job])
         rotate = AsyncMock()
         with ExitStack() as stack:
-            _advance_patches(stack, db, rotate=rotate)
-            from orchestrator.main import _advance_project_loop
-
-            await _advance_project_loop(job, {"error": "kaboom"}, [])
+            deps = _advance_patches(stack, db, rotate=rotate)
+            await advance_project_loop(job, {"error": "kaboom"}, [], dependencies=deps)
         kw = rotate.await_args.kwargs
         assert kw["consecutive"] == 1
         assert kw["last_error"] == "kaboom"  # not the fan-out aggregate string
@@ -248,10 +275,8 @@ class TestUnifiedAdvance:
         db = _advance_db(loop, [ok, bad])
         rotate = AsyncMock()
         with ExitStack() as stack:
-            _advance_patches(stack, db, rotate=rotate)
-            from orchestrator.main import _advance_project_loop
-
-            await _advance_project_loop(ok, {}, [])
+            deps = _advance_patches(stack, db, rotate=rotate)
+            await advance_project_loop(ok, {}, [], dependencies=deps)
         kw = rotate.await_args.kwargs
         assert kw["consecutive"] == 0 and kw["last_error"] is None
 
@@ -271,13 +296,9 @@ class TestUnifiedAdvance:
         db = _advance_db(loop, [job])
         planner = AsyncMock(return_value=(True, None))  # handled: member spawned
         with ExitStack() as stack:
-            _advance_patches(stack, db, rotate=None)
-            stack.enter_context(
-                patch("orchestrator.main._advance_planner_campaign", planner)
-            )
-            from orchestrator.main import _advance_project_loop
-
-            await _advance_project_loop(job, {}, [])
+            deps = _advance_patches(stack, db, rotate=None)
+            stack.enter_context(patch(f"{_ADV}.advance_planner_campaign", planner))
+            await advance_project_loop(job, {}, [], dependencies=deps)
         planner.assert_awaited_once()
         kw = planner.await_args.kwargs
         assert kw["completed_job"] is job
@@ -297,13 +318,11 @@ class TestResume:
         by_id = {done["id"]: done, running["id"]: running}
         db.get_job.side_effect = lambda jid: by_id.get(str(jid))
         adv = AsyncMock()
+        deps = _deps(store=db)
         with ExitStack() as stack:
-            stack.enter_context(patch("orchestrator.main.postgres_db", db))
-            stack.enter_context(patch("orchestrator.main._advance_project_loop", adv))
-            from orchestrator.main import _resume_project_loop
-
-            await _resume_project_loop(LOOP_ID)
-        adv.assert_awaited_once_with(done, {}, [])
+            stack.enter_context(patch(f"{_ADV}.advance_project_loop", adv))
+            await resume_project_loop(LOOP_ID, dependencies=deps)
+        adv.assert_awaited_once_with(done, {}, [], dependencies=deps)
 
 
 # =============================================================================
@@ -335,11 +354,12 @@ class TestCooldownPark:
         reset_at = _time.time() + 7200
         actions: list = []
         with ExitStack() as stack:
-            _advance_patches(stack, db, rotate=rotate, notify=notify)
-            from orchestrator.main import _advance_project_loop
-
-            await _advance_project_loop(
-                job, {"error": _cooldown_error(reset_at)}, actions
+            deps = _advance_patches(stack, db, rotate=rotate, notify=notify)
+            await advance_project_loop(
+                job,
+                {"error": _cooldown_error(reset_at)},
+                actions,
+                dependencies=deps,
             )
         kw = rotate.await_args.kwargs
         assert kw["park_until"] is not None
@@ -359,11 +379,12 @@ class TestCooldownPark:
         db = _advance_db(loop, [job])
         rotate, notify = AsyncMock(), AsyncMock()
         with ExitStack() as stack:
-            _advance_patches(stack, db, rotate=rotate, notify=notify)
-            from orchestrator.main import _advance_project_loop
-
-            await _advance_project_loop(
-                job, {"error": _cooldown_error(_time.time() - 60)}, []
+            deps = _advance_patches(stack, db, rotate=rotate, notify=notify)
+            await advance_project_loop(
+                job,
+                {"error": _cooldown_error(_time.time() - 60)},
+                [],
+                dependencies=deps,
             )
         assert rotate.await_args.kwargs["park_until"] is None
         notify.assert_not_awaited()
@@ -375,11 +396,12 @@ class TestCooldownPark:
         db = _advance_db(loop, [job])
         rotate, notify = AsyncMock(), AsyncMock()
         with ExitStack() as stack:
-            _advance_patches(stack, db, rotate=rotate, notify=notify)
-            from orchestrator.main import _advance_project_loop
-
-            await _advance_project_loop(
-                job, {"error": {"message": "boom", "type": "llm_error"}}, []
+            deps = _advance_patches(stack, db, rotate=rotate, notify=notify)
+            await advance_project_loop(
+                job,
+                {"error": {"message": "boom", "type": "llm_error"}},
+                [],
+                dependencies=deps,
             )
         kw = rotate.await_args.kwargs
         assert kw["park_until"] is None
@@ -401,10 +423,8 @@ class TestCooldownPark:
         db = _advance_db(loop, [job])
         rotate = AsyncMock()
         with ExitStack() as stack:
-            _advance_patches(stack, db, rotate=rotate)
-            from orchestrator.main import _advance_project_loop
-
-            await _advance_project_loop(job, {}, [])
+            deps = _advance_patches(stack, db, rotate=rotate)
+            await advance_project_loop(job, {}, [], dependencies=deps)
         kw = rotate.await_args.kwargs
         assert kw["park_until"] is not None
         assert abs(kw["park_until"].timestamp() - reset_at) < 2
@@ -428,10 +448,10 @@ class TestCooldownPark:
         )
         rotate = AsyncMock()
         with ExitStack() as stack:
-            _advance_patches(stack, db, rotate=rotate)
-            from orchestrator.main import _advance_project_loop
-
-            await _advance_project_loop(winner, {"error": _cooldown_error(t1)}, [])
+            deps = _advance_patches(stack, db, rotate=rotate)
+            await advance_project_loop(
+                winner, {"error": _cooldown_error(t1)}, [], dependencies=deps
+            )
         kw = rotate.await_args.kwargs
         assert abs(kw["park_until"].timestamp() - t2) < 2
         # Only the sibling needed a row refetch — the winner rode the payload.
@@ -458,10 +478,8 @@ class TestCooldownPark:
         )
         rotate = AsyncMock()
         with ExitStack() as stack:
-            _advance_patches(stack, db, rotate=rotate)
-            from orchestrator.main import _advance_project_loop
-
-            await _advance_project_loop(ok, {}, [])
+            deps = _advance_patches(stack, db, rotate=rotate)
+            await advance_project_loop(ok, {}, [], dependencies=deps)
         kw = rotate.await_args.kwargs
         assert kw["consecutive"] == 0
         assert abs(kw["park_until"].timestamp() - reset_at) < 2
@@ -477,11 +495,12 @@ class TestCooldownPark:
         db = _advance_db(loop, [job])
         rotate = AsyncMock()
         with ExitStack() as stack:
-            _advance_patches(stack, db, rotate=rotate)
-            from orchestrator.main import _advance_project_loop
-
-            await _advance_project_loop(
-                job, {"error": _cooldown_error(_time.time() + 365 * 24 * 3600)}, []
+            deps = _advance_patches(stack, db, rotate=rotate)
+            await advance_project_loop(
+                job,
+                {"error": _cooldown_error(_time.time() + 365 * 24 * 3600)},
+                [],
+                dependencies=deps,
             )
         park = rotate.await_args.kwargs["park_until"]
         assert (
@@ -502,11 +521,12 @@ class TestCooldownPark:
         db = _advance_db(loop, [job])
         rotate, notify = AsyncMock(), AsyncMock()
         with ExitStack() as stack:
-            _advance_patches(stack, db, rotate=rotate, notify=notify)
-            from orchestrator.main import _advance_project_loop
-
-            await _advance_project_loop(
-                job, {"error": _cooldown_error(_time.time() + 7200)}, []
+            deps = _advance_patches(stack, db, rotate=rotate, notify=notify)
+            await advance_project_loop(
+                job,
+                {"error": _cooldown_error(_time.time() + 7200)},
+                [],
+                dependencies=deps,
             )
         rotate.assert_not_awaited()
         notify.assert_not_awaited()
@@ -524,14 +544,9 @@ class TestParkThreading:
         db = AsyncMock()
         spawn = AsyncMock(return_value=([{"id": "j2"}], 2))
         with ExitStack() as stack:
-            stack.enter_context(patch("orchestrator.main.postgres_db", db))
-            stack.enter_context(patch("orchestrator.main._spawn_loop_stage", spawn))
-            stack.enter_context(
-                patch("orchestrator.main._writeback_loop_stage", AsyncMock())
-            )
-            from orchestrator.main import _rotate_loop_to_next_stage
-
-            await _rotate_loop_to_next_stage(
+            stack.enter_context(patch(f"{_ADV}.spawn_loop_stage", spawn))
+            stack.enter_context(patch(f"{_ADV}.writeback_loop_stage", AsyncMock()))
+            await rotate_loop_to_next_stage(
                 loop,
                 seq_index_completed=0,
                 base_total=1,
@@ -540,6 +555,7 @@ class TestParkThreading:
                 last_error=None,
                 actions=[],
                 park_until=park,
+                dependencies=_deps(store=db),
             )
         assert spawn.await_args.kwargs["park_until"] == park
 
@@ -552,13 +568,8 @@ class TestParkThreading:
         loop = _loop(scheduling="campaign")
         planner = AsyncMock(return_value=(True, None))
         with ExitStack() as stack:
-            stack.enter_context(patch("orchestrator.main.postgres_db", AsyncMock()))
-            stack.enter_context(
-                patch("orchestrator.main._advance_planner_campaign", planner)
-            )
-            from orchestrator.main import _rotate_loop_to_next_stage
-
-            await _rotate_loop_to_next_stage(
+            stack.enter_context(patch(f"{_ADV}.advance_planner_campaign", planner))
+            await rotate_loop_to_next_stage(
                 loop,
                 seq_index_completed=0,
                 base_total=1,
@@ -570,6 +581,7 @@ class TestParkThreading:
                 completed_ctx=job["context"],
                 completed_failed=True,
                 park_until=park,
+                dependencies=_deps(),
             )
         assert planner.await_args.kwargs["park_until"] == park
 
@@ -582,14 +594,9 @@ class TestParkThreading:
         campaign = {"id": "c1", "title": "t", "stages": ["developer"]}
         spawn = AsyncMock(return_value=([{"id": "j3"}], 2))
         with ExitStack() as stack:
-            stack.enter_context(patch("orchestrator.main.postgres_db", AsyncMock()))
-            stack.enter_context(patch("orchestrator.main._spawn_loop_stage", spawn))
-            stack.enter_context(
-                patch("orchestrator.main._writeback_loop_stage", AsyncMock())
-            )
-            from orchestrator.main import _spawn_campaign_member
-
-            await _spawn_campaign_member(
+            stack.enter_context(patch(f"{_ADV}.spawn_loop_stage", spawn))
+            stack.enter_context(patch(f"{_ADV}.writeback_loop_stage", AsyncMock()))
+            await spawn_campaign_member(
                 loop,
                 campaign=campaign,
                 stage_index=0,
@@ -600,6 +607,7 @@ class TestParkThreading:
                 last_error=None,
                 actions=[],
                 park_until=park,
+                dependencies=_deps(),
             )
         assert spawn.await_args.kwargs["park_until"] == park
 
@@ -611,8 +619,6 @@ class TestParkThreading:
         loop = _loop()
         create = AsyncMock(return_value={"id": "j4"})
         with ExitStack() as stack:
-            stack.enter_context(patch("orchestrator.main.postgres_db", AsyncMock()))
-            stack.enter_context(patch("orchestrator.main._trigger_dispatch"))
             stack.enter_context(
                 patch("orchestrator.services.project_loops.create_loop_job", create)
             )
@@ -622,9 +628,13 @@ class TestParkThreading:
                     AsyncMock(),
                 )
             )
-            from orchestrator.main import _spawn_loop_job
-
-            await _spawn_loop_job(loop, role="critic", iteration=2, park_until=park)
+            await spawn_loop_job(
+                loop,
+                role="critic",
+                iteration=2,
+                park_until=park,
+                dependencies=_deps(),
+            )
         assert create.await_args.kwargs["park_until"] == park
 
 
@@ -651,13 +661,15 @@ class TestSpawnRequiresUnattendedOperationsGrant:
         job = AsyncMock()
         db = self._db(granted=False)
         with ExitStack() as stack:
-            stack.enter_context(patch("orchestrator.main.postgres_db", db))
-            stack.enter_context(patch("orchestrator.main._spawn_loop_job", job))
-            from orchestrator.main import _spawn_loop_stage
-
+            stack.enter_context(patch(f"{_SPAWN}.spawn_loop_job", job))
             with pytest.raises(PermissionError) as exc:
-                await _spawn_loop_stage(
-                    loop, stage="scholar", seq_index=0, base_total=0, remaining=5
+                await spawn_loop_stage(
+                    loop,
+                    stage="scholar",
+                    seq_index=0,
+                    base_total=0,
+                    remaining=5,
+                    dependencies=_deps(store=db),
                 )
 
         assert "unattended_operations" in str(exc.value)
@@ -669,12 +681,14 @@ class TestSpawnRequiresUnattendedOperationsGrant:
         job = AsyncMock(return_value={"id": "j1"})
         db = self._db(granted=True)
         with ExitStack() as stack:
-            stack.enter_context(patch("orchestrator.main.postgres_db", db))
-            stack.enter_context(patch("orchestrator.main._spawn_loop_job", job))
-            from orchestrator.main import _spawn_loop_stage
-
-            jobs, total = await _spawn_loop_stage(
-                loop, stage="scholar", seq_index=0, base_total=0, remaining=5
+            stack.enter_context(patch(f"{_SPAWN}.spawn_loop_job", job))
+            jobs, total = await spawn_loop_stage(
+                loop,
+                stage="scholar",
+                seq_index=0,
+                base_total=0,
+                remaining=5,
+                dependencies=_deps(store=db),
             )
 
         assert total == 1
@@ -687,12 +701,14 @@ class TestSpawnRequiresUnattendedOperationsGrant:
         loop = _loop(owner_id="u7", project_id="p9")
         db = self._db(granted=True, owner={"id": "u7"})
         with ExitStack() as stack:
-            stack.enter_context(patch("orchestrator.main.postgres_db", db))
-            stack.enter_context(patch("orchestrator.main._spawn_loop_job", AsyncMock()))
-            from orchestrator.main import _spawn_loop_stage
-
-            await _spawn_loop_stage(
-                loop, stage="scholar", seq_index=0, base_total=0, remaining=5
+            stack.enter_context(patch(f"{_SPAWN}.spawn_loop_job", AsyncMock()))
+            await spawn_loop_stage(
+                loop,
+                stage="scholar",
+                seq_index=0,
+                base_total=0,
+                remaining=5,
+                dependencies=_deps(store=db),
             )
 
         assert db.get_user.await_args.args == ("u7",)
@@ -707,12 +723,14 @@ class TestSpawnRequiresUnattendedOperationsGrant:
         loop = _loop(project_id="p1")  # no owner_id
         db = self._db(granted=False)
         with ExitStack() as stack:
-            stack.enter_context(patch("orchestrator.main.postgres_db", db))
-            stack.enter_context(patch("orchestrator.main._spawn_loop_job", AsyncMock()))
-            from orchestrator.main import _spawn_loop_stage
-
-            await _spawn_loop_stage(
-                loop, stage="scholar", seq_index=0, base_total=0, remaining=5
+            stack.enter_context(patch(f"{_SPAWN}.spawn_loop_job", AsyncMock()))
+            await spawn_loop_stage(
+                loop,
+                stage="scholar",
+                seq_index=0,
+                base_total=0,
+                remaining=5,
+                dependencies=_deps(store=db),
             )
 
         db.user_can_run_unattended_operations.assert_not_awaited()
@@ -734,10 +752,10 @@ class TestTurnOutcomeReachesRotation:
         db = _advance_db(loop, [job])
         rotate = AsyncMock()
         with ExitStack() as stack:
-            _advance_patches(stack, db, rotate=rotate)
-            from orchestrator.main import _advance_project_loop
-
-            await _advance_project_loop(job, {"error": "critic blew up"}, [])
+            deps = _advance_patches(stack, db, rotate=rotate)
+            await advance_project_loop(
+                job, {"error": "critic blew up"}, [], dependencies=deps
+            )
         kw = rotate.await_args.kwargs
         assert kw["turn_all_failed"] is True
         assert kw["consecutive"] == 1
@@ -749,10 +767,8 @@ class TestTurnOutcomeReachesRotation:
         db = _advance_db(loop, [job])
         rotate = AsyncMock()
         with ExitStack() as stack:
-            _advance_patches(stack, db, rotate=rotate)
-            from orchestrator.main import _advance_project_loop
-
-            await _advance_project_loop(job, {}, [])
+            deps = _advance_patches(stack, db, rotate=rotate)
+            await advance_project_loop(job, {}, [], dependencies=deps)
         assert rotate.await_args.kwargs["turn_all_failed"] is False
 
     @pytest.mark.asyncio
@@ -763,10 +779,10 @@ class TestTurnOutcomeReachesRotation:
         db = _advance_db(loop, [ok, bad])
         rotate = AsyncMock()
         with ExitStack() as stack:
-            _advance_patches(stack, db, rotate=rotate)
-            from orchestrator.main import _advance_project_loop
-
-            await _advance_project_loop(bad, {"error": "one leg died"}, [])
+            deps = _advance_patches(stack, db, rotate=rotate)
+            await advance_project_loop(
+                bad, {"error": "one leg died"}, [], dependencies=deps
+            )
         kw = rotate.await_args.kwargs
         assert kw["turn_all_failed"] is False
         assert kw["consecutive"] == 0

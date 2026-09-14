@@ -1,4 +1,4 @@
-import {Component, computed, effect, inject, OnInit, signal, untracked} from '@angular/core';
+import {Component, computed, effect, inject, OnInit, signal, untracked, viewChild} from '@angular/core';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {ApiService} from '../../core/services/api.service';
 import {DataService} from '../../core/services/data.service';
@@ -225,9 +225,9 @@ function relativeTime(iso: string | null | undefined, nowLabel: string): string 
 
       .item-badge {
         text-transform: uppercase;
-        letter-spacing: 0.5px;
+        letter-spacing: 0.06em;
         font-weight: 600;
-        font-size: 10px;
+        font-size: 11px;
         /* Theme token (was the non-existent --warning-color → invisible
            Catppuccin fallback on the light theme). Mixed toward text for WCAG AA at 10px. */
         color: color-mix(in srgb, var(--warning) 55%, var(--text-primary));
@@ -260,6 +260,7 @@ export class JobReviewPageComponent implements OnInit {
   readonly pendingJobs = signal<JobSummary[]>([]);
   readonly isLoading = signal<boolean>(false);
   readonly currentJobId = this.data.currentJobId;
+  private readonly review = viewChild(JobReviewComponent);
 
   constructor() {
     // Auto-select the first pending job when the list loads and nothing is selected.
@@ -279,6 +280,10 @@ export class JobReviewPageComponent implements OnInit {
   }
 
   refresh(): void {
+    // The review panel used to carry its own title + reload button under this
+    // header — one "Job Review" over another. This is the single refresh now,
+    // so it reloads the open job as well as the queue.
+    this.review()?.loadJob();
     this.isLoading.set(true);
     this.api.getJobs('pending_review').subscribe((jobs) => {
       this.pendingJobs.set(jobs);

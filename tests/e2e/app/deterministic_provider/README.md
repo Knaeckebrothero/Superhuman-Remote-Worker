@@ -17,6 +17,12 @@ The Kubernetes Service publishes inference only. The harness reaches control wit
 `E2E_INFERENCE_API_KEY` are required process environment variables and come from the
 run-owned `srw-e2e-model-fixture` Secret; neither has a checked-in default.
 
+`E2E_CHAT_MODEL_ID` can replace the default `e2e-chat` wire ID with a unique
+lowercase test model name. The manifest cutover smoke uses this when registering
+its own temporary endpoint in an existing installation. The configured ID is the
+only accepted chat model and is advertised by `/v1/models`; other IDs continue to
+fail without being echoed into diagnostic records.
+
 ## Control contract
 
 Arm an isolated run before inference:
@@ -44,6 +50,27 @@ then returns through `job_complete` and the remaining strategic todos. It reads 
 todo guide required by the enforced staging contract before staging, and reads the
 verification guide at each completion boundary. Tool results still pass through SRW
 normally and are never retained by the fixture.
+
+The `worker-job` scenario is the hermetic sibling of the two below. `search-job`
+and `fetch-job` are deliberately *live-gate* drivers: each requires a real
+third-party provider (SearXNG, Crawl4AI) so it can exercise the off-pod
+boundary. A profile that has neither — the owned minimal profile does not, and
+adding one breaks its "exactly one endpoint, exactly two models" determinism
+contract — cannot complete a worker job with either. `worker-job` binds only
+`read_file`, `todo_complete`, `next_phase_todos` and `job_complete`: it reads
+the todo guide the staging contract requires, runs the strategic todos, stages
+a two-todo tactical phase, reads the verification guide at the completion
+boundary, then returns through `job_complete`. It fails closed the same way when
+a required tool is not bound.
+
+`prepared-workspace-job` extends that workflow with a real `run_command` call
+over the workspace SSH backend. It checks the prepared executable and the
+per-workspace initialization receipt, then writes an execution marker. Fresh
+runs require that marker to be absent; run IDs ending in `-reuse` require an
+existing marker. The fixture advances only after the tool returns both exit
+code zero and the exact run-specific proof. It retains counters, not shell
+output. `scripts/workspace-preparation-srw-k3d-gate.py` uses this scenario to
+exercise MCP admission and prepared VM isolation through the installed harness.
 
 The `fetch-job` scenario follows the same fail-closed pattern for the off-pod fetch
 boundary. It calls `extract_webpage` and `crawl_website` against `example.com` before

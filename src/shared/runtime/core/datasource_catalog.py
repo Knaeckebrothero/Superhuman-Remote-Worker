@@ -34,6 +34,9 @@ class DatasourceTypeDefinition:
 
 DATASOURCE_TYPE_CATALOG: tuple[DatasourceTypeDefinition, ...] = (
     DatasourceTypeDefinition("generic", "Generic", "datasources", "generic_env"),
+    DatasourceTypeDefinition(
+        "credentials", "Credentials", "datasources", "generic_env"
+    ),
     DatasourceTypeDefinition("repository", "Repository", "datasources", "repository"),
     DatasourceTypeDefinition(
         "kb",

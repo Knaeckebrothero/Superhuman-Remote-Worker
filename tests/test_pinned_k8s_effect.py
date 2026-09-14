@@ -13,6 +13,7 @@ from orchestrator.services.pinned_k8s_effect import (
     finalizer_release_patch,
     legacy_pinned_namespace_candidates,
     protect_legacy_pinned_agent_authority,
+    release_planned_pinned_pod_authority,
     run_bounded_k8s_mutation,
 )
 
@@ -181,3 +182,53 @@ async def test_legacy_adoption_refuses_ambiguous_namespace_before_any_patch():
 
     assert evidence is None
     assert patch_calls == []
+
+
+@pytest.mark.asyncio
+async def test_warm_release_removes_finalizer_from_exact_terminal_deleting_pod():
+    class NotFound(Exception):
+        status = 404
+
+    class CoreApi:
+        def __init__(self) -> None:
+            self.pod = SimpleNamespace(
+                metadata=SimpleNamespace(
+                    uid="pod-u1",
+                    resource_version="41",
+                    labels={"authority": "exact"},
+                    finalizers=[PINNED_AUTHORITY_FINALIZER],
+                    annotations=None,
+                    deletion_timestamp="2026-09-13T22:09:01Z",
+                ),
+                status=SimpleNamespace(
+                    container_statuses=[
+                        SimpleNamespace(
+                            state=SimpleNamespace(terminated=SimpleNamespace())
+                        )
+                    ]
+                ),
+            )
+
+        def read_namespaced_pod(self, *, name, namespace, _request_timeout=None):
+            del name, namespace, _request_timeout
+            if self.pod is None:
+                raise NotFound()
+            return self.pod
+
+        def patch_namespaced_pod(self, *, name, namespace, body, _request_timeout=None):
+            del name, namespace, _request_timeout
+            assert body[-1] == {
+                "op": "replace",
+                "path": "/metadata/finalizers",
+                "value": [],
+            }
+            self.pod = None
+
+    api = CoreApi()
+    assert await release_planned_pinned_pod_authority(
+        api,
+        namespace="agents-a",
+        pod_name="warm-pod",
+        expected_pod_uid="pod-u1",
+        expected_labels={"authority": "exact"},
+    ) == {"outcome": "exact_absent_v1", "agent_present": False}

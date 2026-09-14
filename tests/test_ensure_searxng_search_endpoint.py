@@ -43,6 +43,7 @@ async def test_fresh_install_creates_keyless_search_row_and_primary(monkeypatch)
         "base_url": "http://srw-searxng:8080",
         "api_key": None,
         "key_prefix": None,
+        "source": "default",
     }
     model = db.create_model.await_args.kwargs
     assert model["model_id"] == SEARXNG_MODEL_ID
@@ -52,7 +53,7 @@ async def test_fresh_install_creates_keyless_search_row_and_primary(monkeypatch)
         "ops": ["search"],
     }
     assert db.set_default_llm_model.await_args_list == [
-        call("search", SEARXNG_MODEL_ID)
+        call("search", SEARXNG_MODEL_ID, source="default")
     ]
 
 
@@ -67,7 +68,7 @@ async def test_existing_primary_places_searxng_in_empty_fallback(primary):
     )
 
     assert db.set_default_llm_model.await_args_list == [
-        call("search_fallback", SEARXNG_MODEL_ID)
+        call("search_fallback", SEARXNG_MODEL_ID, source="default")
     ]
 
 

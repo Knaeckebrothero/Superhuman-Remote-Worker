@@ -1,0 +1,68 @@
+// One look for every data table. Apply with class="app-table" on <table>
+// (a class hook, not a structural change). Column widths and meaning-bearing
+// colours stay local to the component.
+//
+// Not named .data-table: project-detail and the workbench db-table already
+// use that as a LOCAL class, and a global rule with the same name would fight
+// their component-scoped declarations.
+//
+// Header: eyebrow, 36px, sticky. Rows: 44px, hairline dividers, hover tint.
+// Selection: 6% accent tint plus the 2px accent left rule (the Roman
+// approval-card idiom, kept as the selection idiom).
+@use 'variables' as v;
+
+.app-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: v.$font-size-control;
+
+  thead th {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    height: 36px;
+    padding: 0 v.$space-12;
+    text-align: left;
+    background: var(--panel-bg);
+    border-bottom: 1px solid var(--border-hairline);
+    font-size: 0.6875rem;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    white-space: nowrap;
+  }
+
+  tbody td {
+    padding: 10px v.$space-12;
+    border-bottom: 1px solid var(--border-hairline);
+    color: var(--text-primary);
+    vertical-align: middle;
+  }
+
+  tbody tr {
+    transition: background-color 0.15s ease;
+  }
+
+  tbody tr:hover {
+    background: var(--hover);
+  }
+
+  tbody tr.selected {
+    background: color-mix(in srgb, var(--accent-color) 6%, transparent);
+    box-shadow: inset 2px 0 0 var(--accent-color);
+  }
+
+  // Actions column: right-aligned, ghost buttons, one non-ghost at most.
+  td.actions-cell,
+  th.col-actions {
+    text-align: right;
+    white-space: nowrap;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .app-table tbody tr {
+    transition: none;
+  }
+}

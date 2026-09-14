@@ -21,8 +21,16 @@ from orchestrator.services.family_matcher import detect_family
         # Anthropic
         ("claude-opus-4-7", "claude-opus"),
         ("claude-opus-4-7-20251024", "claude-opus"),
+        # Opus 5 splits off (full xhigh/max effort ladder); 4.x stays generic.
+        ("claude-opus-5", "claude-opus-5"),
+        ("openrouter/anthropic/claude-opus-5", "claude-opus-5"),
+        ("claude-opus-4-5", "claude-opus"),
         ("claude-sonnet-4-6", "claude-sonnet"),
         ("claude-haiku-4-5", "claude-haiku"),
+        # Fable 5 and 5.1 share one family.
+        ("claude-fable-5", "claude-fable"),
+        ("claude-fable-5-1", "claude-fable"),
+        ("openrouter/anthropic/claude-fable-5-1", "claude-fable"),
         # OpenAI gpt-5 + o-series (split families post chunk 1)
         ("gpt-5", "gpt-5"),
         ("gpt-5.2", "gpt-5"),
@@ -33,6 +41,10 @@ from orchestrator.services.family_matcher import detect_family
         ("gpt-5.6-terra", "gpt-5.6"),
         ("openrouter/openai/gpt-5.6-luna", "gpt-5.6"),
         ("gpt-5.6-codex", "codex"),
+        # GPT-6 (Astra) — its own family; codex rules still win on a codex id.
+        ("gpt-6-astra", "gpt-6"),
+        ("openrouter/openai/gpt-6-astra", "gpt-6"),
+        ("gpt-6-astra-codex", "codex"),
         ("o3", "o-series"),
         ("o3-mini", "o-series"),
         ("o4", "o-series"),
@@ -121,6 +133,7 @@ def test_case_insensitive_match() -> None:
     """Provider catalogs sometimes return mixed-case IDs (Claude-Opus,
     GEMINI-2.5-pro). The matcher should not care."""
     assert detect_family("CLAUDE-OPUS-4-7").family == "claude-opus"
+    assert detect_family("Claude-Opus-5").family == "claude-opus-5"
     assert detect_family("Gemini-2.5-pro").family == "gemini"
     assert detect_family("GPT-OSS-120B").family == "gpt-oss"
 

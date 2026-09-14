@@ -14,6 +14,7 @@ corrupts search rather than merely failing it. The marker that prevents it is
 
 from __future__ import annotations
 
+import logging
 import uuid
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -22,19 +23,30 @@ import pytest
 from fastapi import HTTPException
 from pydantic import ValidationError
 
-from orchestrator.main import (
-    DatasourceUpdate,
-    ExternalKnowledgeBase,
-    ProjectCreate,
-    _normalize_kb_config,
-    _plan_external_kb_vault,
-    _provision_external_project_knowledge_repo,
-    _provision_project_knowledge_repo,
-    attach_project_knowledge_repository,
-    create_project,
+from orchestrator.routers.datasources import (
+    DatasourcesDependencies,
     reindex_datasource_knowledge,
     update_datasource,
 )
+from orchestrator.routers.projects import (
+    ProjectsDependencies,
+    attach_project_knowledge_repository,
+    create_project,
+)
+from orchestrator.schemas.datasources import DatasourceUpdate
+from orchestrator.schemas.projects import ExternalKnowledgeBase, ProjectCreate
+from orchestrator.services.datasource_config import normalize_kb_config
+from orchestrator.services.datasources import DatasourceDependencies
+from orchestrator.services.kb_task_registry import KbDatasourceTaskRegistry
+from orchestrator.services.knowledge_index import KnowledgeIndexDependencies
+from orchestrator.services.project_provisioning import (
+    ProjectProvisioningDependencies,
+    ProjectRepairState,
+    plan_external_kb_vault,
+    provision_external_project_knowledge_repo,
+    provision_project_knowledge_repo,
+)
+from orchestrator.services.projects import ProjectDependencies
 from orchestrator.services.kb_datasources import (
     NATIVE_PROJECT_CONFIG_KEY,
     native_kb_project_id,
@@ -49,6 +61,93 @@ from agent.services.knowledge.bindings import (
     build_knowledge_bindings,
 )
 from tests._fs_backend import FilesystemTestBackend
+
+
+def _index_deps(store) -> KnowledgeIndexDependencies:
+    """The KB-index collaborators main's ``_knowledge_index_dependencies``
+    supplies; every KB path here is either stubbed or purely marker logic."""
+    return KnowledgeIndexDependencies(
+        store=store,
+        vector_db=MagicMock(),
+        gitea_client=MagicMock(),
+        logger=MagicMock(),
+        tasks=KbDatasourceTaskRegistry(),
+        inject_system_kb_embedding_profile=AsyncMock(return_value=None),
+    )
+
+
+def _provisioning_deps(store, gitea=None) -> ProjectProvisioningDependencies:
+    """Provisioning ports, composed the way main's factory composes them."""
+    return ProjectProvisioningDependencies(
+        store=store,
+        forge=gitea if gitea is not None else MagicMock(is_initialized=False),
+        keycloak_groups=MagicMock(),
+        main_cloud_router=MagicMock(),
+        logger=logging.getLogger("test.kb_native"),
+        repair=ProjectRepairState(),
+        knowledge_index=_index_deps(store),
+    )
+
+
+def _projects_deps(store, gitea=None, **gates) -> ProjectsDependencies:
+    """Project router dependencies, composed the way main's factory does.
+
+    ``with_validated_tool_overrides`` is main's real write-boundary gate, and
+    every gate not named in ``gates`` keeps the real
+    ``orchestrator.security.access`` implementation the dataclass defaults to —
+    which is what an unpatched ``main`` global used to resolve to.
+    """
+    from orchestrator import main
+
+    forge = gitea if gitea is not None else MagicMock(is_initialized=False)
+    gates.setdefault("require_admin", AsyncMock())
+    return ProjectsDependencies(
+        store=store,
+        operations=ProjectDependencies(
+            store=store,
+            vector_db=MagicMock(),
+            forge=forge,
+            keycloak_groups=MagicMock(),
+            main_cloud_router=MagicMock(),
+            logger=logging.getLogger("test.kb_native"),
+            provisioning=_provisioning_deps(store, forge),
+            with_validated_tool_overrides=main._with_validated_tool_overrides,
+        ),
+        **gates,
+    )
+
+
+def _attach_deps(store, gitea) -> ProjectsDependencies:
+    """``_projects_deps`` with the project-owner gate these attach tests stub."""
+    return _projects_deps(
+        store,
+        gitea,
+        require_project_owner=AsyncMock(
+            return_value=(
+                {"id": OWNER_ID, "is_admin": False},
+                {"id": PROJECT_ID, "name": "Better Resavio"},
+            )
+        ),
+    )
+
+
+def _ds_deps(store=None, **gates) -> DatasourcesDependencies:
+    """Connector router dependencies, composed the way main's factory does."""
+    from orchestrator import main
+
+    db = MagicMock() if store is None else store
+    return DatasourcesDependencies(
+        store=db,
+        operations=DatasourceDependencies(
+            store=db,
+            vector_db=MagicMock(),
+            knowledge_index=_index_deps(db),
+            mcp_datasources_enabled=main._mcp_datasources_enabled,
+            validate_mcp_datasource=main._validate_mcp_datasource,
+        ),
+        **gates,
+    )
+
 
 PROJECT_ID = "1a387b4d-1111-2222-3333-444444444444"
 ID8 = PROJECT_ID[:8]
@@ -166,17 +265,19 @@ class TestProjectCreationProvisioning:
         return gitea
 
     async def _create(self, db, gitea, *, external_kb=None):
-        with (
-            patch(
-                "orchestrator.main.require_approved_user",
-                AsyncMock(return_value={"id": OWNER_ID, "is_admin": False}),
+        deps = _projects_deps(
+            db,
+            gitea,
+            require_approved_user=AsyncMock(
+                return_value={"id": OWNER_ID, "is_admin": False}
             ),
-            patch("orchestrator.main.postgres_db", db),
-            patch("orchestrator.main.gitea_client", gitea),
-            patch(
-                "orchestrator.main._ensure_project_cloud_resources",
-                AsyncMock(side_effect=lambda project: project),
-            ),
+        )
+        # Kept so a caller can assert on the exact dependency value the
+        # provisioning layer was handed.
+        self.deps = deps
+        with patch(
+            "orchestrator.services.project_provisioning.ensure_project_cloud_resources",
+            AsyncMock(side_effect=lambda project, **_kwargs: project),
         ):
             return await create_project(
                 ProjectCreate(
@@ -185,6 +286,7 @@ class TestProjectCreationProvisioning:
                     external_kb=external_kb,
                 ),
                 object(),
+                dependencies=deps,
             )
 
     @pytest.mark.asyncio
@@ -289,13 +391,11 @@ class TestProjectCreationProvisioning:
     @pytest.mark.asyncio
     async def test_helper_returns_the_created_row(self):
         db, gitea = self._db(), self._gitea()
-        with (
-            patch("orchestrator.main.postgres_db", db),
-            patch("orchestrator.main.gitea_client", gitea),
-        ):
-            created = await _provision_project_knowledge_repo(
-                {"id": PROJECT_ID, "name": "Better Resavio"}, OWNER_ID
-            )
+        created = await provision_project_knowledge_repo(
+            {"id": PROJECT_ID, "name": "Better Resavio"},
+            OWNER_ID,
+            dependencies=_provisioning_deps(db, gitea),
+        )
         assert created["id"] == DATASOURCE_ID
 
 
@@ -372,11 +472,13 @@ class TestExternalProjectKnowledgeProvisioning(TestProjectCreationProvisioning):
         db.create_datasource.side_effect = RuntimeError("db failure")
         db.remove_project_repository = AsyncMock()
 
-        with patch("orchestrator.main.postgres_db", db), pytest.raises(RuntimeError):
-            await _provision_external_project_knowledge_repo(
+        provisioning = _provisioning_deps(db)
+        with pytest.raises(RuntimeError):
+            await provision_external_project_knowledge_repo(
                 {"id": PROJECT_ID, "name": "Better Resavio"},
                 OWNER_ID,
-                await _plan_external_kb_vault(self.EXTERNAL),
+                await plan_external_kb_vault(self.EXTERNAL, dependencies=provisioning),
+                dependencies=provisioning,
             )
 
         db.remove_project_repository.assert_awaited_once()
@@ -396,22 +498,9 @@ class TestAttachExternalProjectKnowledgeRepo(TestProjectCreationProvisioning):
         db.get_project_repositories = AsyncMock(return_value=[])
         request = object()
 
-        with (
-            patch(
-                "orchestrator.main.require_project_owner",
-                AsyncMock(
-                    return_value=(
-                        {"id": OWNER_ID, "is_admin": False},
-                        {"id": PROJECT_ID, "name": "Better Resavio"},
-                    )
-                ),
-            ),
-            patch("orchestrator.main.postgres_db", db),
-            patch("orchestrator.main.gitea_client", gitea),
-        ):
-            result = await attach_project_knowledge_repository(
-                request, PROJECT_ID, self.EXTERNAL
-            )
+        result = await attach_project_knowledge_repository(
+            request, PROJECT_ID, self.EXTERNAL, dependencies=_attach_deps(db, gitea)
+        )
 
         assert result["status"] == "attached"
         assert "credentials" not in result["repository"]
@@ -426,22 +515,12 @@ class TestAttachExternalProjectKnowledgeRepo(TestProjectCreationProvisioning):
             return_value=[{"id": uuid.uuid4(), "role": "knowledge"}]
         )
 
-        with (
-            patch(
-                "orchestrator.main.require_project_owner",
-                AsyncMock(
-                    return_value=(
-                        {"id": OWNER_ID, "is_admin": False},
-                        {"id": PROJECT_ID, "name": "Better Resavio"},
-                    )
-                ),
-            ),
-            patch("orchestrator.main.postgres_db", db),
-            patch("orchestrator.main.gitea_client", gitea),
-            pytest.raises(HTTPException) as exc,
-        ):
+        with pytest.raises(HTTPException) as exc:
             await attach_project_knowledge_repository(
-                object(), PROJECT_ID, self.EXTERNAL
+                object(),
+                PROJECT_ID,
+                self.EXTERNAL,
+                dependencies=_attach_deps(db, gitea),
             )
 
         assert exc.value.status_code == 409
@@ -509,7 +588,10 @@ class TestAdoptConnectorAsProjectVault(TestProjectCreationProvisioning):
         return db
 
     async def _create_adopting(self, db, gitea, external_kb=None):
-        with patch("orchestrator.main._purge_kb_datasource_index", AsyncMock()):
+        with patch(
+            "orchestrator.services.project_provisioning.purge_kb_datasource_index",
+            AsyncMock(),
+        ):
             return await self._create(db, gitea, external_kb=external_kb or self.ADOPT)
 
     @pytest.mark.asyncio
@@ -566,11 +648,15 @@ class TestAdoptConnectorAsProjectVault(TestProjectCreationProvisioning):
         db, gitea = self._db(), self._gitea()
 
         with patch(
-            "orchestrator.main._purge_kb_datasource_index", AsyncMock()
+            "orchestrator.services.project_provisioning.purge_kb_datasource_index",
+            AsyncMock(),
         ) as purge:
             await self._create(db, gitea, external_kb=self.ADOPT)
 
-        purge.assert_awaited_once_with(str(CONNECTOR_ID))
+        purge.assert_awaited_once_with(
+            str(CONNECTOR_ID),
+            dependencies=self.deps.operations.provisioning.knowledge_index,
+        )
         assert db.update_datasource_with_policy.await_count == 1
 
     @pytest.mark.asyncio
@@ -580,7 +666,7 @@ class TestAdoptConnectorAsProjectVault(TestProjectCreationProvisioning):
         db, gitea = self._db(), self._gitea()
 
         with patch(
-            "orchestrator.main._purge_kb_datasource_index",
+            "orchestrator.services.project_provisioning.purge_kb_datasource_index",
             AsyncMock(side_effect=RuntimeError("vector db down")),
         ):
             project = await self._create(db, gitea, external_kb=self.ADOPT)
@@ -717,18 +803,23 @@ class TestAdoptConnectorAsProjectVault(TestProjectCreationProvisioning):
         db.update_datasource_with_policy.side_effect = RuntimeError("db failure")
         db.remove_project_repository = AsyncMock()
 
+        provisioning = _provisioning_deps(db)
         with (
-            patch("orchestrator.main.postgres_db", db),
-            patch("orchestrator.main._purge_kb_datasource_index", AsyncMock()) as purge,
+            patch(
+                "orchestrator.services.project_provisioning.purge_kb_datasource_index",
+                AsyncMock(),
+            ) as purge,
             pytest.raises(RuntimeError),
         ):
-            await _provision_external_project_knowledge_repo(
+            await provision_external_project_knowledge_repo(
                 {"id": PROJECT_ID, "name": "Better Resavio"},
                 OWNER_ID,
-                await _plan_external_kb_vault(
+                await plan_external_kb_vault(
                     self.ADOPT,
                     caller={"id": OWNER_ID, "is_admin": False},
+                    dependencies=provisioning,
                 ),
+                dependencies=provisioning,
             )
 
         db.remove_project_repository.assert_awaited_once()
@@ -739,22 +830,12 @@ class TestAdoptConnectorAsProjectVault(TestProjectCreationProvisioning):
         db, gitea = self._db(), self._gitea()
         db.get_project_repositories = AsyncMock(return_value=[])
 
-        with (
-            patch(
-                "orchestrator.main.require_project_owner",
-                AsyncMock(
-                    return_value=(
-                        {"id": OWNER_ID, "is_admin": False},
-                        {"id": PROJECT_ID, "name": "Better Resavio"},
-                    )
-                ),
-            ),
-            patch("orchestrator.main.postgres_db", db),
-            patch("orchestrator.main.gitea_client", gitea),
-            patch("orchestrator.main._purge_kb_datasource_index", AsyncMock()),
+        with patch(
+            "orchestrator.services.project_provisioning.purge_kb_datasource_index",
+            AsyncMock(),
         ):
             result = await attach_project_knowledge_repository(
-                object(), PROJECT_ID, self.ADOPT
+                object(), PROJECT_ID, self.ADOPT, dependencies=_attach_deps(db, gitea)
             )
 
         assert result["status"] == "attached"
@@ -771,21 +852,10 @@ class TestAdoptConnectorAsProjectVault(TestProjectCreationProvisioning):
             return_value=native_kb_row()
         )
 
-        with (
-            patch(
-                "orchestrator.main.require_project_owner",
-                AsyncMock(
-                    return_value=(
-                        {"id": OWNER_ID, "is_admin": False},
-                        {"id": PROJECT_ID, "name": "Better Resavio"},
-                    )
-                ),
-            ),
-            patch("orchestrator.main.postgres_db", db),
-            patch("orchestrator.main.gitea_client", gitea),
-            pytest.raises(HTTPException) as exc,
-        ):
-            await attach_project_knowledge_repository(object(), PROJECT_ID, self.ADOPT)
+        with pytest.raises(HTTPException) as exc:
+            await attach_project_knowledge_repository(
+                object(), PROJECT_ID, self.ADOPT, dependencies=_attach_deps(db, gitea)
+            )
 
         assert exc.value.status_code == 409
         db.add_project_repository.assert_not_awaited()
@@ -799,22 +869,12 @@ class TestAdoptConnectorAsProjectVault(TestProjectCreationProvisioning):
         db.get_project_repositories = AsyncMock(return_value=[])
         db.list_datasource_projects = AsyncMock(return_value=[PROJECT_ID])
 
-        with (
-            patch(
-                "orchestrator.main.require_project_owner",
-                AsyncMock(
-                    return_value=(
-                        {"id": OWNER_ID, "is_admin": False},
-                        {"id": PROJECT_ID, "name": "Better Resavio"},
-                    )
-                ),
-            ),
-            patch("orchestrator.main.postgres_db", db),
-            patch("orchestrator.main.gitea_client", gitea),
-            patch("orchestrator.main._purge_kb_datasource_index", AsyncMock()),
+        with patch(
+            "orchestrator.services.project_provisioning.purge_kb_datasource_index",
+            AsyncMock(),
         ):
             result = await attach_project_knowledge_repository(
-                object(), PROJECT_ID, self.ADOPT
+                object(), PROJECT_ID, self.ADOPT, dependencies=_attach_deps(db, gitea)
             )
 
         assert result["status"] == "attached"
@@ -950,13 +1010,20 @@ class TestExternalSweepSkipsNativeKb:
     async def test_manual_reindex_endpoint_refuses_a_native_row(self):
         with (
             patch(
-                "orchestrator.main.require_datasource_owner",
-                AsyncMock(return_value=({}, native_kb_row())),
-            ),
-            patch("orchestrator.main._reindex_kb_datasource_now", AsyncMock()) as now,
+                "orchestrator.services.knowledge_index.reindex_kb_datasource_now",
+                AsyncMock(),
+            ) as now,
             pytest.raises(HTTPException) as exc,
         ):
-            await reindex_datasource_knowledge(object(), str(DATASOURCE_ID))
+            await reindex_datasource_knowledge(
+                object(),
+                str(DATASOURCE_ID),
+                dependencies=_ds_deps(
+                    require_datasource_owner=AsyncMock(
+                        return_value=({}, native_kb_row())
+                    )
+                ),
+            )
 
         assert exc.value.status_code == 400
         assert "own knowledge base" in str(exc.value.detail)
@@ -978,12 +1045,12 @@ class TestExternalSweepSkipsNativeKb:
 class TestMarkerDurability:
     def test_stored_config_keeps_the_marker(self):
         stored = {"root_path": "knowledge", NATIVE_PROJECT_CONFIG_KEY: PROJECT_ID}
-        assert _normalize_kb_config(stored, stored=True) == stored
+        assert normalize_kb_config(stored, stored=True) == stored
 
     def test_user_supplied_marker_is_rejected(self):
         """Nobody can hand-forge a row out of the sweep from the outside."""
         with pytest.raises(HTTPException) as exc:
-            _normalize_kb_config({NATIVE_PROJECT_CONFIG_KEY: PROJECT_ID})
+            normalize_kb_config({NATIVE_PROJECT_CONFIG_KEY: PROJECT_ID})
         assert exc.value.status_code == 400
         assert NATIVE_PROJECT_CONFIG_KEY in str(exc.value.detail)
 
@@ -993,7 +1060,7 @@ class TestMarkerDurability:
             NATIVE_PROJECT_CONFIG_KEY: PROJECT_ID,
             "forge": "github",
         }
-        assert _normalize_kb_config(stored, stored=True) == stored
+        assert normalize_kb_config(stored, stored=True) == stored
 
     @pytest.mark.asyncio
     async def test_editing_the_root_path_does_not_strip_the_marker(self):
@@ -1007,19 +1074,24 @@ class TestMarkerDurability:
 
         with (
             patch(
-                "orchestrator.main.require_datasource_owner",
-                AsyncMock(return_value=({}, native_kb_row())),
-            ),
-            patch("orchestrator.main.postgres_db", db),
-            patch(
-                "orchestrator.main._mark_kb_datasource_pending", AsyncMock()
+                "orchestrator.services.knowledge_index.mark_kb_datasource_pending",
+                AsyncMock(),
             ) as pending,
-            patch("orchestrator.main._schedule_kb_datasource_reindex", schedule),
+            patch(
+                "orchestrator.services.knowledge_index.schedule_kb_datasource_reindex",
+                schedule,
+            ),
         ):
             await update_datasource(
                 object(),
                 str(DATASOURCE_ID),
                 DatasourceUpdate(name="Renamed", config={"root_path": "notes"}),
+                dependencies=_ds_deps(
+                    db,
+                    require_datasource_owner=AsyncMock(
+                        return_value=({}, native_kb_row())
+                    ),
+                ),
             )
 
         written = db.update_datasource.await_args.kwargs["config"]
@@ -1038,16 +1110,20 @@ class TestMarkerDurability:
         db.list_datasource_projects = AsyncMock(return_value=[])
         db.get_datasource = AsyncMock(return_value=native_kb_row())
 
-        with (
-            patch(
-                "orchestrator.main.require_datasource_owner",
-                AsyncMock(return_value=({}, native_kb_row())),
-            ),
-            patch("orchestrator.main.postgres_db", db),
-            patch("orchestrator.main._schedule_kb_datasource_reindex", MagicMock()),
+        with patch(
+            "orchestrator.services.knowledge_index.schedule_kb_datasource_reindex",
+            MagicMock(),
         ):
             result = await update_datasource(
-                object(), str(DATASOURCE_ID), DatasourceUpdate(name="Renamed")
+                object(),
+                str(DATASOURCE_ID),
+                DatasourceUpdate(name="Renamed"),
+                dependencies=_ds_deps(
+                    db,
+                    require_datasource_owner=AsyncMock(
+                        return_value=({}, native_kb_row())
+                    ),
+                ),
             )
 
         assert str(result["id"]) == str(DATASOURCE_ID)

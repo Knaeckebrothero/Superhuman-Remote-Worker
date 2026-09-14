@@ -102,7 +102,6 @@ def endpoint(monkeypatch):
             "permission_mode": "auto_accept",
         }
 
-    monkeypatch.setattr(routes, "_get_db", lambda: database)
     monkeypatch.setattr(routes, "require_approved_user", require_approved)
     monkeypatch.setattr(routes, "require_thread_owner", require_owner)
     monkeypatch.setattr(
@@ -127,6 +126,10 @@ def endpoint(monkeypatch):
 
     app = FastAPI()
     app.include_router(routes.router)
+    # R1.B02: the router reads the mounted application's own store rather than
+    # importing the application module, so bind the real seam instead of
+    # monkeypatching the private accessor.
+    app.state.store = database
     client = TestClient(app, raise_server_exceptions=False)
     return client, state, calls, audit, routes
 

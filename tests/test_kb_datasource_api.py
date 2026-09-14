@@ -1,5 +1,7 @@
 """Control-plane contract for OKF Knowledge Base datasources (Slice 4)."""
 
+from tests import _b09_control_seams as control_seams
+
 import asyncio
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
@@ -10,33 +12,69 @@ import pytest
 from fastapi import HTTPException
 
 from orchestrator.main import (
-    DatasourceCreate,
-    DatasourceUpdate,
     ThreadCreateRequest,
-    _authorize_thread_datasource_ids,
     _authorize_thread_project_ids,
     _build_datasources_payload,
-    _normalize_kb_config,
-    _revalidate_thread_datasource_selection,
     _revalidate_thread_project_ids,
     _thread_has_knowledge_scope,
     _thread_creation_project_ids,
-    _validate_kb_repository_url,
-    create_datasource,
     create_thread,
+)
+from orchestrator.routers.datasources import (
+    DatasourcesDependencies,
+    create_datasource,
     delete_datasource,
     get_datasource_index_status,
     reindex_datasource_knowledge,
-    resume_thread,
     update_datasource,
 )
+from orchestrator.schemas.datasources import DatasourceCreate, DatasourceUpdate
 from orchestrator.services.config_drift import DriftItem
+from orchestrator.services.datasource_config import (
+    normalize_kb_config,
+    validate_kb_repository_url,
+)
+from orchestrator.services.datasources import DatasourceDependencies
 from orchestrator.services.kb_datasources import (
     index_status_payload,
     reindex_kb_datasource,
     test_kb_datasource as probe_kb_datasource,
 )
+from orchestrator.services.kb_task_registry import KbDatasourceTaskRegistry
+from orchestrator.services.knowledge_index import KnowledgeIndexDependencies
 from shared.runtime.services.knowledge_store import KbWatermark
+
+
+def _ds_deps(store=None, **gates) -> DatasourcesDependencies:
+    """Connector router dependencies, composed the way main's factory does.
+
+    Gates named in ``gates`` replace what these tests used to patch onto
+    ``orchestrator.main``; every gate left unnamed keeps the real
+    ``orchestrator.security.access`` implementation the dataclass defaults to,
+    which is exactly what an unpatched ``main`` global used to resolve to. The
+    MCP predicates come from ``main`` itself so their behavior is unchanged.
+    """
+    from orchestrator import main
+
+    db = MagicMock() if store is None else store
+    return DatasourcesDependencies(
+        store=db,
+        operations=DatasourceDependencies(
+            store=db,
+            vector_db=MagicMock(),
+            knowledge_index=KnowledgeIndexDependencies(
+                store=db,
+                vector_db=MagicMock(),
+                gitea_client=MagicMock(),
+                logger=MagicMock(),
+                tasks=KbDatasourceTaskRegistry(),
+                inject_system_kb_embedding_profile=AsyncMock(return_value=None),
+            ),
+            mcp_datasources_enabled=main._mcp_datasources_enabled,
+            validate_mcp_datasource=main._validate_mcp_datasource,
+        ),
+        **gates,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -49,11 +87,11 @@ def _trust_test_git_hosts(monkeypatch):
 
 class TestNormalizeKbConfig:
     def test_defaults_to_repository_root(self):
-        assert _normalize_kb_config(None) == {"root_path": ""}
-        assert _normalize_kb_config({}) == {"root_path": ""}
+        assert normalize_kb_config(None) == {"root_path": ""}
+        assert normalize_kb_config({}) == {"root_path": ""}
 
     def test_normalizes_relative_posix_path(self):
-        assert _normalize_kb_config({"root_path": r"./docs\\knowledge//notes"}) == {
+        assert normalize_kb_config({"root_path": r"./docs\\knowledge//notes"}) == {
             "root_path": "docs/knowledge/notes"
         }
 
@@ -63,14 +101,14 @@ class TestNormalizeKbConfig:
     )
     def test_rejects_unsafe_root(self, root):
         with pytest.raises(HTTPException) as exc:
-            _normalize_kb_config({"root_path": root})
+            normalize_kb_config({"root_path": root})
         assert exc.value.status_code == 400
 
     def test_rejects_non_string_and_unknown_keys(self):
         with pytest.raises(HTTPException):
-            _normalize_kb_config({"root_path": 42})
+            normalize_kb_config({"root_path": 42})
         with pytest.raises(HTTPException) as exc:
-            _normalize_kb_config({"path_prefix": "knowledge"})
+            normalize_kb_config({"path_prefix": "knowledge"})
         assert "path_prefix" in str(exc.value.detail)
 
 
@@ -85,7 +123,7 @@ class TestKbRepositoryUrl:
         ],
     )
     def test_accepts_normal_git_urls(self, url):
-        assert _validate_kb_repository_url(url) == url
+        assert validate_kb_repository_url(url) == url
 
     @pytest.mark.parametrize(
         "url",
@@ -106,7 +144,7 @@ class TestKbRepositoryUrl:
     )
     def test_rejects_missing_or_embedded_credentials(self, url):
         with pytest.raises(HTTPException) as exc:
-            _validate_kb_repository_url(url)
+            validate_kb_repository_url(url)
         assert exc.value.status_code == 400
 
 
@@ -200,14 +238,15 @@ async def test_status_endpoint_uses_normal_visibility_gate():
     gate = AsyncMock(return_value=({}, {"id": datasource_id, "type": "kb"}))
     get_watermark = AsyncMock(return_value=None)
 
-    with (
-        patch("orchestrator.main.require_datasource_access", gate),
-        patch(
-            "shared.runtime.services.knowledge_store.KnowledgeStore.get_watermark",
-            get_watermark,
-        ),
+    with patch(
+        "shared.runtime.services.knowledge_store.KnowledgeStore.get_watermark",
+        get_watermark,
     ):
-        result = await get_datasource_index_status(request, datasource_id)
+        result = await get_datasource_index_status(
+            request,
+            datasource_id,
+            dependencies=_ds_deps(require_datasource_access=gate),
+        )
 
     assert result["status"] == "pending"
     assert result["notes_done"] is None
@@ -238,14 +277,15 @@ async def test_status_endpoint_resolves_native_connector_to_project_watermark():
     )
     get_watermark = AsyncMock(return_value=watermark)
 
-    with (
-        patch("orchestrator.main.require_datasource_access", gate),
-        patch(
-            "shared.runtime.services.knowledge_store.KnowledgeStore.get_watermark",
-            get_watermark,
-        ),
+    with patch(
+        "shared.runtime.services.knowledge_store.KnowledgeStore.get_watermark",
+        get_watermark,
     ):
-        result = await get_datasource_index_status(request, datasource_id)
+        result = await get_datasource_index_status(
+            request,
+            datasource_id,
+            dependencies=_ds_deps(require_datasource_access=gate),
+        )
 
     assert result["datasource_id"] == datasource_id
     assert result["status"] == "ready"
@@ -261,14 +301,18 @@ async def test_manual_reindex_is_owner_gated_and_uses_stored_datasource():
     gate = AsyncMock(return_value=({}, datasource))
     run = AsyncMock(return_value={"status": "completed", "upserted": 2})
 
-    with (
-        patch("orchestrator.main.require_datasource_owner", gate),
-        patch("orchestrator.main._reindex_kb_datasource_now", run),
-    ):
-        result = await reindex_datasource_knowledge(object(), datasource_id, full=True)
+    deps = _ds_deps(require_datasource_owner=gate)
+    with patch("orchestrator.services.knowledge_index.reindex_kb_datasource_now", run):
+        result = await reindex_datasource_knowledge(
+            object(), datasource_id, full=True, dependencies=deps
+        )
 
     assert result["status"] == "completed"
-    run.assert_awaited_once_with(datasource, force_full=True)
+    run.assert_awaited_once_with(
+        datasource,
+        force_full=True,
+        dependencies=deps.operations.knowledge_index,
+    )
 
 
 @pytest.mark.asyncio
@@ -294,20 +338,26 @@ async def test_create_marks_pending_and_schedules_initial_full_index():
         config={"root_path": "vault"},
     )
 
+    deps = _ds_deps(
+        db, require_approved_user=AsyncMock(return_value={"id": UUID(int=1)})
+    )
     with (
         patch(
-            "orchestrator.main.require_approved_user",
-            AsyncMock(return_value={"id": UUID(int=1)}),
+            "orchestrator.services.knowledge_index.mark_kb_datasource_pending", pending
         ),
-        patch("orchestrator.main.postgres_db", db),
-        patch("orchestrator.main._mark_kb_datasource_pending", pending),
-        patch("orchestrator.main._schedule_kb_datasource_reindex", schedule),
+        patch(
+            "orchestrator.services.knowledge_index.schedule_kb_datasource_reindex",
+            schedule,
+        ),
     ):
-        result = await create_datasource(body, object())
+        result = await create_datasource(body, object(), dependencies=deps)
 
     assert "credentials" not in result
-    pending.assert_awaited_once_with(str(datasource_id))
-    schedule.assert_called_once_with(str(datasource_id), force_full=True)
+    index_deps = deps.operations.knowledge_index
+    pending.assert_awaited_once_with(str(datasource_id), dependencies=index_deps)
+    schedule.assert_called_once_with(
+        str(datasource_id), force_full=True, dependencies=index_deps
+    )
 
 
 @pytest.mark.asyncio
@@ -322,15 +372,14 @@ async def test_kb_create_rejects_legacy_job_id_auto_attachment():
         job_id=victim_job_id,
     )
 
-    with (
-        patch(
-            "orchestrator.main.require_approved_user",
-            AsyncMock(side_effect=AssertionError("auth ran past shape validation")),
+    deps = _ds_deps(
+        db,
+        require_approved_user=AsyncMock(
+            side_effect=AssertionError("auth ran past shape validation")
         ),
-        patch("orchestrator.main.postgres_db", db),
-        pytest.raises(HTTPException) as exc,
-    ):
-        await create_datasource(body, object())
+    )
+    with pytest.raises(HTTPException) as exc:
+        await create_datasource(body, object(), dependencies=deps)
 
     assert exc.value.status_code == 400
     assert "explicit connector selection" in str(exc.value.detail)
@@ -350,15 +399,11 @@ async def test_non_kb_create_rejects_non_secret_config_surface():
         config={"password": "must-not-be-persisted"},
     )
 
-    with (
-        patch(
-            "orchestrator.main.require_approved_user",
-            AsyncMock(return_value={"id": UUID(int=1)}),
-        ),
-        patch("orchestrator.main.postgres_db", db),
-        pytest.raises(HTTPException) as exc,
-    ):
-        await create_datasource(body, object())
+    deps = _ds_deps(
+        db, require_approved_user=AsyncMock(return_value={"id": UUID(int=1)})
+    )
+    with pytest.raises(HTTPException) as exc:
+        await create_datasource(body, object(), dependencies=deps)
 
     assert exc.value.status_code == 400
     assert "only supported" in str(exc.value.detail)
@@ -376,15 +421,11 @@ async def test_create_rejects_token_over_plain_http_before_persistence():
         credentials={"auth_method": "token", "token": "secret"},
     )
 
-    with (
-        patch(
-            "orchestrator.main.require_approved_user",
-            AsyncMock(return_value={"id": UUID(int=1)}),
-        ),
-        patch("orchestrator.main.postgres_db", db),
-        pytest.raises(HTTPException) as exc,
-    ):
-        await create_datasource(body, object())
+    deps = _ds_deps(
+        db, require_approved_user=AsyncMock(return_value={"id": UUID(int=1)})
+    )
+    with pytest.raises(HTTPException) as exc:
+        await create_datasource(body, object(), dependencies=deps)
 
     assert exc.value.status_code == 400
     assert "HTTPS" in str(exc.value.detail)
@@ -401,15 +442,11 @@ async def test_create_rejects_untrusted_git_host_before_persistence():
         connection_url="https://arbitrary.example/knowledge.git",
     )
 
-    with (
-        patch(
-            "orchestrator.main.require_approved_user",
-            AsyncMock(return_value={"id": UUID(int=1)}),
-        ),
-        patch("orchestrator.main.postgres_db", db),
-        pytest.raises(HTTPException) as exc,
-    ):
-        await create_datasource(body, object())
+    deps = _ds_deps(
+        db, require_approved_user=AsyncMock(return_value={"id": UUID(int=1)})
+    )
+    with pytest.raises(HTTPException) as exc:
+        await create_datasource(body, object(), dependencies=deps)
 
     assert exc.value.status_code == 400
     assert "not trusted" in str(exc.value.detail)
@@ -423,16 +460,13 @@ async def test_non_kb_update_rejects_non_secret_config_surface():
     db = MagicMock()
     db.update_datasource = AsyncMock()
 
-    with (
-        patch(
-            "orchestrator.main.require_datasource_owner",
-            AsyncMock(return_value=({}, existing)),
-        ),
-        patch("orchestrator.main.postgres_db", db),
-        pytest.raises(HTTPException) as exc,
-    ):
+    deps = _ds_deps(db, require_datasource_owner=AsyncMock(return_value=({}, existing)))
+    with pytest.raises(HTTPException) as exc:
         await update_datasource(
-            object(), datasource_id, DatasourceUpdate(config={"token": "secret"})
+            object(),
+            datasource_id,
+            DatasourceUpdate(config={"token": "secret"}),
+            dependencies=deps,
         )
 
     assert exc.value.status_code == 400
@@ -454,18 +488,13 @@ async def test_update_validates_preserved_token_against_changed_transport():
     db = MagicMock()
     db.update_datasource = AsyncMock()
 
-    with (
-        patch(
-            "orchestrator.main.require_datasource_owner",
-            AsyncMock(return_value=({}, existing)),
-        ),
-        patch("orchestrator.main.postgres_db", db),
-        pytest.raises(HTTPException) as exc,
-    ):
+    deps = _ds_deps(db, require_datasource_owner=AsyncMock(return_value=({}, existing)))
+    with pytest.raises(HTTPException) as exc:
         await update_datasource(
             object(),
             datasource_id,
             DatasourceUpdate(connection_url="http://git.example.test/knowledge.git"),
+            dependencies=deps,
         )
 
     assert exc.value.status_code == 400
@@ -487,18 +516,13 @@ async def test_update_validates_new_token_against_preserved_plain_http_url():
     db = MagicMock()
     db.update_datasource = AsyncMock()
 
-    with (
-        patch(
-            "orchestrator.main.require_datasource_owner",
-            AsyncMock(return_value=({}, existing)),
-        ),
-        patch("orchestrator.main.postgres_db", db),
-        pytest.raises(HTTPException) as exc,
-    ):
+    deps = _ds_deps(db, require_datasource_owner=AsyncMock(return_value=({}, existing)))
+    with pytest.raises(HTTPException) as exc:
         await update_datasource(
             object(),
             datasource_id,
             DatasourceUpdate(credentials={"auth_method": "token", "token": "secret"}),
+            dependencies=deps,
         )
 
     assert exc.value.status_code == 400
@@ -518,12 +542,12 @@ async def test_delete_uses_coordinated_kb_index_and_app_row_cleanup():
         return_value=({"id": actor_id}, {"id": datasource_id, "type": "kb"})
     )
 
-    with (
-        patch("orchestrator.main.require_datasource_owner", gate),
-        patch("orchestrator.main.postgres_db", db),
-        patch("orchestrator.main._delete_kb_datasource_with_index", cleanup),
+    deps = _ds_deps(db, require_datasource_owner=gate)
+    with patch(
+        "orchestrator.services.knowledge_index.delete_kb_datasource_with_index",
+        cleanup,
     ):
-        result = await delete_datasource(object(), datasource_id)
+        result = await delete_datasource(object(), datasource_id, dependencies=deps)
 
     assert result == {"status": "deleted"}
     # deleted_by is the SAME authenticated caller the non-kb branch already
@@ -533,6 +557,7 @@ async def test_delete_uses_coordinated_kb_index_and_app_row_cleanup():
         datasource_id,
         authority_project_scope_id=None,
         deleted_by=actor_id,
+        dependencies=deps.operations.knowledge_index,
     )
     db.delete_datasource.assert_not_awaited()
 
@@ -765,7 +790,7 @@ async def test_thread_attachment_rejects_an_inaccessible_private_kb():
         patch("orchestrator.main.postgres_db", db),
         pytest.raises(HTTPException) as exc,
     ):
-        await _authorize_thread_datasource_ids(
+        await control_seams.authorize_thread_datasource_ids(
             {"id": owner_id},
             [str(datasource_id)],
             workspace_backend="virtual",
@@ -794,14 +819,14 @@ async def test_thread_attachment_allows_kb_but_not_clone_repo_on_lite_tier():
     db.get_datasource_policy_rows = AsyncMock(side_effect=lambda _ids: [policy_row])
 
     with patch("orchestrator.main.postgres_db", db):
-        selected = await _authorize_thread_datasource_ids(
+        selected = await control_seams.authorize_thread_datasource_ids(
             {"id": owner_id},
             [str(datasource_id), str(datasource_id)],
             workspace_backend="virtual",
         )
         policy_row["type"] = "repository"
         with pytest.raises(HTTPException) as exc:
-            await _authorize_thread_datasource_ids(
+            await control_seams.authorize_thread_datasource_ids(
                 {"id": owner_id},
                 [str(datasource_id)],
                 workspace_backend="virtual",
@@ -838,7 +863,7 @@ async def test_persisted_thread_datasource_is_denied_after_access_revocation():
         patch("orchestrator.main._thread_project_ids", AsyncMock(return_value=[])),
         pytest.raises(HTTPException) as exc,
     ):
-        await _revalidate_thread_datasource_selection(
+        await control_seams.revalidate_thread_datasource_selection(
             {"id": "thread-1", "user_id": owner_id},
             [str(datasource_id)],
         )
@@ -876,14 +901,14 @@ async def test_persisted_thread_revalidation_preserves_global_and_system_semanti
         (
             global_selection,
             global_revisions,
-        ) = await _revalidate_thread_datasource_selection(
+        ) = await control_seams.revalidate_thread_datasource_selection(
             {"id": "thread-user", "user_id": owner_id},
             [str(datasource_id)],
         )
         (
             system_selection,
             system_revisions,
-        ) = await _revalidate_thread_datasource_selection(
+        ) = await control_seams.revalidate_thread_datasource_selection(
             {"id": "thread-system", "user_id": None},
             [str(datasource_id), str(datasource_id)],
         )
@@ -1063,10 +1088,13 @@ async def test_resume_revalidates_datasources_before_mutating_thread_status():
             AsyncMock(return_value=(user, thread)),
         ),
         patch("orchestrator.main.postgres_db", db),
-        patch("orchestrator.main._thread_config_drift", AsyncMock(return_value=drift)),
+        patch(
+            "orchestrator.main.thread_resume_operations.thread_config_drift",
+            AsyncMock(return_value=drift),
+        ),
         pytest.raises(HTTPException) as exc,
     ):
-        await resume_thread("thread-1", object())
+        await control_seams.resume_thread("thread-1", object())
 
     assert exc.value.status_code == 428
     assert exc.value.detail["drift"][0]["id"] == f"connector:{datasource_id}"
@@ -1112,10 +1140,13 @@ async def test_resume_blocks_revoked_native_project_scope_before_status_mutation
             AsyncMock(return_value=(user, thread)),
         ),
         patch("orchestrator.main.postgres_db", db),
-        patch("orchestrator.main._thread_config_drift", AsyncMock(return_value=drift)),
+        patch(
+            "orchestrator.main.thread_resume_operations.thread_config_drift",
+            AsyncMock(return_value=drift),
+        ),
         pytest.raises(HTTPException) as exc,
     ):
-        await resume_thread("thread-1", object())
+        await control_seams.resume_thread("thread-1", object())
 
     assert exc.value.status_code == 428
     assert exc.value.detail["drift"][0]["id"] == f"project:{project_id}"
@@ -1166,14 +1197,15 @@ async def test_metadata_only_kb_edit_does_not_schedule_full_rebuild():
     pending = AsyncMock()
     schedule = MagicMock()
 
+    deps = _ds_deps(db, require_datasource_owner=AsyncMock(return_value=({}, existing)))
     with (
         patch(
-            "orchestrator.main.require_datasource_owner",
-            AsyncMock(return_value=({}, existing)),
+            "orchestrator.services.knowledge_index.mark_kb_datasource_pending", pending
         ),
-        patch("orchestrator.main.postgres_db", db),
-        patch("orchestrator.main._mark_kb_datasource_pending", pending),
-        patch("orchestrator.main._schedule_kb_datasource_reindex", schedule),
+        patch(
+            "orchestrator.services.knowledge_index.schedule_kb_datasource_reindex",
+            schedule,
+        ),
     ):
         result = await update_datasource(
             object(),
@@ -1184,6 +1216,7 @@ async def test_metadata_only_kb_edit_does_not_schedule_full_rebuild():
                 default_branch="main",
                 config={"root_path": "vault"},
             ),
+            dependencies=deps,
         )
 
     assert result["id"] == datasource_id
@@ -1209,20 +1242,25 @@ async def test_root_change_schedules_full_rebuild():
     pending = AsyncMock()
     schedule = MagicMock()
 
+    deps = _ds_deps(db, require_datasource_owner=AsyncMock(return_value=({}, existing)))
     with (
         patch(
-            "orchestrator.main.require_datasource_owner",
-            AsyncMock(return_value=({}, existing)),
+            "orchestrator.services.knowledge_index.mark_kb_datasource_pending", pending
         ),
-        patch("orchestrator.main.postgres_db", db),
-        patch("orchestrator.main._mark_kb_datasource_pending", pending),
-        patch("orchestrator.main._schedule_kb_datasource_reindex", schedule),
+        patch(
+            "orchestrator.services.knowledge_index.schedule_kb_datasource_reindex",
+            schedule,
+        ),
     ):
         await update_datasource(
             object(),
             datasource_id,
             DatasourceUpdate(config={"root_path": "handbook"}),
+            dependencies=deps,
         )
 
-    pending.assert_awaited_once_with(datasource_id)
-    schedule.assert_called_once_with(datasource_id, force_full=True)
+    index_deps = deps.operations.knowledge_index
+    pending.assert_awaited_once_with(datasource_id, dependencies=index_deps)
+    schedule.assert_called_once_with(
+        datasource_id, force_full=True, dependencies=index_deps
+    )

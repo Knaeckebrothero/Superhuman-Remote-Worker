@@ -37,10 +37,24 @@ _T = TypeVar("_T")
 
 
 async def run_bounded_k8s_call(
-    function: Callable[..., _T], /, *args: Any, **kwargs: Any
+    function: Callable[..., _T],
+    /,
+    *args: Any,
+    request_timeout: Any | None = None,
+    **kwargs: Any,
 ) -> _T:
-    """Run one sync Kubernetes call and join it before propagating cancel."""
+    """Run one sync Kubernetes call and join it before propagating cancel.
 
+    ``request_timeout`` is the public spelling of the generated client's
+    ``_request_timeout``. Call sites must not name ``_``-prefixed kwargs --
+    a client generation that rejects one raises ``ApiTypeError`` only in a
+    deployed orchestrator, never against the fakes unit tests inject, so
+    tests/test_k8s_patch_kwargs_contract.py bans them at the call site. This
+    wrapper is the one place that spelling is allowed to exist.
+    """
+
+    if request_timeout is not None:
+        kwargs["_request_timeout"] = request_timeout
     kwargs.setdefault("_request_timeout", K8S_MUTATION_REQUEST_TIMEOUT)
     worker = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
     cancelled = False
@@ -271,6 +285,7 @@ def _exact_object_metadata(
     *,
     expected_uid: str | None,
     expected_labels: dict[str, str],
+    allow_terminal_deleting: bool = False,
 ) -> dict[str, Any] | None:
     metadata = getattr(value, "metadata", None)
     uid = str(getattr(metadata, "uid", "") or "")
@@ -279,7 +294,10 @@ def _exact_object_metadata(
     if not (
         uid
         and resource_version
-        and getattr(metadata, "deletion_timestamp", None) is None
+        and (
+            getattr(metadata, "deletion_timestamp", None) is None
+            or (allow_terminal_deleting and pod_containers_are_terminal(value))
+        )
         and (not expected_uid or uid == str(expected_uid))
         and all(
             labels.get(key) == expected for key, expected in expected_labels.items()
@@ -306,6 +324,7 @@ async def _read_exact_object(
     namespace: str,
     expected_uid: str | None,
     expected_labels: dict[str, str],
+    allow_terminal_deleting: bool = False,
 ) -> tuple[Any, dict[str, Any]] | None:
     try:
         value = await run_bounded_k8s_call(
@@ -321,6 +340,7 @@ async def _read_exact_object(
         value,
         expected_uid=expected_uid,
         expected_labels=expected_labels,
+        allow_terminal_deleting=allow_terminal_deleting,
     )
     return (value, evidence) if evidence is not None else None
 
@@ -723,7 +743,13 @@ async def release_planned_pinned_pod_authority(
     expected_pod_uid: str,
     expected_labels: dict[str, str],
 ) -> dict[str, Any] | None:
-    """Remove only SRW's exact live warm-binding finalizer and re-read it."""
+    """Remove SRW's finalizer from one exact released warm-binding Pod.
+
+    Route publication may turn the once-live warm Pod into a terminal deleting
+    object before the durable release row is reconciled.  Terminal container
+    evidence plus the captured UID/labels is sufficient to remove only our
+    finalizer; physical absence is still required before that path settles.
+    """
 
     observed = await observe_planned_pinned_pod_authority(
         core_api,
@@ -739,8 +765,12 @@ async def release_planned_pinned_pod_authority(
         return {"outcome": "exact_replacement_v1", "agent_present": False}
     if state not in {"exact_live", "exact_terminal"}:
         return None
-    if not observed.get("finalizer_present"):
+    if state == "exact_live" and not observed.get("finalizer_present"):
         return {"outcome": "exact_live_unprotected_v1", "agent_present": True}
+    if not observed.get("finalizer_present"):
+        # A terminal deleting object without our finalizer is on its way to
+        # physical absence. Do not return its dead actor to the warm pool.
+        return None
 
     exact = await _read_exact_object(
         core_api.read_namespaced_pod,
@@ -748,11 +778,9 @@ async def release_planned_pinned_pod_authority(
         namespace=namespace,
         expected_uid=expected_pod_uid,
         expected_labels=expected_labels,
+        allow_terminal_deleting=state == "exact_terminal",
     )
     if exact is None:
-        # A terminal Pod has deletionTimestamp and intentionally does not pass
-        # the live-object helper.  Warm release is only for an unbound pool
-        # Pod; its ordinary GC path owns terminal finalizer release.
         return None
     _, evidence = exact
     patch = finalizer_release_patch(

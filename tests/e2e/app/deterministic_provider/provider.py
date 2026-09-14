@@ -15,19 +15,24 @@ import asyncio
 import hashlib
 import hmac
 import json
+import os
 import re
+import shlex
 import time
 import uuid
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Literal
+from datetime import datetime, timezone
+from typing import Any, AsyncIterator, Final, Literal
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-CHAT_MODEL_ID = "e2e-chat"
+CHAT_MODEL_ID = os.environ.get("E2E_CHAT_MODEL_ID", "e2e-chat")
+if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,126}", CHAT_MODEL_ID):
+    raise RuntimeError("E2E_CHAT_MODEL_ID must be a lowercase test model identifier")
 EMBEDDING_MODEL_ID = "e2e-embedding"
 RERANK_MODEL_ID = "qwen3-reranker-8b"
 EMBEDDING_DIMENSIONS = 4096
@@ -41,6 +46,8 @@ SUPPORTED_SCENARIOS = frozenset(
         "numbered-stream",
         "search-job",
         "fetch-job",
+        "worker-job",
+        "prepared-workspace-job",
     }
 )
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{2,127}$")
@@ -48,6 +55,7 @@ _CORRELATION_RE = re.compile(
     r"(?<![A-Za-z0-9_-])E2E-([A-Za-z0-9][A-Za-z0-9_-]{2,127})(?![A-Za-z0-9_-])"
 )
 _DIAGNOSTIC_MODELS = frozenset({CHAT_MODEL_ID, EMBEDDING_MODEL_ID, RERANK_MODEL_ID})
+_MAX_UNSCOPED_DIAGNOSTICS: Final = 4096
 
 
 class ArmScenarioRequest(BaseModel):
@@ -63,6 +71,8 @@ class ArmScenarioRequest(BaseModel):
         "numbered-stream",
         "search-job",
         "fetch-job",
+        "worker-job",
+        "prepared-workspace-job",
     ] = "reply"
     required_responses: int = Field(default=1, ge=1, le=100)
     chunk_delay_ms: int = Field(default=100, ge=0, le=2_000)
@@ -106,6 +116,7 @@ class RunState:
     error_once_emitted: bool = False
     search_job_tool_steps: int = 0
     fetch_job_tool_steps: int = 0
+    worker_job_tool_steps: int = 0
     next_sequence: int = 1
     counters: Counter[tuple[str, str, bool, str]] = field(default_factory=Counter)
     calls: list[dict[str, Any]] = field(default_factory=list)
@@ -146,6 +157,7 @@ class ScenarioStore:
         self._lock = asyncio.Lock()
         self._runs: dict[str, RunState] = {}
         self._unscoped_unexpected_calls = 0
+        self._unscoped_calls: list[dict[str, Any]] = []
 
     async def arm(self, run_id: str, request: ArmScenarioRequest) -> dict[str, Any]:
         _validate_run_id(run_id)
@@ -184,9 +196,49 @@ class ScenarioStore:
                     self._serialize(self._runs[key]) for key in sorted(self._runs)
                 ],
                 "unscoped_unexpected_calls": self._unscoped_unexpected_calls,
+                "unscoped_calls_truncated": max(
+                    0,
+                    self._unscoped_unexpected_calls - len(self._unscoped_calls),
+                ),
+                "unscoped_calls": list(self._unscoped_calls),
             }
 
-    async def resolve_run(self, payload: dict[str, Any]) -> str:
+    def _record_unscoped_locked(
+        self,
+        *,
+        endpoint: str,
+        outcome: str,
+        model: Any = None,
+        stream: Any = False,
+        correlation_run_ids: set[str] | None = None,
+    ) -> None:
+        """Record one rejected/unaccounted request using safe metadata only."""
+
+        self._unscoped_unexpected_calls += 1
+        sequence = self._unscoped_unexpected_calls
+        diagnostic = {
+            "sequence": sequence,
+            "correlation_id": f"unscoped:{sequence}",
+            "observed_at": datetime.now(timezone.utc)
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z"),
+            "endpoint": endpoint,
+            "model": _diagnostic_model(model),
+            "stream": stream if isinstance(stream, bool) else False,
+            "outcome": outcome,
+            "correlation_run_ids": sorted(correlation_run_ids or ()),
+            "active_run_ids": sorted(self._runs),
+        }
+        if len(self._unscoped_calls) == _MAX_UNSCOPED_DIAGNOSTICS:
+            del self._unscoped_calls[0]
+        self._unscoped_calls.append(diagnostic)
+
+    async def resolve_run(
+        self,
+        payload: dict[str, Any],
+        *,
+        endpoint: str,
+    ) -> str:
         """Resolve one run without retaining any request content.
 
         A correlation token wins.  Calls without a token are accepted only when
@@ -196,9 +248,14 @@ class ScenarioStore:
 
         try:
             explicit_run_id = _metadata_run_id(payload)
-        except ScenarioError:
+        except ScenarioError as exc:
             async with self._lock:
-                self._unscoped_unexpected_calls += 1
+                self._record_unscoped_locked(
+                    endpoint=endpoint,
+                    outcome=exc.error_type,
+                    model=payload.get("model"),
+                    stream=payload.get("stream", False),
+                )
             raise
         discovered = _discover_run_ids(payload)
         if explicit_run_id:
@@ -206,7 +263,13 @@ class ScenarioStore:
 
         async with self._lock:
             if len(discovered) > 1:
-                self._unscoped_unexpected_calls += 1
+                self._record_unscoped_locked(
+                    endpoint=endpoint,
+                    outcome="ambiguous_run",
+                    model=payload.get("model"),
+                    stream=payload.get("stream", False),
+                    correlation_run_ids=discovered,
+                )
                 raise ScenarioError(
                     409,
                     "ambiguous_run",
@@ -215,7 +278,13 @@ class ScenarioStore:
             if discovered:
                 run_id = next(iter(discovered))
                 if run_id not in self._runs:
-                    self._unscoped_unexpected_calls += 1
+                    self._record_unscoped_locked(
+                        endpoint=endpoint,
+                        outcome="scenario_not_armed",
+                        model=payload.get("model"),
+                        stream=payload.get("stream", False),
+                        correlation_run_ids=discovered,
+                    )
                     raise ScenarioError(
                         409,
                         "scenario_not_armed",
@@ -225,7 +294,17 @@ class ScenarioStore:
             if len(self._runs) == 1:
                 return next(iter(self._runs))
 
-            self._unscoped_unexpected_calls += 1
+            outcome = (
+                "run_correlation_required_no_active_scenario"
+                if not self._runs
+                else "run_correlation_required_multiple_active_scenarios"
+            )
+            self._record_unscoped_locked(
+                endpoint=endpoint,
+                outcome=outcome,
+                model=payload.get("model"),
+                stream=payload.get("stream", False),
+            )
             message = (
                 "No E2E scenario is armed."
                 if not self._runs
@@ -274,7 +353,13 @@ class ScenarioStore:
                 target = next(iter(self._runs.values()))
 
             if target is None:
-                self._unscoped_unexpected_calls += 1
+                self._record_unscoped_locked(
+                    endpoint=endpoint,
+                    outcome=outcome,
+                    model=model,
+                    stream=stream,
+                    correlation_run_ids=candidates,
+                )
                 return
             self._record_immediate(
                 target,
@@ -300,7 +385,13 @@ class ScenarioStore:
         async with self._lock:
             state = self._runs.get(run_id)
             if state is None:
-                self._unscoped_unexpected_calls += 1
+                self._record_unscoped_locked(
+                    endpoint=endpoint,
+                    outcome="scenario_reset_before_start",
+                    model=model,
+                    stream=stream,
+                    correlation_run_ids={run_id},
+                )
                 raise ScenarioError(
                     409,
                     "scenario_not_armed",
@@ -391,6 +482,14 @@ class ScenarioStore:
             if state is None:
                 # Reset is allowed only after clients are closed; if a caller violates
                 # that order there is intentionally no recreated/tombstoned state.
+                # Keep the successful/rejected HTTP request globally visible instead.
+                self._record_unscoped_locked(
+                    endpoint=decision.endpoint,
+                    outcome="scenario_reset_before_finish",
+                    model=decision.model,
+                    stream=decision.stream,
+                    correlation_run_ids={decision.run_id},
+                )
                 return
             pending = state.pending.pop(decision.sequence, None)
             if pending is None:
@@ -409,6 +508,12 @@ class ScenarioStore:
                 and decision.tool_phase
             ):
                 state.fetch_job_tool_steps += 1
+            if (
+                outcome == "success"
+                and decision.scenario in {"worker-job", "prepared-workspace-job"}
+                and decision.tool_phase
+            ):
+                state.worker_job_tool_steps += 1
             if outcome != "success":
                 state.unexpected_calls += 1
             duration_ms = max(0, int((time.monotonic() - pending.started_at) * 1000))
@@ -480,6 +585,7 @@ class ScenarioStore:
             "remaining_required_responses": state.remaining_required_responses,
             "search_job_tool_steps": state.search_job_tool_steps,
             "fetch_job_tool_steps": state.fetch_job_tool_steps,
+            "worker_job_tool_steps": state.worker_job_tool_steps,
             "unexpected_count": state.unexpected_calls,
             "pending_calls": len(state.pending),
             "counters": counters,
@@ -560,7 +666,7 @@ def create_inference_app(
             payload = await _accounted_json_object(
                 request, store=store, endpoint="chat.completions"
             )
-            run_id = await store.resolve_run(payload)
+            run_id = await store.resolve_run(payload, endpoint="chat.completions")
             try:
                 model = _required_string(payload, "model")
                 messages = payload.get("messages")
@@ -584,7 +690,7 @@ def create_inference_app(
                 raise
 
             structured_name = _structured_output_name(payload)
-            if structured_name not in {None, "ConversationTitle", "ExtractedMemories"}:
+            if structured_name not in _MODELLED_SCHEMAS:
                 await _account_rejection(
                     store,
                     run_id=run_id,
@@ -636,6 +742,39 @@ def create_inference_app(
                         422,
                         "required_tool_missing",
                         "The search-job scenario requires a tool that was not bound.",
+                    )
+            elif structured_name is None and state["scenario"] in {
+                "worker-job",
+                "prepared-workspace-job",
+            }:
+                tool_names = _tool_names(payload)
+                if tool_names & {
+                    "read_file",
+                    "todo_complete",
+                    "next_phase_todos",
+                    "job_complete",
+                }:
+                    if state["scenario"] == "prepared-workspace-job":
+                        tool_call = _prepared_workspace_tool_call(
+                            state["worker_job_tool_steps"], run_id, messages
+                        )
+                    else:
+                        tool_call = _worker_job_tool_call(
+                            state["worker_job_tool_steps"], run_id
+                        )
+                if tool_call is not None and tool_call.name not in tool_names:
+                    await _account_rejection(
+                        store,
+                        run_id=run_id,
+                        endpoint="chat.completions",
+                        model=model,
+                        stream=stream,
+                        outcome="unexpected_required_tool_missing",
+                    )
+                    raise ScenarioError(
+                        422,
+                        "required_tool_missing",
+                        "The worker-job scenario requires a tool that was not bound.",
                     )
             elif structured_name is None and state["scenario"] == "fetch-job":
                 tool_names = _tool_names(payload)
@@ -720,7 +859,7 @@ def create_inference_app(
             payload = await _accounted_json_object(
                 request, store=store, endpoint="embeddings"
             )
-            run_id = await store.resolve_run(payload)
+            run_id = await store.resolve_run(payload, endpoint="embeddings")
             try:
                 model = _required_string(payload, "model")
                 raw_input = payload.get("input")
@@ -764,7 +903,7 @@ def create_inference_app(
             payload = await _accounted_json_object(
                 request, store=store, endpoint="rerank"
             )
-            run_id = await store.resolve_run(payload)
+            run_id = await store.resolve_run(payload, endpoint="rerank")
             try:
                 model = _required_string(payload, "model")
                 query = payload.get("query")
@@ -991,6 +1130,23 @@ def _discover_run_ids(payload: dict[str, Any]) -> set[str]:
     return run_ids
 
 
+#: Structured-output schemas this fixture answers deterministically. Anything
+#: else is a real unexpected call and must stay a 422 — the set is deliberately
+#: an allowlist, not a fallback, so a NEW schema shows up as a rejection rather
+#: than as a silently fabricated answer.
+_MODELLED_SCHEMAS: Final = frozenset(
+    {
+        None,
+        "ConversationTitle",
+        "ExtractedMemories",
+        "AssemblyResult",
+        "ConversationSummary",
+        "CurationResult",
+        "KnowledgeAssemblyResult",
+    }
+)
+
+
 def _structured_output_name(payload: dict[str, Any]) -> str | None:
     response_format = payload.get("response_format")
     if not isinstance(response_format, dict):
@@ -1026,6 +1182,64 @@ def _structured_content(schema_name: str, run_id: str) -> str:
         )
     if schema_name == "ExtractedMemories":
         return '{"memories":[]}'
+    if schema_name == "AssemblyResult":
+        # Memory Light's assembler (`AssembleMemoriesTask`) runs as a
+        # non-blocking auxiliary task during any sufficiently long worker job.
+        # It is not part of any scenario's assertion, but leaving its schema
+        # unmodelled made every worker run record two `unexpected_schema`
+        # rejections that the agent then logged as "Memory assembly failed
+        # (non-fatal)" — real degradation, and noise that hides a genuine
+        # unexpected call. A no-op review is the honest deterministic answer.
+        return json.dumps(
+            {
+                "actions_taken": [],
+                "gaps_identified": [],
+                "summary": f"E2E-{run_id} deterministic no-op assembly review.",
+            },
+            separators=(",", ":"),
+        )
+    if schema_name == "ConversationSummary":
+        # Context compaction (`SummarizeTask`) folds a long worker conversation
+        # through this schema. A loop member that runs long enough to compact
+        # asked for it and got a 422, which the agent retried three times and
+        # then degraded to trimming — real behaviour change, and two
+        # `unexpected_schema` rejections that hide a genuine unexpected call.
+        # The deterministic answer is a valid, content-free summary.
+        return json.dumps(
+            {
+                "summary": f"E2E-{run_id} deterministic conversation summary.",
+                "tasks_completed": "",
+                "tasks_in_progress": "",
+                "key_decisions": "",
+                "current_state": "",
+                "blockers": "",
+                "critical_facts": "",
+                "state_changes": "",
+                "pinned_instructions": "",
+                "identity_anchor": "",
+            },
+            separators=(",", ":"),
+        )
+    if schema_name == "CurationResult":
+        return json.dumps(
+            {
+                "notes_created": 0,
+                "notes_updated": 0,
+                "summary": f"E2E-{run_id} deterministic no-op curation.",
+            },
+            separators=(",", ":"),
+        )
+    if schema_name == "KnowledgeAssemblyResult":
+        return json.dumps(
+            {
+                "notes_refreshed": 0,
+                "notes_superseded": 0,
+                "notes_merged": 0,
+                "notes_archived": 0,
+                "summary": f"E2E-{run_id} deterministic no-op convergence.",
+            },
+            separators=(",", ":"),
+        )
     raise AssertionError(f"unsupported structured schema: {schema_name}")
 
 
@@ -1317,6 +1531,136 @@ def _search_job_tool_call(step: int, run_id: str) -> ToolCallSpec:
         name="todo_complete",
         arguments=json.dumps(
             {"completion_note": "PASS: SearXNG live search gate completed."},
+            separators=(",", ":"),
+        ),
+    )
+
+
+def _prepared_workspace_tool_call(
+    step: int, run_id: str, messages: list[dict[str, Any]]
+) -> ToolCallSpec:
+    """Require an actual prepared-workspace shell result before completion."""
+    if step == 6:
+        existing = "-f" if run_id.endswith("-reuse") else "! -e"
+        command = "\n".join(
+            [
+                "set -eu",
+                'test "$(srw-cache-check)" = srw-prepared-tool-v1',
+                'test "$(cat .srw-initialize-count)" = initialized',
+                f"test {existing} .srw-execution-marker",
+                "printf '%s\\n' " + shlex.quote(run_id) + " > .srw-execution-marker",
+                "printf 'SRW_PREPARED_PASS:%s\\n' " + shlex.quote(run_id),
+            ]
+        )
+        if "-job-sudo-" in run_id:
+            # Keep sudo as the first word to exercise the harness gate. This
+            # only queries the installed version; it runs no privileged command.
+            command = "sudo --version >/dev/null && (\n" + command + "\n)"
+        return ToolCallSpec(
+            name="run_command",
+            arguments=json.dumps(
+                {"command": command, "working_dir": ".", "timeout": 30},
+                separators=(",", ":"),
+            ),
+        )
+    if step == 7:
+        previous = next(
+            (
+                message
+                for message in reversed(messages)
+                if isinstance(message, dict) and message.get("role") == "tool"
+            ),
+            {},
+        )
+        output = previous.get("content")
+        if (
+            not isinstance(output, str)
+            or f"SRW_PREPARED_PASS:{run_id}" not in output.splitlines()
+            or "Exit code: 0" not in output.splitlines()
+        ):
+            raise ScenarioError(
+                422,
+                "workspace_proof_missing",
+                "Prepared workspace execution did not return the required proof.",
+            )
+    return _worker_job_tool_call(step if step < 6 else step - 1, run_id)
+
+
+def _worker_job_tool_call(step: int, run_id: str) -> ToolCallSpec:
+    """Drive the real phased agent to completion without any off-pod tool.
+
+    `search-job` and `fetch-job` are deliberately *live-gate* drivers: each
+    requires a third-party provider (SearXNG, Crawl4AI) so it can exercise the
+    off-pod boundary. The owned minimal profile has neither, and adding one
+    breaks its determinism contract ("exactly one endpoint, exactly two
+    models"). This scenario covers the case those two cannot: a real worker
+    job reaching `job_complete` using only core, in-workspace tools.
+
+    Same shape as its siblings — read the todo guide the staging contract
+    requires, run the strategic todos, stage a tactical phase, read the
+    verification guide at the completion boundary, then complete.
+    """
+
+    if step == 0:
+        return ToolCallSpec(
+            name="read_file",
+            arguments=json.dumps(
+                {"path": "skills/todo-guide/SKILL.md"}, separators=(",", ":")
+            ),
+        )
+    if step < 5:
+        return ToolCallSpec(
+            name="todo_complete",
+            arguments=json.dumps(
+                {"completion_note": "PASS: hermetic strategic setup step."},
+                separators=(",", ":"),
+            ),
+        )
+    if step == 5:
+        return ToolCallSpec(
+            name="next_phase_todos",
+            arguments=json.dumps(
+                {
+                    "todos": [
+                        "Record the hermetic worker-job acceptance marker.",
+                        "Verify the marker and close the phase.",
+                    ],
+                    "phase_name": "Hermetic worker-job gate",
+                },
+                separators=(",", ":"),
+            ),
+        )
+    if step in {6, 7}:
+        return ToolCallSpec(
+            name="todo_complete",
+            arguments=json.dumps(
+                {"completion_note": "PASS: hermetic tactical step."},
+                separators=(",", ":"),
+            ),
+        )
+    if step == 8:
+        return ToolCallSpec(
+            name="read_file",
+            arguments=json.dumps(
+                {"path": "skills/verify-before-done/SKILL.md"}, separators=(",", ":")
+            ),
+        )
+    if step == 9:
+        return ToolCallSpec(
+            name="job_complete",
+            arguments=json.dumps(
+                {
+                    "summary": f"Completed the hermetic worker gate for E2E-{run_id}.",
+                    "deliverables": [],
+                    "confidence": 1.0,
+                },
+                separators=(",", ":"),
+            ),
+        )
+    return ToolCallSpec(
+        name="todo_complete",
+        arguments=json.dumps(
+            {"completion_note": "PASS: hermetic worker-job gate completed."},
             separators=(",", ":"),
         ),
     )

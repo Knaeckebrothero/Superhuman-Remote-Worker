@@ -26,7 +26,10 @@ from shared.runtime.core.loader import (
 
 def test_base_only_resolves_to_blob():
     # No expert, no overrides → just the bundled base, serialized.
-    blob = resolve_config(base_config_name="persistent_defaults")
+    blob = resolve_config(
+        base_config_name="persistent_defaults",
+        request_override={"workspace": {"backend": "sandbox"}},
+    )
     assert "agent" in blob and "prompts" in blob and "instructions" in blob
     assert blob["agent"]["agent_id"]  # base loaded + parsed
     assert "api_key" not in blob["agent"].get("llm", {})  # serialize strips it
@@ -44,7 +47,10 @@ def test_base_only_matches_load_agent_config():
     cfg = load_agent_config(path, dep)
     expected = serialize_resolved_config(cfg, model=cfg.llm.model)
 
-    blob = resolve_config(base_config_name="persistent_defaults")
+    blob = resolve_config(
+        base_config_name="persistent_defaults",
+        request_override={"workspace": {"backend": "sandbox"}},
+    )
 
     assert blob["agent"] == expected["agent"]
     assert blob["prompts"] == expected["prompts"]
@@ -108,6 +114,38 @@ def test_account_fallback_sits_below_bundled_expert_leaf():
     assert cap["merged_fragment"]["llm"]["reasoning_level"] == "high"
 
 
+def test_canonical_expert_leaf_removal_cannot_restore_a_setting_from_its_assets():
+    from pathlib import Path
+    from shared.manifests import parse_documents
+    from shared.runtime.core.srw_manifest_config import srw_private_config
+
+    path = Path(__file__).resolve().parents[1] / "config/experts/developer/config.yaml"
+    private = srw_private_config(parse_documents(path.read_text())[0])
+    assert private["config_name"] == "worker_base"
+    assert private["asset_name"] == "developer"
+    assert private["config"]["llm"].pop("reasoning_level") == "high"
+    row = {
+        "expert_type": "worker",
+        "harness_adapter": "srw/v1",
+        "harness_config_name": private["config_name"],
+        "harness_asset_name": private["asset_name"],
+        "config": private["config"],
+        "prompts": {},
+    }
+    capture = {}
+    resolved = resolve_config(
+        base_config_name="worker_base",
+        expert_row=row,
+        base_defaults={"llm": {"reasoning_level": "low"}},
+        expert_type="worker",
+        capture=capture,
+    )
+    assert capture["merged_fragment"]["llm"]["reasoning_level"] == "low"
+    original = resolve_config(base_config_name="developer", expert_type="worker")
+    assert resolved["prompts"] == original["prompts"]
+    assert resolved["instructions"] == original["instructions"]
+
+
 def test_expert_model_applies_when_no_request_override():
     blob = resolve_config(
         base_config_name="persistent_defaults",
@@ -119,7 +157,10 @@ def test_expert_model_applies_when_no_request_override():
 
 def test_bundled_base_has_no_persona_source_marker():
     """Only DB experts are fenced — a plain base resolve carries no marker."""
-    blob = resolve_config(base_config_name="persistent_defaults")
+    blob = resolve_config(
+        base_config_name="persistent_defaults",
+        request_override={"workspace": {"backend": "sandbox"}},
+    )
     assert "_persona_source" not in blob["agent"]
     assert "_db_prompt_keys" not in blob["agent"]
 
@@ -186,7 +227,10 @@ def test_credentials_injected_into_delivery_copy_only():
     """resolve_config returns a secret-free blob (serialize strips llm.api_key);
     delivery injects creds into a COPY — the original (persistable) blob is
     never mutated."""
-    blob = resolve_config(base_config_name="persistent_defaults")
+    blob = resolve_config(
+        base_config_name="persistent_defaults",
+        request_override={"workspace": {"backend": "sandbox"}},
+    )
 
     async def fake_injector(co):  # mirrors _inject_dispatch_credentials
         co.setdefault("llm", {})["api_key"] = "sk-secret"
@@ -208,7 +252,10 @@ def test_research_credentials_reach_resolved_config_delivery_only():
     ``AgentConfig.extra``. The persistable source blob must remain untouched so
     provider credentials never enter dispatch state.
     """
-    blob = resolve_config(base_config_name="persistent_defaults")
+    blob = resolve_config(
+        base_config_name="persistent_defaults",
+        request_override={"workspace": {"backend": "sandbox"}},
+    )
     original_research = copy.deepcopy(blob["agent"].get("research"))
 
     async def fake_injector(co):

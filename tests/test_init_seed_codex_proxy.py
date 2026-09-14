@@ -1,8 +1,9 @@
-"""Tests for ``orchestrator.init._seed_codex_proxy_endpoint``.
+"""Tests for ``orchestrator.init._seed_subscription_proxy_endpoint``.
 
-Seeds a system-scoped llm_endpoints row (label=``codex-proxy``) when the
-``CODEX_PROXY_URL`` env var is set. Re-uses the existing helm-style seeder
-under the hood so re-runs are no-ops by label match.
+Seeds a system-scoped llm_endpoints row (label=``subscription-proxy``, marker
+``transport_kind='subscription-proxy'``) when the proxy URL env var is set.
+Re-uses the existing helm-style seeder under the hood so re-runs are no-ops —
+matched by the transport marker, or by either the new or the legacy label.
 """
 
 from __future__ import annotations
@@ -30,7 +31,8 @@ def _fake_db(*, existing_endpoints: list[dict] | None = None):
 
 @pytest.mark.asyncio
 async def test_no_codex_proxy_url_is_noop(monkeypatch):
-    """Without CODEX_PROXY_URL, the seed bails before any DB calls."""
+    """Without a proxy URL, the seed bails before any DB calls."""
+    monkeypatch.delenv("SUBSCRIPTION_PROXY_URL", raising=False)
     monkeypatch.delenv("CODEX_PROXY_URL", raising=False)
     monkeypatch.delenv("CODEX_MANAGEMENT_KEY", raising=False)
 
@@ -52,7 +54,11 @@ async def test_seeds_codex_proxy_endpoint(monkeypatch):
 
     db.create_system_llm_endpoint.assert_awaited_once()
     kwargs = db.create_system_llm_endpoint.await_args.kwargs
-    assert kwargs["label"] == init_mod.CODEX_PROXY_ENDPOINT_LABEL == "codex-proxy"
+    assert (
+        kwargs["label"]
+        == init_mod.SUBSCRIPTION_PROXY_ENDPOINT_LABEL
+        == "subscription-proxy"
+    )
     assert kwargs["base_url"] == "http://codex-proxy:8317/v1"
     # Management key was resolved via apiKeyEnv and inlined for the insert.
     assert kwargs["api_key"] == "sk-mgmt-test"
@@ -117,5 +123,5 @@ async def test_seeds_without_management_key(monkeypatch):
 
     db.create_system_llm_endpoint.assert_awaited_once()
     kwargs = db.create_system_llm_endpoint.await_args.kwargs
-    assert kwargs["label"] == "codex-proxy"
+    assert kwargs["label"] == "subscription-proxy"
     assert kwargs["api_key"] is None

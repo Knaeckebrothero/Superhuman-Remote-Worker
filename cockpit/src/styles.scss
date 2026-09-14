@@ -3,12 +3,14 @@
 @use 'styles/root-tokens';        // Primitive scale at :root (--radius-*, --font-family-*)
 @use 'styles/semantic-tokens';    // Role tokens at :root (--radius-control, --font-primary, …)
 @use 'styles/themes/themes' as theme;
-@use 'styles/themes/shape-overrides';
+@use 'styles/themes/roman-accents';
 @use 'styles/code-highlight';     // Global PrismJS token theme for <markdown> code blocks
 @use 'styles/katex';              // Global presentation tweaks for KaTeX math in <markdown>
 @use 'styles/canvas-content';     // Sanitized Dynamic Canvas markdown typography
 @use 'styles/external-image';     // Inert click-to-load cards in untrusted Markdown
+@use 'styles/workspace-file-link'; // Inert workspace-path controls in untrusted Markdown
 @use 'styles/chat-queued';        // Retry/discard affordances on a stalled chat send
+@use 'styles/app-table';          // Shared data-table look (class="app-table" on <table>)
 
 // --- Theme classes (body-class swap) ---
 // Default look = senate (dark). <body class="theme-senate"> applies these tokens.
@@ -40,10 +42,53 @@ body {
   background: var(--app-bg);
   color: var(--text-primary);
   font-family: v.$font-family-base;
-  font-size: v.$font-size-sm;
   line-height: v.$line-height-base;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+}
+
+// The rem base. This used to be 0.875rem on BOTH html and body, which
+// compounded to a 12.25px body and shrank every rem token (radii, spacing,
+// type scale) by 12.5% against its own comments. html stays at the browser
+// default; body carries the app text size.
+html {
+  font-size: 100%;
+}
+
+body {
+  font-size: v.$font-size-sm; // 14px
+}
+
+// --- Headings ---
+// Sentence case, weight + size carry hierarchy, tracking tightens with size.
+// Components that title without an h-tag use type.heading($level).
+h1,
+h2,
+h3,
+h4 {
+  font-family: var(--font-heading);
+  font-weight: 600;
+  line-height: 1.25;
+  color: var(--text-primary);
+}
+
+h1 {
+  font-size: 1.5rem;
+  letter-spacing: -0.02em;
+}
+
+h2 {
+  font-size: 1.25rem;
+  letter-spacing: -0.015em;
+}
+
+h3 {
+  font-size: 1rem;
+  letter-spacing: -0.01em;
+}
+
+h4 {
+  font-size: 0.875rem;
 }
 
 // --- Angular-split gutter styling ---
@@ -111,7 +156,7 @@ select:focus-visible,
 textarea:focus-visible {
   outline: none;
   border-color: var(--accent-color) !important;
-  box-shadow: 0 0 0 1px var(--accent-color);
+  box-shadow: 0 0 0 3px var(--ring);
 }
 
 // --- Selection ---
@@ -191,6 +236,20 @@ textarea:focus-visible {
   *::after {
     transition-duration: 0.01ms !important;
   }
+}
+
+// --- Sidebar resize gesture ---
+// Held on <body> for the duration of a rail drag (SidebarResizerComponent).
+// Pointer capture keeps the events flowing to the handle once the pointer
+// leaves its 8px strip, but the *cursor* is still resolved from whatever
+// element is under the pointer — without this it flips to a text caret the
+// moment the drag crosses into the transcript. The descendant rule is not
+// redundant with the inherited one: cursor inherits, but every button, link
+// and input in the app sets its own.
+body.sidebar-resizing,
+body.sidebar-resizing * {
+  cursor: col-resize !important;
+  user-select: none !important;
 }
 
 // --- Disable hover effects on touch devices ---

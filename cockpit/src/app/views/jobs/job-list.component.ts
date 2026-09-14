@@ -1,3 +1,4 @@
+import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
 import {
   Component,
   DestroyRef,
@@ -116,7 +117,7 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
   selector: 'app-job-list',
   standalone: true,
   imports: [
-    TranslocoPipe,
+    SidebarToggleComponent, TranslocoPipe,
     AppButtonComponent,
     AppBadgeComponent,
     AppInputComponent,
@@ -136,6 +137,7 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
     <div class="job-list-container">
       <!-- Header with filters -->
       <div class="header-bar">
+        <app-sidebar-toggle />
         <span class="title">{{ 'jobs.title' | transloco }}</span>
         <div class="header-actions">
           @if (snapshotStats()?.available) {
@@ -254,7 +256,7 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
       <div #tableTop tabindex="-1" class="table-anchor"></div>
       @if (displayRows().length > 0) {
         <div class="table-container">
-          <table class="job-table">
+          <table class="job-table app-table">
             <thead>
               <tr>
                 <th class="col-prompt">{{ 'jobs.colJob' | transloco }}</th>
@@ -379,198 +381,99 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
                     {{ formatDate(row.job.created_at) }}
                   </td>
                   <td class="actions-cell">
-                    @if (viewport.isMobile()) {
-                      <!-- Mobile: the whole action set lives in an overflow menu, so
-                           the cell is just the kebab and the prompt gets the width. -->
-                      <app-icon-button
+                    <!-- One primary per row: View (ghost), at most one contextual
+                         action the status demands, and the overflow menu that holds
+                         everything else. On mobile only the menu renders. -->
+                    @if (!viewport.isMobile()) {
+                      <app-button
+                        variant="ghost"
                         size="sm"
-                        [ariaLabel]="'jobs.tooltip.moreActions' | transloco"
-                        [appMenuTrigger]="rowMenu"
-                        menuPlacement="bottom-end"
-                        (click)="$event.stopPropagation()"
+                        [ariaLabel]="'jobs.tooltip.view' | transloco"
+                        (clicked)="viewJob(row.job.id); $event.stopPropagation()"
                       >
-                        <app-icon size="sm">more_vert</app-icon>
-                      </app-icon-button>
-                      <app-menu #rowMenu>
-                        <app-menu-item (activated)="viewJob(row.job.id)">{{ 'jobs.action.view' | transloco }}</app-menu-item>
-                        @if (row.job.pending_approval) {
-                          <app-menu-item (activated)="goToApproveRequest(row.job)">{{ 'jobs.action.approveRequest' | transloco }}</app-menu-item>
-                        } @else if (row.job.status === 'pending_review') {
-                          <app-menu-item (activated)="reviewJob(row.job.id)">{{ 'jobs.action.review' | transloco }}</app-menu-item>
-                        } @else if (row.job.status === 'processing') {
-                          <app-menu-item (activated)="pauseJob(row.job.id)">{{ 'jobs.action.pause' | transloco }}</app-menu-item>
-                        } @else if (!isBlockedUndelivered(row.job) && (row.job.status === 'failed' || row.job.status === 'cancelled' || row.job.status === 'paused' || row.job.status === 'created')) {
-                          <app-menu-item (activated)="resumeJob(row.job.id)">{{ 'jobs.action.resume' | transloco }}</app-menu-item>
-                        }
-                        @if (getWorkspaceUrl(row.job)) {
-                          <app-menu-item (activated)="openWorkspace(row.job)">{{ 'jobs.action.workspace' | transloco }}</app-menu-item>
-                        }
-                        @if (canOpenIde(row.job)) {
-                          <app-menu-item (activated)="openIde(row.job.id)">
-                            @if (ideLoadingJobIds().has(row.job.id)) {
-                              {{ 'jobs.action.starting' | transloco }}
-                            } @else {
-                              {{ 'jobs.action.ide' | transloco }}
-                            }
-                          </app-menu-item>
-                        }
-                        @if (row.job.status !== 'completed' && row.job.status !== 'cancelled') {
-                          <app-menu-item (activated)="askCancel(row.job)">{{ 'jobs.action.cancel' | transloco }}</app-menu-item>
-                        }
-                        @if (row.job.status === 'completed' && !row.job.project_id) {
-                          <app-menu-item (activated)="togglePromote(row.job.id)">{{ 'jobs.action.promote' | transloco }}</app-menu-item>
-                        }
-                        @switch (cloudAction(row.job)) {
-                          @case ('export') {
-                            <app-menu-item (activated)="exportJobToSharedFolder(row.job.id)">{{ 'jobs.action.exportToCloud' | transloco }}</app-menu-item>
-                          }
-                          @case ('open') {
-                            <app-menu-item (activated)="openExportedFolder(row.job)">{{ 'jobs.action.openCloudFolder' | transloco }}</app-menu-item>
-                          }
-                        }
-                        @if (row.job.status !== 'processing' && row.job.status !== 'paused' && row.job.status !== 'reviewing' && row.job.status !== 'waiting') {
-                          <app-menu-item tone="danger" (activated)="askDelete(row.job)">{{ 'jobs.action.delete' | transloco }}</app-menu-item>
-                        }
-                      </app-menu>
-                    } @else {
-                    <app-button
-                      variant="info"
+                        {{ 'jobs.action.view' | transloco }}
+                      </app-button>
+                      @if (row.job.pending_approval) {
+                        <!-- The job is blocked on a sudo/VM-upgrade decision:
+                             Resume would do nothing — route to the request. -->
+                        <app-button
+                          variant="warning"
+                          size="sm"
+                          [ariaLabel]="'jobs.tooltip.approveRequest' | transloco"
+                          (clicked)="goToApproveRequest(row.job); $event.stopPropagation()"
+                        >
+                          {{ 'jobs.action.approveRequest' | transloco }}
+                        </app-button>
+                      } @else if (row.job.status === 'pending_review') {
+                        <app-button
+                          variant="warning"
+                          size="sm"
+                          [ariaLabel]="'jobs.tooltip.reviewJob' | transloco"
+                          (clicked)="reviewJob(row.job.id); $event.stopPropagation()"
+                        >
+                          {{ 'jobs.action.review' | transloco }}
+                        </app-button>
+                      } @else if (!isBlockedUndelivered(row.job) && (row.job.status === 'failed' || row.job.status === 'cancelled' || row.job.status === 'paused' || row.job.status === 'created')) {
+                        <app-button
+                          variant="success"
+                          size="sm"
+                          [ariaLabel]="'jobs.tooltip.resumeJob' | transloco"
+                          (clicked)="resumeJob(row.job.id); $event.stopPropagation()"
+                        >
+                          {{ 'jobs.action.resume' | transloco }}
+                        </app-button>
+                      }
+                    }
+                    <app-icon-button
                       size="sm"
-                      [ariaLabel]="'jobs.tooltip.view' | transloco"
-                      (clicked)="viewJob(row.job.id); $event.stopPropagation()"
+                      [ariaLabel]="'jobs.tooltip.moreActions' | transloco"
+                      [appMenuTrigger]="rowMenu"
+                      menuPlacement="bottom-end"
+                      (click)="$event.stopPropagation()"
                     >
-                      {{ 'jobs.action.view' | transloco }}
-                    </app-button>
-                    @if (getWorkspaceUrl(row.job)) {
-                      <app-button
-                        variant="secondary"
-                        size="sm"
-                        [ariaLabel]="'jobs.tooltip.workspace' | transloco"
-                        (clicked)="openWorkspace(row.job); $event.stopPropagation()"
-                      >
-                        {{ 'jobs.action.workspace' | transloco }}
-                      </app-button>
-                    }
-                    @if (canOpenIde(row.job)) {
-                      <app-button
-                        [variant]="!row.job.snapshot_status && !hasLiveVm(row.job) ? 'secondary' : 'info'"
-                        size="sm"
-                        [loading]="ideLoadingJobIds().has(row.job.id)"
-                        [ariaLabel]="(row.job.snapshot_status === 'available' ? 'jobs.tooltip.ideSnapshot' : 'jobs.tooltip.ideCode') | transloco"
-                        (clicked)="openIde(row.job.id); $event.stopPropagation()"
-                      >
-                        @if (ideLoadingJobIds().has(row.job.id)) {
-                          {{ 'jobs.action.starting' | transloco }}
-                        } @else {
-                          {{ 'jobs.action.ide' | transloco }}
+                      <app-icon size="sm">more_vert</app-icon>
+                    </app-icon-button>
+                    <app-menu #rowMenu>
+                      <app-menu-item (activated)="viewJob(row.job.id)">{{ 'jobs.action.view' | transloco }}</app-menu-item>
+                      @if (row.job.pending_approval) {
+                        <app-menu-item (activated)="goToApproveRequest(row.job)">{{ 'jobs.action.approveRequest' | transloco }}</app-menu-item>
+                      } @else if (row.job.status === 'pending_review') {
+                        <app-menu-item (activated)="reviewJob(row.job.id)">{{ 'jobs.action.review' | transloco }}</app-menu-item>
+                      } @else if (row.job.status === 'processing') {
+                        <app-menu-item (activated)="pauseJob(row.job.id)">{{ 'jobs.action.pause' | transloco }}</app-menu-item>
+                      } @else if (!isBlockedUndelivered(row.job) && (row.job.status === 'failed' || row.job.status === 'cancelled' || row.job.status === 'paused' || row.job.status === 'created')) {
+                        <app-menu-item (activated)="resumeJob(row.job.id)">{{ 'jobs.action.resume' | transloco }}</app-menu-item>
+                      }
+                      @if (getWorkspaceUrl(row.job)) {
+                        <app-menu-item (activated)="openWorkspace(row.job)">{{ 'jobs.action.workspace' | transloco }}</app-menu-item>
+                      }
+                      @if (canOpenIde(row.job)) {
+                        <app-menu-item (activated)="openIde(row.job.id)">
+                          @if (ideLoadingJobIds().has(row.job.id)) {
+                            {{ 'jobs.action.starting' | transloco }}
+                          } @else {
+                            {{ 'jobs.action.ide' | transloco }}
+                          }
+                        </app-menu-item>
+                      }
+                      @if (row.job.status !== 'completed' && row.job.status !== 'cancelled') {
+                        <app-menu-item (activated)="askCancel(row.job)">{{ 'jobs.action.cancel' | transloco }}</app-menu-item>
+                      }
+                      @if (row.job.status === 'completed' && !row.job.project_id) {
+                        <app-menu-item (activated)="togglePromote(row.job.id)">{{ 'jobs.action.promote' | transloco }}</app-menu-item>
+                      }
+                      @switch (cloudAction(row.job)) {
+                        @case ('export') {
+                          <app-menu-item (activated)="exportJobToSharedFolder(row.job.id)">{{ 'jobs.action.exportToCloud' | transloco }}</app-menu-item>
                         }
-                      </app-button>
-                    }
-                    @if (row.job.status === 'processing') {
-                      <app-button
-                        variant="secondary"
-                        size="sm"
-                        [ariaLabel]="'jobs.tooltip.pauseJob' | transloco"
-                        (clicked)="pauseJob(row.job.id); $event.stopPropagation()"
-                      >
-                        {{ 'jobs.action.pause' | transloco }}
-                      </app-button>
-                    }
-                    @if (row.job.status === 'pending_review') {
-                      <app-button
-                        variant="warning"
-                        size="sm"
-                        [ariaLabel]="'jobs.tooltip.reviewJob' | transloco"
-                        (clicked)="reviewJob(row.job.id); $event.stopPropagation()"
-                      >
-                        {{ 'jobs.action.review' | transloco }}
-                      </app-button>
-                    }
-                    @if (row.job.pending_approval) {
-                      <!-- The job is blocked on a sudo/VM-upgrade decision:
-                           Resume would do nothing — route to the request. -->
-                      <app-button
-                        variant="warning"
-                        size="sm"
-                        [ariaLabel]="'jobs.tooltip.approveRequest' | transloco"
-                        (clicked)="goToApproveRequest(row.job); $event.stopPropagation()"
-                      >
-                        {{ 'jobs.action.approveRequest' | transloco }}
-                      </app-button>
-                    } @else if (!isBlockedUndelivered(row.job) && (row.job.status === 'failed' || row.job.status === 'cancelled' || row.job.status === 'paused' || row.job.status === 'created')) {
-                      <app-button
-                        variant="success"
-                        size="sm"
-                        [ariaLabel]="'jobs.tooltip.resumeJob' | transloco"
-                        (clicked)="resumeJob(row.job.id); $event.stopPropagation()"
-                      >
-                        {{ 'jobs.action.resume' | transloco }}
-                      </app-button>
-                    }
-                    @if (row.job.status !== 'completed' && row.job.status !== 'cancelled') {
-                      <app-button
-                        variant="warning"
-                        size="sm"
-                        [loading]="cancelingJobIds().has(row.job.id)"
-                        [ariaLabel]="'jobs.tooltip.cancelJob' | transloco"
-                        (clicked)="askCancel(row.job); $event.stopPropagation()"
-                      >
-                        @if (cancelingJobIds().has(row.job.id)) {
-                          {{ 'jobs.action.canceling' | transloco }}
-                        } @else {
-                          {{ 'jobs.action.cancel' | transloco }}
+                        @case ('open') {
+                          <app-menu-item (activated)="openExportedFolder(row.job)">{{ 'jobs.action.openCloudFolder' | transloco }}</app-menu-item>
                         }
-                      </app-button>
-                    }
-                    @if (row.job.status === 'completed' && !row.job.project_id) {
-                      <app-button
-                        variant="info"
-                        size="sm"
-                        [ariaLabel]="'jobs.tooltip.promoteJob' | transloco"
-                        (clicked)="togglePromote(row.job.id); $event.stopPropagation()"
-                      >
-                        {{ 'jobs.action.promote' | transloco }}
-                      </app-button>
-                    }
-                    @switch (cloudAction(row.job)) {
-                      @case ('export') {
-                        <app-button
-                          variant="secondary"
-                          size="sm"
-                          [loading]="exportingJobIds().has(row.job.id)"
-                          [ariaLabel]="'jobs.tooltip.exportToCloud' | transloco"
-                          (clicked)="exportJobToSharedFolder(row.job.id); $event.stopPropagation()"
-                        >
-                          {{ 'jobs.action.exportToCloud' | transloco }}
-                        </app-button>
                       }
-                      @case ('open') {
-                        <app-button
-                          variant="secondary"
-                          size="sm"
-                          [ariaLabel]="'jobs.tooltip.openCloudFolder' | transloco"
-                          (clicked)="openExportedFolder(row.job); $event.stopPropagation()"
-                        >
-                          {{ 'jobs.action.openCloudFolder' | transloco }}
-                        </app-button>
+                      @if (row.job.status !== 'processing' && row.job.status !== 'paused' && row.job.status !== 'reviewing' && row.job.status !== 'waiting') {
+                        <app-menu-item tone="danger" (activated)="askDelete(row.job)">{{ 'jobs.action.delete' | transloco }}</app-menu-item>
                       }
-                      @case ('exported') {
-                        <app-badge tone="success" size="sm">
-                          {{ 'jobs.action.exported' | transloco }}
-                        </app-badge>
-                      }
-                    }
-                    @if (row.job.status !== 'processing' && row.job.status !== 'paused' && row.job.status !== 'reviewing' && row.job.status !== 'waiting') {
-                      <app-button
-                        variant="danger"
-                        size="sm"
-                        [ariaLabel]="'jobs.tooltip.deleteJob' | transloco"
-                        (clicked)="askDelete(row.job); $event.stopPropagation()"
-                      >
-                        {{ 'jobs.action.delete' | transloco }}
-                      </app-button>
-                    }
-                    }
+                    </app-menu>
                   </td>
                 </tr>
                 @if (promoteJobId() === row.job.id) {
@@ -820,26 +723,8 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
         overflow-x: hidden;
       }
 
-      .job-table {
-        width: 100%;
-        border-collapse: collapse;
-        font-size: 12px;
-      }
-
-      .job-table th {
-        text-align: left;
-        padding: 10px 12px;
-        background: var(--surface-0, var(--surface-0));
-        color: var(--text-muted);
-        font-weight: 500;
-        text-transform: uppercase;
-        font-size: 10px;
-        letter-spacing: 0.5px;
-        border-bottom: 1px solid var(--border-color, var(--surface-1));
-        position: sticky;
-        top: 0;
-        z-index: 1;
-      }
+      /* Table look comes from the global .app-table (src/styles/_app-table.scss);
+         only column widths and row semantics live here. */
 
       .col-prompt { width: 100%; }
       .col-project { width: 180px; white-space: nowrap; }
@@ -847,24 +732,8 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
       .col-created { white-space: nowrap; }
       .col-actions { white-space: nowrap; }
 
-      .job-table td {
-        padding: 10px 12px;
-        border-bottom: 1px solid var(--border-color, var(--surface-0));
-        color: var(--text-primary, var(--text-primary));
-        vertical-align: middle;
-      }
-
       .job-table tbody tr {
         cursor: pointer;
-        transition: background 0.15s ease;
-      }
-
-      .job-table tbody tr:hover {
-        background: var(--surface-0, var(--surface-0));
-      }
-
-      .job-table tbody tr.selected {
-        background: color-mix(in srgb, var(--accent-color) 20%, transparent);
       }
 
       /* Hierarchy */
@@ -956,10 +825,10 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
         display: inline-block;
         padding: 1px 5px;
         border-radius: var(--radius-tag);
-        font-size: 9px;
+        font-size: 11px;
         font-weight: 500;
         text-transform: uppercase;
-        letter-spacing: 0.3px;
+        letter-spacing: 0.06em;
         background: color-mix(in srgb, var(--accent-color) 15%, transparent);
         color: var(--accent-color);
         margin-left: 2px;
@@ -972,7 +841,6 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
         border-radius: var(--radius-tag);
         font-size: 9px;
         font-weight: 500;
-        letter-spacing: 0.3px;
         background: var(--info-tint);
         color: var(--info);
         margin-left: 4px;

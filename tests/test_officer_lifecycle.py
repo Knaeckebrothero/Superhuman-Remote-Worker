@@ -26,14 +26,10 @@ import pytest_asyncio
 from fastapi import HTTPException
 
 import orchestrator.main as orch_main
-from orchestrator.main import (
-    OfficerDecommissionRequest,
-    OfficerHoldRequest,
-    _check_officer_sleep_bounds,
-    _decommission_officer_post,
-    _officer_spend_today,
-    _validated_officer_post_patch,
-    app,
+from orchestrator.main import app
+from orchestrator.database.postgres import PostgresDB
+from orchestrator.routers import officers as officers_router
+from orchestrator.routers.officers import (
     commission_project_officer,
     decommission_project_officer,
     hold_project_officer,
@@ -41,9 +37,31 @@ from orchestrator.main import (
     recycle_project_officer,
     release_project_officer,
 )
-from orchestrator.database.postgres import PostgresDB
-from orchestrator.services import session_wake
+from orchestrator.schemas.officer_post import (
+    OfficerDecommissionRequest,
+    OfficerHoldRequest,
+)
+from orchestrator.services import (
+    officer_notices,
+    officer_post_lifecycle,
+    session_wake,
+)
+from orchestrator.services.officer_post_lifecycle import (
+    OfficerPostLifecycleDependencies,
+)
+from orchestrator.services.officer_post_policy import (
+    OfficerPostPolicyDependencies,
+    check_officer_sleep_bounds as _check_officer_sleep_bounds,
+    validated_officer_post_patch as _validated_officer_post_patch,
+)
+from orchestrator.services.officer_post_views import (
+    OfficerPostViewDependencies,
+    officer_editor_block,
+    officer_spend_today,
+    while_vacant_view,
+)
 from orchestrator.services.persistent_recycler import PersistentRecycleResult
+from tests._route_inventory import mounted_routes
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_FILE = REPO_ROOT / "src" / "orchestrator" / "database" / "schema_current.sql"
@@ -61,10 +79,12 @@ RETIREMENT_TOKEN = str(uuid4())
 
 class TestRoutesRegistered:
     def test_lifecycle_routes_are_wired(self):
-        registered = set()
-        for route in app.routes:
-            for m in getattr(route, "methods", None) or set():
-                registered.add((m, getattr(route, "path", "")))
+        # The Post's nine declarations live on a mounted router now, and this
+        # FastAPI puts one opaque ``_IncludedRouter`` in ``app.routes`` per
+        # include — walking ``app.routes`` directly would report every one of
+        # them missing. ``mounted_routes`` is the reading that survives both
+        # representations.
+        registered = mounted_routes(app)
         expected = {
             ("POST", "/api/projects/{project_id}/officer/commission"),
             ("POST", "/api/projects/{project_id}/officer/decommission"),
@@ -326,7 +346,7 @@ class TestSleepBounds:
 
 class TestEditorBlock:
     def test_seeds_every_editor_field_from_config(self):
-        block = orch_main._officer_editor_block(
+        block = officer_editor_block(
             {
                 "slots": {"line": {"count": 2}},
                 "sleep_min_minutes": 10,
@@ -348,7 +368,7 @@ class TestEditorBlock:
         assert block["max_concurrent_workers"] == 3
 
     def test_unset_numerics_stay_null_not_materialized(self):
-        block = orch_main._officer_editor_block({}, {})
+        block = officer_editor_block({}, {})
         assert block["daily_token_ceiling"] is None
         assert block["max_actions_per_wake"] is None
         assert block["max_concurrent_workers"] is None
@@ -360,7 +380,7 @@ class TestEditorBlock:
 
 class TestWhileVacantView:
     def test_maps_description_to_title_and_counts_dropped(self):
-        view = orch_main._while_vacant_view(
+        view = while_vacant_view(
             {
                 "while_vacant": [
                     {"job_id": "j1", "status": "completed", "description": "d1"},
@@ -374,8 +394,8 @@ class TestWhileVacantView:
         assert view["dropped"] == 3
 
     def test_empty_or_garbage_state_is_the_empty_shape(self):
-        assert orch_main._while_vacant_view(None) == {"entries": [], "dropped": 0}
-        assert orch_main._while_vacant_view({"while_vacant": "nope"}) == {
+        assert while_vacant_view(None) == {"entries": [], "dropped": 0}
+        assert while_vacant_view({"while_vacant": "nope"}) == {
             "entries": [],
             "dropped": 0,
         }
@@ -473,8 +493,43 @@ def db(monkeypatch):
     # lifecycle mechanics, so the grant is held. TestCommissionCapabilityGate
     # below flips it to False and asserts the refusal.
     db.user_can_run_unattended_operations = AsyncMock(return_value=True)
+    # ``_end_thread_flow`` is still main's, and TestEndThreadReroute drives it
+    # through this global.
     monkeypatch.setattr(orch_main, "postgres_db", db)
     return db
+
+
+@pytest.fixture
+def deps(db) -> OfficerPostLifecycleDependencies:
+    """The Post's lifecycle collaborators, taken explicitly. Every field is
+    bound to what ``main._officer_post_lifecycle_dependencies()`` binds, so an
+    unsteered test runs the same collaborator the application does; a test
+    steers ``create_thread`` / ``end_thread_flow`` / the recycler / the release
+    fence HERE, because rebinding them on ``orchestrator.main`` no longer
+    reaches the operation."""
+    return OfficerPostLifecycleDependencies(
+        store=db,
+        persistent_provisioner=orch_main.persistent_provisioner,
+        persistent_thread_recycler=orch_main._persistent_thread_recycler,
+        policy=OfficerPostPolicyDependencies(
+            auto_pull_release_enabled=(
+                lambda: orch_main.OFFICER_AUTO_PULL_RELEASE_ENABLED
+            )
+        ),
+        kick_officer_event_drain=orch_main._kick_officer_event_drain,
+        deliver_officer_note=orch_main._deliver_officer_note,
+        create_thread=orch_main.create_thread,
+        end_thread_flow=orch_main._end_thread_flow,
+    )
+
+
+@pytest.fixture
+def req(deps):
+    """A request whose application resolves the Post's dependencies, so the
+    route declarations — and the owner gate each one calls — stay live."""
+    request = MagicMock()
+    request.app.state.officer_post_lifecycle_dependencies_factory = lambda: deps
+    return request
 
 
 @pytest.fixture
@@ -482,16 +537,16 @@ def as_project_admin(monkeypatch):
     gate = AsyncMock(
         return_value=({"id": str(uuid4()), "is_admin": True}, {"name": "Throwaway"})
     )
-    monkeypatch.setattr(orch_main, "require_project_owner", gate)
+    monkeypatch.setattr(officers_router, "require_project_owner", gate)
     return gate
 
 
 @pytest.fixture
-def quiet_side_channels(monkeypatch):
+def quiet_side_channels(monkeypatch, deps):
     monkeypatch.setattr(
-        orch_main, "_inject_officer_notice", AsyncMock(return_value=False)
+        officer_notices, "inject_officer_notice", AsyncMock(return_value=False)
     )
-    monkeypatch.setattr(orch_main, "_kick_officer_event_drain", MagicMock())
+    deps.kick_officer_event_drain = MagicMock()
 
 
 class TestAdminGate:
@@ -499,25 +554,25 @@ class TestAdminGate:
     @pytest.mark.parametrize(
         "call",
         [
-            lambda req: commission_project_officer(req, PROJECT_ID, None),
-            lambda req: decommission_project_officer(req, PROJECT_ID, None),
-            lambda req: hold_project_officer(req, PROJECT_ID, None),
-            lambda req: release_project_officer(req, PROJECT_ID),
-            lambda req: recycle_project_officer(req, PROJECT_ID),
-            lambda req: patch_project_officer(
-                req, PROJECT_ID, {"max_actions_per_wake": 1}
+            lambda request: commission_project_officer(request, PROJECT_ID, None),
+            lambda request: decommission_project_officer(request, PROJECT_ID, None),
+            lambda request: hold_project_officer(request, PROJECT_ID, None),
+            lambda request: release_project_officer(request, PROJECT_ID),
+            lambda request: recycle_project_officer(request, PROJECT_ID),
+            lambda request: patch_project_officer(
+                request, PROJECT_ID, {"max_actions_per_wake": 1}
             ),
         ],
     )
     async def test_every_endpoint_sits_behind_project_owner(
-        self, monkeypatch, db, call
+        self, monkeypatch, db, req, call
     ):
         gate = AsyncMock(
             side_effect=HTTPException(status_code=403, detail="Project owner required")
         )
-        monkeypatch.setattr(orch_main, "require_project_owner", gate)
+        monkeypatch.setattr(officers_router, "require_project_owner", gate)
         with pytest.raises(HTTPException) as exc:
-            await call(MagicMock())
+            await call(req)
         assert exc.value.status_code == 403
         gate.assert_awaited_once()
         db.merge_project_officer_config.assert_not_awaited()
@@ -527,28 +582,28 @@ class TestAdminGate:
 class TestHoldRelease:
     @pytest.mark.asyncio
     async def test_hold_on_vacant_post_400s(
-        self, db, as_project_admin, quiet_side_channels
+        self, db, as_project_admin, quiet_side_channels, req
     ):
         with pytest.raises(HTTPException) as exc:
-            await hold_project_officer(MagicMock(), PROJECT_ID, None)
+            await hold_project_officer(req, PROJECT_ID, None)
         assert exc.value.status_code == 400
         db.merge_thread_config_override.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_release_on_vacant_post_400s(
-        self, db, as_project_admin, quiet_side_channels
+        self, db, as_project_admin, quiet_side_channels, req
     ):
         with pytest.raises(HTTPException) as exc:
-            await release_project_officer(MagicMock(), PROJECT_ID)
+            await release_project_officer(req, PROJECT_ID)
         assert exc.value.status_code == 400
 
     @pytest.mark.asyncio
     async def test_hold_stamps_maintenance_without_thread_id(
-        self, db, as_project_admin, quiet_side_channels
+        self, db, as_project_admin, quiet_side_channels, req
     ):
         db.get_officer_thread_for_project = AsyncMock(return_value=_officer_thread())
         out = await hold_project_officer(
-            MagicMock(), PROJECT_ID, OfficerHoldRequest(note="quarterly maintenance")
+            req, PROJECT_ID, OfficerHoldRequest(note="quarterly maintenance")
         )
         assert out["status"] == "held"
         db.set_project_officer_hold.assert_awaited_once()
@@ -566,7 +621,7 @@ class TestHoldRelease:
 
     @pytest.mark.asyncio
     async def test_second_hold_400s_and_does_not_clobber(
-        self, db, as_project_admin, quiet_side_channels
+        self, db, as_project_admin, quiet_side_channels, req
     ):
         held = _officer_thread(
             metadata={
@@ -577,19 +632,19 @@ class TestHoldRelease:
         )
         db.get_officer_thread_for_project = AsyncMock(return_value=held)
         with pytest.raises(HTTPException) as exc:
-            await hold_project_officer(MagicMock(), PROJECT_ID, None)
+            await hold_project_officer(req, PROJECT_ID, None)
         assert exc.value.status_code == 400
         db.merge_thread_config_override.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_release_clears_via_json_null_and_kicks_drain(
-        self, db, as_project_admin, monkeypatch
+        self, db, as_project_admin, req, deps, monkeypatch
     ):
         monkeypatch.setattr(
-            orch_main, "_inject_officer_notice", AsyncMock(return_value=True)
+            officer_notices, "inject_officer_notice", AsyncMock(return_value=True)
         )
         kick = MagicMock()
-        monkeypatch.setattr(orch_main, "_kick_officer_event_drain", kick)
+        deps.kick_officer_event_drain = kick
         held = _officer_thread(
             metadata={
                 "config_override": {
@@ -601,7 +656,7 @@ class TestHoldRelease:
             }
         )
         db.get_officer_thread_for_project = AsyncMock(return_value=held)
-        out = await release_project_officer(MagicMock(), PROJECT_ID)
+        out = await release_project_officer(req, PROJECT_ID)
         assert out["status"] == "released"
         db.set_project_officer_hold.assert_awaited_once_with(
             PROJECT_ID,
@@ -612,17 +667,17 @@ class TestHoldRelease:
 
     @pytest.mark.asyncio
     async def test_release_when_not_held_400s(
-        self, db, as_project_admin, quiet_side_channels
+        self, db, as_project_admin, quiet_side_channels, req
     ):
         db.get_officer_thread_for_project = AsyncMock(return_value=_officer_thread())
         with pytest.raises(HTTPException) as exc:
-            await release_project_officer(MagicMock(), PROJECT_ID)
+            await release_project_officer(req, PROJECT_ID)
         assert exc.value.status_code == 400
         db.merge_thread_config_override.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_generic_release_cannot_clear_recycler_owned_hold(
-        self, db, as_project_admin, quiet_side_channels
+        self, db, as_project_admin, quiet_side_channels, req
     ):
         held = _officer_thread(
             metadata={
@@ -639,7 +694,7 @@ class TestHoldRelease:
         )
         db.get_officer_thread_for_project = AsyncMock(return_value=held)
         with pytest.raises(HTTPException) as exc:
-            await release_project_officer(MagicMock(), PROJECT_ID)
+            await release_project_officer(req, PROJECT_ID)
         assert exc.value.status_code == 409
         db.set_project_officer_hold.assert_not_awaited()
 
@@ -647,7 +702,7 @@ class TestHoldRelease:
 class TestOfficerRecycle:
     @pytest.mark.asyncio
     async def test_owner_action_delegates_to_shared_recycler(
-        self, db, as_project_admin, monkeypatch
+        self, db, as_project_admin, req, deps
     ):
         db.get_officer_thread_for_project = AsyncMock(return_value=_officer_thread())
         recycler = MagicMock()
@@ -658,11 +713,10 @@ class TestOfficerRecycle:
             )
         )
         provisioner = MagicMock(is_available=True, expected_build_sha="new")
-        monkeypatch.setattr(orch_main, "_persistent_thread_recycler", recycler)
-        monkeypatch.setattr(orch_main, "persistent_provisioner", provisioner)
-        monkeypatch.setattr(orch_main, "PERSISTENT_AGENT_RECONCILIATION_ENABLED", False)
+        deps.persistent_thread_recycler = recycler
+        deps.persistent_provisioner = provisioner
 
-        result = await recycle_project_officer(MagicMock(), PROJECT_ID)
+        result = await recycle_project_officer(req, PROJECT_ID)
 
         assert result == {
             "thread_id": THREAD_ID,
@@ -683,22 +737,22 @@ class TestOfficerRecycle:
 class TestPatchEndpoint:
     @pytest.mark.asyncio
     async def test_release_gate_refuses_true_before_any_post_write(
-        self, db, as_project_admin, quiet_side_channels, monkeypatch
+        self, db, as_project_admin, quiet_side_channels, req, deps
     ):
-        monkeypatch.setattr(orch_main, "OFFICER_AUTO_PULL_RELEASE_ENABLED", False)
+        deps.policy.auto_pull_release_enabled = lambda: False
         with pytest.raises(HTTPException) as exc:
-            await patch_project_officer(MagicMock(), PROJECT_ID, {"auto_pull": True})
+            await patch_project_officer(req, PROJECT_ID, {"auto_pull": True})
         assert exc.value.status_code == 409
         assert "not released" in str(exc.value.detail)
         db.update_project_officer_post.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_release_gate_always_permits_disable_and_spend_edits(
-        self, db, as_project_admin, quiet_side_channels, monkeypatch
+        self, db, as_project_admin, quiet_side_channels, req, deps
     ):
-        monkeypatch.setattr(orch_main, "OFFICER_AUTO_PULL_RELEASE_ENABLED", False)
+        deps.policy.auto_pull_release_enabled = lambda: False
         await patch_project_officer(
-            MagicMock(),
+            req,
             PROJECT_ID,
             {"auto_pull": False, "worker_spend_ceiling_daily": 19.5},
         )
@@ -715,9 +769,9 @@ class TestPatchEndpoint:
 
     @pytest.mark.asyncio
     async def test_released_enable_mirrors_all_three_control_layers(
-        self, db, as_project_admin, quiet_side_channels, monkeypatch
+        self, db, as_project_admin, quiet_side_channels, req, deps
     ):
-        monkeypatch.setattr(orch_main, "OFFICER_AUTO_PULL_RELEASE_ENABLED", True)
+        deps.policy.auto_pull_release_enabled = lambda: True
         db.update_project_officer_post = AsyncMock(
             return_value={
                 "post": _post_row(
@@ -741,7 +795,7 @@ class TestPatchEndpoint:
             }
         )
         out = await patch_project_officer(
-            MagicMock(),
+            req,
             PROJECT_ID,
             {
                 "auto_pull": True,
@@ -775,11 +829,9 @@ class TestPatchEndpoint:
 
     @pytest.mark.asyncio
     async def test_vacant_post_writes_the_row_only(
-        self, db, as_project_admin, quiet_side_channels
+        self, db, as_project_admin, quiet_side_channels, req
     ):
-        out = await patch_project_officer(
-            MagicMock(), PROJECT_ID, {"daily_token_ceiling": 5}
-        )
+        out = await patch_project_officer(req, PROJECT_ID, {"daily_token_ceiling": 5})
         db.update_project_officer_post.assert_awaited_once_with(
             PROJECT_ID,
             config_updates={"officer": {"daily_token_ceiling": 5}},
@@ -792,10 +844,10 @@ class TestPatchEndpoint:
 
     @pytest.mark.asyncio
     async def test_commissioned_post_mirrors_to_thread_and_notices_not_wakes(
-        self, db, as_project_admin, monkeypatch
+        self, db, as_project_admin, req, monkeypatch
     ):
         notice = AsyncMock(return_value=True)
-        monkeypatch.setattr(orch_main, "_inject_officer_notice", notice)
+        monkeypatch.setattr(officer_notices, "inject_officer_notice", notice)
         officer = _officer_thread()
         db.update_project_officer_post = AsyncMock(
             return_value={
@@ -811,7 +863,7 @@ class TestPatchEndpoint:
             }
         )
         out = await patch_project_officer(
-            MagicMock(),
+            req,
             PROJECT_ID,
             {"slots": {"line": {"count": 1}}, "brain": {"reasoning_level": "high"}},
         )
@@ -828,10 +880,10 @@ class TestPatchEndpoint:
 
     @pytest.mark.asyncio
     async def test_communication_policy_is_never_mirrored_to_the_thread(
-        self, db, as_project_admin, quiet_side_channels
+        self, db, as_project_admin, quiet_side_channels, req
     ):
         await patch_project_officer(
-            MagicMock(),
+            req,
             PROJECT_ID,
             {"communication_policy": {"worker_messages": "officer_first"}},
         )
@@ -844,14 +896,16 @@ class TestPatchEndpoint:
         db.merge_thread_config_override.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_empty_body_400s(self, db, as_project_admin, quiet_side_channels):
+    async def test_empty_body_400s(
+        self, db, as_project_admin, quiet_side_channels, req
+    ):
         with pytest.raises(HTTPException) as exc:
-            await patch_project_officer(MagicMock(), PROJECT_ID, {})
+            await patch_project_officer(req, PROJECT_ID, {})
         assert exc.value.status_code == 400
 
     @pytest.mark.asyncio
     async def test_min_over_max_400s_against_the_standing_row(
-        self, db, as_project_admin, quiet_side_channels
+        self, db, as_project_admin, quiet_side_channels, req
     ):
         db.get_or_create_project_officer = AsyncMock(
             return_value=_post_row(
@@ -859,21 +913,19 @@ class TestPatchEndpoint:
             )
         )
         with pytest.raises(HTTPException) as exc:
-            await patch_project_officer(
-                MagicMock(), PROJECT_ID, {"sleep_min_minutes": 45}
-            )
+            await patch_project_officer(req, PROJECT_ID, {"sleep_min_minutes": 45})
         assert exc.value.status_code == 400
         db.merge_project_officer_config.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_shrinking_below_in_flight_is_allowed(
-        self, db, as_project_admin, quiet_side_channels
+        self, db, as_project_admin, quiet_side_channels, req
     ):
         """Drain semantics, decided (§7): the 409 lives at the next dispatch,
         never at the form save."""
         db.get_officer_thread_for_project = AsyncMock(return_value=_officer_thread())
         out = await patch_project_officer(
-            MagicMock(), PROJECT_ID, {"slots": {"line": {"count": 0}}}
+            req, PROJECT_ID, {"slots": {"line": {"count": 0}}}
         )
         assert out["status"] == "updated"
 
@@ -886,14 +938,14 @@ class TestCommissionCapabilityGate:
 
     @pytest.mark.asyncio
     async def test_missing_grant_403s_before_anything_mutates(
-        self, db, as_project_admin, quiet_side_channels, monkeypatch
+        self, db, as_project_admin, quiet_side_channels, req, deps
     ):
         create = AsyncMock()
-        monkeypatch.setattr(orch_main, "create_thread", create)
+        deps.create_thread = create
         db.user_can_run_unattended_operations = AsyncMock(return_value=False)
 
         with pytest.raises(HTTPException) as exc:
-            await commission_project_officer(MagicMock(), PROJECT_ID, None)
+            await commission_project_officer(req, PROJECT_ID, None)
 
         assert exc.value.status_code == 403
         assert "unattended_operations" in str(exc.value.detail)
@@ -903,16 +955,16 @@ class TestCommissionCapabilityGate:
 
     @pytest.mark.asyncio
     async def test_grant_is_resolved_against_this_project(
-        self, db, as_project_admin, quiet_side_channels, monkeypatch
+        self, db, as_project_admin, quiet_side_channels, req, deps
     ):
         """Project scope is the axis an operator most wants ("this team may run
         officers, that one may not"), so the project id must reach the read —
         dropping it would silently reduce the key to a user-only capability."""
-        monkeypatch.setattr(orch_main, "create_thread", AsyncMock())
+        deps.create_thread = AsyncMock()
         db.user_can_run_unattended_operations = AsyncMock(return_value=False)
 
         with pytest.raises(HTTPException):
-            await commission_project_officer(MagicMock(), PROJECT_ID, None)
+            await commission_project_officer(req, PROJECT_ID, None)
 
         _user, project_id = db.user_can_run_unattended_operations.await_args.args
         assert project_id == PROJECT_ID
@@ -921,15 +973,13 @@ class TestCommissionCapabilityGate:
 class TestCommissionEndpoint:
     @pytest.mark.asyncio
     async def test_dark_release_gate_refuses_commission_true_without_mutation(
-        self, db, as_project_admin, quiet_side_channels, monkeypatch
+        self, db, as_project_admin, quiet_side_channels, req, deps
     ):
-        monkeypatch.setattr(orch_main, "OFFICER_AUTO_PULL_RELEASE_ENABLED", False)
+        deps.policy.auto_pull_release_enabled = lambda: False
         create = AsyncMock()
-        monkeypatch.setattr(orch_main, "create_thread", create)
+        deps.create_thread = create
         with pytest.raises(HTTPException) as exc:
-            await commission_project_officer(
-                MagicMock(), PROJECT_ID, {"auto_pull": True}
-            )
+            await commission_project_officer(req, PROJECT_ID, {"auto_pull": True})
         assert exc.value.status_code == 409
         create.assert_not_awaited()
         db.get_or_create_project_officer.assert_not_awaited()
@@ -937,16 +987,16 @@ class TestCommissionEndpoint:
 
     @pytest.mark.asyncio
     async def test_dark_release_gate_refuses_recommission_of_standing_true(
-        self, db, as_project_admin, quiet_side_channels, monkeypatch
+        self, db, as_project_admin, quiet_side_channels, req, deps
     ):
-        monkeypatch.setattr(orch_main, "OFFICER_AUTO_PULL_RELEASE_ENABLED", False)
+        deps.policy.auto_pull_release_enabled = lambda: False
         create = AsyncMock()
-        monkeypatch.setattr(orch_main, "create_thread", create)
+        deps.create_thread = create
         db.get_or_create_project_officer = AsyncMock(
             return_value=_post_row(config_override={"officer": {"auto_pull": True}})
         )
         with pytest.raises(HTTPException) as exc:
-            await commission_project_officer(MagicMock(), PROJECT_ID, None)
+            await commission_project_officer(req, PROJECT_ID, None)
         assert exc.value.status_code == 409
         create.assert_not_awaited()
         db.update_project_officer_post.assert_not_awaited()
@@ -954,47 +1004,42 @@ class TestCommissionEndpoint:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("legacy_true", ["true", "True", 1])
     async def test_dark_release_gate_refuses_legacy_truthy_recommission(
-        self,
-        db,
-        as_project_admin,
-        quiet_side_channels,
-        monkeypatch,
-        legacy_true,
+        self, db, as_project_admin, quiet_side_channels, legacy_true, req, deps
     ):
-        monkeypatch.setattr(orch_main, "OFFICER_AUTO_PULL_RELEASE_ENABLED", False)
+        deps.policy.auto_pull_release_enabled = lambda: False
         create = AsyncMock()
-        monkeypatch.setattr(orch_main, "create_thread", create)
+        deps.create_thread = create
         db.get_or_create_project_officer = AsyncMock(
             return_value=_post_row(
                 config_override={"officer": {"auto_pull": legacy_true}}
             )
         )
         with pytest.raises(HTTPException) as exc:
-            await commission_project_officer(MagicMock(), PROJECT_ID, None)
+            await commission_project_officer(req, PROJECT_ID, None)
         assert exc.value.status_code == 409
         create.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_standing_officer_409s_before_any_create(
-        self, db, as_project_admin, quiet_side_channels, monkeypatch
+        self, db, as_project_admin, quiet_side_channels, req, deps
     ):
         create = AsyncMock()
-        monkeypatch.setattr(orch_main, "create_thread", create)
+        deps.create_thread = create
         db.get_officer_thread_for_project = AsyncMock(return_value=_officer_thread())
         with pytest.raises(HTTPException) as exc:
-            await commission_project_officer(MagicMock(), PROJECT_ID, None)
+            await commission_project_officer(req, PROJECT_ID, None)
         assert exc.value.status_code == 409
         create.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_released_commission_carries_auto_pull_and_spend_layers(
-        self, db, as_project_admin, quiet_side_channels, monkeypatch
+        self, db, as_project_admin, quiet_side_channels, req, deps
     ):
-        monkeypatch.setattr(orch_main, "OFFICER_AUTO_PULL_RELEASE_ENABLED", True)
+        deps.policy.auto_pull_release_enabled = lambda: True
         new_tid = str(uuid4())
 
-        async def create_with_continuity(req, _request):
-            req._officer_commission_result = {
+        async def create_with_continuity(create_request, _request):
+            create_request._officer_commission_result = {
                 "brief_enqueued": True,
                 "while_vacant": [],
                 "while_vacant_dropped": 0,
@@ -1003,7 +1048,7 @@ class TestCommissionEndpoint:
             return {"thread_id": new_tid, "status": "created"}
 
         create = AsyncMock(side_effect=create_with_continuity)
-        monkeypatch.setattr(orch_main, "create_thread", create)
+        deps.create_thread = create
         original = _post_row(config_override={"officer": {}})
         commissioned_config = {
             "officer": {
@@ -1029,7 +1074,7 @@ class TestCommissionEndpoint:
         )
 
         await commission_project_officer(
-            MagicMock(),
+            req,
             PROJECT_ID,
             {
                 "auto_pull": True,
@@ -1059,13 +1104,13 @@ class TestCommissionEndpoint:
 
     @pytest.mark.asyncio
     async def test_bad_kit_400s_before_any_create(
-        self, db, as_project_admin, quiet_side_channels, monkeypatch
+        self, db, as_project_admin, quiet_side_channels, req, deps
     ):
         create = AsyncMock()
-        monkeypatch.setattr(orch_main, "create_thread", create)
+        deps.create_thread = create
         with pytest.raises(HTTPException) as exc:
             await commission_project_officer(
-                MagicMock(), PROJECT_ID, {"slots": {"line": {"count": "many"}}}
+                req, PROJECT_ID, {"slots": {"line": {"count": "many"}}}
             )
         assert exc.value.status_code == 400
         create.assert_not_awaited()
@@ -1073,7 +1118,7 @@ class TestCommissionEndpoint:
 
     @pytest.mark.asyncio
     async def test_commission_goes_through_the_funnel_with_the_rows_kit(
-        self, db, as_project_admin, quiet_side_channels, monkeypatch
+        self, db, as_project_admin, quiet_side_channels, req, deps
     ):
         new_tid = str(uuid4())
         continuity = {
@@ -1084,12 +1129,12 @@ class TestCommissionEndpoint:
             "payload": {"vacant_since": "2026-08-10T00:00:00+00:00"},
         }
 
-        async def create_with_continuity(req, _request):
-            req._officer_commission_result = continuity
+        async def create_with_continuity(create_request, _request):
+            create_request._officer_commission_result = continuity
             return {"thread_id": new_tid, "status": "created"}
 
         create = AsyncMock(side_effect=create_with_continuity)
-        monkeypatch.setattr(orch_main, "create_thread", create)
+        deps.create_thread = create
         row = _post_row(
             config_override={
                 "officer": {
@@ -1123,7 +1168,7 @@ class TestCommissionEndpoint:
         )
 
         body = {"max_actions_per_wake": 4}
-        out = await commission_project_officer(MagicMock(), PROJECT_ID, body)
+        out = await commission_project_officer(req, PROJECT_ID, body)
 
         # Body validated + merged into the row under the post lock FIRST.
         db.update_project_officer_post.assert_awaited_once_with(
@@ -1133,35 +1178,35 @@ class TestCommissionEndpoint:
             expected_vacant_updated_at=row["updated_at"],
         )
         # One funnel: the create-thread endpoint, with the row's kit.
-        req = create.await_args.args[0]
-        assert req.project_id == PROJECT_ID
-        assert req.title == "Centurion — Throwaway"
-        assert req.model == "MiniMax-M3"
-        assert req.reasoning_level == "high"
-        assert req.permission_mode == "autonomous"
+        create_request = create.await_args.args[0]
+        assert create_request.project_id == PROJECT_ID
+        assert create_request.title == "Centurion — Throwaway"
+        assert create_request.model == "MiniMax-M3"
+        assert create_request.reasoning_level == "high"
+        assert create_request.permission_mode == "autonomous"
         # The expert IS the job surface. Without an explicit config_name the
         # request falls to session_base and the officer boots with NO
         # job_control plane — he cannot dispatch, steer, approve or read
         # evidence. Found live on the Resavio change of command 2026-08-15:
         # the endpoint-commissioned officer had 34 tools, none of which could
         # create a job.
-        assert req.config_name == "centurion"
+        assert create_request.config_name == "centurion"
         # An officer is headless: a supervised gate can never be answered, so
         # every tool call parks the turn and he executes nothing at all. The
         # row pinned "autonomous" here, so it travels; the absent case is
         # covered by test_headless_officer_defaults_to_autonomous below.
-        officer_frag = req.config_override["officer"]
+        officer_frag = create_request.config_override["officer"]
         assert officer_frag["enabled"] is True
         assert "conference" not in officer_frag
         assert "slots" not in officer_frag
-        assert req._officer_post_config_snapshot["officer"]["slots"]["line"] == {
-            "count": 2
-        }
-        assert req.config_override["workspace"] == {"backend": "sandbox"}
+        assert create_request._officer_post_config_snapshot["officer"]["slots"][
+            "line"
+        ] == {"count": 2}
+        assert create_request.config_override["workspace"] == {"backend": "sandbox"}
 
         # Continuity was already restored/drained/enqueued inside registration's
         # post-locked transaction. The endpoint performs no split follow-up writes.
-        assert req._officer_commission_result == continuity
+        assert create_request._officer_commission_result == continuity
         db.merge_thread_officer_state.assert_not_awaited()
         db.drain_project_officer_while_vacant.assert_not_awaited()
         db.enqueue_session_wake_event.assert_not_awaited()
@@ -1175,7 +1220,7 @@ class TestCommissionEndpoint:
 
     @pytest.mark.asyncio
     async def test_headless_officer_defaults_to_autonomous(
-        self, db, as_project_admin, quiet_side_channels, monkeypatch
+        self, db, as_project_admin, quiet_side_channels, req, deps
     ):
         """A post that pins no permission mode must NOT inherit the create
         endpoint's ``supervised`` default.
@@ -1190,8 +1235,8 @@ class TestCommissionEndpoint:
         """
         new_tid = str(uuid4())
 
-        async def create_with_continuity(req, _request):
-            req._officer_commission_result = {
+        async def create_with_continuity(create_request, _request):
+            create_request._officer_commission_result = {
                 "brief_enqueued": True,
                 "while_vacant": [],
                 "while_vacant_dropped": 0,
@@ -1200,7 +1245,7 @@ class TestCommissionEndpoint:
             return {"thread_id": new_tid, "status": "created"}
 
         create = AsyncMock(side_effect=create_with_continuity)
-        monkeypatch.setattr(orch_main, "create_thread", create)
+        deps.create_thread = create
         # No "interactive" block at all — the shape a fresh post has.
         row = _post_row(config_override={"officer": {"enabled": True}})
         db.get_or_create_project_officer = AsyncMock(return_value=row)
@@ -1209,15 +1254,15 @@ class TestCommissionEndpoint:
         )
         db.get_project_officer = AsyncMock(return_value=row)
 
-        await commission_project_officer(MagicMock(), PROJECT_ID, None)
+        await commission_project_officer(req, PROJECT_ID, None)
 
-        req = create.await_args.args[0]
-        assert req.permission_mode == "autonomous"
-        assert req.config_name == "centurion"
+        create_request = create.await_args.args[0]
+        assert create_request.permission_mode == "autonomous"
+        assert create_request.config_name == "centurion"
 
     @pytest.mark.asyncio
     async def test_commission_asks_the_funnel_for_connector_defaults(
-        self, db, as_project_admin, quiet_side_channels, monkeypatch
+        self, db, as_project_admin, quiet_side_channels, req, deps
     ):
         """The third field this endpoint forgot, after config_name and
         permission_mode.
@@ -1232,8 +1277,8 @@ class TestCommissionEndpoint:
         """
         new_tid = str(uuid4())
 
-        async def create_with_continuity(req, _request):
-            req._officer_commission_result = {
+        async def create_with_continuity(create_request, _request):
+            create_request._officer_commission_result = {
                 "brief_enqueued": True,
                 "while_vacant": [],
                 "while_vacant_dropped": 0,
@@ -1242,7 +1287,7 @@ class TestCommissionEndpoint:
             return {"thread_id": new_tid, "status": "created"}
 
         create = AsyncMock(side_effect=create_with_continuity)
-        monkeypatch.setattr(orch_main, "create_thread", create)
+        deps.create_thread = create
         row = _post_row(config_override={"officer": {"enabled": True}})
         db.get_or_create_project_officer = AsyncMock(return_value=row)
         db.update_project_officer_post = AsyncMock(
@@ -1250,23 +1295,23 @@ class TestCommissionEndpoint:
         )
         db.get_project_officer = AsyncMock(return_value=row)
 
-        await commission_project_officer(MagicMock(), PROJECT_ID, None)
+        await commission_project_officer(req, PROJECT_ID, None)
 
-        req = create.await_args.args[0]
-        assert req.use_datasource_defaults is True
-        assert "datasource_ids" not in req.model_fields_set
+        create_request = create.await_args.args[0]
+        assert create_request.use_datasource_defaults is True
+        assert "datasource_ids" not in create_request.model_fields_set
 
     @pytest.mark.asyncio
     async def test_cleared_row_fields_do_not_travel_to_the_funnel(
-        self, db, as_project_admin, quiet_side_channels, monkeypatch
+        self, db, as_project_admin, quiet_side_channels, req, deps
     ):
         """After a PATCH null-clear the row carries JSON nulls; commission
         must drop them — the funnel spells 'default' by omission, and its
         validator 400s on null ints/slots."""
         new_tid = str(uuid4())
 
-        async def create_with_continuity(req, _request):
-            req._officer_commission_result = {
+        async def create_with_continuity(create_request, _request):
+            create_request._officer_commission_result = {
                 "brief_enqueued": True,
                 "while_vacant": [],
                 "while_vacant_dropped": 0,
@@ -1275,7 +1320,7 @@ class TestCommissionEndpoint:
             return {"thread_id": new_tid, "status": "created"}
 
         create = AsyncMock(side_effect=create_with_continuity)
-        monkeypatch.setattr(orch_main, "create_thread", create)
+        deps.create_thread = create
         row = _post_row(
             config_override={
                 "officer": {
@@ -1293,29 +1338,29 @@ class TestCommissionEndpoint:
             return_value={"post": row, "thread": None, "applied_to_thread": False}
         )
 
-        await commission_project_officer(MagicMock(), PROJECT_ID, None)
+        await commission_project_officer(req, PROJECT_ID, None)
 
-        req = create.await_args.args[0]
-        officer_frag = req.config_override["officer"]
+        create_request = create.await_args.args[0]
+        officer_frag = create_request.config_override["officer"]
         assert "slots" not in officer_frag
         assert "daily_token_ceiling" not in officer_frag
         assert officer_frag["max_actions_per_wake"] == 2
         assert officer_frag["enabled"] is True
-        assert req.model is None
-        assert req.reasoning_level is None
+        assert create_request.model is None
+        assert create_request.reasoning_level is None
 
     @pytest.mark.asyncio
     async def test_funnel_409_propagates(
-        self, db, as_project_admin, quiet_side_channels, monkeypatch
+        self, db, as_project_admin, quiet_side_channels, req, deps
     ):
         """The registration claim inside the funnel is the rival authority —
         commission inherits its 409 instead of double-claiming."""
         create = AsyncMock(
             side_effect=HTTPException(status_code=409, detail="already commissioned")
         )
-        monkeypatch.setattr(orch_main, "create_thread", create)
+        deps.create_thread = create
         with pytest.raises(HTTPException) as exc:
-            await commission_project_officer(MagicMock(), PROJECT_ID, None)
+            await commission_project_officer(req, PROJECT_ID, None)
         assert exc.value.status_code == 409
         db.enqueue_session_wake_event.assert_not_awaited()
 
@@ -1323,9 +1368,9 @@ class TestCommissionEndpoint:
 class TestDecommissionEndpoint:
     @pytest.mark.asyncio
     async def test_vacant_post_is_an_idempotent_success(
-        self, db, as_project_admin, quiet_side_channels
+        self, db, as_project_admin, quiet_side_channels, req
     ):
-        out = await decommission_project_officer(MagicMock(), PROJECT_ID, None)
+        out = await decommission_project_officer(req, PROJECT_ID, None)
         assert out == {
             "status": "decommissioned",
             "already_vacant": True,
@@ -1335,7 +1380,7 @@ class TestDecommissionEndpoint:
 
     @pytest.mark.asyncio
     async def test_in_flight_jobs_warn_is_a_200_without_force(
-        self, db, as_project_admin, quiet_side_channels, monkeypatch
+        self, db, as_project_admin, quiet_side_channels, req, deps
     ):
         """The warning is a 200 body (O5 card contract) — an error status
         would route to the card's failure path instead of the leave-running
@@ -1352,8 +1397,8 @@ class TestDecommissionEndpoint:
                 "in_flight_jobs": jobs,
             }
         )
-        monkeypatch.setattr(orch_main, "_end_thread_flow", flow)
-        out = await decommission_project_officer(MagicMock(), PROJECT_ID, None)
+        deps.end_thread_flow = flow
+        out = await decommission_project_officer(req, PROJECT_ID, None)
         assert out["status"] == "in_flight"
         assert out["in_flight_jobs"] == jobs
         assert "force=true" in out["warning"]
@@ -1364,7 +1409,7 @@ class TestDecommissionEndpoint:
 
     @pytest.mark.asyncio
     async def test_force_proceeds_through_the_end_funnel_leaving_jobs(
-        self, db, as_project_admin, quiet_side_channels, monkeypatch
+        self, db, as_project_admin, quiet_side_channels, req, deps
     ):
         db.get_or_create_project_officer = AsyncMock(
             return_value=_post_row(thread_id=THREAD_ID)
@@ -1377,9 +1422,9 @@ class TestDecommissionEndpoint:
                 "_officer_handoff": {"in_flight_jobs": jobs},
             }
         )
-        monkeypatch.setattr(orch_main, "_end_thread_flow", flow)
+        deps.end_thread_flow = flow
         out = await decommission_project_officer(
-            MagicMock(), PROJECT_ID, OfficerDecommissionRequest(force=True)
+            req, PROJECT_ID, OfficerDecommissionRequest(force=True)
         )
         flow.assert_awaited_once()
         args, kwargs = flow.await_args
@@ -1393,7 +1438,7 @@ class TestDecommissionEndpoint:
 
     @pytest.mark.asyncio
     async def test_no_jobs_needs_no_force(
-        self, db, as_project_admin, quiet_side_channels, monkeypatch
+        self, db, as_project_admin, quiet_side_channels, req, deps
     ):
         db.get_or_create_project_officer = AsyncMock(
             return_value=_post_row(thread_id=THREAD_ID)
@@ -1405,14 +1450,14 @@ class TestDecommissionEndpoint:
                 "_officer_handoff": {"in_flight_jobs": []},
             }
         )
-        monkeypatch.setattr(orch_main, "_end_thread_flow", flow)
-        out = await decommission_project_officer(MagicMock(), PROJECT_ID, None)
+        deps.end_thread_flow = flow
+        out = await decommission_project_officer(req, PROJECT_ID, None)
         assert out["status"] == "decommissioned"
         assert flow.await_args.kwargs["officer_retire_reason"] == "decommissioned"
 
     @pytest.mark.asyncio
     async def test_server_owned_runtime_state_is_not_reported_as_harvested_memory(
-        self, db, as_project_admin, quiet_side_channels, monkeypatch
+        self, db, as_project_admin, quiet_side_channels, req, deps
     ):
         db.get_or_create_project_officer = AsyncMock(
             return_value=_post_row(thread_id=THREAD_ID)
@@ -1429,42 +1474,38 @@ class TestDecommissionEndpoint:
                 "incarnations": [{"thread_id": THREAD_ID}],
             }
         )
-        monkeypatch.setattr(
-            orch_main,
-            "_end_thread_flow",
-            AsyncMock(
-                return_value={
-                    "status": "ended",
-                    "_officer_handoff": {"in_flight_jobs": []},
-                }
-            ),
+        deps.end_thread_flow = AsyncMock(
+            return_value={
+                "status": "ended",
+                "_officer_handoff": {"in_flight_jobs": []},
+            }
         )
 
-        out = await decommission_project_officer(MagicMock(), PROJECT_ID, None)
+        out = await decommission_project_officer(req, PROJECT_ID, None)
 
         assert out["status"] == "decommissioned"
         assert out["harvested"] is False
 
     @pytest.mark.asyncio
     async def test_already_ended_link_folds_without_the_end_flow(
-        self, db, as_project_admin, quiet_side_channels, monkeypatch
+        self, db, as_project_admin, quiet_side_channels, req, deps, monkeypatch
     ):
         db.get_or_create_project_officer = AsyncMock(
             return_value=_post_row(thread_id=THREAD_ID)
         )
         db.get_thread = AsyncMock(return_value=_officer_thread(status="ended"))
         fold = AsyncMock(return_value={"harvested": True, "folded": 1, "deleted": 2})
-        monkeypatch.setattr(orch_main, "_decommission_officer_post", fold)
+        monkeypatch.setattr(officer_post_lifecycle, "decommission_officer_post", fold)
         flow = AsyncMock()
-        monkeypatch.setattr(orch_main, "_end_thread_flow", flow)
-        out = await decommission_project_officer(MagicMock(), PROJECT_ID, None)
+        deps.end_thread_flow = flow
+        out = await decommission_project_officer(req, PROJECT_ID, None)
         fold.assert_awaited_once()
         flow.assert_not_awaited()
         assert out["already_ended"] is True
 
     @pytest.mark.asyncio
     async def test_missing_thread_row_uses_the_atomic_handoff(
-        self, db, as_project_admin, quiet_side_channels
+        self, db, as_project_admin, quiet_side_channels, req
     ):
         db.get_or_create_project_officer = AsyncMock(
             return_value=_post_row(thread_id=THREAD_ID)
@@ -1483,7 +1524,7 @@ class TestDecommissionEndpoint:
                 "incarnation": {"thread_id": THREAD_ID},
             }
         )
-        out = await decommission_project_officer(MagicMock(), PROJECT_ID, None)
+        out = await decommission_project_officer(req, PROJECT_ID, None)
         db.decommission_project_officer.assert_awaited_once_with(
             PROJECT_ID,
             THREAD_ID,
@@ -1503,7 +1544,9 @@ class TestDecommissionEndpoint:
 
 class TestDecommissionHygieneHelper:
     @pytest.mark.asyncio
-    async def test_registered_officer_runs_harvest_fold_unlink_incarnation(self, db):
+    async def test_registered_officer_runs_harvest_fold_unlink_incarnation(
+        self, db, deps
+    ):
         created_at = datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc)
         thread = _officer_thread(created_at=created_at)
         thread["metadata"]["officer_state"] = {
@@ -1527,7 +1570,9 @@ class TestDecommissionHygieneHelper:
                 },
             }
         )
-        out = await _decommission_officer_post(thread, reason="decommissioned")
+        out = await officer_post_lifecycle.decommission_officer_post(
+            thread, reason="decommissioned", dependencies=deps
+        )
         assert out is not None
         db.decommission_project_officer.assert_awaited_once_with(
             PROJECT_ID,
@@ -1545,13 +1590,15 @@ class TestDecommissionHygieneHelper:
         db.append_project_officer_incarnation.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_unregistered_officer_thread_touches_nothing(self, db):
+    async def test_unregistered_officer_thread_touches_nothing(self, db, deps):
         """A legacy enabled thread that never claimed the post must not
         harvest over another incarnation's state."""
         db.get_project_officer = AsyncMock(
             return_value=_post_row(thread_id=str(uuid4()))
         )
-        out = await _decommission_officer_post(_officer_thread(), reason="retired")
+        out = await officer_post_lifecycle.decommission_officer_post(
+            _officer_thread(), reason="retired", dependencies=deps
+        )
         assert out["transitioned"] is False
         db.decommission_project_officer.assert_awaited_once_with(
             PROJECT_ID,
@@ -1565,9 +1612,9 @@ class TestDecommissionHygieneHelper:
         db.append_project_officer_incarnation.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_projectless_thread_is_a_noop(self, db):
-        out = await _decommission_officer_post(
-            _officer_thread(project_id=None), reason="retired"
+    async def test_projectless_thread_is_a_noop(self, db, deps):
+        out = await officer_post_lifecycle.decommission_officer_post(
+            _officer_thread(project_id=None), reason="retired", dependencies=deps
         )
         assert out is None
         db.get_project_officer.assert_not_awaited()
@@ -1599,13 +1646,13 @@ class TestEndThreadReroute:
         db.settle_pinned_thread_retirement = AsyncMock(return_value=True)
         db.try_thread_advisory_lock = MagicMock(return_value=lock)
         monkeypatch.setattr(
-            orch_main,
-            "_pinned_retirement_is_current",
+            orch_main.PinnedRetirementOperations,
+            "pinned_retirement_is_current",
             AsyncMock(return_value=True),
         )
         monkeypatch.setattr(
-            orch_main,
-            "_cleanup_pinned_thread_retirement",
+            orch_main.PinnedRetirementOperations,
+            "cleanup_pinned_thread_retirement",
             AsyncMock(),
         )
 
@@ -1616,9 +1663,15 @@ class TestEndThreadReroute:
         """The officer branch of ``end_thread``'s stand-down IS decommission
         step 2-3-5 (officer_post.md §5) — reason 'retired' by default."""
         monkeypatch.setattr(
-            orch_main, "_thread_turn_in_flight", AsyncMock(return_value=False)
+            orch_main.thread_retirement_operations,
+            "thread_turn_in_flight",
+            AsyncMock(return_value=False),
         )
-        monkeypatch.setattr(orch_main, "_release_thread_resources", AsyncMock())
+        monkeypatch.setattr(
+            orch_main.thread_retirement_operations,
+            "release_thread_resources",
+            AsyncMock(),
+        )
         monkeypatch.setattr(orch_main, "_conclude_conference_if_any", AsyncMock())
         db.get_project_officer = AsyncMock(return_value=_post_row(thread_id=THREAD_ID))
         db.decommission_project_officer = AsyncMock(
@@ -1673,13 +1726,19 @@ class TestEndThreadReroute:
     @pytest.mark.asyncio
     async def test_authoritative_handoff_failure_blocks_the_end(self, db, monkeypatch):
         monkeypatch.setattr(
-            orch_main, "_thread_turn_in_flight", AsyncMock(return_value=False)
+            orch_main.thread_retirement_operations,
+            "thread_turn_in_flight",
+            AsyncMock(return_value=False),
         )
-        monkeypatch.setattr(orch_main, "_release_thread_resources", AsyncMock())
+        monkeypatch.setattr(
+            orch_main.thread_retirement_operations,
+            "release_thread_resources",
+            AsyncMock(),
+        )
         monkeypatch.setattr(orch_main, "_conclude_conference_if_any", AsyncMock())
         monkeypatch.setattr(
-            orch_main,
-            "_decommission_officer_post",
+            orch_main.officer_post_lifecycle_service,
+            "decommission_officer_post",
             AsyncMock(side_effect=RuntimeError("post table on fire")),
         )
         db.end_thread = AsyncMock()
@@ -1714,11 +1773,15 @@ class TestEndThreadReroute:
             }
         )
         monkeypatch.setattr(
-            orch_main, "_thread_turn_in_flight", AsyncMock(return_value=False)
+            orch_main.thread_retirement_operations,
+            "thread_turn_in_flight",
+            AsyncMock(return_value=False),
         )
         release = AsyncMock()
         conclude = AsyncMock()
-        monkeypatch.setattr(orch_main, "_release_thread_resources", release)
+        monkeypatch.setattr(
+            orch_main.thread_retirement_operations, "release_thread_resources", release
+        )
         monkeypatch.setattr(orch_main, "_conclude_conference_if_any", conclude)
         db.end_thread = AsyncMock()
         thread = _officer_thread(execution_lane="pinned")
@@ -1759,9 +1822,15 @@ class TestEndThreadReroute:
             }
         )
         monkeypatch.setattr(
-            orch_main, "_thread_turn_in_flight", AsyncMock(return_value=False)
+            orch_main.thread_retirement_operations,
+            "thread_turn_in_flight",
+            AsyncMock(return_value=False),
         )
-        monkeypatch.setattr(orch_main, "_release_thread_resources", AsyncMock())
+        monkeypatch.setattr(
+            orch_main.thread_retirement_operations,
+            "release_thread_resources",
+            AsyncMock(),
+        )
         monkeypatch.setattr(orch_main, "_conclude_conference_if_any", AsyncMock())
         db.end_thread = AsyncMock()
         thread = _officer_thread(execution_lane="pinned")
@@ -1781,13 +1850,19 @@ class TestEndThreadReroute:
 
     @pytest.mark.asyncio
     async def test_direct_end_and_explicit_decommission_share_one_transition(
-        self, db, as_project_admin, quiet_side_channels, monkeypatch
+        self, db, req, as_project_admin, quiet_side_channels, monkeypatch
     ):
         """Both public controls reach the same post/thread transaction."""
         monkeypatch.setattr(
-            orch_main, "_thread_turn_in_flight", AsyncMock(return_value=False)
+            orch_main.thread_retirement_operations,
+            "thread_turn_in_flight",
+            AsyncMock(return_value=False),
         )
-        monkeypatch.setattr(orch_main, "_release_thread_resources", AsyncMock())
+        monkeypatch.setattr(
+            orch_main.thread_retirement_operations,
+            "release_thread_resources",
+            AsyncMock(),
+        )
         monkeypatch.setattr(orch_main, "_conclude_conference_if_any", AsyncMock())
         db.get_or_create_project_officer = AsyncMock(
             return_value=_post_row(thread_id=THREAD_ID)
@@ -1821,7 +1896,7 @@ class TestEndThreadReroute:
 
         db.decommission_project_officer.reset_mock()
         await decommission_project_officer(
-            MagicMock(),
+            req,
             PROJECT_ID,
             OfficerDecommissionRequest(reason="retired"),
         )
@@ -1847,7 +1922,7 @@ class TestEndThreadReroute:
 
     @pytest.mark.asyncio
     async def test_notifier_failure_does_not_falsify_committed_handoff(
-        self, db, monkeypatch
+        self, db, deps, monkeypatch
     ):
         from orchestrator.services import message_routing
 
@@ -1877,8 +1952,8 @@ class TestEndThreadReroute:
         deliver = AsyncMock(side_effect=fail_after_commit)
         monkeypatch.setattr(message_routing, "deliver_route_to_user", deliver)
 
-        out = await _decommission_officer_post(
-            _officer_thread(), reason="decommissioned"
+        out = await officer_post_lifecycle.decommission_officer_post(
+            _officer_thread(), reason="decommissioned", dependencies=deps
         )
 
         assert out["transitioned"] is True
@@ -1889,7 +1964,7 @@ class TestEndThreadReroute:
 
     @pytest.mark.asyncio
     async def test_notifier_exception_does_not_falsify_committed_handoff(
-        self, db, monkeypatch
+        self, db, deps, monkeypatch
     ):
         from orchestrator.services import message_routing
 
@@ -1914,8 +1989,8 @@ class TestEndThreadReroute:
         deliver = AsyncMock(side_effect=RuntimeError("notifier unavailable"))
         monkeypatch.setattr(message_routing, "deliver_route_to_user", deliver)
 
-        out = await _decommission_officer_post(
-            _officer_thread(), reason="decommissioned"
+        out = await officer_post_lifecycle.decommission_officer_post(
+            _officer_thread(), reason="decommissioned", dependencies=deps
         )
 
         assert out["transitioned"] is True
@@ -1927,12 +2002,22 @@ class TestEndThreadReroute:
     @pytest.mark.asyncio
     async def test_plain_session_end_skips_officer_hygiene(self, db, monkeypatch):
         monkeypatch.setattr(
-            orch_main, "_thread_turn_in_flight", AsyncMock(return_value=False)
+            orch_main.thread_retirement_operations,
+            "thread_turn_in_flight",
+            AsyncMock(return_value=False),
         )
-        monkeypatch.setattr(orch_main, "_release_thread_resources", AsyncMock())
+        monkeypatch.setattr(
+            orch_main.thread_retirement_operations,
+            "release_thread_resources",
+            AsyncMock(),
+        )
         monkeypatch.setattr(orch_main, "_conclude_conference_if_any", AsyncMock())
         hygiene = AsyncMock()
-        monkeypatch.setattr(orch_main, "_decommission_officer_post", hygiene)
+        monkeypatch.setattr(
+            orch_main.officer_post_lifecycle_service,
+            "decommission_officer_post",
+            hygiene,
+        )
         db.end_thread = AsyncMock()
         plain = {
             "id": THREAD_ID,
@@ -2028,15 +2113,29 @@ class TestWhileVacantLeg:
 # =========================================================================
 
 
+def _view_deps(usage_ledger) -> OfficerPostViewDependencies:
+    """The card's read collaborators. The metering ledger is a dependency
+    field now, so a suite wires it here instead of rebinding
+    ``orchestrator.main.usage_ledger``."""
+    return OfficerPostViewDependencies(
+        store=MagicMock(),
+        vector_store=MagicMock(),
+        usage_ledger=usage_ledger,
+        persistent_provisioner=MagicMock(),
+        auto_pull_release_enabled=lambda: False,
+        persistent_agent_reconciliation_enabled=lambda: False,
+        find_open_conference_thread=AsyncMock(return_value=None),
+    )
+
+
 class TestSpendToday:
     @pytest.mark.asyncio
-    async def test_vacant_post_is_zero_spend(self, monkeypatch):
-        monkeypatch.setattr(orch_main, "usage_ledger", None)
-        out = await _officer_spend_today(None, 5_000_000)
+    async def test_vacant_post_is_zero_spend(self):
+        out = await officer_spend_today(None, 5_000_000, dependencies=_view_deps(None))
         assert out == {"tokens": 0, "ceiling": 5_000_000}
 
     @pytest.mark.asyncio
-    async def test_commissioned_sums_token_categories_over_today(self, monkeypatch):
+    async def test_commissioned_sums_token_categories_over_today(self):
         ledger = MagicMock()
         ledger.is_available = True
         ledger.query_usage = AsyncMock(
@@ -2049,8 +2148,9 @@ class TestSpendToday:
                 ]
             }
         )
-        monkeypatch.setattr(orch_main, "usage_ledger", ledger)
-        out = await _officer_spend_today(THREAD_ID, 5_000_000)
+        out = await officer_spend_today(
+            THREAD_ID, 5_000_000, dependencies=_view_deps(ledger)
+        )
         assert out == {"tokens": 1_500_000, "ceiling": 5_000_000}
         kwargs = ledger.query_usage.await_args.kwargs
         assert kwargs["ref_id"] == THREAD_ID
@@ -2058,18 +2158,16 @@ class TestSpendToday:
         assert kwargs["to_ts"] - kwargs["from_ts"] < timedelta(days=1)
 
     @pytest.mark.asyncio
-    async def test_metering_down_reads_none_not_zero(self, monkeypatch):
+    async def test_metering_down_reads_none_not_zero(self):
         ledger = MagicMock()
         ledger.is_available = True
         ledger.query_usage = AsyncMock(side_effect=RuntimeError("metering down"))
-        monkeypatch.setattr(orch_main, "usage_ledger", ledger)
-        out = await _officer_spend_today(THREAD_ID, 0)
+        out = await officer_spend_today(THREAD_ID, 0, dependencies=_view_deps(ledger))
         assert out == {"tokens": None, "ceiling": 0}
 
     @pytest.mark.asyncio
-    async def test_no_ledger_wired_reads_none(self, monkeypatch):
-        monkeypatch.setattr(orch_main, "usage_ledger", None)
-        out = await _officer_spend_today(THREAD_ID, 100)
+    async def test_no_ledger_wired_reads_none(self):
+        out = await officer_spend_today(THREAD_ID, 100, dependencies=_view_deps(None))
         assert out == {"tokens": None, "ceiling": 100}
 
 

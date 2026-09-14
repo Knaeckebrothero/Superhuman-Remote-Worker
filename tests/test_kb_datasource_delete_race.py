@@ -7,8 +7,27 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-import orchestrator.main as orchestrator_main
+from orchestrator.services import knowledge_index
 from orchestrator.services.kb_reindex import kb_index_lock, reindex_kb
+from orchestrator.services.kb_task_registry import KbDatasourceTaskRegistry
+
+
+def _index_dependencies(
+    store, *, tasks=None
+) -> "knowledge_index.KnowledgeIndexDependencies":
+    """The collaborators main's ``_knowledge_index_dependencies()`` supplies.
+
+    ``store`` is the app pool the delete path writes the row through; the
+    vector pool only reaches ``KnowledgeStore``, which these tests patch.
+    """
+    return knowledge_index.KnowledgeIndexDependencies(
+        store=store,
+        vector_db=MagicMock(),
+        gitea_client=MagicMock(),
+        logger=MagicMock(),
+        tasks=tasks if tasks is not None else KbDatasourceTaskRegistry(),
+        inject_system_kb_embedding_profile=AsyncMock(return_value=None),
+    )
 
 
 class _CoordinatedStore:
@@ -86,15 +105,20 @@ async def test_delete_waits_for_writer_then_stale_reindex_cannot_resurrect_index
     await writer_started.wait()
 
     cancel_local = AsyncMock()
+    dependencies = _index_dependencies(db)
     with (
-        patch("orchestrator.main.postgres_db", db),
         patch(
             "shared.runtime.services.knowledge_store.KnowledgeStore", return_value=store
         ),
-        patch("orchestrator.main._cancel_kb_datasource_reindexes", cancel_local),
+        patch(
+            "orchestrator.services.knowledge_index.cancel_kb_datasource_reindexes",
+            cancel_local,
+        ),
     ):
         deletion = asyncio.create_task(
-            orchestrator_main._delete_kb_datasource_with_index(datasource_id)
+            knowledge_index.delete_kb_datasource_with_index(
+                datasource_id, dependencies=dependencies
+            )
         )
         await asyncio.sleep(0)
         assert not deletion.done(), "delete passed an in-flight KB writer"
@@ -103,7 +127,7 @@ async def test_delete_waits_for_writer_then_stale_reindex_cannot_resurrect_index
         assert await deletion is True
 
     await writer
-    cancel_local.assert_awaited_once_with(datasource_id)
+    cancel_local.assert_awaited_once_with(datasource_id, dependencies=dependencies)
     assert events == [
         "writer-start",
         "writer-finish",
@@ -140,7 +164,7 @@ async def test_cancel_datasource_reindexes_drains_and_forgets_owned_task():
     cleaned = asyncio.Event()
     never = asyncio.Event()
 
-    async def scheduled(_datasource_id: str, *, force_full: bool) -> None:
+    async def scheduled(_datasource_id: str, *, force_full: bool, dependencies) -> None:
         assert force_full is True
         started.set()
         try:
@@ -148,13 +172,23 @@ async def test_cancel_datasource_reindexes_drains_and_forgets_owned_task():
         finally:
             cleaned.set()
 
-    with patch("orchestrator.main._run_scheduled_kb_datasource_reindex", scheduled):
-        orchestrator_main._schedule_kb_datasource_reindex(
-            datasource_id, force_full=True
+    tasks = KbDatasourceTaskRegistry()
+    dependencies = _index_dependencies(MagicMock(), tasks=tasks)
+    with patch(
+        "orchestrator.services.knowledge_index.run_scheduled_kb_datasource_reindex",
+        scheduled,
+    ):
+        knowledge_index.schedule_kb_datasource_reindex(
+            datasource_id, force_full=True, dependencies=dependencies
         )
         await started.wait()
-        await orchestrator_main._cancel_kb_datasource_reindexes(datasource_id)
+        await knowledge_index.cancel_kb_datasource_reindexes(
+            datasource_id, dependencies=dependencies
+        )
         await asyncio.sleep(0)
 
     assert cleaned.is_set()
-    assert datasource_id not in orchestrator_main._kb_datasource_tasks_by_id
+    # The registry's per-datasource index is what a delete fences against, so
+    # this reaches its internal view deliberately: ``pending()`` is the
+    # shutdown ownership set and would not catch a leaked per-id entry.
+    assert datasource_id not in tasks._tasks_by_id

@@ -1,0 +1,118 @@
+# Strategic todos for engineer job initialization (first strategic phase).
+# Read the brief, map the repository, review prior knowledge, stage ONE
+# execution phase. No spec ceremony: the brief is the specification.
+todos:
+  - id: 1
+    content: >-
+      EXPLORE THE TASK: Read the brief and the instructions before doing anything else.
+
+      Steps:
+      (1) Use read_file to read task_brief.md — the task and its required deliverables.
+      (2) Use read_file to read instructions.md in full.
+      (3) Use read_file to read README.md in the workspace root — it lists every attached
+          repository with its clone name (repos/<name>/), base branch and writability.
+      (4) Use list_files on documents/ to inventory input material.
+
+      {% if has_tool("kb_write") -%}
+      Persist what must survive compaction with kb_write:
+      - Required deliverables (exact paths, formats) → type="goal", tag="deliverable"
+      - Hard rules from the brief (forbidden actions, branch/PR conventions) → type="decision", tag="pinned"
+      Search first (kb_search) so you do not duplicate notes from earlier jobs in this project.
+
+      COMPLETION CRITERIA: task_brief.md, instructions.md and README.md read in full; a
+      deliverables note exists (verify with kb_list).
+      {% else -%}
+      Persist what must survive compaction in notes/task_rules.md: required deliverables
+      (exact paths, formats) under "## Deliverables"; hard rules from the brief under
+      "## Hard Rules".
+
+      COMPLETION CRITERIA: task_brief.md, instructions.md and README.md read in full;
+      notes/task_rules.md exists.
+      {%- endif %}
+
+      INSTEAD OF: Starting to edit code now — you do not yet know the conventions or the
+      test command.
+
+  - id: 2
+    content: >-
+      MAP THE REPOSITORY: Learn enough to change it the way its own authors would.
+
+      If README.md lists no repository, this task has no code checkout: record that fact
+      and skip to todo 3 — do not invent a repository directory.
+
+      Otherwise, with <name> from README.md:
+
+      (1) list_files on repos/<name>/ for the top-level layout; read its README and the
+          dependency manifest (pyproject.toml, package.json, go.mod, ...).
+      (2) Find the test command, the lint/format command and the build command: CI config
+          under repos/<name>/.github/workflows/ or equivalent, Makefile, package.json
+          scripts, tox/nox config.
+      (3) Read the files the task touches and 1-2 neighbours that show the conventions:
+          naming, import order, error handling, how tests are written.
+
+      {% if has_shell -%}
+      Run the test command once with working_dir="repos/<name>" (raise `tail`) to see the
+      baseline; record failures that predate you.
+      {% endif %}
+
+      {% if has_tool("delegate_agent") -%}
+      FAN-OUT: when the repository has several independent areas, delegate the steps
+      above to `explorer` children — several delegate_agent calls in ONE turn run in
+      parallel, each with a self-contained brief ("map repos/<name>/src/<area>: modules,
+      conventions, test layout — report back") — and assemble the map yourself.
+      {% endif %}
+
+      {% if has_tool("kb_write") -%}
+      Record the map with kb_write (type=learning, tag=repository): clone name and base
+      branch, stack, exact test/lint/build commands, source and test directories,
+      conventions, baseline test result.
+      {% else -%}
+      Record the map in notes/task_rules.md under "## Repository": clone name and base
+      branch, stack, exact test/lint/build commands, source and test directories,
+      conventions, baseline test result.
+      {%- endif %}
+
+      COMPLETION CRITERIA: you can name the test command and the files you will change.
+
+      INSTEAD OF: Reading the whole codebase — read what the task touches plus the test
+      infrastructure. Instead of guessing conventions — read real files.
+
+  - id: 3
+    content: >-
+      {% if has_tool("kb_search") -%}
+      REVIEW PROJECT KNOWLEDGE: Use kb_list (status="active") and kb_search with the task's
+      key terms. Prior jobs in this project may have recorded conventions, decisions or
+      failed approaches that constrain you. Check kb_contradictions.
+
+      COMPLETION CRITERIA: kb_search called at least once; relevant prior notes read.
+      {% else -%}
+      REVIEW PROJECT CONTEXT: Read plan.md, notes/ and archive/ if they exist from earlier
+      phases; they may record decisions or failed approaches that constrain you.
+
+      COMPLETION CRITERIA: prior context reviewed.
+      {%- endif %}
+
+      INSTEAD OF: Skipping this — a recorded failed approach saves a wasted phase.
+
+  - id: 4
+    content: >-
+      PLAN AND STAGE ONE EXECUTION PHASE.
+
+      Write plan.md: a "## Deliverables" list (exact paths from the brief) and a numbered
+      list of steps, each naming the files it changes and the command that verifies it.
+      Keep it short; the brief is the specification.
+
+      Then call next_phase_todos with the execution todos (the todo-guide skill at
+      skills/todo-guide/SKILL.md covers the format). Default to ONE execution phase for
+      the whole task; add a later phase only when its todos cannot be written until
+      earlier results are in. Each todo:
+      - names the files and the specific change,
+      - names the verification command and the expected result,
+      - is completable in a few tool calls.
+      Include a final verification todo that runs the project's full test command (and
+      lint/build if present) and records the output.
+
+      COMPLETION CRITERIA: plan.md exists; next_phase_todos called successfully.
+
+      INSTEAD OF: Spec, cleanup, archiving or "final review" phases — verification is a
+      todo, not a phase, and git versioning keeps the history.

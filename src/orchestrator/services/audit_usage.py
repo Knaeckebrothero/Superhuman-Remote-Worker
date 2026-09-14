@@ -45,6 +45,7 @@ idempotency namespace.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Optional
@@ -284,4 +285,74 @@ async def materialize_llm_usage_from_audit(
     return {"materialized": inserted, "cursor": new_cursor, "scanned": len(rows)}
 
 
-__all__ = ["materialize_llm_usage_from_audit"]
+async def llm_usage_poll_loop(
+    shutdown_event: asyncio.Event,
+    *,
+    audit_db: Any,
+    app_store: Any,
+    usage_ledger: Any,
+    logger: Any = logger,
+    interval: float = 120.0,
+) -> None:
+    """Background loop: materialize the audit trail into usage_events (LLM cost).
+
+    Reads new ``llm_requests`` rows via ``materialize_llm_usage_from_audit`` and
+    prices them from ``usage_rates`` (seeded by ``llm_pricing_sync_loop``) — no
+    proxy in the path. Idempotent at the ledger; never raises into the lifespan.
+
+    Forward-only: the cursor anchors at the current max ``llm_requests.timestamp``
+    on startup, so the audit materializer does not backfill historical rows unless
+    an operator deliberately lowers the anchor. The cursor is a timestamp, NOT an
+    id: ``llm_requests.id`` is not monotonic with time. No-op when the ledger or
+    either pool is unavailable.
+
+    Extracted from ``orchestrator.main`` (R1.B05 lane C). ``audit_db``,
+    ``app_store``, ``usage_ledger`` and ``logger`` are rebound by the
+    application during ``lifespan``, so they are passed in at the single call
+    site rather than read from a module global — the same shape
+    ``workspace_metering_loop`` and ``llm_pricing_sync_loop`` already use.
+    ``asyncio.CancelledError`` is deliberately NOT caught: a poll loop that
+    swallows it blocks shutdown.
+    """
+    if usage_ledger is None or not usage_ledger.is_available:
+        logger.info("LLM usage poll loop disabled (usage ledger unavailable)")
+        return
+    if audit_db is None or audit_db.pool is None or app_store.pool is None:
+        logger.info("LLM usage poll loop disabled (audit/app pool unavailable)")
+        return
+
+    # Forward-only anchor: start after the newest existing row by timestamp.
+    # Falls back to wall-clock now when empty.
+    cursor = datetime.now(timezone.utc)
+    try:
+        async with audit_db.pool.acquire() as conn:
+            newest = await conn.fetchval("SELECT max(timestamp) FROM llm_requests")
+        if newest is not None:
+            cursor = newest
+    except Exception:
+        logger.warning(
+            "LLM usage anchor query failed; starting from now", exc_info=True
+        )
+    logger.info(
+        "LLM usage poll loop starting (audit source, anchor ts=%s, interval=%ss)",
+        cursor,
+        interval,
+    )
+    try:
+        while not shutdown_event.is_set():
+            try:
+                res = await materialize_llm_usage_from_audit(
+                    audit_db.pool, app_store.pool, usage_ledger, since_ts=cursor
+                )
+                cursor = res.get("cursor") or cursor
+            except Exception:
+                logger.exception("LLM usage poll tick failed (non-fatal)")
+            try:
+                await asyncio.wait_for(shutdown_event.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                pass
+    finally:
+        logger.info("LLM usage poll loop stopped")
+
+
+__all__ = ["llm_usage_poll_loop", "materialize_llm_usage_from_audit"]

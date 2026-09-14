@@ -325,3 +325,35 @@ export function humanizeCategoryKey(key: string): string {
         .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
         .join(' ');
 }
+
+/** One roster entry as the Delegation row lists it. */
+export interface RosterLine {
+    name: string;
+    description: string | null;
+    /** The `subagents.default` entry — what a `delegate_agent` call without a type runs. */
+    isDefault: boolean;
+}
+
+/**
+ * The roster a Delegation tick reaches, as lines — three answers, kept apart:
+ *
+ * - `null`: the server made no claim (older orchestrator, or the resolve
+ *   failed). Render nothing; a false "no roster" would be a confident lie.
+ * - `[]`: the server resolved the expert and it has NO roster. Render the
+ *   warning — every `delegate_agent` call on this session will error.
+ * - lines: the expert's `subagent_type`s, the default flagged.
+ *
+ * Keys the response in insertion order, which is the roster's authored
+ * order (and the order the model sees in the tool description).
+ */
+export function rosterLines(
+    response: SessionToolGroupsResponse | null | undefined,
+): RosterLine[] | null {
+    const roster = response?.subagents;
+    if (!roster || !Array.isArray(roster.roster)) return null;
+    return roster.roster.map((entry) => ({
+        name: entry.name,
+        description: entry.description ?? null,
+        isDefault: roster.default != null && entry.name === roster.default,
+    }));
+}

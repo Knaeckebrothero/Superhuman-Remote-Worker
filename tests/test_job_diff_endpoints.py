@@ -14,17 +14,19 @@ single key or status code.
 Follows the house pattern in tests/test_export_to_cloud_endpoint.py: import
 ``main`` (conftest puts orchestrator/ on sys.path), patch its module
 globals with an ExitStack, and call the endpoint coroutine directly (no HTTP
-transport needed — ``require_job_access`` is patched to skip auth/DB
-entirely).
+transport needed — ``require_job_access`` is replaced on the route
+dependencies to skip auth/DB entirely).
 """
 
 from contextlib import ExitStack
+import dataclasses
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
 
 import orchestrator.main
+from orchestrator.routers import job_diff as job_diff_routes
 
 # --------------------------------------------------------------------------- #
 # Fixtures / helpers
@@ -116,15 +118,26 @@ def _make_gitea(
 
 
 def _patch_endpoint(*, user: dict, job: dict, gitea) -> ExitStack:
+    # ``user``/``job`` are the pair the caller hands to ``_deps`` — the access
+    # gate lives on the route dependencies, not on a patchable global.
     stack = ExitStack()
-    stack.enter_context(
-        patch(
-            "orchestrator.main.require_job_access", AsyncMock(return_value=(user, job))
-        )
-    )
     stack.enter_context(patch("orchestrator.main.gitea_client", gitea))
     stack.enter_context(patch("orchestrator.main.postgres_db", MagicMock()))
     return stack
+
+
+def _deps(user: dict, job: dict):
+    """Route dependencies built from the patched globals, auth short-circuited.
+
+    ``require_job_access`` is a field default on ``JobDiffDependencies``, so
+    the gate is replaced here rather than patched on a module the router
+    never reads. Call inside the ``_patch_endpoint`` stack — the factory
+    reads ``main``'s globals when it runs.
+    """
+    return dataclasses.replace(
+        orchestrator.main._job_diff_dependencies(),
+        require_job_access=AsyncMock(return_value=(user, job)),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -140,7 +153,9 @@ class TestDiffSummary:
         gitea = _make_gitea()
         stack = _patch_endpoint(user=user, job=job, gitea=gitea)
         with stack:
-            result = await orchestrator.main.get_job_diff(fake_request, JOB_ID)
+            result = await job_diff_routes.get_job_diff(
+                fake_request, JOB_ID, dependencies=_deps(user, job)
+            )
 
         assert result == {
             "job_id": JOB_ID,
@@ -161,7 +176,9 @@ class TestDiffSummary:
         gitea = _make_gitea()
         stack = _patch_endpoint(user=user, job=job, gitea=gitea)
         with stack, pytest.raises(HTTPException) as ei:
-            await orchestrator.main.get_job_diff(fake_request, JOB_ID)
+            await job_diff_routes.get_job_diff(
+                fake_request, JOB_ID, dependencies=_deps(user, job)
+            )
         assert ei.value.status_code == 404
         assert "baseline" in ei.value.detail.lower()
 
@@ -172,7 +189,9 @@ class TestDiffSummary:
         gitea = _make_gitea(initialized=False)
         stack = _patch_endpoint(user=user, job=job, gitea=gitea)
         with stack, pytest.raises(HTTPException) as ei:
-            await orchestrator.main.get_job_diff(fake_request, JOB_ID)
+            await job_diff_routes.get_job_diff(
+                fake_request, JOB_ID, dependencies=_deps(user, job)
+            )
         assert ei.value.status_code == 503
 
     @pytest.mark.asyncio
@@ -183,7 +202,9 @@ class TestDiffSummary:
         gitea = _make_gitea()
         stack = _patch_endpoint(user=user, job=job, gitea=gitea)
         with stack, pytest.raises(HTTPException) as ei:
-            await orchestrator.main.get_job_diff(fake_request, JOB_ID)
+            await job_diff_routes.get_job_diff(
+                fake_request, JOB_ID, dependencies=_deps(user, job)
+            )
         assert ei.value.status_code == 404
         assert "unavailable" in ei.value.detail.lower()
 
@@ -209,8 +230,8 @@ class TestDiffFile:
         )
         stack = _patch_endpoint(user=user, job=job, gitea=gitea)
         with stack:
-            result = await orchestrator.main.get_job_diff_file(
-                fake_request, JOB_ID, path
+            result = await job_diff_routes.get_job_diff_file(
+                fake_request, JOB_ID, path, dependencies=_deps(user, job)
             )
 
         assert result == {
@@ -232,8 +253,8 @@ class TestDiffFile:
         gitea = _make_gitea(file_contents={(path, BRANCH): "brand new"})
         stack = _patch_endpoint(user=user, job=job, gitea=gitea)
         with stack:
-            result = await orchestrator.main.get_job_diff_file(
-                fake_request, JOB_ID, path
+            result = await job_diff_routes.get_job_diff_file(
+                fake_request, JOB_ID, path, dependencies=_deps(user, job)
             )
 
         assert result["status"] == "added"
@@ -250,8 +271,8 @@ class TestDiffFile:
         gitea = _make_gitea(file_contents={(path, BASELINE): "gone soon"})
         stack = _patch_endpoint(user=user, job=job, gitea=gitea)
         with stack:
-            result = await orchestrator.main.get_job_diff_file(
-                fake_request, JOB_ID, path
+            result = await job_diff_routes.get_job_diff_file(
+                fake_request, JOB_ID, path, dependencies=_deps(user, job)
             )
 
         assert result["status"] == "deleted"
@@ -267,8 +288,8 @@ class TestDiffFile:
         gitea = _make_gitea()
         stack = _patch_endpoint(user=user, job=job, gitea=gitea)
         with stack, pytest.raises(HTTPException) as ei:
-            await orchestrator.main.get_job_diff_file(
-                fake_request, JOB_ID, "outside/file.py"
+            await job_diff_routes.get_job_diff_file(
+                fake_request, JOB_ID, "outside/file.py", dependencies=_deps(user, job)
             )
         assert ei.value.status_code == 400
 
@@ -279,8 +300,11 @@ class TestDiffFile:
         gitea = _make_gitea()
         stack = _patch_endpoint(user=user, job=job, gitea=gitea)
         with stack, pytest.raises(HTTPException) as ei:
-            await orchestrator.main.get_job_diff_file(
-                fake_request, JOB_ID, "projects/proj1/mod.py"
+            await job_diff_routes.get_job_diff_file(
+                fake_request,
+                JOB_ID,
+                "projects/proj1/mod.py",
+                dependencies=_deps(user, job),
             )
         assert ei.value.status_code == 404
         assert "baseline" in ei.value.detail.lower()
@@ -297,8 +321,8 @@ class TestDiffFile:
         gitea = _make_gitea()
         stack = _patch_endpoint(user=user, job=job, gitea=gitea)
         with stack, pytest.raises(HTTPException) as ei:
-            await orchestrator.main.get_job_diff_file(
-                fake_request, JOB_ID, "outside/file.py"
+            await job_diff_routes.get_job_diff_file(
+                fake_request, JOB_ID, "outside/file.py", dependencies=_deps(user, job)
             )
         assert ei.value.status_code == 404
 
@@ -309,8 +333,11 @@ class TestDiffFile:
         gitea = _make_gitea(initialized=False)
         stack = _patch_endpoint(user=user, job=job, gitea=gitea)
         with stack, pytest.raises(HTTPException) as ei:
-            await orchestrator.main.get_job_diff_file(
-                fake_request, JOB_ID, "projects/proj1/mod.py"
+            await job_diff_routes.get_job_diff_file(
+                fake_request,
+                JOB_ID,
+                "projects/proj1/mod.py",
+                dependencies=_deps(user, job),
             )
         assert ei.value.status_code == 503
 
@@ -321,8 +348,11 @@ class TestDiffFile:
         gitea = _make_gitea()
         stack = _patch_endpoint(user=user, job=job, gitea=gitea)
         with stack, pytest.raises(HTTPException) as ei:
-            await orchestrator.main.get_job_diff_file(
-                fake_request, JOB_ID, "projects/proj1/mod.py"
+            await job_diff_routes.get_job_diff_file(
+                fake_request,
+                JOB_ID,
+                "projects/proj1/mod.py",
+                dependencies=_deps(user, job),
             )
         assert ei.value.status_code == 404
         assert "repo" in ei.value.detail.lower()
@@ -334,8 +364,11 @@ class TestDiffFile:
         gitea = _make_gitea()
         stack = _patch_endpoint(user=user, job=job, gitea=gitea)
         with stack, pytest.raises(HTTPException) as ei:
-            await orchestrator.main.get_job_diff_file(
-                fake_request, JOB_ID, "projects/proj1/does-not-exist.py"
+            await job_diff_routes.get_job_diff_file(
+                fake_request,
+                JOB_ID,
+                "projects/proj1/does-not-exist.py",
+                dependencies=_deps(user, job),
             )
         assert ei.value.status_code == 404
         assert "not in the diff" in ei.value.detail

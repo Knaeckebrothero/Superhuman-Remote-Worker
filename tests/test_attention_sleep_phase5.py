@@ -325,7 +325,7 @@ class TestAttentionSleepSweeper:
         self._orig_db = om.postgres_db
         self._orig_svc = om.workspace_suspension_service
         self._orig_promote = om.promote_expired_stateless_pauses
-        self._orig_end_thread_flow = om._end_thread_flow
+        self._orig_retirement_factory = om._thread_retirement_operations
         om.promote_expired_stateless_pauses = AsyncMock(return_value=[])
 
     def teardown_method(self):
@@ -334,7 +334,7 @@ class TestAttentionSleepSweeper:
         om.postgres_db = self._orig_db
         om.workspace_suspension_service = self._orig_svc
         om.promote_expired_stateless_pauses = self._orig_promote
-        om._end_thread_flow = self._orig_end_thread_flow
+        om._thread_retirement_operations = self._orig_retirement_factory
 
     @pytest.mark.asyncio
     async def test_suspends_stale_awaiting_user(self):
@@ -348,7 +348,9 @@ class TestAttentionSleepSweeper:
 
         om.postgres_db = db
         om.workspace_suspension_service = svc
-        om._end_thread_flow = end_thread_flow
+        om._thread_retirement_operations = lambda: MagicMock(
+            end_thread_flow=end_thread_flow
+        )
 
         shutdown = asyncio.Event()
         # Run one tick: schedule the sweeper, give it a moment, signal shutdown.
@@ -379,7 +381,9 @@ class TestAttentionSleepSweeper:
 
         om.postgres_db = db
         om.workspace_suspension_service = svc
-        om._end_thread_flow = end_thread_flow
+        om._thread_retirement_operations = lambda: MagicMock(
+            end_thread_flow=end_thread_flow
+        )
 
         shutdown = asyncio.Event()
         task = asyncio.create_task(om.attention_sleep_sweeper(shutdown))
@@ -401,7 +405,9 @@ class TestAttentionSleepSweeper:
 
         om.postgres_db = db
         om.workspace_suspension_service = svc
-        om._end_thread_flow = end_thread_flow
+        om._thread_retirement_operations = lambda: MagicMock(
+            end_thread_flow=end_thread_flow
+        )
 
         shutdown = asyncio.Event()
         task = asyncio.create_task(om.attention_sleep_sweeper(shutdown))
@@ -422,7 +428,9 @@ class TestAttentionSleepSweeper:
         end_thread_flow = AsyncMock(return_value={"status": "suspended"})
         om.postgres_db = db
         om.workspace_suspension_service = svc
-        om._end_thread_flow = end_thread_flow
+        om._thread_retirement_operations = lambda: MagicMock(
+            end_thread_flow=end_thread_flow
+        )
         om.promote_expired_stateless_pauses = AsyncMock(
             side_effect=RuntimeError("presence table unavailable")
         )

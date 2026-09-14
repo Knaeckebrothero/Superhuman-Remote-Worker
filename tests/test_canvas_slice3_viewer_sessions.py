@@ -851,7 +851,6 @@ def test_attachment_route_requires_bff_cookie_and_exact_state_etag(
     async def represent(*args, **kwargs):
         return representation
 
-    monkeypatch.setattr(canvas_routes, "_get_db", lambda: db)
     monkeypatch.setattr(
         canvas_routes,
         "_get_canvas_service",
@@ -861,6 +860,7 @@ def test_attachment_route_requires_bff_cookie_and_exact_state_etag(
     monkeypatch.setattr(canvas_routes, "require_thread_owner", owner)
     monkeypatch.setattr(canvas_routes, "_represent", represent)
     app = FastAPI()
+    app.state.store = db
     app.include_router(canvas_routes.router)
     client = TestClient(app)
     url = f"/api/persistent/threads/{record.thread_id}/canvases/main/view-attachments"
@@ -983,7 +983,6 @@ def test_attachment_route_accepts_the_weakened_form_of_its_own_state_etag(
     async def represent(*args, **kwargs):
         return representation
 
-    monkeypatch.setattr(canvas_routes, "_get_db", lambda: db)
     monkeypatch.setattr(
         canvas_routes,
         "_get_canvas_service",
@@ -993,6 +992,7 @@ def test_attachment_route_accepts_the_weakened_form_of_its_own_state_etag(
     monkeypatch.setattr(canvas_routes, "require_thread_owner", owner)
     monkeypatch.setattr(canvas_routes, "_represent", represent)
     app = FastAPI()
+    app.state.store = db
     app.include_router(canvas_routes.router)
     client = TestClient(app)
     url = f"/api/persistent/threads/{record.thread_id}/canvases/main/view-attachments"
@@ -1061,10 +1061,10 @@ def test_authorize_route_requires_exact_bff_session_origin_and_closed_schema(
         assert current_db is db
         return {"id": user_id}, {"id": thread_id, "user_id": user_id}
 
-    monkeypatch.setattr(canvas_routes, "_get_db", lambda: db)
     monkeypatch.setattr(canvas_routes, "_get_viewer_service", lambda current_db: viewer)
     monkeypatch.setattr(canvas_routes, "require_thread_owner", owner)
     app = FastAPI()
+    app.state.store = db
     app.include_router(canvas_routes.router)
     client = TestClient(app)
     url = (

@@ -438,8 +438,9 @@ test.describe('Dynamic Canvas production-browser conformance', () => {
     // the normal authenticated shell before exercising its real Logout
     // control; the viewer cookie remains scoped to its isolated origin.
     await page.goto('/', {waitUntil: 'domcontentloaded'});
-    await expect(page.getByRole('button', {name: 'Logout'})).toBeVisible();
-    await page.getByRole('button', {name: 'Logout'}).click();
+    await page.getByRole('button', {name: /Canvas Test User/}).click();
+    await expect(page.getByRole('menuitem', {name: 'Logout'})).toBeVisible();
+    await page.getByRole('menuitem', {name: 'Logout'}).click();
     await expect(page.locator('[data-testid="fixture-login"]')).toBeVisible();
 
     const fixture = await fixtureState(request);

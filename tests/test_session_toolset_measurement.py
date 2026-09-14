@@ -33,6 +33,12 @@ from shared.runtime.core.tool_report import (
 _AGENT_ROW = {"id": "agent-1", "pod_ip": "10.0.0.9", "pod_port": 8001}
 
 
+@pytest.fixture(autouse=True)
+def account_workspace_defaults(fake_db):
+    fake_db.get_user_settings.return_value = {}
+    fake_db.resolve_default_for_capability.return_value = None
+
+
 def _approved(user):
     """A stand-in with the REAL ``require_approved_user(request, db)`` arity.
 
@@ -1046,6 +1052,7 @@ class TestOneDeadlineForTheWholeProbe:
         self, user_a, fake_db, fake_request
     ):
         import orchestrator.main as orch_main
+        from orchestrator.services import agent_toolset_probe
 
         async def _crawl(url):
             await asyncio.sleep(5)
@@ -1075,7 +1082,10 @@ class TestOneDeadlineForTheWholeProbe:
             patch(
                 "orchestrator.main._resolve_runner_grants", AsyncMock(return_value=None)
             ),
-            patch.object(orch_main, "_AGENT_TOOLSET_BUDGET_S", 0.2),
+            # R1.B05 moved the probe to `services/agent_toolset_probe`, which
+            # reads its own module constant. Patching the budget on `main`
+            # would leave this case green while the probe ran unbounded.
+            patch.object(agent_toolset_probe, "AGENT_TOOLSET_BUDGET_S", 0.2),
             patch(
                 "orchestrator.main.httpx.AsyncClient", MagicMock(return_value=client)
             ),
@@ -1217,3 +1227,127 @@ class TestBothAgentAppsRegisterTheRoute:
             app = create_dual_app()
         paths = {getattr(r, "path", "") for r in app.routes}
         assert "/session/toolset" in paths
+
+
+class TestPreviewRoster:
+    """The New Session form's read carries the same ``subagents`` summary as
+    the thread endpoint, so the Delegation row can warn BEFORE the session
+    exists that the picked expert has nothing to delegate to."""
+
+    @pytest.mark.asyncio
+    async def test_preview_reports_the_expert_roster(
+        self, user_a, fake_db, fake_request
+    ):
+        from pathlib import Path
+        from uuid import UUID
+
+        import yaml
+
+        from orchestrator.main import ToolGroupPreviewRequest, preview_tool_groups
+        from shared.manifests.resolution import content_revision
+        from tests.conftest import _UID_A
+
+        document = yaml.safe_load(
+            (
+                Path(__file__).resolve().parents[1]
+                / "config/subagents/reader/config.yaml"
+            ).read_text()
+        )
+        description = "Reader from the saved Catalog revision."
+        document["spec"]["runtime"]["config"]["config"]["description"] = description
+        catalog = {
+            "id": UUID("44444444-2222-3333-4444-555555555555"),
+            "owner_id": None,
+            "document": document,
+            "resolved": document,
+            "resource_version": 2,
+            "revision": content_revision(document["spec"]),
+        }
+
+        async def stored_definition(query, *args):
+            if "FROM srw_resources" in query:
+                assert args == ("Expert", "Catalog", "shared", "subagent-reader")
+                return catalog
+            return None
+
+        fake_db.fetchrow = AsyncMock(side_effect=stored_definition)
+        expert_id = "11111111-2222-3333-4444-555555555555"
+        fake_db.get_expert_by_id = AsyncMock(
+            return_value={
+                "id": expert_id,
+                "user_id": _UID_A,
+                "name": "rostered",
+                "config": {
+                    "subagents": {
+                        "default": "reader",
+                        "roster": {"reader": {"$ref": "subagents/reader"}},
+                    }
+                },
+            }
+        )
+        with (
+            patch(
+                "orchestrator.main.require_approved_user",
+                AsyncMock(return_value=user_a),
+            ),
+            patch("orchestrator.main.postgres_db", fake_db),
+            patch(
+                "orchestrator.main._is_experts_db_enabled", MagicMock(return_value=True)
+            ),
+            patch(
+                "orchestrator.main._user_experts_enabled", AsyncMock(return_value=True)
+            ),
+            patch(
+                "orchestrator.main._resolve_runner_grants", AsyncMock(return_value=None)
+            ),
+        ):
+            with_roster = await preview_tool_groups(
+                ToolGroupPreviewRequest(
+                    config_name="session_base", expert_id=expert_id
+                ),
+                fake_request,
+            )
+            bare = await preview_tool_groups(
+                ToolGroupPreviewRequest(config_name="session_base"), fake_request
+            )
+
+        assert with_roster["subagents"]["default"] == "reader"
+        assert [e["name"] for e in with_roster["subagents"]["roster"]] == ["reader"]
+        assert with_roster["subagents"]["roster"][0]["ref"] == "subagents/reader"
+        assert with_roster["subagents"]["roster"][0]["description"] == description
+        assert bare["subagents"] == {"default": None, "roster": []}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["none", "virtual", "sandbox"])
+async def test_explicit_workspace_preview_overrides_expert_recommendation(
+    user_a, fake_db, fake_request, backend
+):
+    from orchestrator.main import ToolGroupPreviewRequest, preview_tool_groups
+
+    selected = (
+        None if backend == "none" else {"template": {"inline": {"backend": backend}}}
+    )
+    with (
+        patch("orchestrator.main.require_approved_user", _approved(user_a)),
+        patch("orchestrator.main.postgres_db", fake_db),
+        patch("orchestrator.main._resolve_runner_grants", AsyncMock(return_value=None)),
+    ):
+        result = await preview_tool_groups(
+            ToolGroupPreviewRequest(
+                config_name="session_base",
+                workspace=selected,
+                workspace_preference="sandbox",
+                config_override={"tools": {"shell": ["run_command"]}},
+            ),
+            fake_request,
+        )
+    assert result["workspace"] == {
+        "backend": backend,
+        "source": "request",
+        "binding": selected,
+    }
+    assert result["origin"] == ORIGIN_PREDICTION
+    if backend != "sandbox":
+        assert result["categories"]["shell"]["state"] == STATE_UNAVAILABLE
+        assert result["categories"]["shell"]["decided_by"] == "backend"

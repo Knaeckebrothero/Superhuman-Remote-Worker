@@ -7260,7 +7260,7 @@ class TestHandleConfigUpdateEnrichmentGate:
         from agent.api.persistent_app import _handle_config_update
 
         src = getsource(_handle_config_update)
-        assert 'config_override.get("auxiliary", {}).get("model")' in src, (
+        assert "if _orchestrator_client and _thread_id:" in src, (
             "Auxiliary model changes must trigger the orchestrator-PATCH "
             "enrichment gate."
         )
@@ -7287,7 +7287,7 @@ class TestHandleConfigUpdateEnrichmentGate:
         from agent.api.persistent_app import _handle_config_update
 
         src = getsource(_handle_config_update)
-        assert 'or config_override.get("tools")' in src
+        assert "if _orchestrator_client and _thread_id:" in src
         assert src.index("update_thread_config(") < src.index(
             "resetup_tools_for_backend()"
         )
@@ -7531,7 +7531,7 @@ class TestHandleConfigUpdateAckProtocol:
         from agent.api.persistent_app import _handle_config_update
 
         src = getsource(_handle_config_update)
-        assert src.index("not needs_enrichment") < src.index(
+        assert src.index("update_thread_config(") < src.index(
             "_session.permission_mode = pm"
         )
 
@@ -7609,7 +7609,7 @@ class TestHandleConfigUpdateDatasources:
         await mod._handle_config_update(MagicMock(), {}, datasource_ids=[])
 
         orchestrator_client.update_thread_config.assert_awaited_once_with(
-            "thread-1", {}, datasource_ids=[]
+            "thread-1", {}, datasource_ids=[], snapshot_generation=None
         )
         event, payload = send.await_args.args[1:]
         assert event == "error"
@@ -7728,7 +7728,7 @@ class TestAttachSessionRebinds:
         """M3 scrub-on-claim (§5.6) moved the embedding-override block into
         the pop-first helper ``_apply_session_embedding_env``; the attach path
         must still route through it, and the helper must reset the singleton
-        and own all four memory-embedding keys."""
+        and own every memory transport key (embedding + the rerank slot)."""
         from inspect import getsource
         from agent.api.persistent_app import (
             MEMORY_EMBEDDING_ENV_KEYS,
@@ -7746,6 +7746,9 @@ class TestAttachSessionRebinds:
             "EMBEDDING_MODEL",
             "EMBEDDING_BASE_URL",
             "EMBEDDING_API_KEY",
+            "RERANK_MODEL",
+            "RERANK_BASE_URL",
+            "RERANK_API_KEY",
         }
         # Pop-first: the scrub precedes any re-application of new env values.
         assert helper_src.index("os.environ.pop") < helper_src.index(

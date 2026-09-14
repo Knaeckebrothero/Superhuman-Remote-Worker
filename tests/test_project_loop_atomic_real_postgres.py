@@ -14,12 +14,46 @@ import pytest_asyncio
 from testcontainers.postgres import PostgresContainer
 
 from orchestrator.database.postgres import PostgresDB
+from orchestrator.services.project_loop_advance import (
+    decrement_project_loop_kb_ttl_once,
+)
 from orchestrator.services.project_loop_atomic import (
     LoopAdvanceExpectation,
     LoopAdvanceMutation,
     materialize_loop_advance_atomic,
     plan_loop_advance,
 )
+from orchestrator.services.project_loop_spawn import (
+    ProjectLoopDependencies,
+    notify_loop_event,
+)
+
+
+def _deps(**over) -> ProjectLoopDependencies:
+    """The loop engine's one dependency object, built from mocks.
+
+    ``main._project_loop_dependencies()`` binds these fields to the live
+    application globals; these tests bind the two stores to the real
+    container-backed handles and leave the rest inert.
+    """
+    from unittest.mock import AsyncMock
+
+    fields = dict(
+        store=AsyncMock(),
+        vector_store=None,
+        notifier=AsyncMock(),
+        gitea_client=MagicMock(),
+        main_cloud_router=MagicMock(),
+        trigger_dispatch=MagicMock(),
+        kick_officer_event_drain=MagicMock(),
+        enforce_dispatch_grants=AsyncMock(),
+        reindex_project_kb=AsyncMock(),
+        completion_commands_enabled=lambda: False,
+        completion_sweep_router=MagicMock(),
+    )
+    fields.update(over)
+    return ProjectLoopDependencies(**fields)
+
 
 SCHEMA_FILE = (
     Path(__file__).resolve().parents[1]
@@ -58,6 +92,19 @@ async def db(pg_dsn, _schema_applied, monkeypatch):
         await conn.execute(
             "TRUNCATE project_loops, job_datasources, jobs, projects CASCADE"
         )
+        # The reset cascades through users to their grant-author FK as well.
+        await conn.execute("""
+            INSERT INTO capability_grants(scope_kind,key,value_json) VALUES
+                ('global','shell_tools','true'),
+                ('global','delegation','true'),
+                ('global','autonomy_ceiling','"full"')
+            ON CONFLICT(scope_kind,scope_id,key) DO UPDATE SET value_json=EXCLUDED.value_json
+        """)
+    from orchestrator.services.manifest_experts import seed_bundled_expert_manifests
+
+    await seed_bundled_expert_manifests(
+        store, Path(__file__).resolve().parents[1] / "config"
+    )
     try:
         yield store
     finally:
@@ -291,7 +338,7 @@ async def test_two_contenders_commit_one_campaign_successor_set(db):
 
 
 @pytest.mark.asyncio
-async def test_vector_ttl_turn_ledger_survives_response_loss(db, monkeypatch):
+async def test_vector_ttl_turn_ledger_survives_response_loss(db):
     """INSERT-ledger + TTL UPDATE are one vector transaction and replay once."""
 
     migration = (
@@ -320,18 +367,16 @@ async def test_vector_ttl_turn_ledger_survives_response_loss(db, monkeypatch):
             project_id,
         )
 
-    import orchestrator.main
-
-    monkeypatch.setattr(orchestrator.main, "vector_db", db)
+    deps = _deps(vector_store=db)
     args = {
         "loop_id": str(loop_id),
         "project_id": str(project_id),
         "completed_member_id": str(member_id),
         "total_jobs_run": 4,
     }
-    assert await orchestrator.main._decrement_project_loop_kb_ttl_once(**args) is True
+    assert await decrement_project_loop_kb_ttl_once(**args, dependencies=deps) is True
     # Models a crash after vector COMMIT but before handoff/effect ack.
-    assert await orchestrator.main._decrement_project_loop_kb_ttl_once(**args) is False
+    assert await decrement_project_loop_kb_ttl_once(**args, dependencies=deps) is False
 
     async with db.acquire() as conn:
         assert (
@@ -351,8 +396,8 @@ async def test_vector_ttl_turn_ledger_survives_response_loss(db, monkeypatch):
         )
 
     with pytest.raises(RuntimeError, match="different turn"):
-        await orchestrator.main._decrement_project_loop_kb_ttl_once(
-            **{**args, "completed_member_id": str(uuid4())}
+        await decrement_project_loop_kb_ttl_once(
+            **{**args, "completed_member_id": str(uuid4())}, dependencies=deps
         )
 
 
@@ -365,10 +410,8 @@ async def test_loop_notification_response_loss_dedups_bell_and_sse(db, monkeypat
             "INSERT INTO users (id,display_name) VALUES ($1,'Loop Owner')", user_id
         )
 
-    import orchestrator.main
     from orchestrator.services.notification_feed import notification_feed
 
-    monkeypatch.setattr(orchestrator.main, "postgres_db", db)
     broadcast = MagicMock()
     monkeypatch.setattr(notification_feed, "broadcast", broadcast)
     # The bell row is a feed row: wire the singleton to this DB + feed (attrs
@@ -379,6 +422,7 @@ async def test_loop_notification_response_loss_dedups_bell_and_sse(db, monkeypat
     monkeypatch.setattr(notification_service, "_available", True)
     monkeypatch.setattr(notification_service, "_notification_feed", notification_feed)
     monkeypatch.setattr(notification_service, "_email_service", None)
+    deps = _deps(store=db, notifier=notification_service)
     loop = {**loop, "owner_id": user_id}
     kwargs = {
         "job_id": str(member_id),
@@ -388,9 +432,9 @@ async def test_loop_notification_response_loss_dedups_bell_and_sse(db, monkeypat
         "dedup_turn_identity": f"{member_id}:2",
         "note_id": "planned:0",
     }
-    await orchestrator.main._notify_loop_event(loop, **kwargs)
+    await notify_loop_event(loop, **kwargs, dependencies=deps)
     # Models a response loss after durable insert + SSE but before handoff ack.
-    await orchestrator.main._notify_loop_event(loop, **kwargs)
+    await notify_loop_event(loop, **kwargs, dependencies=deps)
 
     async with db.acquire() as conn:
         # The durable bell row is a feed row now (unified notification system):
@@ -407,9 +451,10 @@ async def test_loop_notification_response_loss_dedups_bell_and_sse(db, monkeypat
     broadcast.assert_called_once()
 
     with pytest.raises(RuntimeError, match="different payload"):
-        await orchestrator.main._notify_loop_event(
+        await notify_loop_event(
             loop,
             **{**kwargs, "message": "identity drift"},
+            dependencies=deps,
         )
 
 

@@ -594,14 +594,14 @@ interface EditorForm {
         background: var(--danger-tint);
         color: var(--danger);
         padding: 0.5rem 0.75rem;
-        border-radius: 6px;
+        border-radius: var(--radius-control);
         margin-bottom: 1rem;
       }
       .banner.info {
         background: var(--info-tint);
         color: var(--info);
         padding: 0.5rem 0.75rem;
-        border-radius: 6px;
+        border-radius: var(--radius-control);
         margin-bottom: 1rem;
       }
     `,

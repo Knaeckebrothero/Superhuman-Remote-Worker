@@ -346,6 +346,9 @@ async def accept_completion_command(
                 """
                 SELECT id, status::text AS status, execution_lane,
                        assigned_agent_id, completion_seq_hwm, context,
+                       (SELECT execution.harness_adapter FROM srw_execution_specs execution
+                        WHERE execution.work_kind='Job' AND execution.work_id=jobs.id)
+                       AS execution_harness_adapter,
                        extract(epoch FROM now())::float8 AS db_now_epoch
                 FROM jobs
                 WHERE id = $1::uuid
@@ -355,6 +358,10 @@ async def accept_completion_command(
             )
             if job is None:
                 raise CompletionCommandNotFound(f"job '{job_uuid}' not found")
+            if job.get("execution_harness_adapter") not in (None, "srw/v1"):
+                raise CompletionFenceRejected(
+                    "This execution is owned by its manifest harness runtime"
+                )
 
             # Exact-key lookup happens before current-owner validation.  The
             # accepted fence is immutable and remains replayable after accept

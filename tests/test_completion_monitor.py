@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from orchestrator.services.completion_monitor import (
+    OLDEST_QUEUED_SESSION_TURN_DEDUP_KEY,
     OLDEST_QUEUED_WORKER_BATCH_DEDUP_KEY,
     OLDEST_UNFINALIZED_COMMAND_DEDUP_KEY,
     ZERO_FINALIZER_LEADER_DEDUP_KEY,
@@ -100,6 +101,48 @@ def test_runnable_worker_age_uses_fixed_key_independently_of_commands() -> None:
     assert alerts[0].age_seconds == 300
 
 
+def test_runnable_session_turn_age_uses_its_own_fixed_key() -> None:
+    """Interactive twin of the worker alarm: independent key, lower threshold,
+    and the worker alarm does not fire for a session-only backlog."""
+    ticks = [10.0]
+    monitor = CompletionMonitor(
+        object(),
+        lambda _alert: None,
+        completion_commands_enabled=False,
+        max_queued_worker_age_seconds=300,
+        max_queued_session_age_seconds=60,
+        startup_grace_seconds=30,
+        clock=lambda: ticks[0],
+    )
+    ticks[0] = 40.0
+    sample = replace(
+        _sample(leaders=0, age=None),
+        oldest_session_unit_id=JOB_ID,
+        oldest_session_state="queued",
+        oldest_session_runnable_at=NOW,
+        oldest_session_age_seconds=60,
+    )
+
+    assert monitor.alerts_for(replace(sample, oldest_session_age_seconds=59.9)) == ()
+    alerts = monitor.alerts_for(sample)
+
+    assert [alert.dedup_key for alert in alerts] == [
+        OLDEST_QUEUED_SESSION_TURN_DEDUP_KEY
+    ]
+    assert alerts[0].kind == "oldest_queued_session_turn"
+    assert alerts[0].unit_id == JOB_ID
+    assert alerts[0].queue_state == "queued"
+    assert alerts[0].runnable_at == NOW
+    assert alerts[0].age_seconds == 60
+
+
+def test_session_threshold_must_be_positive() -> None:
+    with pytest.raises(ValueError):
+        CompletionMonitor(
+            object(), lambda _alert: None, max_queued_session_age_seconds=0
+        )
+
+
 @pytest.mark.asyncio
 async def test_commands_off_sample_queries_only_run_queue() -> None:
     queries: list[str] = []
@@ -113,6 +156,10 @@ async def test_commands_off_sample_queries_only_run_queue() -> None:
                 "oldest_worker_state": None,
                 "oldest_worker_runnable_at": None,
                 "oldest_worker_age_seconds": None,
+                "oldest_session_unit_id": None,
+                "oldest_session_state": None,
+                "oldest_session_runnable_at": None,
+                "oldest_session_age_seconds": None,
             }
 
     sample = await CompletionMonitor(

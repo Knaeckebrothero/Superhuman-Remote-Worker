@@ -269,7 +269,7 @@ async def test_resolve_issues_no_update():
 async def test_resolve_returns_the_key_id_for_a_later_bump():
     """The gateway needs the matched key's id to call ``mark_ssh_key_used``
     after ``key.verify``, without a second fingerprint lookup. ``id`` stays
-    the USER id — ``user_can_access_ide_entity`` and ``_ssh_target_response``
+    the USER id — ``user_can_access_ide_entity`` and ``ssh_target_response``
     both read it as such."""
     conn = FakeConn(fetchrow={"ssh_key_id": "k1", "id": "u1"})
     row = await _db(conn).resolve_user_by_ssh_fingerprint("SHA256:" + "A" * 43)

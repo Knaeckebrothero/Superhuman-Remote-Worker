@@ -18,6 +18,8 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from tests import _b09_control_seams as control_seams
+
 from orchestrator.main import _resolve_session_config, _strip_acknowledged_grants
 from orchestrator.services.config_drift import (
     acknowledged_drift_ids,
@@ -122,10 +124,15 @@ async def test_resolve_session_config_strips_the_delivered_blob_not_just_the_cap
     metadata = {"config_drift_ack": {"grant:shell_tools": "revoked"}}
 
     with (
+        patch("orchestrator.main.postgres_db.fetchrow", AsyncMock(return_value=None)),
         patch("orchestrator.main._is_experts_db_enabled", return_value=True),
         patch("orchestrator.main._user_experts_enabled", AsyncMock(return_value=True)),
+        # R1.B05 lane P: same-module sibling of the resolve once main
+        # delegates to ``services.session_config_resolution`` — patch both so
+        # the stub is reached before AND after the extraction.
         patch(
-            "orchestrator.main._resolve_session_account_defaults",
+            "orchestrator.services.session_config_resolution"
+            ".resolve_session_account_defaults",
             AsyncMock(return_value={}),
         ),
         patch("orchestrator.main._gather_in_scope_skills", AsyncMock(return_value={})),
@@ -182,8 +189,6 @@ class TestConnectorStripIsConditionalOnCurrentAvailability:
 
     @pytest.mark.asyncio
     async def test_recovered_acknowledged_connector_is_used_again(self):
-        from orchestrator.main import _revalidate_thread_datasource_selection
-
         thread = {
             "id": "22222222-2222-4222-8222-222222222222",
             "user_id": OWNER,
@@ -194,7 +199,10 @@ class TestConnectorStripIsConditionalOnCurrentAvailability:
         db.get_datasource_policy_rows = AsyncMock(return_value=[_ds_row(DS_OK)])
 
         with patch("orchestrator.main.postgres_db", db):
-            selected, revisions = await _revalidate_thread_datasource_selection(
+            (
+                selected,
+                revisions,
+            ) = await control_seams.revalidate_thread_datasource_selection(
                 thread, [DS_OK], target_project_ids=[]
             )
 
@@ -207,8 +215,6 @@ class TestConnectorStripIsConditionalOnCurrentAvailability:
         acknowledged id that is STILL unavailable must still be dropped
         (not silently kept forever, and not silently denying the rest of
         the selection either)."""
-        from orchestrator.main import _revalidate_thread_datasource_selection
-
         thread = {
             "id": "22222222-2222-4222-8222-222222222222",
             "user_id": OWNER,
@@ -219,7 +225,10 @@ class TestConnectorStripIsConditionalOnCurrentAvailability:
         db.get_datasource_policy_rows = AsyncMock(return_value=[])  # still gone
 
         with patch("orchestrator.main.postgres_db", db):
-            selected, revisions = await _revalidate_thread_datasource_selection(
+            (
+                selected,
+                revisions,
+            ) = await control_seams.revalidate_thread_datasource_selection(
                 thread, [DS_GONE], target_project_ids=[]
             )
 
@@ -234,8 +243,6 @@ class TestConnectorStripIsConditionalOnCurrentAvailability:
         silent partial selection."""
         from fastapi import HTTPException
 
-        from orchestrator.main import _revalidate_thread_datasource_selection
-
         thread = {
             "id": "22222222-2222-4222-8222-222222222222",
             "user_id": OWNER,
@@ -247,7 +254,7 @@ class TestConnectorStripIsConditionalOnCurrentAvailability:
 
         with patch("orchestrator.main.postgres_db", db):
             with pytest.raises(HTTPException) as exc:
-                await _revalidate_thread_datasource_selection(
+                await control_seams.revalidate_thread_datasource_selection(
                     thread, [DS_OK, DS_GONE], target_project_ids=[]
                 )
 
@@ -269,8 +276,6 @@ async def test_strip_still_denied_ack_translates_unavailable_to_403():
     """
     from fastapi import HTTPException
 
-    from orchestrator.main import _revalidate_thread_datasource_selection
-
     thread = {
         "id": "22222222-2222-4222-8222-222222222222",
         "user_id": OWNER,
@@ -281,7 +286,7 @@ async def test_strip_still_denied_ack_translates_unavailable_to_403():
 
     with patch("orchestrator.main.postgres_db", db):
         with pytest.raises(HTTPException) as exc:
-            await _revalidate_thread_datasource_selection(
+            await control_seams.revalidate_thread_datasource_selection(
                 thread, ["not-a-uuid"], target_project_ids=[]
             )
 

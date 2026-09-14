@@ -284,6 +284,41 @@ def test_availability_fact_accepts_tool_inventory_wording(cases):
     assert score["passed"] is True
 
 
+@pytest.mark.parametrize(
+    ("case_id", "topic", "answer", "dead_end"),
+    [
+        (
+            "availability-enable-browser-in-virtual-session",
+            "canvas-and-browser",
+            "Open Settings in the header. Choose Container and confirm the upgrade; "
+            "your existing files carry over in the same conversation. Under Tools, "
+            "enable Browser. Changes apply from the next response; send a follow-up "
+            "after the upgrade finishes so I can check the form.",
+            "I don't have browser tools in this Virtual session, so I cannot check "
+            "your booking form here.",
+        ),
+        (
+            "workflow-publish-business-website",
+            "files-and-integrations",
+            "We can prepare the site now. A static hosting service would suit an "
+            "information site; use its default address and connect a domain later. "
+            "I can walk you through the provider dashboard to upload the files. "
+            "First, what name and services should visitors see?",
+            "I cannot host websites from this chat. You would need to arrange "
+            "hosting and give me somewhere to deploy.",
+        ),
+    ],
+)
+def test_setup_cases_require_a_path_beyond_a_capability_denial(
+    cases, case_id, topic, answer, dead_end
+):
+    case = _case(cases, case_id)
+    calls = [{"name": APP_GUIDE_LOADER_TOOL, "topic_id": topic}]
+
+    assert score_case(case, calls, answer)["passed"] is True
+    assert score_case(case, calls, dead_end)["passed"] is False
+
+
 def test_required_fact_gap_accepts_faithful_connector_limit(cases):
     case = _case(cases, "workflow-weekly-invoice-connector-limit")
     answer = (

@@ -107,6 +107,17 @@ def _parse_connection_string(connection_string: str) -> dict:
     }
 
 
+def _database_log_label(*, vector: bool = False) -> str:
+    """Read diagnostic identity independently of a credential-bearing DSN."""
+    if vector:
+        if os.getenv("VECTOR_POSTGRES_USER") and os.getenv("VECTOR_POSTGRES_PASSWORD"):
+            return os.getenv("VECTOR_POSTGRES_DB") or "vector database"
+        return "vector database configured via VECTOR_DB_URL"
+    if os.getenv("POSTGRES_USER") and os.getenv("POSTGRES_PASSWORD"):
+        return os.getenv("POSTGRES_DB") or "srw"
+    return "application database configured via DATABASE_URL"
+
+
 async def init_postgres(force_reset: bool = False) -> bool:
     """Initialize PostgreSQL database.
 
@@ -129,8 +140,8 @@ async def init_postgres(force_reset: bool = False) -> bool:
         return False
 
     connection_string = get_postgres_connection_string()
-    db_name = connection_string.split("/")[-1].split("?")[0]
-    logger.info(f"  Database: {db_name}")
+    db_name = _database_log_label()
+    logger.info("  Database: %s", db_name)
 
     db = PostgresDB(connection_string)
 
@@ -192,9 +203,9 @@ async def init_postgres(force_reset: bool = False) -> bool:
         # mirrors the helm seeder Job)
         await _seed_llm_keys_from_env(db)
 
-        # Seed the codex-proxy system endpoint when CODEX_PROXY_URL is set
-        # (idempotent; matched by well-known label)
-        await _seed_codex_proxy_endpoint(db)
+        # Seed the subscription-proxy system endpoint when the proxy URL is set
+        # (idempotent; matched by its stable transport marker)
+        await _seed_subscription_proxy_endpoint(db)
 
         # Promote the legacy deployment-wide Tavily key into the model catalog.
         # This must precede any bundled SearXNG seed so upgrades retain Tavily
@@ -305,8 +316,8 @@ async def init_vector_db(force_reset: bool = False) -> bool:
         logger.error(f"  Could not import PostgresDB: {e}")
         return False
 
-    db_name = vector_url.split("/")[-1].split("?")[0]
-    logger.info(f"  Database: {db_name}")
+    db_name = _database_log_label(vector=True)
+    logger.info("  Database: %s", db_name)
 
     db = PostgresDB(vector_url, migrations_dir=MIGRATIONS_VECTOR_DIR)
 
@@ -437,7 +448,10 @@ def backup_vector_db(backup_file: Path) -> bool:
     env = os.environ.copy()
     env["PGPASSWORD"] = params["password"]
 
-    logger.info(f"  Running pg_dump for vector database: {params['database']}")
+    logger.info(
+        "  Running pg_dump for vector database: %s",
+        _database_log_label(vector=True),
+    )
 
     try:
         subprocess.run(cmd, env=env, capture_output=True, text=True, check=True)
@@ -489,7 +503,10 @@ def restore_vector_db(backup_file: Path) -> bool:
         str(backup_file),
     ]
 
-    logger.info(f"  Running pg_restore for vector database: {params['database']}")
+    logger.info(
+        "  Running pg_restore for vector database: %s",
+        _database_log_label(vector=True),
+    )
 
     try:
         result = subprocess.run(cmd, env=env, capture_output=True, text=True)
@@ -562,7 +579,10 @@ def backup_postgres(backup_file: Path) -> bool:
     env = os.environ.copy()
     env["PGPASSWORD"] = params["password"]
 
-    logger.info(f"  Running pg_dump for database: {params['database']}")
+    logger.info(
+        "  Running pg_dump for database: %s",
+        _database_log_label(),
+    )
 
     try:
         subprocess.run(cmd, env=env, capture_output=True, text=True, check=True)
@@ -596,7 +616,10 @@ def restore_postgres(backup_file: Path) -> bool:
     env["PGPASSWORD"] = params["password"]
 
     # Clear database first
-    logger.info(f"  Clearing database: {params['database']}")
+    logger.info(
+        "  Clearing database: %s",
+        _database_log_label(),
+    )
     try:
         asyncio.run(_reset_postgres_schema())
     except Exception as e:
@@ -617,7 +640,10 @@ def restore_postgres(backup_file: Path) -> bool:
         str(backup_file),
     ]
 
-    logger.info(f"  Running pg_restore for database: {params['database']}")
+    logger.info(
+        "  Running pg_restore for database: %s",
+        _database_log_label(),
+    )
 
     try:
         result = subprocess.run(cmd, env=env, capture_output=True, text=True)
@@ -830,43 +856,60 @@ async def _seed_llm_keys_from_env(db) -> None:
         return
 
     report = await llm_seed(db, {"systemApiKeys": entries})
-    if report.api_keys_seeded:
-        logger.info(f"  Seeded system_api_keys: {', '.join(report.api_keys_seeded)}")
-    if report.api_keys_skipped:
+    # Report the providers via the literal tuple this function seeds from, so
+    # no string that passed through the seeder's key handling reaches the log.
+    seeded = [p for p in _SEEDABLE_PROVIDERS if p in set(report.api_keys_seeded)]
+    skipped = [p for p in _SEEDABLE_PROVIDERS if p in set(report.api_keys_skipped)]
+    if seeded:
+        logger.info("  Seeded system_api_keys: %s", ", ".join(seeded))
+    if skipped:
         logger.info(
-            f"  Skipped existing system_api_keys: {', '.join(report.api_keys_skipped)}"
+            "  Skipped existing system_api_keys: %s",
+            ", ".join(skipped),
         )
 
 
 from orchestrator.seed.llm_config import (  # noqa: E402, F401
     CODEX_PROXY_ENDPOINT_LABEL,  # re-exported: tests reference init_mod.CODEX_PROXY_ENDPOINT_LABEL
+    SUBSCRIPTION_PROXY_ENDPOINT_LABEL,
     ensure_codex_proxy_endpoint,
     ensure_elevenlabs_tts_endpoint,
     ensure_searxng_search_endpoint,
+    ensure_subscription_proxy_endpoint,
     ensure_tavily_search_endpoint,
 )
 
 
-async def _seed_codex_proxy_endpoint(db) -> None:
-    """Boot-time seed for the system-scoped ``codex-proxy`` llm_endpoints row.
+async def _seed_subscription_proxy_endpoint(db) -> None:
+    """Boot-time seed for the system-scoped subscription-proxy llm_endpoints row.
 
-    Skips when ``CODEX_PROXY_URL`` is unset so a fresh stack with no codex
-    proxy configured doesn't carry a dangling transport row. Runtime paths
-    (OAuth callback, availability probe) call
-    :func:`ensure_codex_proxy_endpoint` directly with a fallback URL so a
-    user who connects a subscription via the cockpit gets wired up without
+    Skips when neither ``SUBSCRIPTION_PROXY_URL`` nor the legacy
+    ``CODEX_PROXY_URL`` is set, so a fresh stack with no proxy configured
+    doesn't carry a dangling transport row. Runtime paths (an OAuth callback,
+    the availability probe) call
+    :func:`ensure_subscription_proxy_endpoint` directly with a fallback URL so
+    a user who connects a subscription via the cockpit gets wired up without
     having to set the env var.
     """
-    proxy_url = os.environ.get("CODEX_PROXY_URL")
+    proxy_url = os.environ.get("SUBSCRIPTION_PROXY_URL") or os.environ.get(
+        "CODEX_PROXY_URL"
+    )
     if not proxy_url:
-        logger.info("  CODEX_PROXY_URL not set — skipping codex-proxy endpoint seed")
+        logger.info(
+            "  SUBSCRIPTION_PROXY_URL/CODEX_PROXY_URL not set — "
+            "skipping subscription-proxy endpoint seed"
+        )
         return
 
-    created = await ensure_codex_proxy_endpoint(db, proxy_url=proxy_url)
+    created = await ensure_subscription_proxy_endpoint(db, proxy_url=proxy_url)
     if created:
-        logger.info(f"  Seeded codex-proxy endpoint at {proxy_url}")
+        logger.info(f"  Seeded subscription-proxy endpoint at {proxy_url}")
     else:
-        logger.info("  codex-proxy endpoint already present — leaving untouched")
+        logger.info("  subscription-proxy endpoint already present — leaving untouched")
+
+
+# Back-compat alias for callers/tests written against the Codex-only name.
+_seed_codex_proxy_endpoint = _seed_subscription_proxy_endpoint
 
 
 async def _seed_models_from_helm(db) -> None:
@@ -877,7 +920,9 @@ async def _seed_models_from_helm(db) -> None:
     delegates to :func:`orchestrator.seed.llm_config.seed`. Each entry becomes
     one ``(model, capability)`` catalog row with ``provider_kind='system'``,
     inserted via ``ON CONFLICT DO NOTHING`` so admin edits made via the
-    Cockpit are never clobbered.
+    Cockpit are never clobbered. The sibling ``llm.seed.defaults`` map rides
+    along: it pins ``llm.default_<kind>_model`` only for kinds that have no
+    pin yet, and only to models present in the catalog.
 
     Rows whose ``provider`` has no ``system_api_keys`` entry yet are skipped
     by the seeder — they would not be reachable. Bare-metal devs running
@@ -887,6 +932,7 @@ async def _seed_models_from_helm(db) -> None:
     """
     helm_values_path = Path(__file__).resolve().parents[2] / "helm" / "values.yaml"
     system_models: list[dict] = []
+    defaults: dict = {}
 
     if helm_values_path.exists():
         try:
@@ -896,9 +942,12 @@ async def _seed_models_from_helm(db) -> None:
             helm_raw = {}
         seed_block = (helm_raw.get("llm") or {}).get("seed") or {}
         system_models = list(seed_block.get("systemModels") or [])
+        defaults = dict(seed_block.get("defaults") or {})
 
-    if not system_models:
-        logger.info("  Catalog seed skipped — no helm.llm.seed.systemModels entries")
+    if not system_models and not defaults:
+        logger.info(
+            "  Catalog seed skipped — no helm.llm.seed.systemModels or defaults entries"
+        )
         return
 
     try:
@@ -907,9 +956,9 @@ async def _seed_models_from_helm(db) -> None:
         logger.warning(f"  Could not import seed.llm_config: {e}")
         return
 
-    # Only systemModels here. Endpoint seeding is owned by
+    # Only systemModels + defaults here. Endpoint seeding is owned by
     # _seed_codex_proxy_endpoint (init.py) and the helm post-install Job.
-    report = await llm_seed(db, {"systemModels": system_models})
+    report = await llm_seed(db, {"systemModels": system_models, "defaults": defaults})
 
     if report.models_seeded:
         logger.info(f"  Seeded {len(report.models_seeded)} catalog rows from helm seed")
@@ -919,6 +968,15 @@ async def _seed_models_from_helm(db) -> None:
         logger.info(
             f"  Skipped {len(report.models_skipped)} catalog rows "
             "(already present or provider not seeded)"
+        )
+    if report.defaults_seeded:
+        logger.info(
+            f"  Pinned {len(report.defaults_seeded)} default model(s) from helm seed"
+        )
+    if report.defaults_skipped:
+        logger.info(
+            f"  Skipped {len(report.defaults_skipped)} default pin(s) "
+            "(already pinned or model not in the catalog)"
         )
 
 

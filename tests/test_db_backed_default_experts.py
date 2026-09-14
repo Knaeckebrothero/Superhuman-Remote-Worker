@@ -1,5 +1,6 @@
 """Managed seed and authoritative root-expert selection contracts."""
 
+from copy import deepcopy
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -125,6 +126,32 @@ class SeedDB:
         self.rows[managed_key] = row
         return row, True
 
+    async def upgrade_managed_expert_seed(
+        self,
+        *,
+        managed_key,
+        seed_version,
+        config_additions,
+        expected_seed_version=None,
+        expected_subagents=None,
+        replacement_subagents=None,
+    ):
+        # Models PostgresDB.upgrade_managed_expert_seed: `$additions || config`
+        # (the row wins every key it has) under a `seed_version < $3` guard.
+        row = self.rows[managed_key]
+        if int(row.get("seed_version") or 0) >= seed_version:
+            return None
+        if expected_seed_version is not None:
+            if (
+                row["seed_version"] != expected_seed_version
+                or row["config"].get("subagents") != expected_subagents
+            ):
+                return None
+            row["config"] = {**row["config"], "subagents": replacement_subagents}
+        row["config"] = {**config_additions, **row["config"]}
+        row["seed_version"] = seed_version
+        return row
+
     async def ensure_application_expert_default(self, *, expert_type, expert_id):
         self.defaults.setdefault(expert_type, expert_id)
         return {"expert_type": expert_type, "expert_id": self.defaults[expert_type]}
@@ -142,6 +169,96 @@ async def test_managed_seed_is_idempotent_and_insert_only():
         == "Operator Assistant"
     )
     assert set(db.defaults) == {"worker", "session"}
+
+
+@pytest.mark.asyncio
+async def test_seed_upgrade_adds_only_the_keys_the_row_lacks():
+    """A row seeded before the assistant grew its roster gains `subagents`
+    on the next start; everything the operator touched stays theirs."""
+    db = SeedDB()
+    await seed_managed_default_experts(db, ROOT / "config")
+    row = db.rows["application-default-session-seed"]
+    assert "subagents" in row["config"], "the bundle ships the roster"
+    # Rewind the row to what a pre-roster deployment holds: seed 1, no
+    # `subagents`, plus two operator edits (a renamed expert, a tools tweak).
+    row["seed_version"] = 1
+    row["config"] = {k: v for k, v in row["config"].items() if k != "subagents"}
+    row["config"]["tools"] = {"shell": ["run_command"]}
+    row["display_name"] = "Operator Assistant"
+
+    await seed_managed_default_experts(db, ROOT / "config")
+
+    upgraded = db.rows["application-default-session-seed"]
+    assert upgraded["seed_version"] == 3
+    assert upgraded["config"]["subagents"]["default"] == "explorer"
+    assert set(upgraded["config"]["subagents"]["roster"]) == {
+        "explorer",
+        "reader",
+        "implementer",
+    }
+    assert upgraded["config"]["tools"] == {"shell": ["run_command"]}
+    assert upgraded["display_name"] == "Operator Assistant"
+
+
+@pytest.mark.asyncio
+async def test_seed_upgrade_never_replaces_an_operators_roster():
+    db = SeedDB()
+    await seed_managed_default_experts(db, ROOT / "config")
+    row = db.rows["application-default-session-seed"]
+    row["seed_version"] = 1
+    theirs = {"default": "critic", "roster": {"critic": {"$ref": "critic"}}}
+    row["config"]["subagents"] = theirs
+
+    await seed_managed_default_experts(db, ROOT / "config")
+
+    assert row["seed_version"] == 3
+    assert row["config"]["subagents"] == theirs
+
+
+@pytest.mark.asyncio
+async def test_seed_upgrade_is_a_no_op_at_the_current_version():
+    from orchestrator.services.default_experts import (
+        MANAGED_SEEDS,
+        upgrade_managed_seed,
+    )
+
+    db = SeedDB()
+    await seed_managed_default_experts(db, ROOT / "config")
+    spec = next(s for s in MANAGED_SEEDS if s["expert_type"] == "session")
+    row = db.rows[spec["managed_key"]]
+    bundle = load_seed_bundle(
+        ROOT / "config", directory=spec["directory"], expert_type="session"
+    )
+    assert await upgrade_managed_seed(db, spec=spec, bundle=bundle, row=row) is None
+
+
+@pytest.mark.asyncio
+async def test_future_seed_target_still_repairs_v2_with_historical_safe_roster():
+    from orchestrator.services.default_experts import (
+        MANAGED_SEEDS,
+        upgrade_managed_seed,
+    )
+
+    db = SeedDB()
+    await seed_managed_default_experts(db, ROOT / "config")
+    spec = next(s for s in MANAGED_SEEDS if s["expert_type"] == "session")
+    row = db.rows[spec["managed_key"]]
+    safe_v3_roster = deepcopy(row["config"]["subagents"])
+    row["seed_version"] = 2
+    row["config"]["subagents"]["roster"]["implementer"].pop("tools")
+    future_bundle = load_seed_bundle(
+        ROOT / "config", directory="assistant", expert_type="session"
+    )
+    future_bundle["config"]["future_top_level_key"] = True
+    future_bundle["config"]["subagents"]["default"] = "reader"
+
+    await upgrade_managed_seed(
+        db, spec={**spec, "seed_version": 4}, bundle=future_bundle, row=row
+    )
+
+    assert row["seed_version"] == 4
+    assert row["config"]["subagents"] == safe_v3_roster
+    assert row["config"]["future_top_level_key"] is True
 
 
 def test_default_expert_migration_shape():

@@ -5,6 +5,9 @@ from copy import deepcopy
 import pytest
 
 import orchestrator.main
+from orchestrator.services.cloud_stage_authority import (
+    _retirement_stage_event_from_receipt,
+)
 from orchestrator.services.cloud.protected_reader_authority import (
     ProtectedNextcloudReaderGrantPlan,
 )
@@ -105,8 +108,13 @@ def _receipt_fixture():
 def test_retirement_stage_receipt_accepts_exact_immutable_source():
     retirement, thread, row = _receipt_fixture()
 
-    valid, event = orchestrator.main._retirement_stage_event_from_receipt(
-        retirement, thread, row
+    valid, event = _retirement_stage_event_from_receipt(
+        retirement,
+        thread,
+        row,
+        never_delivered_protected_reader_shape=(
+            orchestrator.main._pinned_retirement_operations().never_delivered_protected_reader_shape
+        ),
     )
 
     assert valid is True
@@ -138,8 +146,13 @@ def test_retirement_stage_receipt_rejects_source_identity_drift(mutate):
     retirement, thread, row = deepcopy(_receipt_fixture())
     mutate(retirement, thread, row)
 
-    assert orchestrator.main._retirement_stage_event_from_receipt(
-        retirement, thread, row
+    assert _retirement_stage_event_from_receipt(
+        retirement,
+        thread,
+        row,
+        never_delivered_protected_reader_shape=(
+            orchestrator.main._pinned_retirement_operations().never_delivered_protected_reader_shape
+        ),
     ) == (
         False,
         None,

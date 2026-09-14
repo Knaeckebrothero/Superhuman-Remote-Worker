@@ -1,5 +1,9 @@
 """Tests for the per-job repo model (resolve_job_repo, _graft_subjob_output, etc.)."""
 
+from tests import _b09_control_seams as control_seams
+
+from tests import b08_completion_helpers as b08_helpers
+
 import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -62,7 +66,7 @@ class TestResolveJobRepo:
             mock_db.get_job = AsyncMock(return_value=None)
 
             with pytest.raises(HTTPException) as exc_info:
-                await orch_main.resolve_job_repo("nonexistent-id")
+                await b08_helpers.resolve_job_repo("nonexistent-id")
             assert exc_info.value.status_code == 404
 
     @pytest.mark.asyncio
@@ -72,7 +76,7 @@ class TestResolveJobRepo:
         with patch(f"{MODULE}.postgres_db") as mock_db:
             mock_db.get_job = AsyncMock(return_value=job)
 
-            repo, branch = await orch_main.resolve_job_repo("abcd1234-xxxx")
+            repo, branch = await b08_helpers.resolve_job_repo("abcd1234-xxxx")
             assert repo == "job-abcd1234"
             assert branch is None
 
@@ -87,7 +91,7 @@ class TestResolveJobRepo:
         with patch(f"{MODULE}.postgres_db") as mock_db:
             mock_db.get_job = AsyncMock(return_value=job)
 
-            repo, branch = await orch_main.resolve_job_repo("abcd1234-xxxx")
+            repo, branch = await b08_helpers.resolve_job_repo("abcd1234-xxxx")
             assert repo == "job-parent12"
             assert branch == "subjob/abcd1234/creator"
 
@@ -109,7 +113,7 @@ class TestResolveJobRepo:
                 }.get(jid)
             )
 
-            repo, branch = await orch_main.resolve_job_repo("sub12345-xxxx")
+            repo, branch = await b08_helpers.resolve_job_repo("sub12345-xxxx")
             assert repo == "job-parent12"
             assert branch == "subjob/sub12345/validator"
 
@@ -129,7 +133,7 @@ class TestResolveJobRepo:
                 return_value=[{"name": "my-project-jobs"}]
             )
 
-            repo, branch = await orch_main.resolve_job_repo("legacy-id")
+            repo, branch = await b08_helpers.resolve_job_repo("legacy-id")
             assert repo == "my-project-jobs"
             assert branch == "job/legacy-branch"
             mock_db.get_project_repositories.assert_awaited_once_with(
@@ -149,7 +153,7 @@ class TestResolveJobRepo:
         with patch(f"{MODULE}.postgres_db") as mock_db:
             mock_db.get_job = AsyncMock(return_value=job)
 
-            repo, branch = await orch_main.resolve_job_repo("full-uuid-here")
+            repo, branch = await b08_helpers.resolve_job_repo("full-uuid-here")
             assert repo == "job-full-uuid-here"
             assert branch is None
 
@@ -200,7 +204,7 @@ class TestDeleteJobGiteaCleanup:
             mock_gitea.delete_repo = AsyncMock()
             mock_gitea.delete_branch = AsyncMock()
 
-            result = await orch_main.delete_job(
+            result = await control_seams.delete_job(
                 _stub_request(), "abcd1234-1111-4111-8111-111111111111"
             )
 
@@ -233,7 +237,7 @@ class TestDeleteJobGiteaCleanup:
             mock_gitea.delete_branch = AsyncMock()
             mock_gitea.delete_repo = AsyncMock()
 
-            result = await orch_main.delete_job(
+            result = await control_seams.delete_job(
                 _stub_request(), "abcd1234-1111-4111-8111-111111111111"
             )
 
@@ -269,7 +273,7 @@ class TestDeleteJobGiteaCleanup:
             mock_gitea.delete_branch = AsyncMock()
             mock_gitea.delete_repo = AsyncMock()
 
-            result = await orch_main.delete_job(
+            result = await control_seams.delete_job(
                 _stub_request(), "12345678-1111-4111-8111-111111111111"
             )
 
@@ -306,7 +310,7 @@ class TestDeleteJobGiteaCleanup:
             mock_gitea.delete_branch = AsyncMock()
             mock_gitea.delete_repo = AsyncMock()
 
-            result = await orch_main.delete_job(_stub_request(), str(job["id"]))
+            result = await control_seams.delete_job(_stub_request(), str(job["id"]))
 
         assert result == DELETE_RESULT
         mock_gitea.delete_branch.assert_awaited_once_with(
@@ -339,7 +343,7 @@ class TestDeleteJobGiteaCleanup:
             mock_gitea.delete_repo = AsyncMock(return_value=False)
 
             with pytest.raises(HTTPException) as exc:
-                await orch_main.delete_job(_stub_request(), "some-id")
+                await control_seams.delete_job(_stub_request(), "some-id")
 
             assert exc.value.status_code == 503
             mock_db.delete_job.assert_not_awaited()
@@ -363,7 +367,9 @@ class TestDeleteJobGiteaCleanup:
             patch(f"{MODULE}.postgres_db") as mock_db,
             patch(f"{MODULE}.gitea_client") as mock_gitea,
             patch(f"{MODULE}.snapshot_service") as mock_snapshots,
-            patch(f"{MODULE}._archive_and_cleanup_workspace") as cleanup_workspace,
+            patch(
+                "orchestrator.main.thread_retirement_operations.ThreadRetirementOperations.archive_and_cleanup_workspace"
+            ) as cleanup_workspace,
             _bypass_job_access_gate(job),
         ):
             mock_db.has_child_jobs = AsyncMock(return_value=False)
@@ -398,7 +404,7 @@ class TestDeleteJobGiteaCleanup:
             mock_gitea.is_initialized = False
             mock_snapshots.is_available = False
 
-            result = await orch_main.delete_job(_stub_request(), str(job["id"]))
+            result = await control_seams.delete_job(_stub_request(), str(job["id"]))
 
         assert result == DELETE_RESULT
         cleanup_workspace.assert_awaited_once_with(str(job["id"]))
@@ -421,7 +427,9 @@ class TestDeleteJobGiteaCleanup:
 
         with (
             patch(f"{MODULE}.postgres_db") as mock_db,
-            patch(f"{MODULE}._archive_and_cleanup_workspace") as cleanup_workspace,
+            patch(
+                "orchestrator.main.thread_retirement_operations.ThreadRetirementOperations.archive_and_cleanup_workspace"
+            ) as cleanup_workspace,
             _bypass_job_access_gate(job),
         ):
             mock_db.has_child_jobs = AsyncMock(return_value=False)
@@ -429,7 +437,7 @@ class TestDeleteJobGiteaCleanup:
             mock_db.delete_job = AsyncMock()
 
             with pytest.raises(HTTPException) as exc_info:
-                await orch_main.delete_job(_stub_request(), str(job["id"]))
+                await control_seams.delete_job(_stub_request(), str(job["id"]))
 
         assert exc_info.value.status_code == 409
         cleanup_workspace.assert_not_awaited()
@@ -446,7 +454,9 @@ class TestDeleteJobGiteaCleanup:
 
         with (
             patch(f"{MODULE}.postgres_db") as mock_db,
-            patch(f"{MODULE}._archive_and_cleanup_workspace") as cleanup_workspace,
+            patch(
+                "orchestrator.main.thread_retirement_operations.ThreadRetirementOperations.archive_and_cleanup_workspace"
+            ) as cleanup_workspace,
             _bypass_job_access_gate(job),
         ):
             mock_db.has_child_jobs = AsyncMock(return_value=False)
@@ -456,7 +466,7 @@ class TestDeleteJobGiteaCleanup:
             mock_db.delete_job = AsyncMock()
 
             with pytest.raises(HTTPException) as exc_info:
-                await orch_main.delete_job(_stub_request(), str(job["id"]))
+                await control_seams.delete_job(_stub_request(), str(job["id"]))
 
         assert exc_info.value.status_code == 500
         assert "strict prune failed" in str(exc_info.value.detail)
@@ -482,7 +492,7 @@ class TestDeleteJobGiteaCleanup:
             mock_db.get_job = AsyncMock(return_value=None)
 
             with pytest.raises(HTTPException) as exc_info:
-                await orch_main.delete_job(_stub_request(), "missing-id")
+                await control_seams.delete_job(_stub_request(), "missing-id")
             assert exc_info.value.status_code == 404
 
 
@@ -506,7 +516,7 @@ class TestSubjobMergeEndpoint:
             mock_db.get_job = AsyncMock(return_value=job)
 
             with pytest.raises(HTTPException) as exc_info:
-                await orch_main.subjob_merge(_stub_request(), "root-job-id")
+                await control_seams.subjob_merge(_stub_request(), "root-job-id")
             assert exc_info.value.status_code == 400
 
     @pytest.mark.asyncio
@@ -518,7 +528,7 @@ class TestSubjobMergeEndpoint:
             mock_db.get_job = AsyncMock(return_value=None)
 
             with pytest.raises(HTTPException) as exc_info:
-                await orch_main.subjob_merge(_stub_request(), "missing-id")
+                await control_seams.subjob_merge(_stub_request(), "missing-id")
             assert exc_info.value.status_code == 404
 
     @pytest.mark.asyncio
@@ -539,7 +549,7 @@ class TestSubjobMergeEndpoint:
             mock_db.get_job = AsyncMock(return_value=job)
             mock_gitea.is_initialized = True
 
-            result = await orch_main.subjob_merge(_stub_request(), "subjob-id")
+            result = await control_seams.subjob_merge(_stub_request(), "subjob-id")
             assert result["status"] == "skipped"
 
     @pytest.mark.asyncio
@@ -553,8 +563,10 @@ class TestSubjobMergeEndpoint:
 
         with (
             patch(f"{MODULE}.postgres_db") as mock_db,
-            patch(
-                f"{MODULE}._graft_subjob_output", new_callable=AsyncMock
+            patch.object(
+                orch_main.subjob_output_operations,
+                "graft_subjob_output",
+                new_callable=AsyncMock,
             ) as mock_graft,
             _bypass_require_internal(),
         ):
@@ -564,7 +576,7 @@ class TestSubjobMergeEndpoint:
                 "output_path": "outputs/001-scholar-abc",
             }
 
-            result = await orch_main.subjob_merge(_stub_request(), "subjob-id")
+            result = await control_seams.subjob_merge(_stub_request(), "subjob-id")
             assert result["status"] == "grafted"
             assert result["job_id"] == "subjob-id"
             assert result["output_path"] == "outputs/001-scholar-abc"
@@ -594,19 +606,19 @@ class TestNextOutputOrdinal:
     async def test_first_ordinal_is_001(self):
         fake = _OutputsFake([])
         with patch(f"{MODULE}.gitea_client", fake):
-            assert await orch_main._next_output_ordinal("job-x", "main") == "001"
+            assert await b08_helpers.next_output_ordinal("job-x", "main") == "001"
 
     @pytest.mark.asyncio
     async def test_increments_past_highest(self):
         fake = _OutputsFake(["001-scholar-aa", "002-critic-bb", "010-developer-cc"])
         with patch(f"{MODULE}.gitea_client", fake):
-            assert await orch_main._next_output_ordinal("job-x", "main") == "011"
+            assert await b08_helpers.next_output_ordinal("job-x", "main") == "011"
 
     @pytest.mark.asyncio
     async def test_ignores_non_numbered_entries(self):
         fake = _OutputsFake(["notes", "003-scholar-dd"])
         with patch(f"{MODULE}.gitea_client", fake):
-            assert await orch_main._next_output_ordinal("job-x", "main") == "004"
+            assert await b08_helpers.next_output_ordinal("job-x", "main") == "004"
 
 
 import base64 as _b64  # noqa: E402
@@ -711,7 +723,7 @@ class TestGraftSubjobOutput:
             db.update_job_merge_status = AsyncMock()
             db.merge_job_context = AsyncMock()
 
-            result = await orch_main._graft_subjob_output("sub-uuid-1234abcd")
+            result = await b08_helpers.graft_subjob_output("sub-uuid-1234abcd")
 
         assert result["status"] == "grafted"
         assert result["output_path"] == "outputs/001-scholar-sub-uuid"
@@ -757,7 +769,7 @@ class TestGraftSubjobOutput:
             db.update_job_merge_status = AsyncMock()
             db.merge_job_context = AsyncMock()
 
-            result = await orch_main._graft_subjob_output("sub-uuid-1234abcd")
+            result = await b08_helpers.graft_subjob_output("sub-uuid-1234abcd")
 
         assert result == {"status": "skipped", "reason": "critic-not-merged"}
         assert all(not k.startswith("outputs/") for k in fake.trees["main"])
@@ -780,7 +792,7 @@ class TestGraftSubjobOutput:
             db.update_job_merge_status = AsyncMock()
             db.merge_job_context = AsyncMock()
 
-            result = await orch_main._graft_subjob_output("sub-uuid-1234abcd")
+            result = await b08_helpers.graft_subjob_output("sub-uuid-1234abcd")
 
         assert result == {"status": "skipped", "reason": "no-output"}
 
@@ -805,7 +817,7 @@ class TestGraftSubjobOutput:
             db.update_job_merge_status = AsyncMock()
             db.merge_job_context = AsyncMock()
 
-            result = await orch_main._graft_subjob_output("sub-uuid-1234abcd")
+            result = await b08_helpers.graft_subjob_output("sub-uuid-1234abcd")
 
         assert result["output_path"] == "outputs/002-scholar-sub-uuid"
         assert fake.trees["main"]["outputs/002-scholar-sub-uuid/y.md"] == b"new"
@@ -834,7 +846,7 @@ class TestGraftSubjobOutput:
             db.update_job_merge_status = AsyncMock()
             db.merge_job_context = AsyncMock()
 
-            result = await orch_main._graft_subjob_output("sub-uuid-1234abcd")
+            result = await b08_helpers.graft_subjob_output("sub-uuid-1234abcd")
 
         assert result["status"] == "skipped"
         assert result["reason"] == "already-grafted"
@@ -864,7 +876,7 @@ class TestGraftSubjobOutput:
             db.update_job_merge_status = AsyncMock()
             db.merge_job_context = AsyncMock()
 
-            result = await orch_main._graft_subjob_output(
+            result = await b08_helpers.graft_subjob_output(
                 "sub-uuid-1234abcd",
                 completion_command_id=self.COMMAND_ID,
             )
@@ -905,7 +917,7 @@ class TestGraftSubjobOutput:
             db.update_job_merge_status = AsyncMock()
             db.merge_job_context = AsyncMock()
 
-            result = await orch_main._graft_subjob_output(
+            result = await b08_helpers.graft_subjob_output(
                 "sub-uuid-1234abcd",
                 completion_command_id=self.COMMAND_ID,
             )
@@ -952,7 +964,7 @@ class TestGraftSubjobOutput:
             db.merge_job_context = AsyncMock()
 
             with pytest.raises(CompletionEffectProbeError):
-                await orch_main._graft_subjob_output(
+                await b08_helpers.graft_subjob_output(
                     "sub-uuid-1234abcd",
                     completion_command_id=self.COMMAND_ID,
                 )
@@ -986,7 +998,7 @@ class TestGraftSubjobOutput:
             with pytest.raises(
                 RuntimeError, match="durable graft write outcome is ambiguous"
             ):
-                await orch_main._graft_subjob_output(
+                await b08_helpers.graft_subjob_output(
                     "sub-uuid-1234abcd",
                     completion_command_id=self.COMMAND_ID,
                 )
@@ -1002,7 +1014,7 @@ class TestCompletionGraftWiring:
         # A delegation child has creation_order set; the old gate skipped it.
         called = {}
 
-        async def fake_graft(job_id):
+        async def fake_graft(job_id, **_kwargs):
             called["job_id"] = job_id
             return {
                 "status": "grafted",
@@ -1017,15 +1029,23 @@ class TestCompletionGraftWiring:
             "repo_name": "job-p",
             "config_name": "developer",
         }
-        with patch(f"{MODULE}._graft_subjob_output", side_effect=fake_graft):
-            res = await orch_main._maybe_graft_completed_subjob(child)
+        with patch.object(
+            orch_main.subjob_output_operations,
+            "graft_subjob_output",
+            side_effect=fake_graft,
+        ):
+            res = await b08_helpers.maybe_graft_completed_subjob(child)
         assert called["job_id"] == "deadbeef-child"
         assert res["status"] == "grafted"
 
     @pytest.mark.asyncio
     async def test_no_graft_for_root_job(self):
-        with patch(f"{MODULE}._graft_subjob_output", new_callable=AsyncMock) as g:
-            res = await orch_main._maybe_graft_completed_subjob(
+        with patch.object(
+            orch_main.subjob_output_operations,
+            "graft_subjob_output",
+            new_callable=AsyncMock,
+        ) as g:
+            res = await b08_helpers.maybe_graft_completed_subjob(
                 {"id": "r", "parent_job_id": None}
             )
         assert res is None
@@ -1066,7 +1086,7 @@ class TestScholarOutputPointer:
             db.merge_job_context = AsyncMock(side_effect=upd_ctx)
             db.update_job_status = AsyncMock()
             with patch(f"{MODULE}._trigger_dispatch"):
-                await orch_main._handle_scholar_completion(scholar_in_memory, [])
+                await b08_helpers.handle_scholar_completion(scholar_in_memory, [])
 
         assert captured["par-1"]["scholar_output_dir"] == "outputs/003-scholar-sch1"
         assert captured["par-1"]["scholar_completed"] is True
@@ -1091,7 +1111,7 @@ class TestScholarOutputPointer:
             db.merge_job_context = AsyncMock()
             db.update_job_status = AsyncMock()
             with patch(f"{MODULE}._trigger_dispatch") as trig:
-                await orch_main._handle_scholar_completion(scholar, [])
+                await b08_helpers.handle_scholar_completion(scholar, [])
         db.merge_job_context.assert_not_awaited()
         db.update_job_status.assert_not_awaited()
         trig.assert_not_called()
@@ -1140,7 +1160,7 @@ class TestDelegationOutputPathPopulation:
             db.update_job_status = AsyncMock()
             db.claim_delegation_resume = AsyncMock(return_value=True)
             with patch(f"{MODULE}._trigger_dispatch"):
-                await orch_main._handle_delegation_child_completion(job, [])
+                await b08_helpers.handle_delegation_child_completion(job, [])
 
         results = captured["par-1"]["delegation_results"]
         by_order = {r["creation_order"]: r for r in results}
@@ -1185,7 +1205,7 @@ class TestDelegationUnblockDispatcherContract:
             db.update_job_status = AsyncMock()
             db.claim_delegation_resume = AsyncMock(return_value=True)
             with patch(f"{MODULE}._trigger_dispatch") as trig:
-                await orch_main._handle_delegation_child_completion(job, [])
+                await b08_helpers.handle_delegation_child_completion(job, [])
         db.claim_delegation_resume.assert_awaited_once_with("par-1")
         # update_job_status can't clear freeze_data → must not be the writer
         db.update_job_status.assert_not_awaited()
@@ -1204,7 +1224,7 @@ class TestDelegationUnblockDispatcherContract:
             db.update_job_status = AsyncMock()
             db.claim_delegation_resume = AsyncMock(return_value=False)
             with patch(f"{MODULE}._trigger_dispatch") as trig:
-                await orch_main._handle_delegation_child_completion(job, [])
+                await b08_helpers.handle_delegation_child_completion(job, [])
         trig.assert_not_called()
 
     @pytest.mark.asyncio
@@ -1225,7 +1245,7 @@ class TestDelegationUnblockDispatcherContract:
             db.merge_job_context = AsyncMock()
             db.claim_delegation_resume = AsyncMock()
             with patch(f"{MODULE}._trigger_dispatch") as trig:
-                await orch_main._handle_delegation_child_completion(job, [])
+                await b08_helpers.handle_delegation_child_completion(job, [])
 
         queued = db.queue_stateless_job_for_resume.await_args
         assert queued.args[0] == "par-1"

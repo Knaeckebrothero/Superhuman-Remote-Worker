@@ -407,6 +407,70 @@ cases:
         severity: critical
         any_of: ["group mapping tab", "sync now button", "built-in okta scim connector"]
 
+  - id: availability-enable-browser-in-virtual-session
+    prompt: >-
+      Can you open my shop's website and check whether its booking form works?
+      This session's Workspace field says Virtual and you said the browser
+      tools were missing. I don't know where to switch anything on.
+    category: availability
+    tags: [browser, live_settings, setup, paraphrase]
+    expected_trigger: true
+    expected_topic: canvas-and-browser
+    allowed_topics: [permissions-and-availability, sessions]
+    expected_gap: false
+    criticality: critical
+    required_facts:
+      - id: settings-entry
+        any_of: ["session settings", "header settings", "header's settings", "open settings", "settings in the header"]
+      - id: container-upgrade
+        any_of: ["container workspace", "workspace to container", "choose container", "select container", "upgrade to container"]
+      - id: browser-selection
+        any_of: ["enable browser", "browser under tools", "tools browser", "turn on browser"]
+      - id: apply-and-continue
+        any_of: ["next response", "next turn", "send a follow-up", "send continue", "message me after"]
+      - id: retain-session-work
+        any_of: ["keep the conversation", "keeps your conversation", "same conversation", "files carry over", "existing files"]
+    forbidden_claims:
+      - id: imaginary-live-advanced-tab
+        severity: critical
+        any_of: ["settings → advanced → workspace", "open the advanced tab"]
+      - id: needless-session-recreation
+        severity: critical
+        any_of: ["you must start a new session", "browser tools cannot be enabled in a running session"]
+      - id: permission-mode-cure
+        severity: critical
+        any_of: ["switch to autonomous to unlock the browser", "autonomous bypasses the browser grant"]
+
+  - id: workflow-publish-business-website
+    prompt: >-
+      Can you build a website for my dog-grooming business from this chat and
+      put it online? I don't have a hosting account or domain and don't know
+      what I need to give you. Please help me get started.
+    category: workflow
+    tags: [hosting, setup, external_service]
+    expected_trigger: true
+    expected_topic: files-and-integrations
+    allowed_topics: [datasources, permissions-and-availability, canvas-and-browser, sessions]
+    expected_gap: false
+    criticality: critical
+    required_facts:
+      - id: concrete-hosting-route
+        any_of: ["static hosting", "hosting service", "hosting provider", "hosting account", "external host"]
+      - id: useful-preparation
+        affirmative: true
+        any_of: ["prepare the site", "build the site", "draft the site", "create the website", "start with the content", "prepare the files"]
+      - id: deployment-access
+        any_of: ["hosting access", "deploy access", "deployment access", "log in", "login", "upload the files", "connect a repository", "provider dashboard"]
+      - id: optional-domain
+        any_of: ["domain later", "domain can come later", "domain is optional", "provider address", "host-provided address", "temporary address", "default address", "free subdomain"]
+    forbidden_claims:
+      - id: invented-srw-hosting
+        severity: critical
+        any_of: ["srw includes permanent public hosting", "click deploy to public", "hosting → new website", "canvas automatically publishes your website"]
+      - id: secrets-in-chat
+        severity: critical
+        any_of: ["paste your password here", "send me your hosting password", "paste your api key into this chat"]
+
   - id: near-miss-repository-onboarding
     prompt: >-
       Onboard me to this repository: identify the backend entry point, test

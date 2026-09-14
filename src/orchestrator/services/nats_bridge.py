@@ -292,6 +292,8 @@ class NatsBridge:
         entity_type: str = "job",
         set_provisioning: bool = True,
         provision_generation: str | None = None,
+        disk_size: Optional[str] = None,
+        initialization: dict | None = None,
     ) -> bool:
         """Publish a VM creation request.
 
@@ -301,6 +303,7 @@ class NatsBridge:
             vm_image: Container disk image (None = controller default).
             cpu_cores: Number of CPU cores.
             memory: Memory allocation (e.g. "4Gi").
+            disk_size: Requested rootdisk size; omitted uses the controller default.
             description: Job description passed to the agent.
             entity_type: "job" (default) or "thread" — controls which DB
                 table receives context updates when the daemon registers.
@@ -348,6 +351,12 @@ class NatsBridge:
             payload["provision_generation"] = generation
         if vm_image:
             payload["vm_image"] = vm_image
+        if disk_size is not None:
+            payload["disk_size"] = disk_size
+        if initialization is not None:
+            from shared.workspace_initialization import validate_initialization_request
+
+            payload["initialization"] = validate_initialization_request(initialization)
         payload = sign_payload(
             payload,
             direction="request",

@@ -1021,6 +1021,8 @@ def redact_datasource(ds: dict[str, Any]) -> dict[str, Any]:
     if not ds:
         return ds
     out = dict(ds)
+    if ds.get("type") == "credentials":
+        out["env_var_names"] = sorted((ds.get("credentials") or {}).get("env_vars", {}))
     out.pop("credentials", None)
     out.pop("connection_url_redacted", None)
     if "connection_url" in out:

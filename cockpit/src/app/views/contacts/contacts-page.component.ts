@@ -170,7 +170,9 @@ import {ContactListComponent} from './contact-list.component';
 
       .header__title {
         margin: 0;
-        font-family: var(--font-display);
+        font-size: 24px;
+        font-weight: 600;
+        letter-spacing: -0.02em;
       }
 
       .header__subtitle {

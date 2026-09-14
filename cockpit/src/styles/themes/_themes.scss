@@ -3,9 +3,36 @@
 @use 'sass:string';
 @use 'theme-config' as config;
 
-// Emit each token in the named theme map as a CSS custom property.
-// Quoted string values (e.g. shadows) are unquoted on the way out so they
+// Emit each token in a map as a CSS custom property. Quoted string values
+// (e.g. shadows, color-mix expressions) are unquoted on the way out so they
 // land as legal CSS without the surrounding quotes.
+@mixin emit-tokens($map) {
+  @each $token, $value in $map {
+    @if meta.type-of($value) == 'string' {
+      --#{$token}: #{string.unquote($value)};
+    } @else {
+      --#{$token}: #{$value};
+    }
+  }
+}
+
+// The five accent tokens for one accent in one mode (see $accents).
+//
+// Usage:
+//   .theme-senate.accent-porphyry { @include theme.apply-accent('porphyry', 'senate'); }
+@mixin apply-accent($accent-name, $theme-name) {
+  $accent-map: map.get(config.$accents, $accent-name, $theme-name);
+
+  @if not $accent-map {
+    @error "Unknown accent '#{$accent-name}' for theme '#{$theme-name}'. Add it to $accents in _theme-config.scss.";
+  }
+
+  @include emit-tokens($accent-map);
+}
+
+// Everything a mode needs: the theme map, the default accent on the bare
+// class, and one nested `&.accent-<name>` block per accent so a second body
+// class swaps the accent without touching the mode.
 //
 // Usage:
 //   .theme-senate     { @include theme.apply-app-theme('senate'); }
@@ -17,11 +44,12 @@
     @error "Unknown theme '#{$theme-name}'. Add it to $themes in _theme-config.scss.";
   }
 
-  @each $token, $value in $theme-map {
-    @if meta.type-of($value) == 'string' {
-      --#{$token}: #{string.unquote($value)};
-    } @else {
-      --#{$token}: #{$value};
+  @include emit-tokens($theme-map);
+  @include apply-accent(config.$default-accent, $theme-name);
+
+  @each $accent-name, $modes in config.$accents {
+    &.accent-#{$accent-name} {
+      @include apply-accent($accent-name, $theme-name);
     }
   }
 }

@@ -14,6 +14,7 @@ from contextlib import AbstractAsyncContextManager
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 from uuid import UUID
 
 import pytest
@@ -2146,6 +2147,31 @@ async def test_drain_retries_transient_leader_election_error(monkeypatch) -> Non
     await asyncio.wait_for(finalizer.run_drain(shutdown), timeout=1.0)
 
     assert attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_background_sweep_runs_with_command_drain_disabled(monkeypatch):
+    shutdown = asyncio.Event()
+    finalizer = CompletionFinalizer(object())
+    monkeypatch.setattr(
+        finalizer, "acquire_leader", AsyncMock(return_value=LeaderTerm("sweeper", NOW))
+    )
+    monkeypatch.setattr(finalizer, "release_leader", AsyncMock(return_value=True))
+    candidate = AsyncMock(side_effect=AssertionError("command drain is disabled"))
+    monkeypatch.setattr(finalizer, "_candidate_id", candidate)
+
+    async def sweep():
+        shutdown.set()
+
+    background = AsyncMock(side_effect=sweep)
+    await asyncio.wait_for(
+        finalizer.run_drain(
+            shutdown, drain_commands=False, background_sweep=background
+        ),
+        timeout=1,
+    )
+    background.assert_awaited_once()
+    candidate.assert_not_awaited()
 
 
 @pytest.mark.asyncio

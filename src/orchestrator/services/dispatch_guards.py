@@ -67,10 +67,15 @@ VM_RECYCLE = "recycle"  # stuck past budget → tear down so it re-provisions
 VM_READY = "ready"  # VM booted → proceed to claim/dispatch
 VM_GOLDEN_POLL = "golden_poll"  # golden image importing → re-poll create, free
 VM_PARK_GOLDEN = "park_golden"  # golden import never finished → fail + park
+VM_PARK_INITIALIZATION = (
+    "park_initialization"  # setup did not finish → fail without retry
+)
 VM_CAPACITY_POLL = "capacity_poll"  # controller at capacity → re-poll create
 VM_PARK_CAPACITY = "park_capacity"  # capacity never became available → fail
 VM_HEADSCALE_POLL = "headscale_poll"  # mesh VPN down → re-poll create, free
 VM_PARK_HEADSCALE = "park_headscale"  # mesh VPN never recovered → fail + park
+VM_PREPARATION_POLL = "preparation_poll"
+VM_PARK_PREPARATION = "park_preparation"
 
 # Teardown states the controller reports when a delete does not complete. Both
 # used to match no branch and fall through to the generic not-ready arm, which
@@ -138,6 +143,9 @@ def vm_provisioning_decision(
     States:
       absent / 'deleted' → PROVISION, or PARK_EXHAUSTED once retries are used up
       'failed'           → PARKED (don't hot-retry the shared VM cluster)
+      initialization    → WAIT within the separate setup budget; otherwise
+                           PARK_INITIALIZATION, preserving partial setup for
+                           diagnosis instead of recycling it as a boot failure
       'suspending'/'suspended'/'restoring'
                          → WAIT (the suspension subsystem owns these and keeps
                            the rootdisk deliberately; recycling would purge it)
@@ -201,6 +209,19 @@ def vm_provisioning_decision(
         if started and (now - float(started)) > golden_timeout_s:
             return VM_PARK_GOLDEN
         return VM_GOLDEN_POLL
+    if status == "waiting_preparation":
+        from shared.workspace_preparation_settings import PreparationSettings
+
+        settings = PreparationSettings.from_environment()
+        budget = settings.wait_budget
+        started = vm_ctx.get("preparation_wait_started_at")
+        if (
+            type(started) not in (int, float)
+            or not 0 < started <= now
+            or now - started > budget
+        ):
+            return VM_PARK_PREPARATION
+        return VM_PREPARATION_POLL
     if status == "waiting_capacity":
         started = vm_ctx.get("capacity_wait_started_at")
         if started and (now - float(started)) > capacity_timeout_s:
@@ -211,6 +232,17 @@ def vm_provisioning_decision(
         if started and (now - float(started)) > headscale_timeout_s:
             return VM_PARK_HEADSCALE
         return VM_HEADSCALE_POLL
+    if status != "ready" and vm_ctx.get("initialization_started_at") is not None:
+        from shared.workspace_initialization import TIMEOUT_SECONDS
+
+        started = vm_ctx["initialization_started_at"]
+        if type(started) not in (int, float) or not 0 < started <= now:
+            return VM_PARK_INITIALIZATION
+        if now - started > TIMEOUT_SECONDS + 60:
+            return VM_PARK_INITIALIZATION
+        # SSH has been verified and guest setup is running. Do not recycle
+        # the disk under a live initializer using the shorter VM boot budget.
+        return VM_WAIT
     if status != "ready":
         provisioned_at = vm_ctx.get("provisioned_at")
         if provisioned_at and (now - float(provisioned_at)) > timeout_s:

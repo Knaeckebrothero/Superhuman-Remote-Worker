@@ -165,7 +165,10 @@ def test_workspace_lifecycle_epoch_revokes_predecessor_service_account() -> None
 
 def test_workspace_lifecycle_cutover_can_retire_only_after_convergence() -> None:
     documents = _render_documents(
-        "--set", "orchestrator.workspaceLifecycleProtocolCutoverEnabled=false"
+        "--set",
+        "orchestrator.workspaceLifecycleProtocolCutoverEnabled=false",
+        "--set",
+        "orchestrator.manifestContractCutoverEnabled=false",
     )
     deployment = next(
         item

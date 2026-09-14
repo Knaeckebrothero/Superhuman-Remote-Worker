@@ -99,6 +99,21 @@ fi
 HOST_KEY_DIR=/var/lib/srw-system/ssh
 install -d -o root -g root -m 0700 /var/lib/srw-system
 install -d -o root -g root -m 0700 "$HOST_KEY_DIR"
+# Native manifest workspaces can pin the SSH host identity before the Pod
+# starts. This Secret belongs to one attachment; no shared host/client key is
+# accepted from the workspace PVC. Older provisioners omit the mount and keep
+# the existing generation-on-start behavior below.
+if [ -d /tmp/ssh-hostkey ]; then
+    if [ ! -s /tmp/ssh-hostkey/ssh_host_ed25519_key ] \
+        || [ ! -s /tmp/ssh-hostkey/ssh_host_ed25519_key.pub ]; then
+        echo "workspace SSH host identity is incomplete" >&2
+        exit 78
+    fi
+    install -o root -g root -m 0600 /tmp/ssh-hostkey/ssh_host_ed25519_key \
+        "$HOST_KEY_DIR/ssh_host_ed25519_key"
+    install -o root -g root -m 0644 /tmp/ssh-hostkey/ssh_host_ed25519_key.pub \
+        "$HOST_KEY_DIR/ssh_host_ed25519_key.pub"
+fi
 if [ ! -s "$HOST_KEY_DIR/ssh_host_ed25519_key" ]; then
     ssh-keygen -q -t ed25519 -N '' -f "$HOST_KEY_DIR/ssh_host_ed25519_key"
 fi

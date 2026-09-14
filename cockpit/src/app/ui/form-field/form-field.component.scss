@@ -20,6 +20,18 @@
   }
 }
 
+.app-form-field__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: v.$space-sm;
+  margin-bottom: v.$space-xs;
+
+  .app-form-field__label {
+    margin-bottom: 0;
+  }
+}
+
 .app-form-field__label {
   display: block;
   margin-bottom: v.$space-xs;

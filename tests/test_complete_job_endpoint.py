@@ -7,6 +7,8 @@ Tests cover:
 3. OrchestratorClient.approve_job: success/failure paths
 """
 
+from tests import b08_completion_helpers as b08_helpers
+
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import asyncpg
@@ -344,7 +346,7 @@ class TestVerificationTriggerGuards:
         result = self._passing_result(error={"message": "failed"})
         actions: list[str] = []
 
-        await main._trigger_verification_on_complete(job, result, actions)
+        await b08_helpers.trigger_verification_on_complete(job, result, actions)
 
         create_job_mock.assert_not_awaited()
         assert actions == []
@@ -361,7 +363,7 @@ class TestVerificationTriggerGuards:
         result = self._passing_result(should_stop=False)
         actions: list[str] = []
 
-        await main._trigger_verification_on_complete(job, result, actions)
+        await b08_helpers.trigger_verification_on_complete(job, result, actions)
 
         create_job_mock.assert_not_awaited()
         assert actions == []
@@ -378,7 +380,7 @@ class TestVerificationTriggerGuards:
         result = self._passing_result()
         actions: list[str] = []
 
-        await main._trigger_verification_on_complete(job, result, actions)
+        await b08_helpers.trigger_verification_on_complete(job, result, actions)
 
         create_job_mock.assert_not_awaited()
         assert actions == []
@@ -396,7 +398,7 @@ class TestVerificationTriggerGuards:
         result = self._passing_result()
         actions: list[str] = []
 
-        await main._trigger_verification_on_complete(job, result, actions)
+        await b08_helpers.trigger_verification_on_complete(job, result, actions)
 
         create_job_mock.assert_not_awaited()
         assert actions == []
@@ -413,7 +415,7 @@ class TestVerificationTriggerGuards:
         result = self._passing_result()
         actions: list[str] = []
 
-        await main._trigger_verification_on_complete(job, result, actions)
+        await b08_helpers.trigger_verification_on_complete(job, result, actions)
 
         create_job_mock.assert_not_awaited()
         assert actions == []
@@ -434,7 +436,7 @@ class TestVerificationTriggerGuards:
         result = self._passing_result()
         actions: list[str] = []
 
-        await main._trigger_verification_on_complete(job, result, actions)
+        await b08_helpers.trigger_verification_on_complete(job, result, actions)
 
         create_job_mock.assert_not_awaited()
         assert actions == []
@@ -465,7 +467,7 @@ class TestVerificationTriggerGuards:
         result = self._passing_result()
         actions: list[str] = []
 
-        await main._trigger_verification_on_complete(job, result, actions)
+        await b08_helpers.trigger_verification_on_complete(job, result, actions)
 
         create_job_mock.assert_awaited_once()
         assert any("critic job" in a and "created" in a for a in actions)
@@ -499,7 +501,9 @@ class TestVerificationTriggerGuards:
             config_override={"workspace": {"backend": "sandbox"}},
         )
 
-        await main._trigger_verification_on_complete(job, self._passing_result(), [])
+        await b08_helpers.trigger_verification_on_complete(
+            job, self._passing_result(), []
+        )
 
         kwargs = create_job_mock.call_args.kwargs
         assert kwargs["context"]["inherits_parent_workspace"] is True
@@ -532,7 +536,7 @@ class TestVerificationTriggerGuards:
         result = self._passing_result()
         actions: list[str] = []
 
-        await main._trigger_verification_on_complete(job, result, actions)
+        await b08_helpers.trigger_verification_on_complete(job, result, actions)
 
         create_job_mock.assert_not_awaited()
         round_lookup_mock.assert_not_awaited()
@@ -602,7 +606,7 @@ class TestVerificationTriggerGuards:
         )
         actions: list[str] = []
 
-        await main._trigger_verification_on_complete(
+        await b08_helpers.trigger_verification_on_complete(
             job,
             self._passing_result(),
             actions,
@@ -701,7 +705,7 @@ class TestVerificationTriggerGuards:
         )
         actions: list[str] = []
 
-        await main._trigger_verification_on_complete(
+        await b08_helpers.trigger_verification_on_complete(
             job,
             self._passing_result(),
             actions,
@@ -740,7 +744,7 @@ class TestVerificationTriggerGuards:
 
         job = self._passing_job()
         actions: list[str] = []
-        await main._trigger_verification_on_complete(
+        await b08_helpers.trigger_verification_on_complete(
             job, self._passing_result(), actions
         )
 
@@ -774,7 +778,7 @@ class TestVerificationTriggerGuards:
         )
 
         with pytest.raises(asyncpg.UniqueViolationError) as exc_info:
-            await main._trigger_verification_on_complete(
+            await b08_helpers.trigger_verification_on_complete(
                 self._passing_job(), self._passing_result(), []
             )
         assert exc_info.value.constraint_name == "some_other_unique_index"

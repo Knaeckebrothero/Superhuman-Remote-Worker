@@ -18,7 +18,7 @@
        Double-tap zoom is separately disabled via touch-action in styles.scss. -->
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, interactive-widget=resizes-content">
   <link rel="manifest" href="manifest.webmanifest">
-  <meta name="theme-color" content="#9c2832" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#5f499c" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#141418" media="(prefers-color-scheme: dark)">
   <link rel="icon" href="favicon.ico" sizes="any">
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
@@ -28,7 +28,7 @@
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="default">
   <meta name="apple-mobile-web-app-title" content="SRW">
-  <meta name="msapplication-TileColor" content="#9c2832">
+  <meta name="msapplication-TileColor" content="#5f499c">
   <meta property="og:title" content="SRW · Cockpit">
   <meta property="og:description" content="Command center for remote AI workers.">
   <meta property="og:image" content="assets/social/og-1200x630.png">
@@ -67,7 +67,7 @@
   <script>
     // Pre-paint theme resolution: pick the body class before Angular hydrates so
     // dark-OS users don't flash through the Travertine fallback class on first paint.
-    // Mirrors ThemeService.readStoredPreference() — keep in sync.
+    // Mirrors ThemeService.readStoredPreference() and readStoredAccent() — keep in sync.
     (function () {
       try {
         var raw = window.localStorage.getItem('cockpit:theme');
@@ -81,6 +81,13 @@
         }
         document.body.classList.remove('theme-travertine', 'theme-senate', 'theme-praetorian');
         document.body.classList.add('theme-' + resolved);
+        // Accent axis: tyrian is the default the bare theme class already
+        // paints; only a stored alternative needs the extra class pre-paint.
+        var accent = window.localStorage.getItem('cockpit:accent');
+        var validAccent = {tyrian: 1, porphyry: 1, graphite: 1};
+        if (!accent || !validAccent[accent]) accent = 'tyrian';
+        document.body.classList.remove('accent-tyrian', 'accent-porphyry', 'accent-graphite');
+        document.body.classList.add('accent-' + accent);
       } catch (e) { /* leave fallback class in place */ }
     })();
   </script>

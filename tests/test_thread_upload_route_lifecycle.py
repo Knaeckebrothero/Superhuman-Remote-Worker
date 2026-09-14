@@ -128,9 +128,30 @@ class _DB:
             self.order.append("unlock")
 
 
+def _dependencies(db, owner):
+    """The application's own wiring with the two patched collaborators swapped.
+
+    ``postgres_db`` and ``require_thread_owner`` used to be ``main`` globals
+    these tests patched; they are ``ThreadFilesDependencies`` fields now. The
+    rest (both provisioners, the backend/lane readers) stays exactly what the
+    application binds, so ``patch.object(main.container_provisioner, ...)``
+    still reaches the object under test.
+    """
+    from dataclasses import replace
+
+    from orchestrator import main
+
+    return replace(
+        main._thread_files_dependencies(),
+        store=db,
+        require_thread_owner=owner,
+    )
+
+
 @pytest.mark.asyncio
 async def test_pinned_k8s_upload_requires_fresh_exact_attestation():
     from orchestrator import main
+    from orchestrator.routers.thread_files import upload_files_to_thread
     from orchestrator.services import thread_uploads
 
     thread = _pinned_thread()
@@ -148,12 +169,6 @@ async def test_pinned_k8s_upload_requires_fresh_exact_attestation():
         ]
 
     with (
-        patch.object(
-            main,
-            "require_thread_owner",
-            AsyncMock(return_value=({"sub": "user-a"}, thread)),
-        ),
-        patch.object(main, "postgres_db", db),
         patch.object(thread_uploads, "resolve_ssh_key_path", return_value="/ssh/key"),
         patch.object(
             main.container_provisioner,
@@ -166,10 +181,13 @@ async def test_pinned_k8s_upload_requires_fresh_exact_attestation():
             AsyncMock(side_effect=_write),
         ) as writer,
     ):
-        result = await main.upload_files_to_thread(
+        result = await upload_files_to_thread(
             THREAD_ID,
             SimpleNamespace(),
             [_Upload([])],
+            dependencies=_dependencies(
+                db, AsyncMock(return_value=({"sub": "user-a"}, thread))
+            ),
         )
 
     assert result["files"][0]["path"] == "uploads/notes.txt"
@@ -182,6 +200,10 @@ async def test_pinned_k8s_upload_requires_fresh_exact_attestation():
 @pytest.mark.parametrize("operation", ["upload", "delete"])
 async def test_pinned_k8s_same_ip_successor_gets_no_legacy_io(operation):
     from orchestrator import main
+    from orchestrator.routers.thread_files import (
+        delete_thread_upload,
+        upload_files_to_thread,
+    )
     from orchestrator.services import thread_uploads
 
     thread = _pinned_thread()
@@ -194,12 +216,6 @@ async def test_pinned_k8s_same_ip_successor_gets_no_legacy_io(operation):
         raise thread_uploads.ThreadUploadError(409, "runtime replaced")
 
     with (
-        patch.object(
-            main,
-            "require_thread_owner",
-            AsyncMock(return_value=({"sub": "user-a"}, thread)),
-        ),
-        patch.object(main, "postgres_db", db),
         patch.object(thread_uploads, "resolve_ssh_key_path", return_value="/ssh/key"),
         patch.object(
             main.container_provisioner,
@@ -227,18 +243,23 @@ async def test_pinned_k8s_same_ip_successor_gets_no_legacy_io(operation):
             legacy_delete,
         ),
     ):
+        dependencies = _dependencies(
+            db, AsyncMock(return_value=({"sub": "user-a"}, thread))
+        )
         with pytest.raises(HTTPException) as error:
             if operation == "upload":
-                await main.upload_files_to_thread(
+                await upload_files_to_thread(
                     THREAD_ID,
                     SimpleNamespace(),
                     [_Upload([])],
+                    dependencies=dependencies,
                 )
             else:
-                await main.delete_thread_upload(
+                await delete_thread_upload(
                     THREAD_ID,
                     "notes.txt",
                     SimpleNamespace(),
+                    dependencies=dependencies,
                 )
 
     assert error.value.status_code == 409
@@ -255,6 +276,7 @@ async def test_pinned_k8s_same_ip_successor_gets_no_legacy_io(operation):
 @pytest.mark.asyncio
 async def test_stateless_upload_holds_lifecycle_lock_through_final_write():
     from orchestrator import main
+    from orchestrator.routers.thread_files import upload_files_to_thread
     from orchestrator.services import thread_uploads
 
     order = []
@@ -274,12 +296,6 @@ async def test_stateless_upload_holds_lifecycle_lock_through_final_write():
         ]
 
     with (
-        patch.object(
-            main,
-            "require_thread_owner",
-            AsyncMock(return_value=({"sub": "user-a"}, thread)),
-        ),
-        patch.object(main, "postgres_db", db),
         patch.object(thread_uploads, "resolve_ssh_key_path", return_value="/ssh/key"),
         patch.object(
             main.container_provisioner,
@@ -292,10 +308,13 @@ async def test_stateless_upload_holds_lifecycle_lock_through_final_write():
             AsyncMock(side_effect=_write),
         ) as writer,
     ):
-        result = await main.upload_files_to_thread(
+        result = await upload_files_to_thread(
             THREAD_ID,
             SimpleNamespace(),
             [_Upload(order)],
+            dependencies=_dependencies(
+                db, AsyncMock(return_value=({"sub": "user-a"}, thread))
+            ),
         )
 
     assert result["files"][0]["path"] == "uploads/notes.txt"
@@ -307,7 +326,7 @@ async def test_stateless_upload_holds_lifecycle_lock_through_final_write():
 
 @pytest.mark.asyncio
 async def test_retirement_marker_wins_before_upload_materialization():
-    from orchestrator import main
+    from orchestrator.routers.thread_files import upload_files_to_thread
     from orchestrator.services import thread_uploads
 
     order = []
@@ -318,24 +337,19 @@ async def test_retirement_marker_wins_before_upload_materialization():
     db = _DB(ended, order)
     upload = _Upload(order)
 
-    with (
-        patch.object(
-            main,
-            "require_thread_owner",
-            AsyncMock(return_value=({"sub": "user-a"}, initial)),
-        ),
-        patch.object(main, "postgres_db", db),
-        patch.object(
-            thread_uploads,
-            "upload_files_to_attested_stateless_workspace",
-            AsyncMock(),
-        ) as writer,
-    ):
+    with patch.object(
+        thread_uploads,
+        "upload_files_to_attested_stateless_workspace",
+        AsyncMock(),
+    ) as writer:
         with pytest.raises(HTTPException) as exc:
-            await main.upload_files_to_thread(
+            await upload_files_to_thread(
                 THREAD_ID,
                 SimpleNamespace(),
                 [upload],
+                dependencies=_dependencies(
+                    db, AsyncMock(return_value=({"sub": "user-a"}, initial))
+                ),
             )
 
     assert exc.value.status_code == 409
@@ -346,6 +360,7 @@ async def test_retirement_marker_wins_before_upload_materialization():
 @pytest.mark.asyncio
 async def test_stateless_delete_holds_lifecycle_lock_through_exact_delete():
     from orchestrator import main
+    from orchestrator.routers.thread_files import delete_thread_upload
     from orchestrator.services import thread_uploads
 
     order: list[str] = []
@@ -358,12 +373,6 @@ async def test_stateless_delete_holds_lifecycle_lock_through_exact_delete():
         return "notes.txt"
 
     with (
-        patch.object(
-            main,
-            "require_thread_owner",
-            AsyncMock(return_value=({"sub": "user-a"}, thread)),
-        ),
-        patch.object(main, "postgres_db", db),
         patch.object(thread_uploads, "resolve_ssh_key_path", return_value="/ssh/key"),
         patch.object(
             main.container_provisioner,
@@ -376,10 +385,13 @@ async def test_stateless_delete_holds_lifecycle_lock_through_exact_delete():
             AsyncMock(side_effect=_delete),
         ) as deleter,
     ):
-        result = await main.delete_thread_upload(
+        result = await delete_thread_upload(
             THREAD_ID,
             "notes.txt",
             SimpleNamespace(),
+            dependencies=_dependencies(
+                db, AsyncMock(return_value=({"sub": "user-a"}, thread))
+            ),
         )
 
     assert result == {
@@ -407,7 +419,7 @@ async def test_stateless_delete_holds_lifecycle_lock_through_exact_delete():
 async def test_present_falsey_stop_marker_refuses_delete_before_transport(
     marker_key, value
 ):
-    from orchestrator import main
+    from orchestrator.routers.thread_files import delete_thread_upload
     from orchestrator.services import thread_uploads
 
     order: list[str] = []
@@ -416,24 +428,19 @@ async def test_present_falsey_stop_marker_refuses_delete_before_transport(
     blocked["metadata"][marker_key] = value
     db = _DB(blocked, order)
 
-    with (
-        patch.object(
-            main,
-            "require_thread_owner",
-            AsyncMock(return_value=({"sub": "user-a"}, initial)),
-        ),
-        patch.object(main, "postgres_db", db),
-        patch.object(
-            thread_uploads,
-            "delete_file_from_attested_stateless_workspace",
-            AsyncMock(),
-        ) as deleter,
-    ):
+    with patch.object(
+        thread_uploads,
+        "delete_file_from_attested_stateless_workspace",
+        AsyncMock(),
+    ) as deleter:
         with pytest.raises(HTTPException) as exc:
-            await main.delete_thread_upload(
+            await delete_thread_upload(
                 THREAD_ID,
                 "notes.txt",
                 SimpleNamespace(),
+                dependencies=_dependencies(
+                    db, AsyncMock(return_value=({"sub": "user-a"}, initial))
+                ),
             )
 
     assert exc.value.status_code == 409
@@ -453,7 +460,7 @@ async def test_present_falsey_stop_marker_refuses_delete_before_transport(
 )
 @pytest.mark.parametrize("value", [None, False, 0, "", [], {}])
 async def test_present_falsey_stop_marker_refuses_upload_before_read(marker_key, value):
-    from orchestrator import main
+    from orchestrator.routers.thread_files import upload_files_to_thread
     from orchestrator.services import thread_uploads
 
     order = []
@@ -462,24 +469,19 @@ async def test_present_falsey_stop_marker_refuses_upload_before_read(marker_key,
     blocked["metadata"][marker_key] = value
     db = _DB(blocked, order)
 
-    with (
-        patch.object(
-            main,
-            "require_thread_owner",
-            AsyncMock(return_value=({"sub": "user-a"}, initial)),
-        ),
-        patch.object(main, "postgres_db", db),
-        patch.object(
-            thread_uploads,
-            "upload_files_to_attested_stateless_workspace",
-            AsyncMock(),
-        ) as writer,
-    ):
+    with patch.object(
+        thread_uploads,
+        "upload_files_to_attested_stateless_workspace",
+        AsyncMock(),
+    ) as writer:
         with pytest.raises(HTTPException) as exc:
-            await main.upload_files_to_thread(
+            await upload_files_to_thread(
                 THREAD_ID,
                 SimpleNamespace(),
                 [_Upload(order)],
+                dependencies=_dependencies(
+                    db, AsyncMock(return_value=({"sub": "user-a"}, initial))
+                ),
             )
 
     assert exc.value.status_code == 409
@@ -489,7 +491,7 @@ async def test_present_falsey_stop_marker_refuses_upload_before_read(marker_key,
 
 @pytest.mark.asyncio
 async def test_cancelled_virtual_upload_keeps_lifecycle_lock_until_writer_finishes():
-    from orchestrator import main
+    from orchestrator.routers.thread_files import upload_files_to_thread
     from orchestrator.services import thread_uploads
 
     order: list[str] = []
@@ -537,12 +539,6 @@ async def test_cancelled_virtual_upload_keeps_lifecycle_lock_until_writer_finish
     db = _LockDB()
     with (
         patch.object(
-            main,
-            "require_thread_owner",
-            AsyncMock(return_value=({"sub": "user-a"}, thread)),
-        ),
-        patch.object(main, "postgres_db", db),
-        patch.object(
             thread_uploads,
             "resolve_thread_upload_destination",
             return_value=destination,
@@ -550,10 +546,13 @@ async def test_cancelled_virtual_upload_keeps_lifecycle_lock_until_writer_finish
         patch.object(thread_uploads, "_virtual_write_files", _blocked_write),
     ):
         uploading = asyncio.create_task(
-            main.upload_files_to_thread(
+            upload_files_to_thread(
                 THREAD_ID,
                 SimpleNamespace(),
                 [_Upload(order)],
+                dependencies=_dependencies(
+                    db, AsyncMock(return_value=({"sub": "user-a"}, thread))
+                ),
             )
         )
         deadline = asyncio.get_running_loop().time() + 2
@@ -582,7 +581,7 @@ async def test_cancelled_virtual_upload_keeps_lifecycle_lock_until_writer_finish
 
 @pytest.mark.asyncio
 async def test_cancelled_virtual_delete_keeps_lifecycle_lock_until_worker_finishes():
-    from orchestrator import main
+    from orchestrator.routers.thread_files import delete_thread_upload
     from orchestrator.services import thread_uploads
 
     order: list[str] = []
@@ -630,12 +629,6 @@ async def test_cancelled_virtual_delete_keeps_lifecycle_lock_until_worker_finish
     db = _LockDB()
     with (
         patch.object(
-            main,
-            "require_thread_owner",
-            AsyncMock(return_value=({"sub": "user-a"}, thread)),
-        ),
-        patch.object(main, "postgres_db", db),
-        patch.object(
             thread_uploads,
             "resolve_thread_upload_destination",
             return_value=destination,
@@ -643,7 +636,14 @@ async def test_cancelled_virtual_delete_keeps_lifecycle_lock_until_worker_finish
         patch.object(thread_uploads, "_virtual_delete_file", _blocked_delete),
     ):
         deleting = asyncio.create_task(
-            main.delete_thread_upload(THREAD_ID, "notes.txt", SimpleNamespace())
+            delete_thread_upload(
+                THREAD_ID,
+                "notes.txt",
+                SimpleNamespace(),
+                dependencies=_dependencies(
+                    db, AsyncMock(return_value=({"sub": "user-a"}, thread))
+                ),
+            )
         )
         deadline = asyncio.get_running_loop().time() + 2
         while not entered.is_set():

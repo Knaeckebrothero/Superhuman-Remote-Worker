@@ -840,6 +840,15 @@ class VMInstanceManager:
                 if isinstance(permit, LifecycleActionPermit):
                     permit.skip("vm_identity_superseded", settled=True)
                 return True
+            if outcome.disposition == "retry_pending":
+                if isinstance(permit, LifecycleActionPermit):
+                    # The controller accepted the exact-generation delete and
+                    # the immediate absence probe still saw it terminating.
+                    # This is a conclusive incomplete attempt, not ambiguous
+                    # ownership: release the term so the next lifecycle tick
+                    # or authorized control can retry promptly.
+                    permit.skip("vm_retirement_retry_pending", settled=True)
+                return False
             return bool(outcome.deleted)
         except Exception:
             logger.exception("Failed to delete VM %s", inst.id)
@@ -1061,6 +1070,9 @@ class VMInstanceManager:
                         continue
                     if outcome.disposition == "identity_superseded":
                         permit.skip("vm_identity_superseded", settled=True)
+                        continue
+                    if outcome.disposition == "retry_pending":
+                        permit.skip("vm_retirement_retry_pending", settled=True)
                         continue
                     if not outcome.deleted:
                         continue

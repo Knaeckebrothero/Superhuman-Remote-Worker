@@ -3,9 +3,20 @@
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+from tests import _b09_control_seams as control_seams
+
+# R1.B06: these handlers moved to services/thread_config_update with their
+# routes in routers/thread_config. main's dependency factory still reads
+# main's attributes at call time, so the patches below keep steering what
+# they steered before.
+from orchestrator.services import thread_config_update  # noqa: E402
 from fastapi import HTTPException
 
 from orchestrator import main
+from orchestrator.services import thread_workspace_delivery
+from orchestrator.services.container_provisioner import WorkspaceRuntimeAttestation
+from orchestrator.services.container_provisioner import WorkspaceRuntimeAuthorityError
 
 
 JOB_ID = "11111111-1111-4111-8111-111111111111"
@@ -17,8 +28,8 @@ BINDING_GENERATION = "66666666-6666-4666-8666-666666666666"
 FINGERPRINT = "SHA256:" + "A" * 43
 
 
-def _attestation(runtime: str = RUNTIME_A) -> main.WorkspaceRuntimeAttestation:
-    return main.WorkspaceRuntimeAttestation(
+def _attestation(runtime: str = RUNTIME_A) -> WorkspaceRuntimeAttestation:
+    return WorkspaceRuntimeAttestation(
         backing_id=f"k8s-pvc:default:{BACKING}",
         workspace_generation=BACKING,
         runtime_incarnation=runtime,
@@ -99,7 +110,9 @@ async def test_pinned_job_attestation_replaces_endpoint_with_exact_runtime():
         "attest_workspace_runtime",
         AsyncMock(return_value=_attestation()),
     ):
-        exact_job, authority = await main._attest_pinned_k8s_job_workspace(_job())
+        exact_job, authority = await control_seams.attest_pinned_k8s_job_workspace(
+            _job()
+        )
 
     assert authority is not None
     assert authority.attestation.runtime_incarnation == RUNTIME_A
@@ -117,11 +130,11 @@ async def test_pinned_job_same_ip_successor_is_refused_before_delivery():
             AsyncMock(return_value=_attestation(RUNTIME_B)),
         ),
         pytest.raises(
-            main.WorkspaceRuntimeAuthorityError,
+            WorkspaceRuntimeAuthorityError,
             match="runtime changed before delivery",
         ),
     ):
-        await main._attest_pinned_k8s_job_workspace(_job())
+        await control_seams.attest_pinned_k8s_job_workspace(_job())
 
 
 @pytest.mark.asyncio
@@ -136,13 +149,14 @@ async def test_pinned_thread_same_ip_successor_is_refused_before_key_payload():
         patch.object(main.postgres_db, "get_thread", AsyncMock(return_value=thread)),
         pytest.raises(HTTPException) as refused,
     ):
-        await main._attest_pinned_thread_k8s_workspace(
+        await thread_workspace_delivery.attest_pinned_thread_k8s_workspace(
             THREAD_ID,
             thread,
             thread["metadata"],
             workspace,
             binding,
             "sandbox",
+            dependencies=main._thread_workspace_delivery_dependencies(),
         )
 
     assert refused.value.status_code == 409
@@ -159,13 +173,14 @@ async def test_pinned_thread_positive_attestation_binds_backing_and_host_key():
         ),
         patch.object(main.postgres_db, "get_thread", AsyncMock(return_value=thread)),
     ):
-        result = await main._attest_pinned_thread_k8s_workspace(
+        result = await thread_workspace_delivery.attest_pinned_thread_k8s_workspace(
             THREAD_ID,
             thread,
             thread["metadata"],
             workspace,
             binding,
             "sandbox",
+            dependencies=main._thread_workspace_delivery_dependencies(),
         )
 
     assert result == _attestation()
@@ -176,16 +191,19 @@ async def test_vm_hot_upgrade_keeps_separate_authority_path():
     expected = {"status": "provisioning", "thread_id": THREAD_ID}
     with (
         patch.object(main, "require_internal", AsyncMock()),
+        # R1.B06: the VM fork is a call *inside* services/thread_config_update,
+        # so the double has to live there — patching main would be inert.
         patch.object(
-            main,
+            thread_config_update,
             "agent_upgrade_thread_to_vm",
             AsyncMock(return_value=expected),
         ) as upgrade_vm,
     ):
-        result = await main.agent_upgrade_thread_to_workspace(
+        result = await thread_config_update.agent_upgrade_thread_to_workspace(
             MagicMock(),
             THREAD_ID,
             main.ThreadWorkspaceUpgradeRequest(target_tier="vm"),
+            dependencies=main._thread_config_update_dependencies(),
         )
 
     assert result == expected

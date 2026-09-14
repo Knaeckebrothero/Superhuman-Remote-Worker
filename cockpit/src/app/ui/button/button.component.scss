@@ -58,34 +58,31 @@
   // --- Sizes (radius unified via --btn-radius above) ---
   &[data-size='sm'] {
     height: 28px;
-    padding: 0 v.$space-sm;
-    font-size: v.$font-size-xs;
+    padding: 0 10px;
+    font-size: v.$font-size-xs; // 12px
   }
 
   &[data-size='md'] {
-    height: 36px;
-    padding: 0 v.$space-md;
-    font-size: v.$font-size-sm;
+    height: 32px;
+    padding: 0 v.$space-12;
+    font-size: v.$font-size-control; // 13px
   }
 
   &[data-size='lg'] {
-    height: 44px;
-    padding: 0 v.$space-lg;
-    font-size: v.$font-size-base;
+    height: 40px;
+    padding: 0 v.$space-md;
+    font-size: v.$font-size-sm; // 14px
   }
 
   // Full-width takes the host's width.
   :host[data-full-width] & { width: 100%; }
 
   // --- Variants ---
-  // The shape.stamp mixin renders to no-op under non-Roman themes (tokens
-  // unset → transparent shadows). Roman themes set --stamp-* in
-  // _shape-overrides.scss and the visual fires. Tinted variants get the
-  // 'soft' variant because the dark inner shadow muddies on translucent
-  // fills. Ghost has no stamp — transparent button doesn't carry a stamp.
+  // Flat. No bevels, no stamps: hover is a tone step, active a slightly
+  // darker one. Tinted variants are subtle by default (tint bg + tone text)
+  // and solid only on request — see button-appearance.ts.
 
   &[data-variant='primary'] {
-    @include shape.stamp;
     @include type.display;
 
     background: var(--accent-color);
@@ -103,8 +100,6 @@
   }
 
   &[data-variant='secondary'] {
-    @include shape.stamp;
-
     background: var(--surface-0);
     color: var(--text-primary);
     border-color: var(--border-color);
@@ -133,67 +128,35 @@
     }
   }
 
-  &[data-variant='danger'] {
-    @include shape.stamp;
+  @each $tone in danger, success, warning, info {
+    &[data-variant='#{$tone}'] {
+      &[data-appearance='subtle'] {
+        background: var(--#{$tone}-tint);
+        color: var(--#{$tone});
+        border-color: transparent;
 
-    background: var(--danger);
-    color: var(--on-danger);
-    border-color: var(--danger);
+        &:hover:not(:disabled) {
+          filter: brightness(1.08);
+        }
 
-    &:hover:not(:disabled) {
-      filter: brightness(1.05);
-    }
+        &:active:not(:disabled) {
+          filter: brightness(0.96);
+        }
+      }
 
-    &:active:not(:disabled) {
-      filter: brightness(0.95);
-    }
-  }
+      &[data-appearance='solid'] {
+        background: var(--#{$tone});
+        color: var(--on-#{$tone});
+        border-color: var(--#{$tone});
 
-  &[data-variant='success'] {
-    @include shape.stamp;
+        &:hover:not(:disabled) {
+          filter: brightness(1.05);
+        }
 
-    background: var(--success);
-    color: var(--on-success);
-    border-color: var(--success);
-
-    &:hover:not(:disabled) {
-      filter: brightness(1.05);
-    }
-
-    &:active:not(:disabled) {
-      filter: brightness(0.95);
-    }
-  }
-
-  &[data-variant='warning'] {
-    @include shape.stamp('soft');
-
-    background: var(--warning-tint);
-    color: var(--warning);
-    border-color: var(--warning-tint);
-
-    &:hover:not(:disabled) {
-      filter: brightness(1.15);
-    }
-
-    &:active:not(:disabled) {
-      filter: brightness(1.2);
-    }
-  }
-
-  &[data-variant='info'] {
-    @include shape.stamp;
-
-    background: var(--info);
-    color: var(--on-info);
-    border-color: var(--info);
-
-    &:hover:not(:disabled) {
-      filter: brightness(1.05);
-    }
-
-    &:active:not(:disabled) {
-      filter: brightness(0.95);
+        &:active:not(:disabled) {
+          filter: brightness(0.95);
+        }
+      }
     }
   }
 }
@@ -201,8 +164,8 @@
 // CDK FocusMonitor adds .cdk-keyboard-focused on the host when focused via
 // keyboard. Show the focus ring only then; mouse clicks stay clean.
 :host.cdk-keyboard-focused .app-button__btn {
-  outline: 2px solid var(--accent-color);
-  outline-offset: 2px;
+  outline: none;
+  box-shadow: 0 0 0 3px var(--ring);
 }
 
 // --- Loading state ---

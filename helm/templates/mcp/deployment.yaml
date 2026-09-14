@@ -77,6 +77,15 @@ spec:
             {{- end }}
             - name: MCP_BASE_URL
               value: {{ include "srw.mcpUrl" . | quote }}
+          # Tool registration and OIDC discovery can outlast the liveness
+          # window on a cold VM at the default CPU limit. Gate those checks
+          # on successful startup, as for the orchestrator and agents.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            failureThreshold: 30
+            periodSeconds: 10
           livenessProbe:
             httpGet:
               path: /health

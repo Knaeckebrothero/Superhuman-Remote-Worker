@@ -1,10 +1,7 @@
 import {ChangeDetectionStrategy, Component, computed, inject, OnInit} from '@angular/core';
-import {TranslocoPipe} from '@jsverse/transloco';
-import {
-  AdminProvidersService,
-  DEFAULT_MODEL_KINDS,
-  DefaultModelKind,
-} from '../../../core/services/admin-providers.service';
+import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
+import {AdminProvidersService, DEFAULT_MODEL_KINDS, DefaultModelKind, HelmManagedDefault} from '../../../core/services/admin-providers.service';
+import {HelmManagedBadgeComponent} from '../../../ui/helm-managed-badge/helm-managed-badge.component';
 import {ModelService} from '../../../core/services/model.service';
 import {AppSelectComponent} from '../../../ui/select';
 import {AppFormFieldComponent} from '../../../ui/form-field';
@@ -15,6 +12,7 @@ import {AppFormFieldComponent} from '../../../ui/form-field';
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [
     TranslocoPipe,
+    HelmManagedBadgeComponent,
     AppSelectComponent,
     AppFormFieldComponent,
   ],
@@ -32,6 +30,9 @@ import {AppFormFieldComponent} from '../../../ui/form-field';
               <app-form-field
                 [label]="('admin.providers.defaults.kind.' + kind) | transloco"
               >
+                @if (helmFor(kind); as helm) {
+                  <app-helm-managed-badge [managed]="helm.managed_by_helm" [drift]="helm.helm_drift" />
+                }
                 <app-select
                   [value]="admin.defaults()[kind] ?? ''"
                   (changed)="setDefault(kind, $event ?? '')"
@@ -43,6 +44,10 @@ import {AppFormFieldComponent} from '../../../ui/form-field';
                   </option>
                   @if (kind === 'embedding') {
                     @for (m of modelService.embeddingModels(); track m.id) {
+                      <option [value]="m.id">{{ m.label }}</option>
+                    }
+                  } @else if (kind === 'rerank') {
+                    @for (m of modelService.rerankModels(); track m.id) {
                       <option [value]="m.id">{{ m.label }}</option>
                     }
                   } @else if (kind === 'vision') {
@@ -143,6 +148,7 @@ import {AppFormFieldComponent} from '../../../ui/form-field';
 export class AdminDefaultsComponent implements OnInit {
   readonly admin = inject(AdminProvidersService);
   readonly modelService = inject(ModelService);
+  private readonly transloco = inject(TranslocoService);
 
   readonly defaultKinds: DefaultModelKind[] = DEFAULT_MODEL_KINDS;
   readonly catalogEmpty = computed(() =>
@@ -153,7 +159,8 @@ export class AdminDefaultsComponent implements OnInit {
     this.modelService.whisperModels().length === 0 &&
     this.modelService.ttsModels().length === 0 &&
     this.modelService.searchModels().length === 0 &&
-    this.modelService.fetchModels().length === 0,
+    this.modelService.fetchModels().length === 0 &&
+    this.modelService.rerankModels().length === 0,
   );
   readonly searchFallbackMatchesPrimary = computed(() => {
     const primary = this.admin.defaults().search;
@@ -162,10 +169,23 @@ export class AdminDefaultsComponent implements OnInit {
 
   ngOnInit(): void {
     this.admin.loadDefaults();
+    this.admin.loadHelmManaged();
     this.modelService.load();
   }
 
+  /** Provenance of one pin from `GET /api/admin/helm-managed`, once loaded. */
+  helmFor(kind: DefaultModelKind): HelmManagedDefault | null {
+    return this.admin.helmManaged()?.defaults?.[kind] ?? null;
+  }
+
   setDefault(kind: DefaultModelKind, model: string): void {
+    if (this.helmFor(kind)?.managed_by_helm) {
+      if (!confirm(this.transloco.translate('admin.helm.confirmOverride'))) {
+        // Re-render the select with the still-current pin.
+        this.admin.defaults.set({...this.admin.defaults()});
+        return;
+      }
+    }
     this.admin.setDefault(kind, model).subscribe();
   }
 }

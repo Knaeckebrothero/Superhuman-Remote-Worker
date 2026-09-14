@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timezone
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
@@ -36,6 +37,8 @@ from orchestrator.services.infrastructure_metering.capabilities import (
     REQUIRED_SLICE3_STORAGE_APP_TRIGGERS,
     MeteringSchemaCapabilities,
 )
+from orchestrator.services import infrastructure_activation_policy as activation_policy
+from orchestrator.services import infrastructure_admin as infrastructure_admin_service
 from orchestrator.services.infrastructure_metering.collectors.contracts import (
     normalized_payload,
 )
@@ -59,6 +62,10 @@ from orchestrator.services.infrastructure_metering.inventory import (
     InventoryItem,
     TransportNonceClaim,
     WatchMutationAction,
+)
+from orchestrator.services.infrastructure_metering.storage_assets import (
+    StorageActivation,
+    StorageSourceActivation,
 )
 
 
@@ -639,8 +646,6 @@ def test_slice3_capability_requires_complete_schema_and_fixed_activation_rows() 
 
 
 def test_slice3_schema_and_activation_readiness_do_not_enable_publication() -> None:
-    import orchestrator.main as orchestrator_main
-
     settings = _vm_settings()
     ready = _ready_slice3_capabilities()
     activation = ComputeActivation(
@@ -650,15 +655,13 @@ def test_slice3_schema_and_activation_readiness_do_not_enable_publication() -> N
         database_time=_RECEIVED_AT,
     )
 
-    resources = (
-        orchestrator_main._capability_gated_infrastructure_publication_resources(
-            settings,
-            ready,
-            compute_activations={
-                "agent_pod": activation,
-                "workspace_vm": replace(activation, activation_key="workspace_vm"),
-            },
-        )
+    resources = activation_policy.capability_gated_infrastructure_publication_resources(
+        settings,
+        ready,
+        compute_activations={
+            "agent_pod": activation,
+            "workspace_vm": replace(activation, activation_key="workspace_vm"),
+        },
     )
 
     assert resources == ("workspace_pod",)
@@ -669,8 +672,6 @@ def test_slice3_schema_and_activation_readiness_do_not_enable_publication() -> N
 
 
 def test_durable_activation_keeps_collection_mutators_armed() -> None:
-    import orchestrator.main as orchestrator_main
-
     settings = InfrastructureMeteringSettings(
         collector_enabled=True,
         shadow_enabled=False,
@@ -690,13 +691,13 @@ def test_durable_activation_keeps_collection_mutators_armed() -> None:
         )
         for key in ("agent_pod", "ide_workspace_pod", "workspace_vm")
     }
-    claim = orchestrator_main.StorageActivation(
+    claim = StorageActivation(
         measurement_basis="claim-requested",
         state="active",
         activated_at=_RECEIVED_AT,
         database_time=_RECEIVED_AT,
     )
-    source = orchestrator_main.StorageSourceActivation(
+    source = StorageSourceActivation(
         measurement_basis="claim-requested",
         collector_id="kubernetes-pods",
         source_cluster="main-dev",
@@ -705,7 +706,7 @@ def test_durable_activation_keeps_collection_mutators_armed() -> None:
         database_time=_RECEIVED_AT,
     )
 
-    runtime = orchestrator_main._durable_collection_settings(
+    runtime = activation_policy.durable_collection_settings(
         settings,
         compute_activations=active,
         claim_activation=claim,
@@ -722,8 +723,6 @@ def test_durable_activation_keeps_collection_mutators_armed() -> None:
 
 
 def test_remote_only_durable_activation_does_not_enable_primary_pod_shadow() -> None:
-    import orchestrator.main as orchestrator_main
-
     settings = InfrastructureMeteringSettings(
         collector_enabled=True,
         shadow_enabled=False,
@@ -740,7 +739,7 @@ def test_remote_only_durable_activation_does_not_enable_primary_pod_shadow() -> 
         database_time=_RECEIVED_AT,
     )
 
-    runtime = orchestrator_main._durable_collection_settings(
+    runtime = activation_policy.durable_collection_settings(
         settings,
         compute_activations={"workspace_vm": vm_activation},
     )
@@ -752,8 +751,6 @@ def test_remote_only_durable_activation_does_not_enable_primary_pod_shadow() -> 
 
 
 def test_storage_only_durable_activation_does_not_enable_primary_pod_shadow() -> None:
-    import orchestrator.main as orchestrator_main
-
     settings = InfrastructureMeteringSettings(
         collector_enabled=True,
         shadow_enabled=False,
@@ -761,13 +758,13 @@ def test_storage_only_durable_activation_does_not_enable_primary_pod_shadow() ->
         namespace_allowlist=("srw",),
         pvc_inventory_enabled=True,
     )
-    claim = orchestrator_main.StorageActivation(
+    claim = StorageActivation(
         measurement_basis="claim-requested",
         state="active",
         activated_at=_RECEIVED_AT,
         database_time=_RECEIVED_AT,
     )
-    source = orchestrator_main.StorageSourceActivation(
+    source = StorageSourceActivation(
         measurement_basis="claim-requested",
         collector_id="kubernetes-pods",
         source_cluster="main-dev",
@@ -776,7 +773,7 @@ def test_storage_only_durable_activation_does_not_enable_primary_pod_shadow() ->
         database_time=_RECEIVED_AT,
     )
 
-    runtime = orchestrator_main._durable_collection_settings(
+    runtime = activation_policy.durable_collection_settings(
         settings,
         claim_activation=claim,
         source_activations=(source,),
@@ -788,19 +785,25 @@ def test_storage_only_durable_activation_does_not_enable_primary_pod_shadow() ->
     assert runtime.ide_pod_shadow_enabled is False
 
 
-def test_active_compute_rollover_gate_is_not_reversed_by_helm(monkeypatch) -> None:
-    import orchestrator.main as orchestrator_main
+def test_active_compute_rollover_gate_is_not_reversed_by_helm() -> None:
+    """A durably activated class stays mutable even with its Helm boolean off."""
 
-    monkeypatch.setattr(
-        orchestrator_main,
-        "infrastructure_metering_settings",
-        InfrastructureMeteringSettings(),
-    )
-    monkeypatch.setattr(
-        orchestrator_main,
-        "infrastructure_durable_compute_activation_keys",
-        frozenset({"agent_pod"}),
+    dependencies = infrastructure_admin_service.InfrastructureAdminDependencies(
+        store=None,
+        logger=logging.getLogger("test"),
+        settings=InfrastructureMeteringSettings(),
+        durable_compute_activation_keys=frozenset({"agent_pod"}),
     )
 
-    assert orchestrator_main._compute_class_shadow_enabled("agent_pod") is True
-    assert orchestrator_main._compute_class_shadow_enabled("ide_workspace_pod") is False
+    assert (
+        infrastructure_admin_service.compute_class_shadow_enabled(
+            "agent_pod", dependencies=dependencies
+        )
+        is True
+    )
+    assert (
+        infrastructure_admin_service.compute_class_shadow_enabled(
+            "ide_workspace_pod", dependencies=dependencies
+        )
+        is False
+    )

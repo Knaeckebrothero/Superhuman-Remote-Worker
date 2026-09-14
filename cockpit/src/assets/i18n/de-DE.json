@@ -120,6 +120,9 @@
     "hide": "Canvas ausblenden",
     "skipToCanvas": "Zum Canvas springen",
     "newContent": "Neuer Canvas-Inhalt verfügbar",
+    "workspaceFile": {
+      "notPresented": "{{path}} ist eine Datei im Workspace dieser Session. Bitte den Agenten, sie im Canvas zu präsentieren."
+    },
     "returnToChat": "Zurück zum Chat",
     "resize": "Chat und Canvas in der Größe ändern",
     "empty": "Der Agent hat noch nichts präsentiert.",
@@ -345,6 +348,7 @@
     "rename": "Umbenennen",
     "copy": "Kopieren",
     "copied": "Kopiert",
+    "copyFailed": "Kopieren in die Zwischenablage fehlgeschlagen",
     "never": "Nie",
     "default": "Standard",
     "noKey": "(kein Schlüssel)"
@@ -369,6 +373,15 @@
   "nav": {
     "cockpit": "Cockpit",
     "builder": "Builder",
+    "modeChat": "Chat",
+    "modeJobs": "Jobs",
+    "modeProjects": "Projekte",
+    "newChat": "Neuer Chat",
+    "searchSessions": "Sitzungen durchsuchen",
+    "clearFilter": "Filter löschen",
+    "noSessionsYet": "Noch keine Sitzungen",
+    "noMatches": "Keine Treffer",
+    "seeAllSessions": "Alle Sitzungen anzeigen",
     "sessions": "Sitzungen",
     "jobs": "Aufträge",
     "review": "Auftragsprüfung",
@@ -383,8 +396,17 @@
     "settings": "Einstellungen",
     "logout": "Abmelden",
     "admin": "Admin",
+    "more": "Mehr",
+    "apiKeys": "API-Schlüssel",
+    "sshKeys": "SSH-Schlüssel",
     "collapseSidebar": "Seitenleiste einklappen",
-    "openSidebar": "Seitenleiste öffnen"
+    "openSidebar": "Seitenleiste öffnen",
+    "resizeSidebar": "Seitenleiste anpassen",
+    "recency": {
+      "today": "Heute",
+      "yesterday": "Gestern",
+      "earlier": "Früher"
+    }
   },
   "grants": {
     "lockedShort": "Erfordert eine Freigabe",
@@ -847,6 +869,8 @@
       "scopeLabel": "Verbrauchsbereich",
       "scopeNoSubjobs": "Dieser Job hat keine Teil-Jobs, beide Werte sind daher identisch.",
       "scopeSubtree": "Inkl. Teil-Jobs",
+      "showLess": "Weniger anzeigen",
+      "showMore": "Mehr anzeigen",
       "showSubjobRows": "{{count}} ausgeblendete als Zeilen anzeigen",
       "showSubjobRowsHint": "Fügt Unteraufträge zum Herkunftsfilter hinzu, damit sie in der Liste erscheinen.",
       "subjobs": "Unteraufträge ({{count}})",
@@ -857,9 +881,9 @@
       "subagentsTranscript": "Transkript",
       "subagentsStatuses": {
         "queued": "In Warteschlange",
+        "parked": "Geparkt",
         "running": "Läuft",
         "completed": "Abgeschlossen",
-        "parked": "Geparkt",
         "interrupted": "Unterbrochen",
         "capped": "Begrenzt",
         "error": "Fehler",
@@ -875,6 +899,51 @@
     }
   },
   "admin": {
+    "helm": {
+      "badge": "Helm",
+      "badgeDrift": "Helm · überschrieben",
+      "tooltip": "Mit reconcile: true in den Helm-Values des Deployments deklariert. Änderungen hier werden beim nächsten helm upgrade zurückgesetzt.",
+      "tooltipDrift": "Nach dem letzten Helm-Apply hier bearbeitet. Das nächste helm upgrade setzt diese Zeile auf den deklarierten Wert zurück.",
+      "confirmOverride": "Diese Zeile wird von Helm verwaltet (reconcile: true in den Deployment-Values). Die Änderung wird beim nächsten helm upgrade zurückgesetzt, sofern die Values nicht ebenfalls angepasst werden. Fortfahren?"
+    },
+    "nav": {
+      "models": "Modelle",
+      "users": "Benutzer",
+      "config": "Konfiguration",
+      "grants": "Berechtigungen",
+      "usage": "Nutzung",
+      "capacity": "Kapazität"
+    },
+    "capacity": {
+      "title": "Kapazität",
+      "desc": "Was der Stateless-Pool und sein Autoscaler gerade sehen: Executors, anstehende Arbeit und nach einem Fehler geparkte Einheiten.",
+      "executors": "Executors",
+      "ready": "bereit",
+      "busy": "belegt",
+      "queued": "In der Warteschlange",
+      "sessions": "Sitzungen",
+      "batches": "Batches",
+      "oldestQueued": "Älteste wartende",
+      "desired": "Gewünschte Replikas",
+      "floor": "Minimum",
+      "reserve": "Reserve",
+      "parked": "Geparkte Einheiten",
+      "none": "Nichts ist geparkt.",
+      "unpark": "Freigeben",
+      "unparked": "Einheit wieder eingereiht.",
+      "unparkFailed": "Freigeben fehlgeschlagen.",
+      "loadFailed": "Kapazität konnte nicht geladen werden.",
+      "observedAt": "Stand {{time}}",
+      "colTitle": "Sitzung",
+      "colOwner": "Besitzer",
+      "colKind": "Art",
+      "colReason": "Grund",
+      "colParkedAt": "Geparkt",
+      "colAttempts": "Versuche",
+      "colPending": "Offene Eingabe",
+      "yes": "ja",
+      "no": "nein"
+    },
     "config": {
       "messages": {
         "saveEmpty": "Nichts zu speichern — wählen Sie einen Konfigurationsschlüssel und geben Sie einen Wert ein.",
@@ -983,7 +1052,8 @@
           "tts": "Sprachsynthese",
           "search": "Suche (primär)",
           "fetch": "Web-Abruf",
-          "search_fallback": "Such-Fallback"
+          "search_fallback": "Such-Fallback",
+          "rerank": "Rerank (Sortierung der Memory-Treffer)"
         }
       }
     },
@@ -1005,8 +1075,14 @@
     "title": "Einstellungen",
     "appearance": {
       "title": "Erscheinungsbild",
-      "desc": "Wählen Sie zwischen hellem und dunklem Modus oder folgen Sie der Systemeinstellung. Die Auswahl wird auf diesem Gerät gespeichert.",
-      "themeLabel": "Design"
+      "desc": "Wählen Sie zwischen hellem und dunklem Modus oder folgen Sie der Systemeinstellung, und legen Sie die Akzentfarbe fest. Beide Einstellungen werden auf diesem Gerät gespeichert.",
+      "themeLabel": "Design",
+      "accentLabel": "Akzentfarbe",
+      "accents": {
+        "tyrian": "Tyrisches Purpur",
+        "porphyry": "Porphyrrot",
+        "graphite": "Graphit"
+      }
     },
     "language": {
       "title": "Sprache",
@@ -1189,6 +1265,7 @@
       "permissionAutoAccept": "Auto-akzeptieren",
       "permissionAutonomous": "Autonom",
       "workspaceBackend": "Standard-Arbeitsbereich",
+      "workspaceRecommendation": "Dieser Experte empfiehlt {{tier}}. Du kannst einen anderen Workspace wählen.",
       "workspaceBackendHint": "Wo neue Sitzungen ihre Dateien ablegen. Virtuell startet in Sekunden und kann während der Sitzung auf einen Container aufgerüstet werden; Container bietet von Anfang an Shell und Git, braucht aber länger zum Bereitstellen.",
       "workspaceVirtual": "Virtuell — sofort, Dateien im Cloud-Speicher",
       "workspaceSandbox": "Container — volle Shell & Git, langsamerer Start",
@@ -1245,41 +1322,86 @@
       "webConnectorDesc": "Fügen Sie diese URL als benutzerdefinierten MCP-Konnektor hinzu. OAuth-Anmeldung wird automatisch durchgeführt — kein Token oder Anmeldeinformationen erforderlich.",
       "webConnectorHint": "Funktioniert mit jedem MCP-Client, der OAuth 2.1 (Authorization Code + PKCE) unterstützt. Lassen Sie die Felder Client-ID und Client-Secret leer — der Server übernimmt die Registrierung automatisch."
     },
-    "codex": {
-      "title": "Codex-Proxy",
-      "desc": "Verwalten Sie den Codex-OAuth-Proxy für ChatGPT-Abo-basierte Modelle",
+    "subscriptions": {
+      "title": "KI-Abos",
+      "desc": "Verbinden Sie Abo-Konten über den gemeinsamen Proxy. Modelle werden separat unter Admin → Models registriert.",
       "checking": "Proxy wird geprüft…",
       "connected": "Verbunden",
-      "notConnected": "Nicht verbunden",
+      "notConnected": "Kein Konto verbunden",
       "notEnabled": "Proxy nicht aktiviert",
-      "disabledTitle": "Codex-Proxy ist nicht aktiviert",
-      "disabledDesc": "Auf dieser Instanz läuft der Codex-OAuth-Proxy nicht, daher sind ChatGPT-Abo-basierte Modelle nicht verfügbar. Um ihn zu aktivieren, setzen Sie folgenden Wert in Ihrem Helm-Values-Overlay, deployen Sie neu und laden Sie diese Seite neu:",
+      "modelsAvailable": "{{count}} Modell(e) verfügbar",
       "refreshStatus": "Status aktualisieren",
       "disconnect": "Trennen",
-      "availableModels": "Verfügbare Modelle",
-      "waiting": "Warte auf OAuth…",
-      "connectAccount": "ChatGPT-Konto verbinden",
-      "completeSignIn": "Anmeldung abschließen",
-      "step1": "Melden Sie sich mit Ihrem OpenAI-Konto im gerade geöffneten Tab an.",
-      "step2": "Nach der Anmeldung versucht der Browser, auf localhost umzuleiten, und zeigt einen Fehler — das ist erwartet.",
-      "step3": "Kopieren Sie die vollständige URL aus der Adressleiste Ihres Browsers.",
-      "step4": "Fügen Sie sie unten ein und klicken Sie auf „Anmeldung abschließen“.",
-      "callbackPlaceholder": "Callback-URL hier einfügen…",
-      "submitting": "Wird gesendet…",
-      "completeLogin": "Anmeldung abschließen",
-      "portForwardHint": "Wenn kubectl port-forward aktiv ist, wird die Anmeldung automatisch abgeschlossen.",
+      "connect": "Verbinden",
+      "cancel": "Anmeldung abbrechen",
+      "dismiss": "Ausblenden",
+      "addTitle": "Abo hinzufügen",
+      "connectedCount": "{{count}} verbunden",
+      "unverified": "Nicht live verifiziert",
+      "disabledTitle": "Der Subscription-Proxy ist nicht aktiviert",
+      "disabledDesc": "Auf dieser Instanz läuft der Subscription-Proxy nicht, daher sind Abo-basierte Modelle nicht verfügbar. Um ihn zu aktivieren, setzen Sie folgenden Wert in Ihrem Helm-Values-Overlay, deployen Sie neu und laden Sie diese Seite neu:",
+      "providers": {
+        "openai-codex": "OpenAI · ChatGPT / Codex",
+        "anthropic-claude-code": "Anthropic · Claude Code",
+        "google-antigravity": "Google · Antigravity",
+        "xai-grok-build": "xAI · Grok Build",
+        "kimi-code": "Moonshot · Kimi Code"
+      },
+      "flows": {
+        "browser": "Melden Sie sich im Browser an und fügen Sie anschließend die Callback-URL ein, falls der Redirect diesen Server nicht erreicht.",
+        "device": "Öffnen Sie den Verifizierungslink und geben Sie den hier angezeigten Code ein."
+      },
+      "states": {
+        "connected": "Verbunden",
+        "pending": "Wartet auf Autorisierung",
+        "refreshing": "Token wird erneuert",
+        "cooldown": "Vorübergehend gedrosselt",
+        "error": "Fehler",
+        "disabled": "Deaktiviert",
+        "unknown": "Unbekannt"
+      },
+      "scope": {
+        "installation": "Gemeinsam"
+      },
+      "browser": {
+        "step1": "Melden Sie sich beim Anbieter im gerade geöffneten Tab an:",
+        "openLink": "Anmeldeseite öffnen",
+        "step2": "Nach der Anmeldung leitet der Browser auf localhost um und zeigt möglicherweise einen Fehler — das ist bei einem Remote-Deployment erwartet.",
+        "step3": "Kopieren Sie die vollständige URL aus der Adressleiste und fügen Sie sie unten ein.",
+        "callbackPlaceholder": "Callback-URL hier einfügen…",
+        "complete": "Anmeldung abschließen",
+        "remoteHint": "Wenn der Redirect den Proxy direkt erreicht, wird die Anmeldung automatisch abgeschlossen und dieses Feld ist nicht nötig."
+      },
+      "device": {
+        "step1": "Öffnen Sie die Verifizierungsseite:",
+        "step2": "Geben Sie diesen Code ein:",
+        "step3": "Bestätigen Sie die Anfrage und lassen Sie diese Seite offen, bis „Verbunden“ angezeigt wird.",
+        "expires": "Der Code läuft um {{time}} ab."
+      },
+      "login": {
+        "pending": "Warte auf Autorisierung durch {{provider}}…",
+        "verifying": "Autorisierung gemeldet — Credential wird bestätigt…",
+        "connected": "{{provider}} verbunden.",
+        "failed": "Anmeldung bei {{provider}} fehlgeschlagen.",
+        "cancelled": "Anmeldung bei {{provider}} abgebrochen."
+      },
       "usage": {
+        "check": "Nutzung prüfen",
+        "toggle": "Nutzung",
+        "unavailable": "Nutzung nicht verfügbar",
         "title": "Nutzungslimits",
         "session": "Aktuelle Sitzung",
         "weekly": "Wochenlimit",
         "resetsIn": "Zurücksetzung in {{time}}",
         "limitReached": "Limit erreicht",
-        "disclaimer": "Der Proxy stellt keine Nutzungsdaten bereit: ChatGPT erfasst über den Proxy geleitete Anfragen als 'zusätzliche Nutzung' außerhalb dieser Fenster, daher spiegeln diese Balken die Proxy-Nutzung noch nicht wider."
+        "disclaimer": "Vom Anbieter für dieses Konto gemeldet. Der Proxy erfasst selbst keine Nutzung, daher können über ihn geleitete Anfragen abweichend gezählt werden."
       },
       "errors": {
-        "urlMissingParams": "Der URL fehlen erforderliche Parameter. Bitte fügen Sie die vollständige URL aus der Adressleiste Ihres Browsers ein.",
-        "invalidUrl": "Ungültige URL. Bitte fügen Sie die vollständige URL aus der Adressleiste Ihres Browsers ein.",
-        "completeFailed": "Anmeldung konnte nicht abgeschlossen werden. Bitte erneut versuchen."
+        "startFailed": "Anmeldung konnte nicht gestartet werden. Prüfen Sie, ob der Proxy erreichbar ist.",
+        "completeFailed": "Anmeldung konnte nicht abgeschlossen werden. Bitte erneut versuchen.",
+        "timeout": "Die Anmeldung ist abgelaufen, bevor sie bestätigt wurde.",
+        "credential_not_persisted": "Der Anbieter meldete Erfolg, es wurde jedoch kein Credential gespeichert. Bitte erneut verbinden.",
+        "authorization_failed": "Der Anbieter hat die Autorisierung abgelehnt."
       }
     },
     "cloud": {
@@ -1574,20 +1696,17 @@
       "filesButton": "Dateien",
       "filesTooltip": "Sitzungsdateien in der Cloud öffnen",
       "gitButton": "Git",
-      "gitTooltip": "Arbeitsbereich in Gitea anzeigen",
       "ideButton": "IDE",
-      "ideActiveTooltip": "Arbeitsbereich in der IDE öffnen",
       "ideLoadingTooltip": "Arbeitsbereich wird gestartet...",
       "citationsButton": "Quellen",
-      "citationsTooltip": "Quellen dieser Sitzung anzeigen",
       "moreActions": "Weitere Aktionen",
+      "copySessionId": "Sitzungs-ID {{id}} kopieren",
       "disconnect": "Trennen",
       "disconnecting": "Wird getrennt…",
       "projectFilesButton": "Projektdateien",
       "projectFilesTooltip": "Projektordner {{name}} in Ihrer Cloud öffnen",
       "sessionFilesButton": "Sitzungsdateien",
-      "sshButton": "SSH",
-      "sshTooltip": "Über SSH mit dem Arbeitsbereich dieser Sitzung verbinden"
+      "sshButton": "SSH"
     },
     "ssh": {
       "intro": "Verbinden Sie sich mit dem Arbeitsbereich dieser Sitzung über Ihr eigenes Terminal, Ihren Editor oder Ihre IDE.",
@@ -1624,8 +1743,6 @@
       "statusUnknown": "Unbekannt"
     },
     "status": {
-      "temp": "Temp. {{value}}",
-      "turn": "Zug {{count}}",
       "agentQuiet": "Arbeitet — keine Ausgabe seit {{seconds}}s",
       "cloudSyncOff": "Cloud-Sync aus",
       "cloudSyncOffTooltip": "Die Cloud-Synchronisierung konnte für diese Sitzung nicht gestartet werden. Im Arbeitsbereich fehlen möglicherweise Dateien aus der Cloud, und Änderungen werden nicht zurückgespeichert."
@@ -1655,6 +1772,23 @@
       "foldMore": "+{{count}} weitere",
       "foldFailed": "⚠ {{count}} fehlgeschlagen",
       "parked": "Dieser Zug wurde nach wiederholten Executor-Fehlern angehalten und erfordert einen Eingriff durch den Administrator."
+    },
+    "queue": {
+      "waiting": "Warten auf einen verfügbaren Agenten…",
+      "busy": "Unsere Systeme sind stärker ausgelastet als üblich – das kann einige Minuten dauern. Sie können die Seite verlassen; die Antwort wartet hier auf Sie.",
+      "elapsed": "Wartezeit {{time}}"
+    },
+    "parked": {
+      "title": "Diese Nachricht konnte nicht verarbeitet werden",
+      "retry": "Erneut versuchen",
+      "retrying": "Wird erneut eingereiht…",
+      "retryFailed": "Erneuter Versuch abgelehnt ({{code}})",
+      "reason": {
+        "attachFailed": "Der Agent konnte diese Sitzung nicht wieder aufnehmen.",
+        "shutdownCancelled": "Die Antwort wurde durch Wartungsarbeiten unterbrochen.",
+        "stopped": "Die Sitzung wurde beendet, bevor diese Nachricht verarbeitet wurde.",
+        "generic": "Die Sitzung ist auf ein Problem gestoßen, das sie nicht selbst beheben kann — ein Administrator muss sie freigeben, bevor diese Nachricht ausgeführt werden kann."
+      }
     },
     "queued": {
       "notSent": "Nicht gesendet",
@@ -1783,7 +1917,11 @@
       "connectorsFailed": "Standard-Konnektoren konnten nicht geladen werden.",
       "connectorsRetry": "Erneut versuchen",
       "connectorsCount": "Standard-Konnektoren ({{count}})",
-      "defaultsFailed": "Standardprojekt und Konnektoren konnten nicht geladen werden. Vor dem Senden erneut versuchen."
+      "defaultsFailed": "Sitzungsstandards konnten nicht geladen werden. Vor dem Senden erneut versuchen.",
+      "recoveryTitle": "Dein Chat konnte nicht starten",
+      "recoveryBody": "Deine Nachrichten wurden noch nicht gesendet. Passe die Optionen unten an und versuche es erneut.",
+      "workspaceDefault": "Projekt- oder Kontostandard verwenden",
+      "retrySend": "Erneut senden"
     },
     "ended": {
       "eyebrow": "Wiederaufnehmbar",
@@ -1833,7 +1971,11 @@
     "control": {
       "backpressure": "Zu viele Änderungen an den Sitzungseinstellungen warten. Versuche es gleich erneut.",
       "admissionFailed": "Die Sitzungseinstellung konnte nicht geändert werden. Versuche es erneut.",
-      "ownerRejected": "Der ausführende Agent hat diese Sitzungseinstellung abgelehnt. Lade die Seite neu und versuche es erneut."
+      "ownerRejected": "Der ausführende Agent hat diese Sitzungseinstellung abgelehnt. Lade die Seite neu und versuche es erneut.",
+      "unavailable": "Diese Steuerung ist in dieser Sitzung nicht verfügbar.",
+      "applyFailed": "Die Sitzungseinstellungen konnten nicht übernommen werden.",
+      "applyTimeout": "Die Sitzung hat die Einstellungsänderung nicht bestätigt. Öffne die Einstellungen erneut, um den aktuellen Stand zu sehen.",
+      "appliedNextTurn": "Sitzungseinstellungen aktualisiert: {{summary}} — gilt ab der nächsten Antwort."
     },
     "workspaceOffer": {
       "title": "Workspace-Upgrade angefordert",
@@ -1861,6 +2003,9 @@
       "sessionStarting": "Schreiben Sie Ihre Nachricht, während die Sitzung startet...",
       "stopping": "Wird gestoppt...",
       "working": "Agent arbeitet...",
+      "queued": "Warten auf einen verfügbaren Agenten…",
+      "parked": "Diese Nachricht muss erneut gesendet werden",
+      "parkedBlocked": "Blockiert, bis ein Administrator sie freigibt",
       "reconnecting": "Getrennt — verbinde erneut…",
       "uploading": "Anhänge werden hochgeladen…",
       "default": "Nachricht eingeben... (Eingabe zum Senden, Umschalt+Eingabe für neue Zeile)",
@@ -2242,7 +2387,8 @@
       "mcp": "MCP-Server",
       "kubeconfig": "Kubeconfig",
       "ssh_key": "SSH-Schlüssel",
-      "generic_file": "Datei"
+      "generic_file": "Datei",
+      "credentials": "Zugangsdaten"
     },
     "catalog": {
       "search": "Konnektoren durchsuchen…",
@@ -2450,7 +2596,9 @@
       "emailUnattendedSendLabel": "Versand-Freigabe",
       "emailUnattendedSendToggle": "Ohne menschliche Freigabe senden",
       "emailUnattendedSendHint": "Erfordert die vom Admin vergebene Berechtigung email_autonomous_send — andernfalls lehnt der Server dies ab. Ist die Option aus, wird der Direktversand abgelehnt; die geplante Freigabe-Warteschlange ist noch nicht verfügbar, daher sollte ein Entwurf verwendet werden.",
-      "emailNotPublishableHint": "E-Mail-Konnektoren können nicht veröffentlicht werden — Postfächer bleiben privat."
+      "emailNotPublishableHint": "E-Mail-Konnektoren können nicht veröffentlicht werden — Postfächer bleiben privat.",
+      "optCredentials": "Zugangsdaten (Umgebungsvariablen)",
+      "credentialsEnvHint": "Für Skripte im Workspace und Browser-Anmeldungen. Variablen hinzufügen oder ersetzen; leere Werte behalten vorhandene Zugangsdaten. Nach dem Anhängen bleibt dieser Connector für die Sitzung verbunden. Agent-Ausgaben werden nicht gefiltert. Die Gültigkeitsdauer bestimmt dein Anbieter."
     },
     "publishDialog": {
       "title": "Konnektor veröffentlichen?",
@@ -2718,7 +2866,6 @@
     "timeNow": "jetzt"
   },
   "jobReview": {
-    "title": "Job-Review",
     "empty": {
       "selectJob": "Wählen Sie einen Job zur Prüfung aus",
       "notFound": "Job nicht gefunden",
@@ -3024,7 +3171,9 @@
       "unavailableLive": "Dieser angehängte Konnektor ist nicht mehr autorisiert oder im Geltungsbereich. Entfernen Sie ihn, bevor Sie fortfahren.",
       "unavailableBadge": "Nicht verfügbar",
       "notReady": "Noch nicht vollständig indiziert — der Agent sieht möglicherweise unvollständige Ergebnisse.",
-      "lockedLive": "Wissensdatenbanken können während einer Session nicht geändert werden"
+      "lockedLive": "Wissensdatenbanken können während einer Session nicht geändert werden",
+      "credentialsLocked": "Zugangsdaten bleiben für diese Sitzung verbunden",
+      "credentialsUnavailable": "Dieser Zugangsdaten-Konnektor ist nicht mehr verfügbar. Beende diese Sitzung und starte eine neue, um ihre Konnektoren zu ändern."
     },
     "execution": {
       "group": "Ausführung",
@@ -3117,6 +3266,9 @@
         "predicted": "Vorhergesagt, nicht gemessen",
         "unknown": "Der aufgelöste Werkzeugsatz konnte nicht gelesen werden"
       },
+      "rosterTitle": "Subagenten, an die dieser Experte delegieren kann",
+      "rosterDefault": "(Standard)",
+      "rosterEmpty": "Dieser Experte hat keine Subagenten-Riege, delegate_agent hat also nichts auszuführen — jeder Aufruf liefert einen Fehler. Riege beim Experten unter Subagenten hinzufügen.",
       "unknownCategory": "Dieser Cockpit-Build hat keine Beschreibung für diese Kategorie."
     },
     "toolCategories": {
@@ -3962,6 +4114,8 @@
       "error": "Fehler",
       "summary": "Zusammenfassung",
       "requestType": "Anfrage",
+      "requestId": "Anfrage-ID",
+      "expiresAt": "Läuft ab",
       "vm": "VM",
       "user": "Benutzer",
       "cwd": "CWD",

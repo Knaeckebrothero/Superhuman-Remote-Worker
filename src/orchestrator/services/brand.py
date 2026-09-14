@@ -9,7 +9,11 @@ Why literal hexes instead of reading the design tokens:
    The runtime has no access to cockpit SCSS even in principle.
 
 tests/test_brand_palette.py parses the SCSS and fails closed if these drift.
-Mirror of $travertine-theme in cockpit/src/styles/themes/_theme-config.scss.
+Mirror of $travertine-theme plus the DEFAULT accent ($accents / $default-accent,
+Tyrian since 2026-09-10) in cockpit/src/styles/themes/_theme-config.scss.
+Email and the login page are not per-user themed, so they always wear the
+default accent; the user-selectable Porphyry and Graphite accents stay in
+the cockpit.
 """
 
 SCSS_TOKEN_SOURCE = "cockpit/src/styles/themes/_theme-config.scss"
@@ -31,7 +35,7 @@ TRAVERTINE: dict[str, str] = {
     "text-primary": "#2a1d12",  # deep umber
     "text-secondary": "#5a4632",
     "text-muted": "#8a7b66",
-    "accent-color": "#9c2832",  # porphyry -- links, primary action
+    "accent-color": "#5f499c",  # tyrian (default accent) -- links, primary action
     "success": "#446b3e",  # laurel -- approve
     "danger": "#9c2832",  # blood -- deny
     "on-accent": "#ffffff",

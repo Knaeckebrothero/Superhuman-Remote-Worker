@@ -245,7 +245,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                 <div class="empty-inline">{{ 'projectDetail.jobs.empty' | transloco }}</div>
               } @else {
                 <div class="table-scroll">
-                <table class="data-table">
+                <table class="data-table app-table">
                   <thead>
                     <tr>
                       <th>{{ 'projectDetail.jobs.colStatus' | transloco }}</th>
@@ -603,7 +603,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                 <div class="empty-inline">{{ 'projectDetail.datasources.empty' | transloco }}</div>
               } @else {
                 <div class="table-scroll">
-                <table class="data-table">
+                <table class="data-table app-table">
                   <thead>
                     <tr>
                       <th>{{ 'projectDetail.datasources.colName' | transloco }}</th>
@@ -719,7 +719,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                 <div class="empty-inline">{{ 'projectDetail.repos.empty' | transloco }}</div>
               } @else {
                 <div class="table-scroll">
-                <table class="data-table">
+                <table class="data-table app-table">
                   <thead>
                     <tr>
                       <th>{{ 'projectDetail.repos.colRole' | transloco }}</th>
@@ -838,7 +838,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                 <div class="empty-inline">{{ 'projectDetail.members.empty' | transloco }}</div>
               } @else {
                 <div class="table-scroll">
-                <table class="data-table">
+                <table class="data-table app-table">
                   <thead>
                     <tr>
                       <th>{{ 'projectDetail.members.colUser' | transloco }}</th>
@@ -1137,13 +1137,15 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
       margin-bottom: 20px;
     }
 
-    .header-info { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+    .header-info { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; flex: 1 1 auto; min-width: 0; }
 
     .page-title {
       font-size: 22px;
       font-weight: 700;
       color: var(--text-primary);
       margin: 0;
+      min-width: 0;
+      max-width: 100%;
     }
 
     .header-badges { display: flex; gap: 6px; }
@@ -1213,12 +1215,16 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
       border-bottom-color: var(--accent-color);
     }
 
+    /* Mirrors app-button[ghost][md] so it sits level with its button siblings. */
     .ghost-link {
       display: inline-flex;
       align-items: center;
-      padding: 8px 16px;
+      height: 32px;
+      padding: 0 12px;
       border-radius: var(--radius-control);
       font-size: 13px;
+      font-weight: 500;
+      line-height: 1.25;
       color: var(--text-secondary);
       text-decoration: none;
       border: 1px solid transparent;
@@ -1255,7 +1261,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
       font-size: 11px;
       color: var(--text-muted);
       text-transform: uppercase;
-      letter-spacing: 0.5px;
+      letter-spacing: 0.06em;
       margin-bottom: 6px;
     }
 
@@ -1304,32 +1310,6 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
 
     /* Tables */
     .table-section { display: flex; flex-direction: column; gap: 12px; }
-
-    .data-table {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 12px;
-    }
-
-    .data-table th {
-      text-align: left;
-      padding: 10px 12px;
-      background: var(--surface-0);
-      color: var(--text-muted);
-      font-weight: 500;
-      text-transform: uppercase;
-      font-size: 10px;
-      letter-spacing: 0.5px;
-      border-bottom: 1px solid var(--border-color);
-    }
-
-    .data-table td {
-      padding: 10px 12px;
-      border-bottom: 1px solid var(--border-color);
-      color: var(--text-primary);
-      vertical-align: middle;
-    }
-
     .desc-cell { max-width: 250px; }
     .url-cell { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
@@ -1834,7 +1814,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
     }
     .kb-detail-content ::ng-deep th {
       font-weight: 600; color: var(--accent-color);
-      font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px;
+      font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em;
     }
 
     .kb-detail-content ::ng-deep hr {
@@ -1850,7 +1830,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
     }
 
     .kb-relationships h4 {
-      font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;
+      font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em;
       color: var(--text-muted); margin: 0 0 8px 0;
     }
 

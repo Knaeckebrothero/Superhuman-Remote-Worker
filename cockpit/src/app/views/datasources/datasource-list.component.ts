@@ -1,3 +1,4 @@
+import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
 import {Component, computed, DestroyRef, inject, OnInit, signal} from '@angular/core';
 import {takeUntilDestroyed} from '@angular/core/rxjs-interop';
 import {forkJoin, timer} from 'rxjs';
@@ -46,7 +47,7 @@ type KeyValueRow = {key: string; value: string};
   selector: 'app-datasource-list',
   standalone: true,
   imports: [
-    TranslocoPipe,
+    SidebarToggleComponent, TranslocoPipe,
     AppButtonComponent,
     AppIconButtonComponent,
     AppBadgeComponent,
@@ -67,6 +68,7 @@ type KeyValueRow = {key: string; value: string};
     <div class="ds-container" [class.form-open]="showForm()">
       <!-- Header -->
       <div class="header-bar">
+        <app-sidebar-toggle />
         <span class="title">{{ 'datasources.title' | transloco }}</span>
         <div class="filter-chips">
           @for (filter of typeFilters; track filter.value) {
@@ -81,7 +83,7 @@ type KeyValueRow = {key: string; value: string};
         </div>
         <div class="header-actions">
           <app-button
-            variant="success"
+            variant="primary"
             size="sm"
             [disabled]="showForm()"
             (clicked)="openCreateForm()"
@@ -211,6 +213,7 @@ type KeyValueRow = {key: string; value: string};
                   [disabled]="isSaving() || !!editingId()"
                 >
                   <optgroup [label]="'datasources.form.typeGroupCli' | transloco">
+                    <option value="credentials">{{ 'datasources.form.optCredentials' | transloco }}</option>
                     <option value="generic">{{ 'datasources.form.optGeneric' | transloco }}</option>
                   </optgroup>
                   <optgroup [label]="'datasources.form.typeGroupKnowledge' | transloco">
@@ -255,7 +258,7 @@ type KeyValueRow = {key: string; value: string};
             }
 
             <!-- Connection URL (required for non-generic, non-credential-file types) -->
-            @if (hasConnectionUrl() && formData.type !== 'generic') {
+            @if (hasConnectionUrl() && !isEnvType()) {
               <app-form-field
                 [label]="(isGitBackedType() ? 'datasources.form.repoUrlLabel' : 'datasources.form.connectionUrlLabel') | transloco"
                 [required]="true"
@@ -272,7 +275,7 @@ type KeyValueRow = {key: string; value: string};
             }
 
             <!-- Generic: optional connection URL -->
-            @if (formData.type === 'generic') {
+            @if (isEnvType()) {
               <app-form-field [label]="'datasources.form.connectionUrlLabel' | transloco" [optional]="'datasources.form.optional' | transloco">
                 <app-input
                   size="sm"
@@ -458,7 +461,7 @@ type KeyValueRow = {key: string; value: string};
             }
 
             <!-- Generic: CLI hint -->
-            @if (formData.type === 'generic') {
+            @if (isEnvType()) {
               <app-form-field [label]="'datasources.form.cliHintLabel' | transloco" [optional]="'datasources.form.optional' | transloco">
                 <app-input
                   size="sm"
@@ -472,8 +475,8 @@ type KeyValueRow = {key: string; value: string};
             }
 
             <!-- Generic: Environment Variables -->
-            @if (formData.type === 'generic') {
-              <app-form-field [label]="'datasources.form.envVarsLabel' | transloco" [hint]="'datasources.form.envHint' | transloco">
+            @if (isEnvType()) {
+              <app-form-field [label]="'datasources.form.envVarsLabel' | transloco" [hint]="(formData.type === 'credentials' ? 'datasources.form.credentialsEnvHint' : 'datasources.form.envHint') | transloco">
                 <div class="env-vars-editor">
                   @for (envVar of envVars; track $index) {
                     <div class="env-var-row">
@@ -1245,7 +1248,7 @@ type KeyValueRow = {key: string; value: string};
                 {{ 'datasources.form.emailNotPublishableHint' | transloco }}
               </div>
             }
-            @if (capabilities.canPublishDatasources() && formData.type !== 'email') {
+            @if (capabilities.canPublishDatasources() && formData.type !== 'email' && formData.type !== 'credentials') {
               <div class="form-row">
                 <app-form-field
                   [label]="'datasources.form.visibilityLabel' | transloco"
@@ -1291,7 +1294,7 @@ type KeyValueRow = {key: string; value: string};
 
           <div class="form-footer-bar">
             <div class="form-actions">
-              @if (formData.type !== 'generic' && formData.type !== 'repository' && !isCredentialFileType()) {
+              @if (!isEnvType() && formData.type !== 'repository' && !isCredentialFileType()) {
                 <app-button
                   variant="secondary"
                   size="sm"
@@ -1364,7 +1367,7 @@ type KeyValueRow = {key: string; value: string};
       @if (filteredDatasources().length > 0) {
         <div class="table-container">
           <div class="table-inner">
-            <table class="ds-table">
+            <table class="ds-table app-table">
               <thead>
                 <tr>
                   <th>{{ 'datasources.table.colType' | transloco }}</th>
@@ -1708,9 +1711,16 @@ type KeyValueRow = {key: string; value: string};
         color: var(--text-primary, var(--text-primary));
       }
 
+      /* Thirteen type chips never fit beside the title, so they take their
+         own row (order + full basis) and the actions stay on the title row —
+         the same shape the Jobs header uses. */
       .filter-chips {
         display: flex;
         gap: 4px;
+        flex-wrap: wrap;
+        order: 1;
+        flex-basis: 100%;
+        min-width: 0;
       }
 
       .header-actions {
@@ -1988,7 +1998,7 @@ type KeyValueRow = {key: string; value: string};
         font-size: 12px;
         font-weight: 600;
         text-transform: uppercase;
-        letter-spacing: 0.4px;
+        letter-spacing: 0.06em;
         color: var(--text-muted);
       }
 
@@ -2226,35 +2236,6 @@ type KeyValueRow = {key: string; value: string};
         padding: 8px 12px 4px;
       }
 
-      .ds-table {
-        width: 100%;
-        border-collapse: collapse;
-        font-size: 12px;
-      }
-
-      .ds-table th {
-        text-align: left;
-        padding: 8px 10px;
-        background: var(--surface-0, var(--surface-0));
-        color: var(--text-muted);
-        font-weight: 500;
-        text-transform: uppercase;
-        font-size: 10px;
-        letter-spacing: 0.5px;
-        border-bottom: 1px solid var(--border-color, var(--surface-1));
-      }
-
-      .ds-table td {
-        padding: 10px;
-        border-bottom: 1px solid var(--border-color, var(--surface-0));
-        color: var(--text-primary, var(--text-primary));
-        vertical-align: middle;
-      }
-
-      .ds-table tbody tr:hover {
-        background: var(--surface-0, var(--surface-0));
-      }
-
       app-badge app-icon {
         margin-right: 4px;
       }
@@ -2321,7 +2302,7 @@ type KeyValueRow = {key: string; value: string};
         position: relative;
         width: 64px;
         height: 4px;
-        border-radius: 2px;
+        border-radius: var(--radius-tag);
         background: var(--surface-3, rgba(127, 127, 127, 0.25));
         overflow: hidden;
       }
@@ -2330,7 +2311,7 @@ type KeyValueRow = {key: string; value: string};
         position: absolute;
         inset: 0 auto 0 0;
         height: 100%;
-        border-radius: 2px;
+        border-radius: var(--radius-tag);
         background: var(--info, #3b82f6);
         transition: width 0.3s ease;
       }
@@ -2436,6 +2417,41 @@ type KeyValueRow = {key: string; value: string};
         .col-scope,
         .col-availability {
           display: none;
+        }
+
+        /* Fixed layout so the three remaining columns share the phone width:
+           under auto layout the type badge alone took 183px and pushed the
+           actions column (the kebab) off-screen (measured 461px in 390px). */
+        .ds-table {
+          table-layout: fixed;
+        }
+
+        .ds-table th:first-child,
+        .ds-table td:first-child {
+          width: 32%;
+        }
+
+        .ds-table th:last-child,
+        .ds-table td:last-child {
+          width: 48px;
+          padding-inline: 4px;
+        }
+
+        /* A lone kebab column: the "Actions" label doesn't fit 48px and clipped
+           at the screen edge (same trick as the jobs table; the text stays in
+           the accessibility tree). */
+        .ds-table th:last-child {
+          font-size: 0;
+        }
+
+        /* The type badge wraps to a second line in its narrower column
+           (same treatment the project cards give their badges). */
+        .ds-table td:first-child app-badge {
+          white-space: normal;
+          height: auto;
+          min-height: 20px;
+          padding-block: 2px;
+          line-height: 1.25;
         }
 
         /* Scope shown inline under the name on mobile (its own column is hidden). */
@@ -2547,6 +2563,7 @@ export class DatasourceListComponent implements OnInit {
   // Filter options
   readonly typeFilters = [
     { labelKey: 'datasources.filter.all', value: 'all' },
+    { labelKey: 'datasources.filter.credentials', value: 'credentials' },
     { labelKey: 'datasources.filter.generic', value: 'generic' },
     { labelKey: 'datasources.filter.repository', value: 'repository' },
     { labelKey: 'datasources.filter.kb', value: 'kb' },
@@ -2564,6 +2581,10 @@ export class DatasourceListComponent implements OnInit {
   // Types whose credentials are materialized as files on the agent (rather
   // than env vars or live connections). No connection URL, no test button.
   readonly credentialFileTypes: DatasourceType[] = ['kubeconfig', 'ssh_key', 'generic_file'];
+
+  isEnvType(): boolean {
+    return this.formData.type === 'generic' || this.formData.type === 'credentials';
+  }
 
   isCredentialFileType(type: DatasourceType | string = this.formData.type): boolean {
     return this.credentialFileTypes.includes(type as DatasourceType);
@@ -2649,6 +2670,9 @@ export class DatasourceListComponent implements OnInit {
       if (this.formData.scope_mode === 'projects' && this.formProjectIds().size === 0) {
         return false;
       }
+    }
+    if (this.formData.type === 'credentials') {
+      return this.editingId() !== null || this.envVars.some(row => row.key.trim() && row.value);
     }
     if (this.formData.type === 'generic') {
       return !!(this.formData.description);
@@ -3173,8 +3197,10 @@ export class DatasourceListComponent implements OnInit {
       this.gitAuthMethod = 'token';
       this.gitSshKey = '';
     }
-    // Generic env vars also live in credentials; keep editing UX consistent.
-    this.envVars = [];
+    // ENV names can round-trip; blank values preserve the saved credentials.
+    this.envVars = ds.type === 'credentials'
+      ? (ds.env_var_names ?? []).map(key => ({key, value: ''}))
+      : [];
     // Credential-file types: contents never come back from the API (F3
     // redaction), so the textareas stay blank. The user re-pastes only
     // if they want to replace the stored value.
@@ -3936,6 +3962,7 @@ export class DatasourceListComponent implements OnInit {
 
   getTypeIcon(type: DatasourceType | string): string {
     const icons: Record<string, string> = {
+      credentials: 'key',
       generic: 'settings_input_component',
       repository: 'code',
       kb: 'menu_book',
@@ -4093,10 +4120,10 @@ export class DatasourceListComponent implements OnInit {
     // back). Returning undefined skips the credentials column in the
     // PUT body so the orchestrator preserves the stored secret.
     const isEditing = this.editingId() !== null;
-    if (this.formData.type === 'generic') {
+    if (this.isEnvType()) {
       const envVarsObj: Record<string, string> = {};
       for (const ev of this.envVars) {
-        if (ev.key.trim()) {
+        if (ev.key.trim() && (this.formData.type !== 'credentials' || ev.value !== '')) {
           envVarsObj[ev.key.trim()] = ev.value;
         }
       }

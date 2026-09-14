@@ -229,7 +229,9 @@ async def test_used_virtual_actor_exit_settles_after_exact_pod_stop(
             networking_api=networking_api,
         ),
     )
-    await main._cleanup_pinned_thread_retirement(retirement)
+    await main._pinned_retirement_operations().cleanup_pinned_thread_retirement(
+        retirement
+    )
     for read in (
         core_api.read_namespaced_service,
         networking_api.read_namespaced_ingress,

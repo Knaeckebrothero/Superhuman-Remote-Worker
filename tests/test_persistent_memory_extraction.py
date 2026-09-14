@@ -519,6 +519,15 @@ class TestTeardownExtraction:
         session = self._make_session()
         extraction = AsyncMock()
         with (
+            patch(
+                "agent.api.persistent_app._begin_exact_session_retirement",
+                AsyncMock(return_value=True),
+            ),
+            patch(
+                "agent.api.persistent_app._termination_admission_closed",
+                return_value=False,
+            ),
+            patch("agent.api.persistent_app._stateless_mode", return_value=False),
             patch("agent.api.persistent_app._session", session),
             patch("agent.api.persistent_app._thread_id", "tid"),
             patch(
@@ -543,6 +552,15 @@ class TestTeardownExtraction:
         session = self._make_session()
         extraction = AsyncMock()
         with (
+            patch(
+                "agent.api.persistent_app._begin_exact_session_retirement",
+                AsyncMock(return_value=True),
+            ),
+            patch(
+                "agent.api.persistent_app._termination_admission_closed",
+                return_value=False,
+            ),
+            patch("agent.api.persistent_app._stateless_mode", return_value=False),
             patch("agent.api.persistent_app._session", session),
             patch("agent.api.persistent_app._thread_id", "tid"),
             patch("agent.api.persistent_app._broadcast"),

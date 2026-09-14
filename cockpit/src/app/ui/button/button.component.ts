@@ -9,6 +9,7 @@ import {
   output,
 } from '@angular/core';
 import { FocusMonitor } from '@angular/cdk/a11y';
+import { resolveAppearance, type ButtonAppearance } from './button-appearance';
 
 export type ButtonVariant =
   | 'primary'
@@ -34,6 +35,7 @@ export type ButtonType = 'button' | 'submit' | 'reset';
       [attr.aria-busy]="loading() || null"
       [attr.data-variant]="variant()"
       [attr.data-size]="size()"
+      [attr.data-appearance]="dataAppearance()"
       [attr.data-loading]="loading() || null"
       [attr.data-full-width]="fullWidth() || null"
     >
@@ -58,8 +60,12 @@ export class AppButtonComponent {
   loading = input<boolean>(false);
   fullWidth = input<boolean>(false);
   ariaLabel = input<string>('');
+  /** Tinted variants only: 'subtle' (default) or 'solid'. See button-appearance.ts. */
+  appearance = input<ButtonAppearance | undefined>(undefined);
 
   clicked = output<MouseEvent>();
+
+  protected dataAppearance = computed(() => resolveAppearance(this.variant(), this.appearance()));
 
   protected isDisabled = computed(() => this.disabled() || this.loading());
 

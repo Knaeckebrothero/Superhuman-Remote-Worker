@@ -1,16 +1,12 @@
 import { Component } from '@angular/core';
-import { SidebarToggleComponent } from '../../shell/sidebar-toggle/sidebar-toggle.component';
 import { JobListComponent } from './job-list.component';
 
 @Component({
   selector: 'app-jobs-page',
   standalone: true,
-  imports: [SidebarToggleComponent, JobListComponent],
+  imports: [JobListComponent],
   template: `
     <div class="page">
-      <div class="page-toggle">
-        <app-sidebar-toggle />
-      </div>
       <main class="page-content">
         <app-job-list />
       </main>
@@ -29,14 +25,6 @@ import { JobListComponent } from './job-list.component';
         height: 100%;
       }
 
-      .page-toggle {
-        padding: 8px 12px;
-        flex-shrink: 0;
-      }
-
-      .page-toggle:not(:has(.sidebar-toggle)) {
-        display: none;
-      }
 
       .page-content {
         flex: 1;

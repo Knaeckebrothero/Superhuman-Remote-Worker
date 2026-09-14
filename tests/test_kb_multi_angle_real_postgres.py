@@ -16,6 +16,7 @@ left byte-identical by migration 0025.
 from __future__ import annotations
 
 import re
+import socket
 import uuid
 from pathlib import Path
 
@@ -291,3 +292,118 @@ async def test_search_chunks_without_exact_or_tags_still_runs_the_old_function(
     recs = await store.search_chunks([kb], "shared words", embedding_version="v1")
     assert [r.note_id for r in recs] == ["plain_note"]
     assert recs[0].matched_arms == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing_service", [False, True])
+async def test_lexical_fallback_with_unreachable_embedder_or_no_service(
+    vector_pool,
+    missing_service,
+):
+    """Real SQL + a real refused embedding connection, without touching dev data.
+
+    Old-version sparse chunks and chunkless literal matches both survive;
+    unrelated recent notes, archived notes and other KBs remain excluded.
+    """
+    from shared.runtime.services.embedding_service import EmbeddingService
+
+    kb = uuid.uuid4()
+    sparse = await _seed_returning_id(
+        vector_pool,
+        kb,
+        "sparse",
+        "Authentication",
+        "Authenticate requests safely",
+    )
+    await _chunk(
+        vector_pool, sparse, kb, "Authenticate requests safely", version="old-model"
+    )
+    await _seed_returning_id(
+        vector_pool,
+        kb,
+        "literal",
+        "Auth",
+        "authenticating requests is important",
+    )
+    recent = await _seed_returning_id(vector_pool, kb, "recent", "Recent", "unrelated")
+    await _chunk(vector_pool, recent, kb, "unrelated", version="old-model")
+    archived = await _seed_returning_id(
+        vector_pool,
+        kb,
+        "archived",
+        "Archived",
+        "authenticating requests",
+    )
+    await vector_pool.execute(
+        "UPDATE knowledge_index SET status = 'archived' WHERE id = $1", archived
+    )
+    await _seed_returning_id(
+        vector_pool,
+        uuid.uuid4(),
+        "other-kb",
+        "Other KB",
+        "authenticating requests",
+    )
+
+    # Reserve a local port without listening so connection refusal is
+    # deterministic and no external endpoint or credentials are involved.
+    with socket.socket() as reserved:
+        reserved.bind(("127.0.0.1", 0))
+        svc = None
+        if not missing_service:
+            svc = EmbeddingService(
+                provider="local",
+                model="unavailable-model",
+                api_key="test-only",
+                base_url=f"http://127.0.0.1:{reserved.getsockname()[1]}/v1",
+            )
+            svc._client.max_retries = 0
+            svc._client.timeout = 1.0
+        try:
+            store = KnowledgeStore(db=vector_pool, embedding_service=svc)
+            results = await store.search_chunks(
+                [kb],
+                "authenticating requests",
+                embedding_version="unavailable-model",
+            )
+        finally:
+            if svc is not None:
+                await svc._client.close()
+
+    by_id = {note.note_id: note for note in results}
+    assert set(by_id) == {"sparse", "literal"}
+    assert "sparse" in by_id["sparse"].matched_arms
+    assert by_id["literal"].matched_arms == ["exact"]
+    assert all("dense" not in note.matched_arms for note in results)
+    assert results.lexical_fallback is True
+    assert "lexical fallback" in results.notice
+
+
+@pytest.mark.asyncio
+async def test_fallback_literal_matching_escapes_wildcards_and_matches_titles(
+    vector_pool,
+):
+    kb = uuid.uuid4()
+    await _seed_returning_id(vector_pool, kb, "literal", r"sales_page%\v1", "body")
+    await _seed_returning_id(
+        vector_pool, kb, "wildcard", "salesXpage anything v1", "body"
+    )
+    store = KnowledgeStore(db=vector_pool, embedding_service=None)
+
+    results = await store.search_chunks([kb], r"sales_page%\v1")
+
+    assert [note.note_id for note in results] == ["literal"]
+    assert results[0].matched_arms == ["exact"]
+
+
+@pytest.mark.asyncio
+async def test_fallback_no_text_matches_does_not_return_recent_notes(vector_pool):
+    kb = uuid.uuid4()
+    recent = await _seed_returning_id(vector_pool, kb, "recent", "Recent", "unrelated")
+    await _chunk(vector_pool, recent, kb, "unrelated")
+    store = KnowledgeStore(db=vector_pool, embedding_service=None)
+
+    results = await store.search_chunks([kb], "no lexical matches here")
+
+    assert results == []
+    assert results.lexical_fallback is True

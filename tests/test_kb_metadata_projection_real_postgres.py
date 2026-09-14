@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import logging
 import re
 import uuid
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import asyncpg
@@ -25,8 +27,14 @@ from fastapi import HTTPException
 pytest.importorskip("testcontainers.postgres")
 
 from orchestrator.database.migrate import run_migrations  # noqa: E402
+from orchestrator.routers.knowledge import KnowledgeDependencies  # noqa: E402
 from orchestrator.services.kb_materialize import retry_knowledge_materialization_intent  # noqa: E402
 from orchestrator.services.kb_reindex import KbRepoRef  # noqa: E402
+from orchestrator.services.kb_task_registry import KbDatasourceTaskRegistry  # noqa: E402
+from orchestrator.services.knowledge_index import KnowledgeIndexDependencies  # noqa: E402
+from orchestrator.services.knowledge_operations import (  # noqa: E402
+    KnowledgeOperationDependencies,
+)
 from shared.runtime.knowledge.gardener import parse_note_md  # noqa: E402
 
 PG_IMAGE = "pgvector/pgvector:pg15"
@@ -177,6 +185,37 @@ async def _projection(pool, project_id: uuid.UUID):
         )
 
 
+def _knowledge_deps(*, ledger, vector_pool, gitea) -> KnowledgeDependencies:
+    """The collaborators main's ``_knowledge_dependencies()`` factory supplies.
+
+    Before R1.B03 each of these arrived by patching a module global on
+    ``orchestrator.main`` (``postgres_db``, ``vector_db``, ``gitea_client``,
+    ``_get_knowledge_graph``). The handler now takes them through this
+    dataclass, so the same objects are passed in here instead — same fakes,
+    same real ``update_knowledge_note`` body below them.
+    """
+    return KnowledgeDependencies(
+        store=ledger,
+        operations=KnowledgeOperationDependencies(
+            store=ledger,
+            vector_db=vector_pool,
+            gitea_client=gitea,
+            logger=logging.getLogger("tests.kb_metadata_projection"),
+            # Neo4j absent, exactly as the old return_value=None patch modelled.
+            graph=SimpleNamespace(get=lambda: None),
+            knowledge_index=KnowledgeIndexDependencies(
+                store=ledger,
+                vector_db=vector_pool,
+                gitea_client=gitea,
+                logger=logging.getLogger("tests.kb_metadata_projection"),
+                tasks=KbDatasourceTaskRegistry(),
+                inject_system_kb_embedding_profile=AsyncMock(return_value=None),
+            ),
+        ),
+        require_project_member=AsyncMock(),
+    )
+
+
 def _repo_ref() -> KbRepoRef:
     return KbRepoRef(
         forge="gitea",
@@ -189,7 +228,8 @@ def _repo_ref() -> KbRepoRef:
 
 @pytest.mark.asyncio
 async def test_first_ready_update_commits_and_projects_typed_timestamp(vector_pool):
-    from orchestrator.main import KnowledgeNoteUpdate, update_knowledge_note
+    from orchestrator.routers.knowledge import update_knowledge_note
+    from orchestrator.schemas.knowledge import KnowledgeNoteUpdate
 
     project_id = uuid.uuid4()
     initial = (
@@ -200,22 +240,17 @@ async def test_first_ready_update_commits_and_projects_typed_timestamp(vector_po
     ledger = _Ledger()
     gitea, git = _stateful_gitea(initial)
 
-    with (
-        patch("orchestrator.main.require_project_member", AsyncMock()),
-        patch("orchestrator.main.vector_db", vector_pool),
-        patch("orchestrator.main.postgres_db", ledger),
-        patch("orchestrator.main.gitea_client", gitea),
-        patch("orchestrator.main._get_knowledge_graph", return_value=None),
-        patch(
-            "orchestrator.services.kb_materialize.resolve_kb_repo",
-            AsyncMock(return_value=_repo_ref()),
-        ),
+    deps = _knowledge_deps(ledger=ledger, vector_pool=vector_pool, gitea=gitea)
+    with patch(
+        "orchestrator.services.kb_materialize.resolve_kb_repo",
+        AsyncMock(return_value=_repo_ref()),
     ):
         result = await update_knowledge_note(
             MagicMock(),
             str(project_id),
             NOTE_ID,
             KnowledgeNoteUpdate(add_tags=["ready"]),
+            dependencies=deps,
         )
 
     frontmatter, _ = parse_note_md(git["content"])
@@ -236,7 +271,8 @@ async def test_first_ready_update_commits_and_projects_typed_timestamp(vector_po
 async def test_sweeper_wins_retry_then_client_preserves_exact_canonical_snapshot(
     vector_pool,
 ):
-    from orchestrator.main import KnowledgeNoteUpdate, update_knowledge_note
+    from orchestrator.routers.knowledge import update_knowledge_note
+    from orchestrator.schemas.knowledge import KnowledgeNoteUpdate
 
     project_id = uuid.uuid4()
     initial = (
@@ -247,16 +283,10 @@ async def test_sweeper_wins_retry_then_client_preserves_exact_canonical_snapshot
     ledger = _Ledger()
     gitea, git = _stateful_gitea(initial, fail_first=True)
 
-    with (
-        patch("orchestrator.main.require_project_member", AsyncMock()),
-        patch("orchestrator.main.vector_db", vector_pool),
-        patch("orchestrator.main.postgres_db", ledger),
-        patch("orchestrator.main.gitea_client", gitea),
-        patch("orchestrator.main._get_knowledge_graph", return_value=None),
-        patch(
-            "orchestrator.services.kb_materialize.resolve_kb_repo",
-            AsyncMock(return_value=_repo_ref()),
-        ),
+    deps = _knowledge_deps(ledger=ledger, vector_pool=vector_pool, gitea=gitea)
+    with patch(
+        "orchestrator.services.kb_materialize.resolve_kb_repo",
+        AsyncMock(return_value=_repo_ref()),
     ):
         with pytest.raises(HTTPException) as exc:
             await update_knowledge_note(
@@ -264,6 +294,7 @@ async def test_sweeper_wins_retry_then_client_preserves_exact_canonical_snapshot
                 str(project_id),
                 NOTE_ID,
                 KnowledgeNoteUpdate(add_tags=["ready"]),
+                dependencies=deps,
             )
         assert exc.value.status_code == 409
         assert (await _projection(vector_pool, project_id))["ready_at"] is None
@@ -291,6 +322,7 @@ async def test_sweeper_wins_retry_then_client_preserves_exact_canonical_snapshot
             str(project_id),
             NOTE_ID,
             KnowledgeNoteUpdate(add_tags=["ready"]),
+            dependencies=deps,
         )
 
     frontmatter, _ = parse_note_md(canonical_after_sweep)

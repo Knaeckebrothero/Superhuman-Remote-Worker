@@ -13,11 +13,13 @@ that depend on PostgreSQL row locks and rollback semantics:
 
 from __future__ import annotations
 
+
 import asyncio
 import json
 import time
 from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -29,7 +31,15 @@ import pytest_asyncio
 from testcontainers.postgres import PostgresContainer
 
 import orchestrator.main as orch_main
+from orchestrator.routers import officers as officers_router
+from orchestrator.services import officer_notices
 from orchestrator.database.postgres import OfficerPostLifecycleConflict, PostgresDB
+from orchestrator.schemas.job_create import JobCreate
+from orchestrator.services.job_admission_config import JobAdmissionConfig
+from orchestrator.services.job_admission_officer import (
+    JobAdmissionOfficerDependencies,
+    prepare_job_admission_officer,
+)
 from orchestrator.services.officer_admission import (
     OfficerAdmissionConflict,
     SlotAdmissionError,
@@ -220,6 +230,21 @@ async def db(pg_dsn, _schema_applied, monkeypatch):
             "TRUNCATE job_message_routes, session_wake_events, message_log, "
             "jobs, project_officers, threads, projects CASCADE"
         )
+        # TRUNCATE reaches users and capability_grants through their FKs,
+        # including nullable granted_by; seed after resetting every test.
+        await conn.execute("""
+            INSERT INTO capability_grants(scope_kind,key,value_json) VALUES
+                ('global','shell_tools','true'),
+                ('global','delegation','true'),
+                ('global','vm_workspace','true'),
+                ('global','autonomy_ceiling','"full"')
+            ON CONFLICT(scope_kind,scope_id,key) DO UPDATE SET value_json=EXCLUDED.value_json
+        """)
+    from orchestrator.services.manifest_experts import seed_bundled_expert_manifests
+
+    await seed_bundled_expert_manifests(
+        store, Path(__file__).resolve().parents[1] / "config"
+    )
     try:
         yield store
     finally:
@@ -247,6 +272,7 @@ async def _seed_post(
 ) -> dict[str, str]:
     project_id = uuid4()
     thread_id = uuid4()
+    owner_id = uuid4()
     runtime_officer = {
         "enabled": True,
         "auto_pull": auto_pull,
@@ -261,6 +287,17 @@ async def _seed_post(
         await conn.execute(
             "INSERT INTO projects (id, name) VALUES ($1, 'post tx proof')",
             project_id,
+        )
+        # Config edits now publish a canonical Project under its actual owner.
+        await conn.execute(
+            "INSERT INTO users(id,display_name,is_approved,default_project_id) VALUES($1,'Post owner',TRUE,$2)",
+            owner_id,
+            project_id,
+        )
+        await conn.execute(
+            "INSERT INTO project_members(project_id,user_id,role) VALUES($1,$2,'owner')",
+            project_id,
+            owner_id,
         )
         await conn.execute(
             """
@@ -2272,6 +2309,99 @@ async def _race(*calls):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("hold_during_ticket_read", [False, True])
+async def test_manual_preparation_reads_ticket_outside_final_admission_transaction(
+    db, hold_during_ticket_read
+):
+    seed = await _seed_post(db)
+    ticket_entered, release_ticket = asyncio.Event(), asyncio.Event()
+
+    async def fetch_ticket(project_id, note_id):
+        assert (project_id, note_id) == (seed["project_id"], "prepared-ticket")
+        ticket_entered.set()
+        await release_ticket.wait()
+        return {
+            "project_id": project_id,
+            "status": "active",
+            "note_type": "feature",
+            "tags": ["ready", "category:executor"],
+            "ready_at": READY_GENERATION,
+        }
+
+    config = JobAdmissionConfig(
+        context={"officer_slot": "line"},
+        project_id=seed["project_id"],
+        config_name="worker_base",
+        config_override=None,
+        expert_id=None,
+        request_config_override=None,
+        requested_workspace_backend=None,
+        root_creation=True,
+    )
+    pending = asyncio.create_task(
+        prepare_job_admission_officer(
+            command=JobCreate(
+                description="prepared dispatch",
+                thread_id=seed["thread_id"],
+                ticket="prepared-ticket",
+            ),
+            config=config,
+            dependencies=JobAdmissionOfficerDependencies(
+                store=db,
+                prepare_officer=partial(prepare_officer_admission, db),
+                fetch_ticket=fetch_ticket,
+            ),
+        )
+    )
+    try:
+        await asyncio.wait_for(ticket_entered.wait(), 5)
+        assert await _job_count(db) == 0
+        assert await _claim_rows(db, seed["project_id"]) == []
+        if hold_during_ticket_read:
+            # This writer takes the durable post lock. It must complete while
+            # vector lookup is suspended, then fence the stale preparation.
+            await asyncio.wait_for(
+                db.set_project_officer_hold(
+                    seed["project_id"],
+                    expected_thread_id=seed["thread_id"],
+                    hold={"kind": "maintenance", "since": "now", "note": "proof"},
+                ),
+                5,
+            )
+    finally:
+        release_ticket.set()
+        prepared = await asyncio.wait_for(pending, 5)
+
+    async def insert():
+        return await admit_and_create_job(
+            db,
+            preparation=prepared.preparation,
+            job_kwargs={
+                **_job_kwargs("prepared dispatch"),
+                "context": prepared.context,
+                "config_override": prepared.config_override,
+            },
+            ticket_note_id="prepared-ticket",
+            ticket_ready_at=prepared.ticket_ready_at,
+            ticket_claim_source="manual",
+        )
+
+    if hold_during_ticket_read:
+        with pytest.raises(OfficerAdmissionConflict) as exc:
+            await insert()
+        assert exc.value.code == "officer_held"
+        assert await _job_count(db) == 0
+        assert await _claim_rows(db, seed["project_id"]) == []
+    else:
+        job = await insert()
+        claims = await _claim_rows(db, seed["project_id"], "prepared-ticket")
+        assert await _job_count(db) == 1 and len(claims) == 1
+        assert claims[0]["job_id"] == job["id"]
+        assert claims[0]["ready_generation_at"] == READY_GENERATION
+        assert claims[0]["source"] == "manual"
+
+
+@pytest.mark.asyncio
 async def test_two_manual_creates_race_for_one_remaining_slot(db):
     seed = await _seed_post(db, count=1)
     preparation = await _prepare(db, seed)
@@ -3137,7 +3267,8 @@ async def test_database_funnel_strips_raw_claim_context_from_ordinary_jobs(db):
 @pytest.mark.parametrize("internal", [False, True], ids=["public", "internal"])
 async def test_http_creation_paths_cannot_persist_raw_claim_context(db, internal):
     import orchestrator.security.access as access_module
-    from orchestrator.main import JobCreate, create_job
+    from orchestrator.main import JobCreate
+    from tests._b09_control_seams import create_job
 
     user_id = uuid4()
     async with db.acquire() as conn:
@@ -3193,14 +3324,13 @@ async def test_http_creation_paths_cannot_persist_raw_claim_context(db, internal
             AsyncMock(return_value=[]),
         ),
         patch(
-            "orchestrator.main._authorize_thread_datasource_ids",
-            AsyncMock(return_value=[]),
-        ),
-        patch(
             "orchestrator.main._enforce_job_create_grants", AsyncMock(return_value=None)
         ),
         patch("orchestrator.services.job_provisioning.provision_job_repo", AsyncMock()),
-        patch("orchestrator.main._spawn_scholar_subjob", AsyncMock(return_value=None)),
+        patch(
+            "orchestrator.main.subjob_completion_operations.spawn_scholar_subjob",
+            AsyncMock(return_value=None),
+        ),
         patch("orchestrator.main._trigger_dispatch", MagicMock()),
     )
     with ExitStack() as stack:
@@ -3249,7 +3379,7 @@ async def test_completion_merge_can_record_server_owned_evidence_manifest(db):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("claimed", [False, True], ids=["ordinary", "claimed"])
 async def test_delete_response_reports_only_an_actual_durable_claim(db, claimed):
-    from orchestrator.main import delete_job
+    from tests._b09_control_seams import delete_job
 
     seed = await _seed_post(db)
     if claimed:
@@ -3285,7 +3415,7 @@ async def test_delete_response_reports_only_an_actual_durable_claim(db, claimed)
             "orchestrator.main.require_job_access", AsyncMock(return_value=(admin, job))
         ),
         patch(
-            "orchestrator.main._archive_and_cleanup_workspace",
+            "orchestrator.main.thread_retirement_operations.ThreadRetirementOperations.archive_and_cleanup_workspace",
             AsyncMock(return_value=[]),
         ),
         patch("orchestrator.main.gitea_client", gitea),
@@ -3415,28 +3545,47 @@ async def test_final_boundary_rejects_lifecycle_or_roster_change(db, mutation):
     assert await _claim_rows(db, seed["project_id"]) == []
 
 
+def _officer_post_request():
+    """A request whose application resolves the Post's dependencies exactly as
+    ``main`` does.
+
+    Both factories read ``postgres_db`` and the release fence per call, so the
+    rebinds each case makes above still steer the operation — and driving the
+    route declarations keeps the owner/member gates in the picture.
+    """
+    request = MagicMock()
+    request.app.state.officer_post_lifecycle_dependencies_factory = (
+        orch_main._officer_post_lifecycle_dependencies
+    )
+    request.app.state.officer_post_view_dependencies_factory = (
+        orch_main._officer_post_view_dependencies
+    )
+    return request
+
+
 @pytest.mark.asyncio
 async def test_bp01_controls_round_trip_and_survive_recommission(db, monkeypatch):
     seed = await _seed_post(db)
     monkeypatch.setattr(orch_main, "postgres_db", db)
     monkeypatch.setattr(orch_main, "OFFICER_AUTO_PULL_RELEASE_ENABLED", True)
     monkeypatch.setattr(
-        orch_main,
+        officers_router,
         "require_project_owner",
         AsyncMock(
             return_value=({"id": str(uuid4()), "is_admin": True}, {"name": "proof"})
         ),
     )
     monkeypatch.setattr(
-        orch_main,
+        officers_router,
         "require_project_member",
         AsyncMock(
             return_value=({"id": str(uuid4()), "is_admin": True}, {"name": "proof"})
         ),
     )
     monkeypatch.setattr(
-        orch_main, "_inject_officer_notice", AsyncMock(return_value=False)
+        officer_notices, "inject_officer_notice", AsyncMock(return_value=False)
     )
+    request = _officer_post_request()
     roster = {
         "research": {
             "count": 1,
@@ -3447,8 +3596,8 @@ async def test_bp01_controls_round_trip_and_survive_recommission(db, monkeypatch
         }
     }
 
-    updated = await orch_main.patch_project_officer(
-        MagicMock(),
+    updated = await officers_router.patch_project_officer(
+        request,
         seed["project_id"],
         {
             "auto_pull": True,
@@ -3456,8 +3605,8 @@ async def test_bp01_controls_round_trip_and_survive_recommission(db, monkeypatch
             "slots": roster,
         },
     )
-    summary = await orch_main.get_project_officer_summary(
-        MagicMock(), seed["project_id"]
+    summary = await officers_router.get_project_officer_summary(
+        request, seed["project_id"]
     )
     post = await db.get_project_officer(seed["project_id"])
     thread = await db.get_thread(seed["thread_id"])
@@ -3490,8 +3639,8 @@ async def test_bp01_controls_round_trip_and_survive_recommission(db, monkeypatch
         require_auto_pull=True,
         expected_category="researcher",
     )
-    await orch_main.patch_project_officer(
-        MagicMock(), seed["project_id"], {"auto_pull": False}
+    await officers_router.patch_project_officer(
+        request, seed["project_id"], {"auto_pull": False}
     )
     with pytest.raises(OfficerAdmissionConflict) as exc:
         await admit_and_create_job(
@@ -3504,8 +3653,8 @@ async def test_bp01_controls_round_trip_and_survive_recommission(db, monkeypatch
     assert exc.value.code == "auto_pull_disabled"
     assert await _job_count(db) == 0
 
-    await orch_main.patch_project_officer(
-        MagicMock(), seed["project_id"], {"auto_pull": True}
+    await officers_router.patch_project_officer(
+        request, seed["project_id"], {"auto_pull": True}
     )
     await db.decommission_project_officer(
         seed["project_id"], seed["thread_id"], reason="BP-01 recommission"
@@ -3564,27 +3713,28 @@ async def test_bp11_whole_roster_replaces_post_thread_admission_and_recommission
     survivor = {"scout": original["scout"]}
     monkeypatch.setattr(orch_main, "postgres_db", db)
     monkeypatch.setattr(
-        orch_main,
+        officers_router,
         "require_project_owner",
         AsyncMock(
             return_value=({"id": str(uuid4()), "is_admin": True}, {"name": "proof"})
         ),
     )
     monkeypatch.setattr(
-        orch_main,
+        officers_router,
         "require_project_member",
         AsyncMock(
             return_value=({"id": str(uuid4()), "is_admin": True}, {"name": "proof"})
         ),
     )
     monkeypatch.setattr(
-        orch_main, "_inject_officer_notice", AsyncMock(return_value=False)
+        officer_notices, "inject_officer_notice", AsyncMock(return_value=False)
     )
-    api_update = await orch_main.patch_project_officer(
-        MagicMock(), seed["project_id"], {"slots": survivor}
+    request = _officer_post_request()
+    api_update = await officers_router.patch_project_officer(
+        request, seed["project_id"], {"slots": survivor}
     )
-    api_summary = await orch_main.get_project_officer_summary(
-        MagicMock(), seed["project_id"]
+    api_summary = await officers_router.get_project_officer_summary(
+        request, seed["project_id"]
     )
     post = await db.get_project_officer(seed["project_id"])
     thread = await db.get_thread(seed["thread_id"])

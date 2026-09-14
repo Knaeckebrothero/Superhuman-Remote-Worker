@@ -167,6 +167,7 @@ describe('AdminProvidersService', () => {
       expect(service.defaults().search).toBeNull();
       expect(service.defaults().fetch).toBeNull();
       expect(service.defaults().search_fallback).toBeNull();
+      expect(service.defaults().rerank).toBeNull();
     });
 
     it('PUTs a new embedding default', () => {

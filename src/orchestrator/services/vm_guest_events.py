@@ -58,6 +58,16 @@ async def resolve_vm_entity(db: Any, entity_id: str) -> VmGuestIdentity | None:
             )
         job = await db.get_job(entity_id)
         if job:
+            vm = _object(_object(job.get("context")).get("vm"))
+            if vm.get("workspace_storage") is not None:
+                from orchestrator.services.retained_vm_workspaces import (
+                    guest_attachment_is_current,
+                )
+
+                if not await guest_attachment_is_current(
+                    db, entity_id, vm["workspace_storage"]
+                ):
+                    return None
             generation = _object(_object(job.get("context")).get("vm")).get(
                 "provision_generation"
             )
@@ -173,9 +183,12 @@ async def record_heartbeat(
     """Record heartbeat liveness and thread-aware IDE connection activity."""
 
     now = datetime.now(timezone.utc).isoformat()
-    merged = await _merge_vm(db, identity, {"last_heartbeat": now})
     connections = payload.get("code_server_connections")
+    telemetry: dict[str, Any] = {"last_heartbeat": now}
     if connections is not None:
+        telemetry["code_server_connections"] = connections
+    merged = await _merge_vm(db, identity, telemetry)
+    if merged and connections is not None:
         updates = {"code_server_connections": connections}
         if connections > 0:
             updates.update({"last_activity": now, "status": "active"})
@@ -187,7 +200,11 @@ async def record_heartbeat(
             else db.merge_ide_session_context
         )
         try:
-            await method(identity.entity_id, updates)
+            await method(
+                identity.entity_id,
+                updates,
+                expected_vm_generation=identity.provision_generation,
+            )
         except Exception:
             logger.warning(
                 "Could not update IDE session heartbeat for %s %s",

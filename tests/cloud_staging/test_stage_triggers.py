@@ -3,7 +3,8 @@
 Covers:
 * ``POST /api/agents/threads/{thread_id}/cloud-stage`` — internal-key gate,
   flag-off no-op, fire-and-forget task scheduling + de-dupe registry
-  (``main._cloud_stage_tasks``, mirrors ``_protected_engage_tasks``).
+  (``main.cloud_task_registry``'s stage half, which mirrors its
+  protected-engage half).
 * ``WorkspaceSuspensionService.suspend_thread_workspace`` — Kubernetes
   capture is contained before any remote read, while a VM snapshot runs only
   under its own lease and never borrows that lease for multi-write staging.
@@ -14,6 +15,7 @@ Follows the house patterns: ``tests/test_export_to_cloud_endpoint.py``
 ``access_module._INTERNAL_KEY`` for the 401 case).
 """
 
+import dataclasses
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -24,6 +26,8 @@ from fastapi import HTTPException
 
 import orchestrator.main
 import orchestrator.security.access as access_module
+from orchestrator.routers import agent_cloud_stage as agent_cloud_stage_routes
+from orchestrator.services import cloud_stage_authority
 from orchestrator.services.container_provisioner import WorkspaceRuntimeAttestation
 from orchestrator.services.vm_provisioner import VMTeardownIdentity, VMTeardownResult
 from orchestrator.services.workspace_suspension import WorkspaceSuspensionService
@@ -46,14 +50,31 @@ async def _owned_lock(*_args, **_kwargs):
     yield True
 
 
+def _stage_tasks() -> dict:
+    """The application's live stage-task registry slot map."""
+    return orchestrator.main.cloud_task_registry.cloud_stage_tasks
+
+
+def _stage_deps(**overrides):
+    """Route dependencies built from the patched globals.
+
+    ``capture_cloud_stage_authority`` is a field default on
+    ``AgentCloudStageDependencies``, so it is replaced here rather than
+    patched on a module the router never reads.
+    """
+    return dataclasses.replace(
+        orchestrator.main._agent_cloud_stage_dependencies(), **overrides
+    )
+
+
 class TestCloudStageEndpoint:
     @pytest.mark.asyncio
     async def test_cloud_stage_requires_internal_key(self, fake_request):
         """No/garbage X-Internal-Key -> 401, before the flag or task logic runs."""
         with patch.object(access_module, "_INTERNAL_KEY", "secret"):
             with pytest.raises(HTTPException) as exc:
-                await orchestrator.main.agent_trigger_cloud_stage(
-                    fake_request, "thread-1"
+                await agent_cloud_stage_routes.agent_trigger_cloud_stage(
+                    fake_request, "thread-1", dependencies=_stage_deps()
                 )
         assert exc.value.status_code == 401
 
@@ -61,18 +82,18 @@ class TestCloudStageEndpoint:
     async def test_cloud_stage_flag_off_skips(self, fake_request):
         """Flag off -> {"skipped": "flag_off"}; no task is ever scheduled."""
         fake_request.headers = {"X-Internal-Key": "secret"}
-        orchestrator.main._cloud_stage_tasks.clear()
+        _stage_tasks().clear()
         with (
             patch.object(access_module, "_INTERNAL_KEY", "secret"),
             patch(
                 "orchestrator.main._is_protected_cloud_mode_enabled", return_value=False
             ),
         ):
-            result = await orchestrator.main.agent_trigger_cloud_stage(
-                fake_request, "thread-1"
+            result = await agent_cloud_stage_routes.agent_trigger_cloud_stage(
+                fake_request, "thread-1", dependencies=_stage_deps()
             )
         assert result == {"skipped": "flag_off"}
-        assert orchestrator.main._cloud_stage_tasks == {}
+        assert _stage_tasks() == {}
 
     @pytest.mark.asyncio
     async def test_cloud_stage_schedules_task(self, fake_request):
@@ -80,7 +101,7 @@ class TestCloudStageEndpoint:
         the task calls stage_thread_cloud_diff and self-evicts from the
         registry when done."""
         fake_request.headers = {"X-Internal-Key": "secret"}
-        orchestrator.main._cloud_stage_tasks.clear()
+        _stage_tasks().clear()
         stage_mock = AsyncMock(return_value={"epoch": 1, "counts": {}})
         with (
             patch.object(access_module, "_INTERNAL_KEY", "secret"),
@@ -111,23 +132,24 @@ class TestCloudStageEndpoint:
                 "_require_pinned_workspace_credential_owner",
                 AsyncMock(),
             ),
-            patch.object(
-                orchestrator.main,
-                "_capture_cloud_stage_authority",
-                return_value=dict(_STAGE_AUTHORITY),
-            ),
         ):
-            result = await orchestrator.main.agent_trigger_cloud_stage(
-                fake_request, "thread-1"
+            result = await agent_cloud_stage_routes.agent_trigger_cloud_stage(
+                fake_request,
+                "thread-1",
+                dependencies=_stage_deps(
+                    capture_cloud_stage_authority=MagicMock(
+                        return_value=dict(_STAGE_AUTHORITY)
+                    )
+                ),
             )
             assert result == {"scheduled": True}
             # Task is registered synchronously (create_task schedules but does
             # not run until the event loop gets control back).
-            task_key = orchestrator.main._cloud_stage_task_key(
+            task_key = cloud_stage_authority._cloud_stage_task_key(
                 "thread-1", _STAGE_AUTHORITY
             )
-            assert task_key in orchestrator.main._cloud_stage_tasks
-            task = orchestrator.main._cloud_stage_tasks[task_key]
+            assert task_key in _stage_tasks()
+            task = _stage_tasks()[task_key]
             await task
 
         stage_mock.assert_awaited_once_with(
@@ -138,17 +160,19 @@ class TestCloudStageEndpoint:
             vm_provisioner=orchestrator.main.vm_provisioner,
         )
         # Self-evicts once the task completes.
-        assert task_key not in orchestrator.main._cloud_stage_tasks
+        assert task_key not in _stage_tasks()
 
     @pytest.mark.asyncio
     async def test_cloud_stage_dedupes_inflight_thread(self, fake_request):
         """A second ping for the same thread while one is still in flight
         must not spawn a duplicate task."""
         fake_request.headers = {"X-Internal-Key": "secret"}
-        orchestrator.main._cloud_stage_tasks.clear()
+        _stage_tasks().clear()
         sentinel_task = MagicMock()
-        task_key = orchestrator.main._cloud_stage_task_key("thread-1", _STAGE_AUTHORITY)
-        orchestrator.main._cloud_stage_tasks[task_key] = sentinel_task
+        task_key = cloud_stage_authority._cloud_stage_task_key(
+            "thread-1", _STAGE_AUTHORITY
+        )
+        _stage_tasks()[task_key] = sentinel_task
         with (
             patch.object(access_module, "_INTERNAL_KEY", "secret"),
             patch(
@@ -169,19 +193,20 @@ class TestCloudStageEndpoint:
                 "_require_pinned_workspace_credential_owner",
                 AsyncMock(),
             ),
-            patch.object(
-                orchestrator.main,
-                "_capture_cloud_stage_authority",
-                return_value=dict(_STAGE_AUTHORITY),
-            ),
         ):
-            result = await orchestrator.main.agent_trigger_cloud_stage(
-                fake_request, "thread-1"
+            result = await agent_cloud_stage_routes.agent_trigger_cloud_stage(
+                fake_request,
+                "thread-1",
+                dependencies=_stage_deps(
+                    capture_cloud_stage_authority=MagicMock(
+                        return_value=dict(_STAGE_AUTHORITY)
+                    )
+                ),
             )
         assert result == {"scheduled": True}
         # Registry slot untouched — still the sentinel, no new task created.
-        assert orchestrator.main._cloud_stage_tasks[task_key] is sentinel_task
-        orchestrator.main._cloud_stage_tasks.clear()
+        assert _stage_tasks()[task_key] is sentinel_task
+        _stage_tasks().clear()
 
 
 # =============================================================================

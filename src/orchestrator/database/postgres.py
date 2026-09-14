@@ -37,10 +37,22 @@ from typing import (
 )
 from uuid import UUID, uuid4
 
+from shared.helm_provenance import provenance_from_breadcrumb
+from shared.credential_connectors import CredentialConnectorAttachedError
+
 try:
     import asyncpg
 except ImportError:
     asyncpg = None
+
+from orchestrator.services.datasource_policy_errors import (
+    DatasourcePolicyError as DatasourcePolicyError,
+    DatasourcePolicyValidationError as DatasourcePolicyValidationError,
+    DatasourcePolicyConflictError as DatasourcePolicyConflictError,
+    DatasourceProjectAuthorizationError as DatasourceProjectAuthorizationError,
+    DatasourceScopeAuthorizationError as DatasourceScopeAuthorizationError,
+    DatasourceMaterializationAuthorizationError as DatasourceMaterializationAuthorizationError,
+)
 
 from orchestrator.database.repositories.contacts import (
     CONTACT_OPT_IN_DEFAULT as CONTACT_OPT_IN_DEFAULT,
@@ -56,7 +68,7 @@ from orchestrator.security.crypto import (
     is_encrypted,
 )
 
-from shared.db_url import build_postgres_url
+from shared.db_url import build_postgres_url, postgres_database_name
 from shared.job_freeze_types import AUTO_REDISPATCH_FREEZE_TYPES
 from shared.job_steering import context_delivery_key, queued_reply_key
 from shared.pinned_session_identity import PinnedSessionBinding
@@ -529,6 +541,25 @@ _TASK_TRANSACTION_SCOPE: ContextVar[_TaskTransactionScope | None] = ContextVar(
 )
 
 
+@dataclass(frozen=True, slots=True)
+class _TaskDatasourceLock:
+    database: "PostgresDB"
+    key: int
+    owner_task: asyncio.Task[Any]
+
+
+_TASK_DATASOURCE_LOCKS: ContextVar[tuple[_TaskDatasourceLock, ...]] = ContextVar(
+    "postgres_task_datasource_locks", default=()
+)
+
+
+def _thread_config_lock_key(thread_id: str) -> int:
+    digest = hashlib.blake2b(
+        b"config_override:" + thread_id.encode(), digest_size=8
+    ).digest()
+    return int.from_bytes(digest, byteorder="big", signed=True)
+
+
 def _strict_json_object(value: Any, *, label: str) -> dict[str, Any]:
     """Return one JSON object without treating malformed falsey values as empty."""
 
@@ -914,30 +945,6 @@ def _workspace_runtime_mutation_lock_name(
     return f"workspace_runtime_mutation:{owner_kind}:{owner_id}:{scope}"
 
 
-class DatasourcePolicyError(ValueError):
-    """Base class for datasource scope/default persistence failures."""
-
-
-class DatasourcePolicyValidationError(DatasourcePolicyError):
-    """A requested datasource policy is structurally invalid."""
-
-
-class DatasourcePolicyConflictError(DatasourcePolicyError):
-    """The caller edited a stale datasource policy revision."""
-
-
-class DatasourceProjectAuthorizationError(DatasourcePolicyError):
-    """A project-link addition lost its required owner authority."""
-
-
-class DatasourceScopeAuthorizationError(DatasourcePolicyError):
-    """A project-scoped principal attempted a cross-scope datasource mutation."""
-
-
-class DatasourceMaterializationAuthorizationError(DatasourcePolicyError):
-    """A work owner lost approval or target-project access before insert."""
-
-
 class DatasourceCatalogCursorError(ValueError):
     """A datasource catalog/linkable-project cursor is malformed."""
 
@@ -1201,7 +1208,29 @@ async def _lock_and_validate_work_owner(
         raise DatasourceMaterializationAuthorizationError(
             "Work owner is no longer authorized"
         )
-    if bool(actor["is_admin"]) or not target_project_uuids:
+    if not target_project_uuids:
+        return
+
+    # The catalog advisory lock orders this read after Project retirement. An
+    # administrator may bypass membership, but cannot materialize work against
+    # a Project row that the winning deletion transaction already removed.
+    # Detect that as the same domain refusal instead of leaking a later FK
+    # violation from the work INSERT.
+    projects = await conn.fetch(
+        """
+        SELECT id
+        FROM projects
+        WHERE id = ANY($1::uuid[])
+        ORDER BY id
+        FOR KEY SHARE
+        """,
+        target_project_uuids,
+    )
+    if {row["id"] for row in projects} != set(target_project_uuids):
+        raise DatasourceMaterializationAuthorizationError(
+            "Work owner is no longer authorized"
+        )
+    if bool(actor["is_admin"]):
         return
 
     rows = await conn.fetch(
@@ -3033,6 +3062,44 @@ class PostgresDB:
                 finally:
                     _TASK_TRANSACTION_SCOPE.reset(token)
 
+    @asynccontextmanager
+    async def using_connection(self, conn):
+        """Bind helper calls to a caller-owned transaction without opening one.
+
+        Admission owners such as Officer already hold locks on ``conn``. They
+        must not acquire a second connection when rendering and recording an
+        execution specification. Child tasks do not inherit this authority.
+        """
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("using_connection requires an asyncio task")
+        scope = _TASK_TRANSACTION_SCOPE.get()
+        if (
+            scope is not None
+            and scope.database is self
+            and scope.owner_task is task
+            and scope.connection is not conn
+        ):
+            raise RuntimeError("Cannot replace an active task transaction connection")
+        token = _TASK_TRANSACTION_SCOPE.set(
+            _TaskTransactionScope(database=self, connection=conn, owner_task=task)
+        )
+        try:
+            yield conn
+        finally:
+            _TASK_TRANSACTION_SCOPE.reset(token)
+
+    @asynccontextmanager
+    async def thread_configuration_transaction(self, thread_id: str):
+        """Acquire delivery/config locks before materializing one session revision."""
+        async with self.thread_datasource_lock(thread_id):
+            async with self.transaction_scope() as conn:
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock($1)",
+                    _thread_config_lock_key(thread_id),
+                )
+                yield conn
+
     async def execute(self, query: str, *args) -> str:
         """Execute a query without returning results.
 
@@ -3668,7 +3735,15 @@ class PostgresDB:
             row = await conn.fetchrow(
                 """
                 SELECT j.id, j.status, j.completion_outcome_kind,
-                       j.config_name, j.expert_id, j.config_override, j.resolved_config,
+                       j.config_name, j.expert_id, j.config_override,
+                       execution.harness_adapter AS execution_harness_adapter,
+                       workspace_binding.instance_id AS workspace_instance_id,
+                       COALESCE(
+                           CASE WHEN execution.harness_adapter = 'srw/v1' THEN
+                               execution.resolved #> '{spec,execution,expert,inline,runtime,config,resolved}'
+                           END,
+                           j.resolved_config
+                       ) AS resolved_config,
                        j.assigned_agent_id, j.user_id,
                        j.project_id, j.parent_job_id, j.priority,
                        j.branch_name, j.repo_name, j.merge_status, j.repo_merge_statuses,
@@ -3683,6 +3758,10 @@ class PostgresDB:
                        (p.main_cloud_folder_handle IS NOT NULL) AS project_has_cloud_folder
                 FROM jobs j
                 LEFT JOIN projects p ON p.id = j.project_id
+                LEFT JOIN srw_execution_specs execution
+                    ON execution.work_kind='Job' AND execution.work_id=j.id
+                LEFT JOIN srw_execution_workspace_bindings workspace_binding
+                    ON workspace_binding.execution_id=execution.id
                 WHERE j.id = $1
                 """,
                 uuid_val,
@@ -3725,6 +3804,8 @@ class PostgresDB:
         requested_workspace_backend: Any = _WORKSPACE_REQUEST_UNSET,
         workspace_assignment_source: str | None = None,
         delivery_contract: Mapping[str, Any] | None = None,
+        execution_manifest: Mapping[str, Any] | None = None,
+        workspace_selection: Mapping[str, Any] | None = None,
         conn: Any = None,
     ) -> Dict[str, Any]:
         """Create a new job.
@@ -3955,6 +4036,11 @@ class PostgresDB:
         description = (description or "").strip()
 
         async def _write(active_conn) -> Any:
+            from orchestrator.services.manifest_execution_retirement import (
+                lock_manifest_execution_catalog,
+            )
+
+            await lock_manifest_execution_catalog(active_conn)
             await _lock_and_compare_policy_snapshot(
                 active_conn,
                 datasource_uuids,
@@ -4040,6 +4126,33 @@ class PostgresDB:
                     json.dumps(prepared_contract.get("pr_bindings") or []),
                     str(prepared_contract.get("digest") or ""),
                 )
+            from orchestrator.services.manifest_execution_snapshot import (
+                capture_execution,
+            )
+
+            await capture_execution(
+                self,
+                active_conn,
+                work_kind="Job",
+                work_id=str(written["id"]),
+                owner_id=user_id,
+                project_ids=[project_id] if project_id else [],
+                execution_manifest=dict(execution_manifest)
+                if execution_manifest is not None
+                else None,
+                config_name=config_name,
+                expert_id=expert_id,
+                config_override=config_override,
+                workspace_selection=dict(workspace_selection)
+                if workspace_selection is not None
+                else None,
+                description=description,
+                datasource_ids=[str(value) for value in datasource_uuids],
+                policy_revisions={
+                    str(key): value for key, value in policy_snapshot.items()
+                },
+                runner_kind=runner_kind,
+            )
             return written
 
         if conn is not None:
@@ -4049,15 +4162,13 @@ class PostgresDB:
             row = await _write(conn)
         else:
             async with self.acquire() as owned_conn:
-                async with _transaction_if(
-                    owned_conn,
-                    bool(datasource_uuids)
-                    or authority_user_id is not None
-                    or prepared_contract is not None,
-                ):
+                async with owned_conn.transaction():
                     row = await _write(owned_conn)
 
         result = dict(row)
+        result["execution_harness_adapter"] = (execution_manifest or {}).get(
+            "harness_adapter", "srw/v1"
+        )
         result["workspace_contract"] = workspace_contract_projection(
             {"context": context, "config_override": config_override},
             vm_mode=vm_mode_from_env(),
@@ -4171,11 +4282,19 @@ class PostgresDB:
                     uuid_val,
                 )
                 deleting_job = await conn.fetchrow(
-                    "SELECT status, completion_outcome_kind "
+                    "SELECT status, completion_outcome_kind, "
+                    "(SELECT execution.harness_adapter FROM srw_execution_specs execution "
+                    " WHERE execution.work_kind='Job' AND execution.work_id=jobs.id) "
+                    "AS execution_harness_adapter "
                     "FROM jobs WHERE id = $1 FOR UPDATE",
                     uuid_val,
                 )
                 if deleting_job is not None:
+                    from orchestrator.services.manifest_runtime_ownership import (
+                        require_srw_runtime,
+                    )
+
+                    require_srw_runtime(deleting_job)
                     # Deletion is never a release. This update and the jobs
                     # DELETE share the transaction, so a fault cannot leave an
                     # audit tombstone for a job row that survived (or erase the
@@ -4909,6 +5028,9 @@ class PostgresDB:
                         assigned_agent_id = NULL,
                         updated_at = CURRENT_TIMESTAMP
                     WHERE id = $1 AND status = 'processing'
+                      AND NOT EXISTS (SELECT 1 FROM srw_execution_specs execution
+                          WHERE execution.work_kind='Job' AND execution.work_id=jobs.id
+                            AND execution.harness_adapter <> 'srw/v1')
                     """,
                     uuid_val,
                 )
@@ -4925,6 +5047,9 @@ class PostgresDB:
                     assigned_agent_id = NULL,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = $1 AND status = 'processing'
+                  AND NOT EXISTS (SELECT 1 FROM srw_execution_specs execution
+                      WHERE execution.work_kind='Job' AND execution.work_id=jobs.id
+                        AND execution.harness_adapter <> 'srw/v1')
                   AND execution_lane = 'pinned'
                   {owner_guard}
                   AND NOT ({_completion_control_active_sql("context")})
@@ -8203,15 +8328,20 @@ class PostgresDB:
 
         return int(row["delegation_depth"]) if row else 0
 
-    async def get_descendant_jobs(self, job_id: str) -> List[Dict[str, Any]]:
+    async def get_descendant_jobs(
+        self, job_id: str, *, include_cancelled: bool = False
+    ) -> List[Dict[str, Any]]:
         """Get all non-terminal descendant jobs (recursive).
 
         Walks the parent_job_id tree downward and returns every descendant
         whose status is not yet terminal (completed/failed/cancelled).
         Includes all subjob types: scholar, critic, curator, delegation.
+        Cancellation retries include cancelled rows whose external retirement
+        may still be incomplete; other callers retain the active-only view.
 
         Args:
             job_id: Root job UUID as string
+            include_cancelled: Include durable cancellation cleanup retry owners.
 
         Returns:
             List of job dicts for active descendants (may be empty)
@@ -8238,11 +8368,16 @@ class PostgresDB:
                     JOIN descendants d ON j.parent_job_id = d.id
                     WHERE d.depth < 20
                 )
-                SELECT *
+                SELECT descendants.*,
+                    (SELECT execution.harness_adapter FROM srw_execution_specs execution
+                     WHERE execution.work_kind='Job' AND execution.work_id=descendants.id)
+                    AS execution_harness_adapter
                 FROM descendants
                 WHERE status NOT IN ('completed', 'failed', 'cancelled')
+                   OR ($2::boolean AND status = 'cancelled')
                 """,
                 uuid_val,
+                include_cancelled,
             )
 
         return [dict(row) for row in rows]
@@ -9628,7 +9763,11 @@ class PostgresDB:
         return result == "UPDATE 1"
 
     async def merge_ide_session_context(
-        self, job_id: str, session_updates: Dict[str, Any]
+        self,
+        job_id: str,
+        session_updates: Dict[str, Any],
+        *,
+        expected_vm_generation: str | None = None,
     ) -> bool:
         """Atomically merge updates into context.ide_session without touching other keys.
 
@@ -9638,6 +9777,8 @@ class PostgresDB:
         Args:
             job_id: Job UUID as string
             session_updates: Dictionary of keys to merge into context.ide_session
+            expected_vm_generation: Restrict heartbeat activity to an existing
+                live VM IDE on this generation.
 
         Returns:
             True if updated, False if not found
@@ -9659,17 +9800,31 @@ class PostgresDB:
             "    updated_at = CURRENT_TIMESTAMP "
             "WHERE id = $2"
         )
-        async with self.acquire() as conn:
-            result = await conn.execute(
-                query, json_module.dumps(session_updates), uuid_val
+        arguments = [json_module.dumps(session_updates), uuid_val]
+        if expected_vm_generation is not None:
+            # Heartbeats update an explicitly hosted VM IDE. They never create
+            # a runtime projection or relabel another/unknown backend. Check
+            # the current generation atomically with this write.
+            query += (
+                " AND context->'vm'->>'provision_generation' = $3"
+                " AND context->'vm'->>'status' = 'ready'"
+                " AND context->'ide_session'->>'restore_type' = 'vm'"
+                " AND context->'ide_session'->>'status' IN ('active','idle')"
             )
+            arguments.append(expected_vm_generation)
+        async with self.acquire() as conn:
+            result = await conn.execute(query, *arguments)
 
         return result == "UPDATE 1"
 
     async def merge_thread_ide_session_context(
-        self, thread_id: str, session_updates: Dict[str, Any]
+        self,
+        thread_id: str,
+        session_updates: Dict[str, Any],
+        *,
+        expected_vm_generation: str | None = None,
     ) -> bool:
-        """Atomically merge updates into threads.metadata.ide_session."""
+        """Merge IDE activity, optionally restricted to the current live VM."""
         import json as json_module
 
         try:
@@ -9686,10 +9841,17 @@ class PostgresDB:
             ") "
             "WHERE id = $2"
         )
-        async with self.acquire() as conn:
-            result = await conn.execute(
-                query, json_module.dumps(session_updates), uuid_val
+        arguments = [json_module.dumps(session_updates), uuid_val]
+        if expected_vm_generation is not None:
+            query += (
+                " AND metadata->'vm'->>'provision_generation' = $3"
+                " AND metadata->'vm'->>'status' = 'ready'"
+                " AND metadata->'ide_session'->>'restore_type' = 'vm'"
+                " AND metadata->'ide_session'->>'status' IN ('active','idle')"
             )
+            arguments.append(expected_vm_generation)
+        async with self.acquire() as conn:
+            result = await conn.execute(query, *arguments)
 
         return result == "UPDATE 1"
 
@@ -9700,6 +9862,7 @@ class PostgresDB:
         *,
         completion_command_id: str | None = None,
         completion_finalizing_by: str | None = None,
+        existing_only: bool = False,
     ) -> bool:
         """Atomically merge updates into context.workspace_container.
 
@@ -9709,6 +9872,8 @@ class PostgresDB:
         Args:
             job_id: Job UUID as string
             container_updates: Dictionary of keys to merge into context.workspace_container
+            existing_only: Only touch a projection naming its provisioner. Routine
+                activity must not create infrastructure state for virtual/none jobs.
 
         Returns:
             True if updated, False if not found
@@ -9750,6 +9915,8 @@ class PostgresDB:
             "    updated_at = CURRENT_TIMESTAMP "
             f"WHERE id = $2{command_guard}"
         )
+        if existing_only:
+            query += " AND context->'workspace_container'->>'provisioner' IN ('k8s', 'docker')"
         async with self.acquire() as conn:
             result = await conn.execute(query, *values)
 
@@ -12904,7 +13071,9 @@ class PostgresDB:
         Kubernetes/VM deletion acknowledgements are control-plane facts, not
         proof that a partitioned node or guest stopped using a delivered
         deploy key. The provisioner records this receipt only after an exact
-        endpoint retirement plus an independent zero scan. A later ambiguous
+        endpoint retirement plus an independent zero scan, or authenticated
+        cancellation evidence that preparation never issued a workspace source
+        together with exact runtime absence. A later ambiguous
         delete response may replay only when the receipt still matches the
         server-owned runtime generation in the same owner row.
         """
@@ -16960,6 +17129,7 @@ class PostgresDB:
         seed_configmap_uid: str | None,
         pvc_uid: str | None,
         service_uid: str | None,
+        resource_location: dict[str, str] | None = None,
     ) -> dict[str, Any] | None:
         """Attach one explicit present/absent resource tuple to a lease."""
 
@@ -16983,6 +17153,48 @@ class PostgresDB:
         seed_uid, claim_uid, service_resource_uid = parsed_resources
         async with self.acquire() as conn:
             async with conn.transaction():
+                if resource_location is not None:
+                    if (
+                        not isinstance(resource_location, dict)
+                        or set(resource_location)
+                        != {"namespace", "pod", "seedConfigMap", "pvc", "service"}
+                        or any(
+                            not isinstance(value, str) or not value
+                            for value in resource_location.values()
+                        )
+                    ):
+                        return None
+                    observed = await conn.fetchrow(
+                        "SELECT owner_kind,owner_id,scope FROM "
+                        "managed_repository_workspace_cleanup_intents WHERE id=$1",
+                        intent_uuid,
+                    )
+                    if observed is None or observed["scope"] != "workspace_container":
+                        return None
+                    table = "threads" if observed["owner_kind"] == "thread" else "jobs"
+                    column = (
+                        "metadata" if observed["owner_kind"] == "thread" else "context"
+                    )
+                    owner = await conn.fetchrow(
+                        f"SELECT {column} AS state FROM {table} WHERE id=$1 FOR UPDATE",
+                        observed["owner_id"],
+                    )
+                    if owner is None:
+                        return None
+                    state = _strict_json_object(owner["state"], label=column)
+                    workspace = state.get("workspace_container")
+                    settled = state.get("_stateless_workspace_retirement_settled")
+                    if not isinstance(workspace, dict) or (
+                        workspace.get("namespace") != resource_location["namespace"]
+                        or workspace.get("pod_name")
+                        not in {None, resource_location["pod"]}
+                        or not (
+                            workspace.get("_runtime_incarnation") == runtime
+                            or isinstance(settled, dict)
+                            and settled.get("runtime_incarnation") == runtime
+                        )
+                    ):
+                        return None
                 intent = await conn.fetchrow(
                     "SELECT * FROM managed_repository_workspace_cleanup_intents "
                     "WHERE id = $1 FOR UPDATE",
@@ -17004,12 +17216,19 @@ class PostgresDB:
                 ):
                     return None
                 if intent.get("capture_complete") is True:
+                    captured_location = intent.get("resource_location")
+                    if isinstance(captured_location, str):
+                        captured_location = json.loads(captured_location)
                     if (
                         str(intent.get("seed_configmap_uid") or "")
                         == str(seed_uid or "")
                         and str(intent.get("pvc_uid") or "") == str(claim_uid or "")
                         and str(intent.get("service_uid") or "")
                         == str(service_resource_uid or "")
+                        and (
+                            resource_location is None
+                            or captured_location == resource_location
+                        )
                     ):
                         return dict(intent)
                     return None
@@ -17017,6 +17236,7 @@ class PostgresDB:
                     "UPDATE managed_repository_workspace_cleanup_intents "
                     "SET seed_configmap_uid = $2, pvc_uid = $3, "
                     "service_uid = $4, capture_complete = TRUE, "
+                    "resource_location = $7::jsonb, "
                     "resources_captured_at = now(), phase = 'captured' "
                     "WHERE id = $1 AND capture_complete IS FALSE "
                     "AND claimed_by = $5 AND claim_token = $6 "
@@ -17027,6 +17247,9 @@ class PostgresDB:
                     service_resource_uid,
                     claimant,
                     claim_token,
+                    json.dumps(resource_location)
+                    if resource_location is not None
+                    else None,
                 )
                 return dict(row) if row is not None else None
 
@@ -19428,7 +19651,10 @@ class PostgresDB:
         expected_attach_token: str | None,
         expected_vm_context: Mapping[str, Any] | None,
         provision_context: Mapping[str, Any],
-    ) -> bool:
+        poll: bool = False,
+        preparation_only: bool = False,
+        expected_preparation_context: Mapping[str, Any] | None = None,
+    ) -> bool | dict:
         """Install one VM provision generation before any controller effect.
 
         The caller's earlier route/read snapshot is advisory.  This method is
@@ -19437,6 +19663,11 @@ class PostgresDB:
         the caller observed, then publishes the new provision generation and
         ``provisioning`` status in the same update.  A stale upgrade therefore
         cannot dispatch after End, Resume, rebind, or another VM attempt.
+
+        ``preparation_only`` instead returns a separate durable cache stage;
+        it installs no physical VM authority and preserves an existing stage's
+        deadline. VM admission then compares ``expected_preparation_context``
+        before consuming that stage in the same transaction.
 
         ``None`` means the ``vm`` member was absent/JSON-null.  Present scalar
         or array values fail closed instead of being truthiness-coerced to an
@@ -19485,6 +19716,19 @@ class PostgresDB:
         ):
             return False
         proposed["provision_generation"] = provision_generation
+        if preparation_only:
+            from shared.workspace_preparation import validate_request
+
+            try:
+                preparation = validate_request(proposed["preparation_request"])
+            except (ValueError, TypeError, KeyError):
+                return False
+            if (
+                preparation["allocationId"] != str(parsed_thread)
+                or preparation["ownerKind"] != "session"
+                or preparation["runtimeGeneration"] != str(parsed_runtime_generation)
+            ):
+                return False
         expected_vm = (
             dict(expected_vm_context) if expected_vm_context is not None else None
         )
@@ -19516,7 +19760,24 @@ class PostgresDB:
                 if current_vm != expected_vm:
                     return False
                 current_vm_status = str((current_vm or {}).get("status") or "")
-                if current_vm_status in {
+                if poll:
+                    if (
+                        current_vm_status
+                        not in {
+                            "waiting_golden",
+                            "waiting_capacity",
+                            "waiting_headscale",
+                            "waiting_preparation",
+                            "provisioning",
+                        }
+                        or (current_vm or {}).get("provision_generation")
+                        != provision_generation
+                        or (current_vm or {}).get("identity_authenticated") is not False
+                        or current_vm_status == "provisioning"
+                        and not (current_vm or {}).get("preparation_request")
+                    ):
+                        return False
+                elif current_vm_status in {
                     "provisioning",
                     "created",
                     "starting",
@@ -19525,6 +19786,7 @@ class PostgresDB:
                     "waiting_golden",
                     "waiting_capacity",
                     "waiting_headscale",
+                    "waiting_preparation",
                 }:
                     return False
                 if not (
@@ -19548,6 +19810,32 @@ class PostgresDB:
                     len(inverse_agents) != 1 or inverse_agents[0]["id"] != parsed_agent
                 ):
                     return False
+
+                # Cache construction has no physical VM identity. Keep it out
+                # of metadata.vm so End can retire this runtime without
+                # inventing VM/PVC UIDs or relaxing physical fencing.
+                stage = metadata.get("workspace_preparation")
+                if stage is not None and not isinstance(stage, dict):
+                    return False
+                if preparation_only:
+                    if stage and stage.get("preparation_request") == preparation:
+                        return dict(stage) if stage.get("status") != "failed" else False
+                    if stage and stage.get("preparation_cancelled_revision") != (
+                        stage.get("preparation_request") or {}
+                    ).get("revision"):
+                        return False
+                    proposed.update(status="waiting_preparation", preparation_only=True)
+                    metadata["workspace_preparation"] = proposed
+                    await conn.execute(
+                        "UPDATE threads SET metadata=$2::jsonb WHERE id=$1::uuid",
+                        parsed_thread,
+                        json.dumps(metadata),
+                    )
+                    return proposed
+                if expected_preparation_context is not None:
+                    if stage != dict(expected_preparation_context):
+                        return False
+                    metadata.pop("workspace_preparation", None)
 
                 # Installing a VM generation is also the exact workspace-tier
                 # transition boundary.  Session upgrades historically left
@@ -19604,6 +19892,26 @@ class PostgresDB:
                     parsed_runtime_generation,
                 )
                 return result == "UPDATE 1"
+
+    async def merge_thread_preparation_if_current(
+        self, thread_id, runtime_generation, expected, updates
+    ) -> bool:
+        """CAS cache progress without installing physical VM authority."""
+        async with self.acquire() as conn:
+            return (
+                await conn.execute(
+                    "UPDATE threads SET metadata=jsonb_set(metadata,'{workspace_preparation}',"
+                    "(metadata->'workspace_preparation') || $4::jsonb) "
+                    "WHERE id=$1::uuid AND runtime_generation=$2::uuid "
+                    "AND runtime_retirement_token IS NULL AND status<>'ended' "
+                    "AND metadata->'workspace_preparation'=$3::jsonb",
+                    UUID(str(thread_id)),
+                    UUID(str(runtime_generation)),
+                    json.dumps(expected),
+                    json.dumps(updates),
+                )
+                == "UPDATE 1"
+            )
 
     async def merge_thread_vm_context(
         self, thread_id: str, vm_updates: Dict[str, Any]
@@ -19729,17 +20037,76 @@ class PostgresDB:
                     "starting",
                     "restoring",
                     "ssh_pending",
+                    "waiting_preparation",
+                    "waiting_golden",
+                    "waiting_capacity",
+                    "waiting_headscale",
                 )
             )
         )
         query = (
             "SELECT id::text AS entity_id, user_id::text AS user_id, "
-            "metadata->'vm' AS vm FROM threads WHERE ("
+            "COALESCE(metadata->'workspace_preparation',metadata->'vm') AS vm FROM threads WHERE ("
             + status_clause
+            + (
+                ""
+                if ready
+                else " OR metadata->'workspace_preparation'->>'status'='waiting_preparation'"
+            )
             + ") AND threads.status <> 'ended' AND threads.ended_at IS NULL"
+            + " AND runtime_retirement_token IS NULL"
         )
         async with self.acquire() as conn:
             return [dict(row) for row in await conn.fetch(query)]
+
+    async def list_vm_preparation_cancellations(self) -> list:
+        """Terminal executions still holding a preparation allocation."""
+        query = """
+            SELECT id::text AS entity_id,'job' AS entity_type,context->'vm' AS vm
+            FROM jobs
+            WHERE (status IN ('completed','failed','cancelled') OR context->'vm'->>'status'='failed')
+              AND jsonb_typeof(context->'vm'->'preparation_request')='object'
+              AND context->'vm'->>'preparation_cancelled_revision' IS DISTINCT FROM
+                  context->'vm'->'preparation_request'->>'revision'
+            UNION ALL
+            SELECT id::text,'thread',metadata->'vm'
+            FROM threads
+            WHERE (status='ended' OR runtime_retirement_token IS NOT NULL OR metadata->'vm'->>'status'='failed')
+              AND jsonb_typeof(metadata->'vm'->'preparation_request')='object'
+              AND metadata->'vm'->>'preparation_cancelled_revision' IS DISTINCT FROM
+                  metadata->'vm'->'preparation_request'->>'revision'
+            UNION ALL
+            SELECT id::text,'thread',metadata->'workspace_preparation'
+            FROM threads
+            WHERE (status='ended' OR runtime_retirement_token IS NOT NULL OR metadata->'workspace_preparation'->>'status'='failed')
+              AND jsonb_typeof(metadata->'workspace_preparation'->'preparation_request')='object'
+              AND metadata->'workspace_preparation'->>'preparation_cancelled_revision' IS DISTINCT FROM
+                  metadata->'workspace_preparation'->'preparation_request'->>'revision'
+            LIMIT 50
+        """
+        async with self.acquire() as conn:
+            return [dict(row) for row in await conn.fetch(query)]
+
+    async def acknowledge_vm_preparation_cancelled(
+        self, entity_type, entity_id, request
+    ):
+        if entity_type not in {"job", "thread"}:
+            raise ValueError("Invalid preparation owner")
+        table, column = (
+            ("jobs", "context") if entity_type == "job" else ("threads", "metadata")
+        )
+        async with self.acquire() as conn:
+            for field in (
+                ("vm",) if entity_type == "job" else ("vm", "workspace_preparation")
+            ):
+                await conn.execute(
+                    f"UPDATE {table} SET {column}=jsonb_set({column},'{{{field}}}',"
+                    f"({column}->'{field}') || jsonb_build_object('preparation_cancelled_revision',$3::text)) "
+                    f"WHERE id=$1::uuid AND {column}->'{field}'->'preparation_request'=$2::jsonb",
+                    UUID(entity_id),
+                    json.dumps(request),
+                    request["revision"],
+                )
 
     async def merge_thread_snapshot_context(
         self, thread_id: str, snapshot_updates: Dict[str, Any]
@@ -19838,10 +20205,7 @@ class PostgresDB:
         # never queue behind the (potentially minutes-long) provisioning
         # lock in thread_advisory_lock, and taken on this same connection
         # so no second pool slot is held while waiting.
-        h = hashlib.blake2b(
-            b"config_override:" + thread_id.encode(), digest_size=8
-        ).digest()
-        lock_key = int.from_bytes(h, byteorder="big", signed=True)
+        lock_key = _thread_config_lock_key(thread_id)
 
         async with self.acquire() as conn:
             async with conn.transaction():
@@ -19936,6 +20300,21 @@ class PostgresDB:
         async with self.thread_datasource_lock(thread_id):
             async with self.acquire() as conn:
                 async with conn.transaction():
+                    retained = await conn.fetch(
+                        """
+                        SELECT d.id, d.type FROM threads t
+                        JOIN datasources d ON
+                            COALESCE(t.metadata->'datasource_ids', '[]'::jsonb) ? d.id::text
+                        WHERE t.id = $1 AND d.type = 'credentials'
+                            AND NOT (d.id = ANY($2::uuid[]))
+                        """,
+                        thread_uuid,
+                        datasource_uuids,
+                    )
+                    if any(row.get("type") == "credentials" for row in retained):
+                        raise CredentialConnectorAttachedError(
+                            "Credential connectors stay attached for the lifetime of the session"
+                        )
                     # Serialize every replacement, including A -> [], with the
                     # credential-delivery boundary. Once this transaction
                     # commits, an in-flight attach can no longer deliver the
@@ -21122,6 +21501,9 @@ class PostgresDB:
                   -- the sole rescue authority for stateless worker jobs.
                   -- Whitelist pinned so unknown future lanes fail closed.
                   AND jobs.execution_lane = 'pinned'
+                  AND NOT EXISTS (SELECT 1 FROM srw_execution_specs execution
+                      WHERE execution.work_kind='Job' AND execution.work_id=jobs.id
+                        AND execution.harness_adapter <> 'srw/v1')
                   -- Leased rows belong exclusively to
                   -- recover_expired_lease_jobs. This predicate is the
                   -- authority partition; detector ordering is not relied on.
@@ -21152,6 +21534,9 @@ class PostgresDB:
                     updated_at = CURRENT_TIMESTAMP
                 WHERE status = 'waiting'
                   AND jobs.execution_lane = 'pinned'
+                  AND NOT EXISTS (SELECT 1 FROM srw_execution_specs execution
+                      WHERE execution.work_kind='Job' AND execution.work_id=jobs.id
+                        AND execution.harness_adapter <> 'srw/v1')
                   AND assigned_agent_id IS NOT NULL
                   AND assigned_agent_id IN (
                       SELECT id FROM agents WHERE status = 'offline'
@@ -21174,6 +21559,9 @@ class PostgresDB:
                     updated_at = CURRENT_TIMESTAMP
                 WHERE status = 'paused'
                   AND jobs.execution_lane = 'pinned'
+                  AND NOT EXISTS (SELECT 1 FROM srw_execution_specs execution
+                      WHERE execution.work_kind='Job' AND execution.work_id=jobs.id
+                        AND execution.harness_adapter <> 'srw/v1')
                   AND assigned_agent_id IS NOT NULL
                   AND assigned_agent_id IN (
                       SELECT id FROM agents WHERE status = 'offline'
@@ -21203,6 +21591,9 @@ class PostgresDB:
                     updated_at = CURRENT_TIMESTAMP
                 WHERE status = 'paused'
                   AND jobs.execution_lane = 'pinned'
+                  AND NOT EXISTS (SELECT 1 FROM srw_execution_specs execution
+                      WHERE execution.work_kind='Job' AND execution.work_id=jobs.id
+                        AND execution.harness_adapter <> 'srw/v1')
                   AND assigned_agent_id IS NULL
                   AND freeze_data->>'freeze_type' = ANY($1::text[])
                   {completion_exclusion}
@@ -21288,6 +21679,9 @@ class PostgresDB:
                    -- Stateless jobs are recovered only by run_queue's
                    -- lease-token reaper (§5.4.4), never this jobs-row lease.
                    AND jobs.execution_lane = 'pinned'
+                   AND NOT EXISTS (SELECT 1 FROM srw_execution_specs execution
+                       WHERE execution.work_kind='Job' AND execution.work_id=jobs.id
+                         AND execution.harness_adapter <> 'srw/v1')
                    AND lease_expires_at IS NOT NULL
                    AND lease_expires_at < NOW()
                    {completion_exclusion}
@@ -22428,6 +22822,9 @@ class PostgresDB:
                        -- One claim authority per job (§5.4.4). Fail closed for
                        -- unknown lanes instead of handing them to legacy pods.
                        AND execution_lane = 'pinned'
+                       AND NOT EXISTS (SELECT 1 FROM srw_execution_specs execution
+                           WHERE execution.work_kind='Job' AND execution.work_id=jobs.id
+                             AND execution.harness_adapter <> 'srw/v1')
                        AND assigned_agent_id IS NULL
                        AND freeze_data IS NULL
                        AND COALESCE(
@@ -25032,6 +25429,7 @@ class PostgresDB:
         config_updates: Optional[Dict[str, Any]] = None,
         communication_policy_patch: Optional[Dict[str, Any]] = None,
         expected_vacant_updated_at: Any = None,
+        project_manifest_write: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """Atomically update durable post config and its runtime projection.
 
@@ -25087,119 +25485,137 @@ class PostgresDB:
                 }
             return merged
 
-        async with self.acquire() as conn:
-            async with conn.transaction():
-                post = await conn.fetchrow(
-                    "SELECT * FROM project_officers WHERE project_id = $1 FOR UPDATE",
-                    project_uuid,
-                )
-                if post is None:
-                    return None
-
-                if expected_vacant_updated_at is not None and (
-                    post["thread_id"] is not None
-                    or post["updated_at"] != expected_vacant_updated_at
-                ):
-                    raise OfficerPostLifecycleConflict(
-                        "commission_generation_changed",
-                        "Officer Post vacancy/configuration changed; retry commission.",
+        async with self.transaction_scope():
+            await self._lock_expert_catalog()
+            async with self.acquire() as conn:
+                async with conn.transaction():
+                    post = await conn.fetchrow(
+                        "SELECT * FROM project_officers WHERE project_id = $1 FOR UPDATE",
+                        project_uuid,
                     )
+                    if post is None:
+                        return None
 
-                thread = None
-                if post["thread_id"] is not None:
-                    thread = await conn.fetchrow(
-                        "SELECT id, project_id, status, metadata "
-                        "FROM threads WHERE id = $1 FOR UPDATE",
-                        post["thread_id"],
-                    )
-
-                current_config = post["config_override"]
-                if isinstance(current_config, str):
-                    try:
-                        current_config = json.loads(current_config)
-                    except (TypeError, ValueError):
-                        current_config = {}
-                if not isinstance(current_config, dict):
-                    current_config = {}
-                merged_config = _merge_post_config(current_config, config_updates or {})
-
-                officer_config = merged_config.get("officer") or {}
-                if isinstance(officer_config, dict):
-                    try:
-                        sleep_min = int(officer_config.get("sleep_min_minutes") or 5)
-                        sleep_max = int(officer_config.get("sleep_max_minutes") or 60)
-                    except (TypeError, ValueError) as exc:
+                    if expected_vacant_updated_at is not None and (
+                        post["thread_id"] is not None
+                        or post["updated_at"] != expected_vacant_updated_at
+                    ):
                         raise OfficerPostLifecycleConflict(
-                            "invalid_config", "Officer sleep bounds must be integers."
-                        ) from exc
-                    if sleep_min > sleep_max:
-                        raise OfficerPostLifecycleConflict(
-                            "invalid_config",
-                            f"sleep_min_minutes ({sleep_min}) must not exceed "
-                            f"sleep_max_minutes ({sleep_max})",
+                            "commission_generation_changed",
+                            "Officer Post vacancy/configuration changed; retry commission.",
                         )
 
-                policy = post["communication_policy"]
-                if isinstance(policy, str):
-                    try:
-                        policy = json.loads(policy)
-                    except (TypeError, ValueError):
-                        policy = {}
-                if not isinstance(policy, dict):
-                    policy = {}
-                merged_policy = {
-                    **policy,
-                    **(communication_policy_patch or {}),
-                }
+                    thread = None
+                    if post["thread_id"] is not None:
+                        thread = await conn.fetchrow(
+                            "SELECT id, project_id, status, metadata "
+                            "FROM threads WHERE id = $1 FOR UPDATE",
+                            post["thread_id"],
+                        )
 
-                updated_post = await conn.fetchrow(
-                    """
-                    UPDATE project_officers
-                       SET config_override = $2::jsonb
-                               #- '{officer,hold}'
-                               #- '{officer,last_respawn_at}',
-                           communication_policy = $3::jsonb,
-                           updated_at = now()
-                     WHERE project_id = $1
-                    RETURNING *
-                    """,
-                    project_uuid,
-                    json.dumps(merged_config),
-                    json.dumps(merged_policy),
+                    current_config = post["config_override"]
+                    if isinstance(current_config, str):
+                        try:
+                            current_config = json.loads(current_config)
+                        except (TypeError, ValueError):
+                            current_config = {}
+                    if not isinstance(current_config, dict):
+                        current_config = {}
+                    merged_config = _merge_post_config(
+                        current_config, config_updates or {}
+                    )
+
+                    officer_config = merged_config.get("officer") or {}
+                    if isinstance(officer_config, dict):
+                        try:
+                            sleep_min = int(
+                                officer_config.get("sleep_min_minutes") or 5
+                            )
+                            sleep_max = int(
+                                officer_config.get("sleep_max_minutes") or 60
+                            )
+                        except (TypeError, ValueError) as exc:
+                            raise OfficerPostLifecycleConflict(
+                                "invalid_config",
+                                "Officer sleep bounds must be integers.",
+                            ) from exc
+                        if sleep_min > sleep_max:
+                            raise OfficerPostLifecycleConflict(
+                                "invalid_config",
+                                f"sleep_min_minutes ({sleep_min}) must not exceed "
+                                f"sleep_max_minutes ({sleep_max})",
+                            )
+
+                    policy = post["communication_policy"]
+                    if isinstance(policy, str):
+                        try:
+                            policy = json.loads(policy)
+                        except (TypeError, ValueError):
+                            policy = {}
+                    if not isinstance(policy, dict):
+                        policy = {}
+                    merged_policy = {
+                        **policy,
+                        **(communication_policy_patch or {}),
+                    }
+
+                    updated_post = await conn.fetchrow(
+                        """
+                        UPDATE project_officers
+                           SET config_override = $2::jsonb
+                                   #- '{officer,hold}'
+                                   #- '{officer,last_respawn_at}',
+                               communication_policy = $3::jsonb,
+                               updated_at = now()
+                         WHERE project_id = $1
+                        RETURNING *
+                        """,
+                        project_uuid,
+                        json.dumps(merged_config),
+                        json.dumps(merged_policy),
+                    )
+
+                    applied_to_thread = False
+                    updated_thread = None
+                    if (
+                        thread is not None
+                        and thread["project_id"] == project_uuid
+                        and thread["status"] != "ended"
+                        and config_updates
+                    ):
+                        metadata = thread["metadata"]
+                        if isinstance(metadata, str):
+                            try:
+                                metadata = json.loads(metadata)
+                            except (TypeError, ValueError):
+                                metadata = {}
+                        if not isinstance(metadata, dict):
+                            metadata = {}
+                        runtime_config = metadata.get("config_override") or {}
+                        runtime_config = _merge_post_config(
+                            runtime_config, config_updates
+                        )
+                        updated_thread = await conn.fetchrow(
+                            """
+                            UPDATE threads
+                               SET metadata = jsonb_set(
+                                       COALESCE(metadata, '{}'::jsonb),
+                                       '{config_override}', $2::jsonb),
+                                   last_activity = now()
+                             WHERE id = $1
+                            RETURNING id, project_id, status, metadata, user_id
+                            """,
+                            thread["id"],
+                            json.dumps(runtime_config),
+                        )
+                        applied_to_thread = updated_thread is not None
+
+            if not project_manifest_write:
+                from orchestrator.services.manifest_projects import (
+                    persist_officer_controller,
                 )
 
-                applied_to_thread = False
-                updated_thread = None
-                if (
-                    thread is not None
-                    and thread["project_id"] == project_uuid
-                    and thread["status"] != "ended"
-                    and config_updates
-                ):
-                    metadata = thread["metadata"]
-                    if isinstance(metadata, str):
-                        try:
-                            metadata = json.loads(metadata)
-                        except (TypeError, ValueError):
-                            metadata = {}
-                    if not isinstance(metadata, dict):
-                        metadata = {}
-                    runtime_config = metadata.get("config_override") or {}
-                    runtime_config = _merge_post_config(runtime_config, config_updates)
-                    updated_thread = await conn.fetchrow(
-                        """
-                        UPDATE threads
-                           SET metadata = jsonb_set(
-                                   COALESCE(metadata, '{}'::jsonb),
-                                   '{config_override}', $2::jsonb),
-                               last_activity = now()
-                         WHERE id = $1
-                        RETURNING id, project_id, status, metadata, user_id
-                        """,
-                        thread["id"],
-                        json.dumps(runtime_config),
-                    )
-                    applied_to_thread = updated_thread is not None
+                await persist_officer_controller(self, project_id, dict(updated_post))
 
         result_thread = (
             dict(updated_thread)
@@ -26028,37 +26444,44 @@ class PostgresDB:
                     merged[key] = value
             return merged
 
-        async with self.acquire() as conn:
-            async with conn.transaction():
-                row = await conn.fetchrow(
-                    "SELECT config_override FROM project_officers "
-                    "WHERE project_id = $1 FOR UPDATE",
-                    project_uuid,
-                )
-                if row is None:
-                    return None
-                current = row["config_override"]
-                if isinstance(current, str):
-                    try:
-                        current = json.loads(current)
-                    except (TypeError, ValueError):
+        async with self.transaction_scope():
+            await self._lock_expert_catalog()
+            async with self.acquire() as conn:
+                async with conn.transaction():
+                    row = await conn.fetchrow(
+                        "SELECT config_override FROM project_officers "
+                        "WHERE project_id = $1 FOR UPDATE",
+                        project_uuid,
+                    )
+                    if row is None:
+                        return None
+                    current = row["config_override"]
+                    if isinstance(current, str):
+                        try:
+                            current = json.loads(current)
+                        except (TypeError, ValueError):
+                            current = {}
+                    if not isinstance(current, dict):
                         current = {}
-                if not isinstance(current, dict):
-                    current = {}
-                merged = _deep_merge(current, config_updates)
-                updated = await conn.fetchrow(
-                    """
-                    UPDATE project_officers
-                       SET config_override = $2::jsonb
-                               #- '{officer,hold}'
-                               #- '{officer,last_respawn_at}',
-                           updated_at = now()
-                     WHERE project_id = $1
-                    RETURNING *
-                    """,
-                    project_uuid,
-                    json.dumps(merged),
-                )
+                    merged = _deep_merge(current, config_updates)
+                    updated = await conn.fetchrow(
+                        """
+                        UPDATE project_officers
+                           SET config_override = $2::jsonb
+                                   #- '{officer,hold}'
+                                   #- '{officer,last_respawn_at}',
+                               updated_at = now()
+                         WHERE project_id = $1
+                        RETURNING *
+                        """,
+                        project_uuid,
+                        json.dumps(merged),
+                    )
+            from orchestrator.services.manifest_projects import (
+                persist_officer_controller,
+            )
+
+            await persist_officer_controller(self, project_id, dict(updated))
         return self._project_officer_row_to_dict(updated)
 
     async def merge_project_officer_state(
@@ -28020,6 +28443,9 @@ class PostgresDB:
                    freeze_data = NULL,
                    updated_at = CURRENT_TIMESTAMP
              WHERE id = $1{lane_guard}{lifecycle_guard}{status_guard}{route_guard}{completion_guard}{control_guard}{trip_guard}
+               AND NOT EXISTS (SELECT 1 FROM srw_execution_specs execution
+                   WHERE execution.work_kind='Job' AND execution.work_id=jobs.id
+                     AND execution.harness_adapter <> 'srw/v1')
             RETURNING id, priority, user_id
             """,
             *args,
@@ -28106,6 +28532,9 @@ class PostgresDB:
                        ),
                        updated_at = CURRENT_TIMESTAMP
                  WHERE id = $1::uuid
+                   AND NOT EXISTS (SELECT 1 FROM srw_execution_specs execution
+                       WHERE execution.work_kind='Job' AND execution.work_id=jobs.id
+                         AND execution.harness_adapter <> 'srw/v1')
                 RETURNING id
                 """,
                 UUID(job_id) if isinstance(job_id, str) else job_id,
@@ -28807,12 +29236,16 @@ class PostgresDB:
                        j.execution_lane, j.branch_name, j.context, j.created_at,
                        -- The managed repository authority keys on repo_name;
                        -- a row without it dispatches a credential-less remote.
-                       j.repo_name
+                       j.repo_name,
+                       (SELECT execution.harness_adapter FROM srw_execution_specs execution
+                        WHERE execution.work_kind='Job' AND execution.work_id=j.id)
+                       AS execution_harness_adapter
                 FROM jobs j
                 -- These three terms are the partial index idx_jobs_dispatchable
                 -- (0046). Statuses MUST stay literal (see docstring); the
                 -- ORDER BY priority DESC, created_at ASC is the index key.
                 WHERE j.status IN ('created', 'paused')
+                  AND NOT EXISTS (SELECT 1 FROM srw_execution_specs execution WHERE execution.work_kind='Job' AND execution.work_id=j.id AND execution.harness_adapter='generic')
                   -- Coexistence partition (§5.4.4): stateless rows are
                   -- admitted through worker_batch enqueue, not this dispatcher.
                   AND j.execution_lane = 'pinned'
@@ -28896,9 +29329,13 @@ class PostgresDB:
                        j.project_id, j.parent_job_id, j.priority, j.runner_kind,
                        j.execution_lane, j.branch_name, j.context, j.created_at,
                        j.expert_id, j.document_path, j.worktree_path,
-                       j.delegation_context
+                       j.delegation_context,
+                       (SELECT execution.harness_adapter FROM srw_execution_specs execution
+                        WHERE execution.work_kind='Job' AND execution.work_id=j.id)
+                       AS execution_harness_adapter
                 FROM jobs j
                 WHERE j.status IN ('created', 'paused')
+                  AND NOT EXISTS (SELECT 1 FROM srw_execution_specs execution WHERE execution.work_kind='Job' AND execution.work_id=j.id AND execution.harness_adapter='generic')
                   AND j.execution_lane = 'stateless'
                   AND j.assigned_agent_id IS NULL
                   AND j.freeze_data IS NULL
@@ -28988,6 +29425,9 @@ class PostgresDB:
                           FROM jobs
                          WHERE id = $1
                            AND execution_lane = 'stateless'
+                           AND NOT EXISTS (SELECT 1 FROM srw_execution_specs execution
+                               WHERE execution.work_kind='Job' AND execution.work_id=jobs.id
+                                 AND execution.harness_adapter <> 'srw/v1')
                            AND status IN ('created', 'paused')
                            AND assigned_agent_id IS NULL
                            AND freeze_data IS NULL
@@ -29253,6 +29693,8 @@ class PostgresDB:
         execution_lane: str = "pinned",
         initial_metadata: Dict[str, Any] | None = None,
         initial_event: str | None = None,
+        execution_manifest: Mapping[str, Any] | None = None,
+        workspace_selection: Mapping[str, Any] | None = None,
     ) -> str:
         """Create a thread with its complete connector selection in one row.
 
@@ -29393,12 +29835,12 @@ class PostgresDB:
                 raise ValueError("initial thread event is too long")
 
         async with self.acquire() as conn:
-            async with _transaction_if(
-                conn,
-                bool(selected_uuids)
-                or authority_user_id is not None
-                or initial_event is not None,
-            ):
+            async with conn.transaction():
+                from orchestrator.services.manifest_execution_retirement import (
+                    lock_manifest_execution_catalog,
+                )
+
+                await lock_manifest_execution_catalog(conn)
                 await _lock_and_compare_policy_snapshot(
                     conn, selected_uuids, policy_snapshot
                 )
@@ -29439,7 +29881,105 @@ class PostgresDB:
                         row["id"],
                         initial_event,
                     )
+                from orchestrator.services.manifest_execution_snapshot import (
+                    capture_execution,
+                )
+
+                snapshot_override = dict(metadata.get("config_override") or {})
+                snapshot_override["interactive"] = {
+                    **(snapshot_override.get("interactive") or {}),
+                    "permission_mode": permission_mode,
+                    "narration_mode": narration_mode,
+                }
+                await capture_execution(
+                    self,
+                    conn,
+                    work_kind="Session",
+                    work_id=str(row["id"]),
+                    owner_id=user_id,
+                    project_ids=[str(value) for value in authority_project_uuids]
+                    or ([project_id] if project_id else []),
+                    execution_manifest=dict(execution_manifest)
+                    if execution_manifest is not None
+                    else None,
+                    config_name=config_name,
+                    expert_id=metadata.get("expert_id"),
+                    config_override=snapshot_override,
+                    workspace_selection=dict(workspace_selection)
+                    if workspace_selection is not None
+                    else None,
+                    description=title,
+                    datasource_ids=selected_ids,
+                    policy_revisions={
+                        str(key): value for key, value in policy_snapshot.items()
+                    },
+                )
         return str(row["id"])
+
+    async def refresh_session_execution(
+        self, thread_id: str, *, conn: Any, config_override: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Patch the frozen current generation on the settings transaction.
+
+        Historical sessions without a snapshot keep their compatibility delta
+        until the next attach captures its newly resolved configuration.
+        """
+        from orchestrator.services.manifest_execution_snapshot import (
+            capture_execution,
+            prepare_srw_session_patch,
+            read_execution,
+        )
+
+        async with self.using_connection(conn):
+            row = await conn.fetchrow(
+                "SELECT * FROM threads WHERE id=$1 FOR UPDATE", UUID(str(thread_id))
+            )
+            if row is None or row.get("kind", "session") != "session":
+                raise ValueError("A session execution requires a session thread")
+            current = await read_execution(conn, "Session", thread_id)
+            if current is None:
+                return {
+                    "delivery_override": config_override,
+                    "configuration_state": "Historical",
+                }
+            metadata = _strict_json_object(row["metadata"], label="session metadata")
+            from orchestrator.services.thread_mount_rows import project_ids_from_mounts
+
+            project_rows = await self.list_thread_mounts(thread_id)
+            project_ids = project_ids_from_mounts(project_rows)
+            if row.get("project_id") and str(row["project_id"]) not in project_ids:
+                project_ids.insert(0, str(row["project_id"]))
+            owner_id = str(row["user_id"]) if row.get("user_id") else None
+            await _lock_and_validate_work_owner(
+                conn,
+                authority_user_id=owner_id,
+                materialized_user_uuid=UUID(owner_id) if owner_id else None,
+                target_project_uuids=[UUID(value) for value in project_ids],
+            )
+            prepared, delivery_override = await prepare_srw_session_patch(
+                self, current, dict(row), metadata, project_ids, config_override
+            )
+            saved = await capture_execution(
+                self,
+                conn,
+                work_kind="Session",
+                work_id=thread_id,
+                owner_id=owner_id,
+                project_ids=project_ids,
+                replace_session=True,
+                execution_manifest=prepared,
+            )
+            from shared.runtime.core.session_config_patch import RESOLVED_PATCH_MARKER
+
+            saved["delivery_override"] = {
+                **delivery_override,
+                RESOLVED_PATCH_MARKER: {
+                    "id": str(saved["id"]),
+                    "generation": saved["generation"],
+                    "revision": saved["revision"],
+                },
+            }
+            return saved
 
     def _dedicated_advisory_slots(self, domain: str) -> asyncio.Semaphore:
         # A few focused tests instantiate PostgresDB via ``__new__``. Lazily
@@ -29581,6 +30121,14 @@ class PostgresDB:
         """Serialize connector writes with delivery without occupying the pool."""
 
         key = _thread_datasource_lock_key(thread_id)
+        task = asyncio.current_task()
+        held = _TASK_DATASOURCE_LOCKS.get()
+        if any(
+            item.database is self and item.key == key and item.owner_task is task
+            for item in held
+        ):
+            yield
+            return
         async with self._dedicated_session_advisory_lock(
             key,
             domain="datasource",
@@ -29589,7 +30137,15 @@ class PostgresDB:
         ) as acquired:
             if not acquired:  # defensive; wait=True raises on timeout
                 raise TimeoutError("datasource lock wait timed out")
-            yield
+            if task is None:
+                raise RuntimeError("datasource locking requires an asyncio task")
+            token = _TASK_DATASOURCE_LOCKS.set(
+                (*held, _TaskDatasourceLock(self, key, task))
+            )
+            try:
+                yield
+            finally:
+                _TASK_DATASOURCE_LOCKS.reset(token)
 
     async def get_thread(self, thread_id: str) -> Dict[str, Any] | None:
         """Get thread by ID.
@@ -29605,7 +30161,11 @@ class PostgresDB:
             return None
         async with self.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT * FROM threads WHERE id = $1",
+                """SELECT threads.*,
+                    (SELECT execution.harness_adapter FROM srw_execution_specs execution
+                     WHERE execution.work_kind='Session' AND execution.work_id=threads.id)
+                    AS execution_harness_adapter
+                    FROM threads WHERE id = $1""",
                 thread_id,
             )
         return dict(row) if row else None
@@ -30828,7 +31388,11 @@ class PostgresDB:
         Besides live predecessors, include a terminal foreground child whose
         parent AI tool call is durable but whose matching ToolMessage is not.
         That is the narrow crash seam after child terminalization and before
-        the parent persisted the synchronous result.
+        the parent persisted the synchronous result. The ToolMessage itself is
+        the delivery fact: once it is durable the child is never a candidate,
+        whatever its recovery stamp says (dev thread ``ad7eb761``, 2026-09-08:
+        a completed, delivered child was offered on every re-attach and each
+        recovery attempt was refused, so the unit bounced between pods forever).
         """
 
         try:
@@ -30871,6 +31435,18 @@ class PostgresDB:
                                    metadata->>
                                        'subagent_foreground_recovery_generation'
                                ) IS DISTINCT FROM runtime_generation::text
+                               -- The ToolMessage is the delivery fact: a child
+                               -- whose synchronous result is durable in the
+                               -- parent transcript has nothing to recover.
+                               AND NOT EXISTS (
+                                   SELECT 1
+                                     FROM thread_messages AS parent_result
+                                    WHERE parent_result.thread_id = $1
+                                      AND parent_result.role = 'tool'
+                                      AND parent_result.tool_call_id =
+                                          threads.parent_tool_call_id
+                                      AND parent_result.rewound_at IS NULL
+                               )
                                AND EXISTS (
                                    SELECT 1
                                      FROM thread_messages AS parent_call
@@ -31239,9 +31815,131 @@ class PostgresDB:
                         queue_consumed = None
                         source_already_complete = source_delivery_state == "settled"
 
+                    # Recovery from facts. The parent's ToolMessage for this
+                    # call IS the child's delivery: when it is durable, an ended
+                    # child is already delivered — decided here, before any
+                    # watermark side effect and before the terminal-retry field
+                    # checks, and regardless of whether a zero-tool-call final
+                    # AI row exists (a final answer that carries its own tool
+                    # call is the parent turn's business, not the child's). A
+                    # continuation event an earlier recovery already committed
+                    # stays canonical, and a still-live child keeps the
+                    # existing crash-seam path below.
+                    call_id = str(child.get("parent_tool_call_id") or "").strip()
+                    if not call_id:
+                        raise ValueError("foreground recovery has no parent tool call")
+                    durable_call_count = await conn.fetchval(
+                        """
+                        SELECT count(*)
+                          FROM thread_messages AS parent_call
+                          CROSS JOIN LATERAL jsonb_array_elements(
+                              COALESCE(parent_call.tool_calls, '[]'::jsonb)
+                          ) AS tool_call
+                         WHERE parent_call.id = $1
+                           AND parent_call.thread_id = $2
+                           AND parent_call.role = 'ai'
+                           AND parent_call.rewound_at IS NULL
+                           AND tool_call->>'id' = $3
+                           AND parent_call.turn_number = $4
+                        """,
+                        parent_ai_message_id,
+                        parent_uuid,
+                        call_id,
+                        parent_iteration,
+                    )
+                    if durable_call_count != 1:
+                        raise ValueError(
+                            "foreground recovery needs one exact durable parent call"
+                        )
+                    parent_ai_seq = await conn.fetchval(
+                        "SELECT seq FROM thread_messages WHERE id=$1",
+                        parent_ai_message_id,
+                    )
+                    parent_result_seq = await conn.fetchval(
+                        """
+                        SELECT CASE WHEN count(*) = 1 THEN min(result.seq) END
+                          FROM thread_messages AS result
+                         WHERE result.thread_id = $1
+                           AND result.role = 'tool'
+                           AND result.tool_call_id = $2
+                           AND result.turn_number = $3
+                           AND result.seq > $4
+                           AND result.rewound_at IS NULL
+                        """,
+                        parent_uuid,
+                        call_id,
+                        parent_iteration,
+                        int(parent_ai_seq),
+                    )
+                    delivered_by_tool_message = False
+                    parent_turn_completed = False
+                    if parent_result_seq is not None and child["status"] == "ended":
+                        delivered_by_tool_message = not await conn.fetchval(
+                            """
+                            SELECT EXISTS (
+                                SELECT 1 FROM thread_input_deliveries
+                                 WHERE delivery_id = $1
+                            )
+                            """,
+                            session_subagent_delivery_id(
+                                child_uuid, expected_generation
+                            ),
+                        )
+                    if delivered_by_tool_message:
+                        # Whether the parent INPUT is consumed is a turn-level
+                        # fact. Two durable proofs that the turn answered it:
+                        # the loop's own ``turn.completed`` frame for that
+                        # turn, journaled after the delegating AI row (the
+                        # only evidence when the final answer carries its own
+                        # tool call — ad7eb761), or the turn's own final answer
+                        # row — same turn_number, after the delegating call,
+                        # no tool calls — which is the evidence the
+                        # already_delivered verdict always used. With
+                        # either, the watermark advances below so the next
+                        # claim cannot answer the input twice; without both,
+                        # the turn may still owe its answer and the watermark
+                        # is left alone — the next claim replays with the
+                        # ToolMessage in the transcript.
+                        parent_turn_completed = bool(
+                            await conn.fetchval(
+                                """
+                                SELECT EXISTS (
+                                    SELECT 1
+                                      FROM thread_events AS frame
+                                     WHERE frame.thread_id = $1
+                                       AND frame.kind = 'turn.completed'
+                                       AND (frame.payload->>'turn_id') = $2::text
+                                       AND frame.created_at >= (
+                                           SELECT created_at
+                                             FROM thread_messages
+                                            WHERE id = $3
+                                       )
+                                )
+                                OR EXISTS (
+                                    SELECT 1
+                                      FROM thread_messages AS answer
+                                     WHERE answer.thread_id = $1
+                                       AND answer.role = 'ai'
+                                       AND answer.turn_number = $5
+                                       AND answer.seq > $4
+                                       AND answer.rewound_at IS NULL
+                                       AND jsonb_array_length(
+                                           COALESCE(answer.tool_calls, '[]'::jsonb)
+                                       ) = 0
+                                )
+                                """,
+                                parent_uuid,
+                                str(int(parent_iteration)),
+                                parent_ai_message_id,
+                                int(parent_ai_seq),
+                                int(parent_iteration),
+                            )
+                        )
+
                     if (
                         parsed.execution_lane == "stateless"
                         and not source_already_complete
+                        and (not delivered_by_tool_message or parent_turn_completed)
                     ):
                         oldest_pending = await conn.fetchval(
                             """
@@ -31323,6 +32021,28 @@ class PostgresDB:
                             raise ValueError(
                                 "foreground recovery lost source input authority"
                             )
+                    if delivered_by_tool_message:
+                        await conn.execute(
+                            """
+                            UPDATE threads
+                               SET metadata = jsonb_set(
+                                   COALESCE(metadata, '{}'::jsonb),
+                                   '{subagent_foreground_recovery_generation}',
+                                   to_jsonb($2::text),
+                                   true
+                               )
+                             WHERE id = $1
+                            """,
+                            child_uuid,
+                            str(expected_generation),
+                        )
+                        return {
+                            "result": "already_delivered",
+                            "thread_id": str(child_uuid),
+                            "runtime_generation": str(expected_generation),
+                            "delivery_id": None,
+                            "delivery_state": None,
+                        }
                 expected_delivery = session_subagent_delivery_id(
                     child_uuid, expected_generation
                 )
@@ -31334,36 +32054,8 @@ class PostgresDB:
                     )
                 parent_result_already_durable = False
                 if foreground_orphan_recovery:
-                    call_id = str(child.get("parent_tool_call_id") or "").strip()
-                    if not call_id:
-                        raise ValueError("foreground recovery has no parent tool call")
-                    durable_call_count = await conn.fetchval(
-                        """
-                        SELECT count(*)
-                          FROM thread_messages AS parent_call
-                          CROSS JOIN LATERAL jsonb_array_elements(
-                              COALESCE(parent_call.tool_calls, '[]'::jsonb)
-                          ) AS tool_call
-                         WHERE parent_call.id = $1
-                           AND parent_call.thread_id = $2
-                           AND parent_call.role = 'ai'
-                           AND parent_call.rewound_at IS NULL
-                           AND tool_call->>'id' = $3
-                           AND parent_call.turn_number = $4
-                        """,
-                        parent_ai_message_id,
-                        parent_uuid,
-                        call_id,
-                        parent_iteration,
-                    )
-                    if durable_call_count != 1:
-                        raise ValueError(
-                            "foreground recovery needs one exact durable parent call"
-                        )
-                    parent_ai_seq = await conn.fetchval(
-                        "SELECT seq FROM thread_messages WHERE id=$1",
-                        parent_ai_message_id,
-                    )
+                    # call_id, parent_ai_seq and parent_result_seq were settled
+                    # above, before the watermark side effects.
                     stateless_finalized_end_seq: int | None = None
                     stateless_completion_effect_present = False
                     if parsed.execution_lane == "stateless":
@@ -31421,22 +32113,6 @@ class PostgresDB:
                             supersedes_input_seq,
                             parent_iteration,
                         )
-                    parent_result_seq = await conn.fetchval(
-                        """
-                        SELECT CASE WHEN count(*) = 1 THEN min(result.seq) END
-                          FROM thread_messages AS result
-                         WHERE result.thread_id = $1
-                           AND result.role = 'tool'
-                           AND result.tool_call_id = $2
-                           AND result.turn_number = $3
-                           AND result.seq > $4
-                           AND result.rewound_at IS NULL
-                        """,
-                        parent_uuid,
-                        call_id,
-                        parent_iteration,
-                        int(parent_ai_seq),
-                    )
                     final_parent_response_seq = await conn.fetchval(
                         """
                                 SELECT min(response.seq)
@@ -32298,6 +32974,13 @@ class PostgresDB:
                 marker["recycle"] = recycle
                 metadata = dict(metadata)
                 metadata["agent_pod"] = marker
+                # The record lives in a sibling of `agent_pod` so it can outlive
+                # a retired endpoint; the copy inside the marker is what the
+                # successor-publication CAS below matches on. Both homes are
+                # written here for the same reason the service writer keeps
+                # them in step -- a stale sibling would be republished over
+                # this one and drop `successor_attempt`.
+                metadata["persistent_recycle"] = recycle
                 await conn.execute(
                     "UPDATE threads SET metadata=$2::jsonb WHERE id=$1::uuid",
                     parsed_thread,
@@ -33316,7 +33999,15 @@ class PostgresDB:
         release_outcome: str,
         agent_present: bool,
     ) -> bool:
-        """Return the exact unprotected Pod to the pool (or mark it absent)."""
+        """Return the exact unprotected Pod to the pool (or mark it absent).
+
+        A cleanly exiting session agent may deregister after the reciprocal
+        detach and before this external-effect receipt is appended. The warm
+        ledger deliberately has no agent foreign key for that reason. Missing,
+        or an exact already-offline detached actor, is therefore settled only
+        for an absent/replaced Pod outcome; a live unprotected Pod still
+        requires the exact draining actor to become ready.
+        """
 
         if release_outcome not in {
             "exact_live_unprotected_v1",
@@ -33356,8 +34047,30 @@ class PostgresDB:
                     warm["agent_id"],
                     "ready" if agent_present else "offline",
                 )
-                if changed != "UPDATE 1" or agent_changed != "UPDATE 1":
+                if changed != "UPDATE 1":
                     raise RuntimeError("warm finalizer release CAS lost")
+                if agent_changed != "UPDATE 1":
+                    actor = await conn.fetchrow(
+                        "SELECT hostname,pod_uid,status::text AS status,"
+                        "thread_id,current_job_id FROM agents "
+                        "WHERE id=$1::uuid FOR UPDATE",
+                        warm["agent_id"],
+                    )
+                    actor_already_absent = bool(
+                        not agent_present
+                        and (
+                            actor is None
+                            or (
+                                actor["hostname"] == warm["pod_name"]
+                                and actor["pod_uid"] == warm["pod_uid"]
+                                and actor["status"] == "offline"
+                                and actor["thread_id"] is None
+                                and actor["current_job_id"] is None
+                            )
+                        )
+                    )
+                    if not actor_already_absent:
+                        raise RuntimeError("warm finalizer release CAS lost")
                 return True
 
     async def get_pinned_warm_binding_protection(
@@ -35591,18 +36304,28 @@ class PostgresDB:
                     return None
                 if require_zero_admission:
                     if (
-                        str(row["status"] or "") != "created"
+                        str(row["status"] or "") not in {"created", "active"}
                         or row["runtime_authority_exposed"] is not True
                     ):
                         return None
-                    admitted_input = await conn.fetchval(
+                    # Resume reopens a thread as created, but binding its next
+                    # exact actor makes the thread active before that life has
+                    # received any input.  Admission belongs to the
+                    # agent/Pod tuple below, not to the thread-wide status,
+                    # which also reflects work completed by older lives.  Once
+                    # that active life owns even queued input, however, the
+                    # input is unfinished work rather than the created-life
+                    # exception and must keep retirement pending.
+                    used_input = await conn.fetchval(
                         "SELECT EXISTS (SELECT 1 FROM thread_input_deliveries "
                         "WHERE thread_id=$1::uuid AND owner_agent_id=$2::uuid "
                         "AND owner_pod_uid=$3 "
-                        "AND state IN ('admitted','settled'))",
+                        "AND (state IN ('admitted','settled') "
+                        "OR ($4::boolean AND state='queued')))",
                         parsed_thread,
                         parsed_agent,
                         expected_agent_pod_uid,
+                        str(row["status"] or "") == "active",
                     )
                     admitted_control = await conn.fetchval(
                         "SELECT EXISTS (SELECT 1 FROM thread_control_requests "
@@ -35610,7 +36333,7 @@ class PostgresDB:
                         parsed_thread,
                         parsed_generation,
                     )
-                    if admitted_input or admitted_control:
+                    if used_input or admitted_control:
                         return None
                 context = row["runtime_retirement_context"]
                 context = {} if context is None else context
@@ -37065,6 +37788,17 @@ class PostgresDB:
                         settled = {**settled, "permanent": True}
                         metadata = dict(metadata)
                         metadata["_stateless_workspace_retirement_settled"] = settled
+                        # Upgrading a resumable End to a permanent one reclaims
+                        # the volume, so the retention record set by
+                        # ``finish_stateless_thread_workspace_retirement`` stops
+                        # being true and is corrected here rather than left to
+                        # contradict the intent.
+                        upgraded = metadata.get("workspace_container")
+                        if isinstance(upgraded, dict):
+                            metadata["workspace_container"] = {
+                                **upgraded,
+                                "volume_reclaimed": True,
+                            }
                         updated = await conn.fetchval(
                             "UPDATE threads SET metadata = $2::jsonb "
                             "WHERE id = $1::uuid AND execution_lane = 'stateless' "
@@ -38065,6 +38799,29 @@ class PostgresDB:
                 ):
                     next_metadata.pop(key, None)
                 next_metadata["_stateless_workspace_retirement_settled"] = settled
+                # Say out loud that the volume survived this End. The cleanup
+                # projection has already written status "deleted" — which is
+                # true of the *pod* — while a resumable End deliberately keeps
+                # the PVC so Resume reattaches the real working tree. Without
+                # this the row reads as "the whole workspace is gone", which is
+                # the state that makes a later reclaim nobody's job.
+                # ``ssh_gateway_targets.resolve_workspace_state`` has always
+                # read this key and nothing ever wrote it.
+                #
+                # Written here, in the retirement settlement, and NOT in the
+                # cleanup projection: that projection is compared for exact
+                # equality by
+                # ``managed_repo_workspace_cleanup_projection_authorized_now``,
+                # so a new key there needs the retirement-authority contract
+                # widened. This UPDATE only has to leave the authority envelope
+                # (a fixed key set that does not include ``volume_reclaimed``)
+                # unchanged, which it does.
+                container = next_metadata.get("workspace_container")
+                if isinstance(container, dict):
+                    next_metadata["workspace_container"] = {
+                        **container,
+                        "volume_reclaimed": False,
+                    }
                 row = await conn.fetchval(
                     "UPDATE threads SET metadata = $2::jsonb "
                     "WHERE id = $1::uuid AND execution_lane = 'stateless' "
@@ -38078,8 +38835,13 @@ class PostgresDB:
         """Resume a thread and revive only its durably pending session work."""
         async with self.acquire() as conn:
             async with conn.transaction():
+                from orchestrator.services.manifest_execution_retirement import (
+                    lock_manifest_execution_catalog,
+                )
+
+                await lock_manifest_execution_catalog(conn)
                 thread = await conn.fetchrow(
-                    "SELECT status::text AS status, execution_lane, metadata, "
+                    "SELECT status::text AS status, user_id, execution_lane, metadata, "
                     "runtime_generation, runtime_retirement_token "
                     "FROM threads WHERE id = $1::uuid FOR UPDATE",
                     thread_id,
@@ -38087,6 +38849,7 @@ class PostgresDB:
                 if (
                     thread is None
                     or str(thread["status"] or "") != "ended"
+                    or thread.get("user_id", True) is None
                     or thread["runtime_retirement_token"] is not None
                 ):
                     return False
@@ -38236,6 +38999,7 @@ class PostgresDB:
                         WHERE id = $1::uuid
                           AND status = 'ended'
                           AND runtime_retirement_token IS NULL
+                          AND user_id IS NOT NULL
                           AND NOT (COALESCE(metadata, '{}'::jsonb)
                                    ? '_stateless_workspace_retirement_pending')
                           AND NOT (COALESCE(metadata, '{}'::jsonb)
@@ -38287,6 +39051,7 @@ class PostgresDB:
                             ended_at      = NULL,
                             last_activity = CURRENT_TIMESTAMP
                         WHERE id = $1::uuid AND status = 'ended'
+                          AND user_id IS NOT NULL
                           AND runtime_retirement_token IS NULL
                         RETURNING id
                         """,
@@ -39148,6 +39913,77 @@ class PostgresDB:
                     )
                     new_ids.append(str(row["id"]))
         return new_ids
+
+    async def survey_partial_thread_mounts(self) -> list[Dict[str, Any]]:
+        """Report project mount rows that name a provider but no usable transport.
+
+        A ``project`` / ``project_default`` row is *partial* when it lacks the
+        installation (``backend_instance_id``) or the WebDAV URL workspace
+        delivery needs. Rows minted while their project was still unstamped
+        (pre-0186) look like this, and stamping the project does not touch
+        them — mount rows are only re-derived for a thread that has none. At
+        delivery one such row discards every other mount the thread has
+        (``_build_agent_cloud_mount`` is all-or-fallback), so they are worth
+        finding. Read-only; the transport repair's dry run reads it.
+        """
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT m.id, m.thread_id, t.status AS thread_status,
+                       m.mount_kind, m.target_path, m.source_ref,
+                       m.backend_id, m.backend_instance_id, m.webdav_url
+                  FROM thread_mounts m
+                  JOIN threads t ON t.id = m.thread_id
+                 WHERE m.mount_kind IN ('project', 'project_default')
+                   AND (m.backend_instance_id IS NULL
+                        OR m.webdav_url IS NULL
+                        OR m.webdav_url = '')
+                 ORDER BY m.created_at, m.target_path
+                """
+            )
+        return [dict(r) for r in rows]
+
+    async def repair_thread_mount_transport(
+        self,
+        mount_id: str,
+        *,
+        backend_id: str,
+        backend_instance_id: str,
+        cloud_handle: str | None,
+        webdav_url: str,
+        target_user_sub: str | None,
+    ) -> bool:
+        """Write a freshly resolved transport onto one partial mount row.
+
+        Narrow and idempotent like ``stamp_main_cloud_instance_authority``:
+        only a row that is still partial is rewritten, so a re-run is a no-op
+        and a row already carrying a full transport is never overwritten. The
+        caller owns resolving the transport — through the same builder that
+        creates rows, against the project's stamped installation — and must
+        not call this with a partial one.
+        """
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE thread_mounts
+                   SET backend_id = $2,
+                       backend_instance_id = $3::uuid,
+                       cloud_handle = $4,
+                       webdav_url = $5,
+                       target_user_sub = COALESCE($6, target_user_sub)
+                 WHERE id = $1
+                   AND (backend_instance_id IS NULL
+                        OR webdav_url IS NULL
+                        OR webdav_url = '')
+                """,
+                UUID(str(mount_id)),
+                backend_id,
+                UUID(str(backend_instance_id)),
+                cloud_handle,
+                webdav_url,
+                target_user_sub,
+            )
+        return result == "UPDATE 1"
 
     async def mark_orphaned_threads_ended(self) -> list[Dict[str, Any]]:
         """Select live pinned runtimes whose exact agent is offline.
@@ -40302,6 +41138,9 @@ class PostgresDB:
                 JOIN agents a ON j.assigned_agent_id = a.id
                 WHERE j.status = 'processing'
                   AND j.assigned_agent_id IS NOT NULL
+                  AND NOT EXISTS (SELECT 1 FROM srw_execution_specs execution
+                      WHERE execution.work_kind='Job' AND execution.work_id=j.id
+                        AND execution.harness_adapter <> 'srw/v1')
                 ORDER BY j.priority ASC, j.created_at DESC
                 """,
             )
@@ -41582,9 +42421,29 @@ class PostgresDB:
                 # dangling thread references behind.
                 async with _transaction_if(conn, authority_scope_uuid is None):
                     doomed = await conn.fetchrow(
-                        "SELECT name FROM datasources WHERE id = $1",
+                        "SELECT name, type FROM datasources WHERE id = $1 FOR UPDATE",
                         uuid_val,
                     )
+                    if doomed and doomed.get("type") == "credentials":
+                        in_use = await conn.fetchval(
+                            """
+                            SELECT EXISTS (
+                                SELECT 1 FROM threads
+                                WHERE status <> 'ended'
+                                  AND COALESCE(metadata->'datasource_ids', '[]'::jsonb) ? $1::text
+                            ) OR EXISTS (
+                                SELECT 1 FROM job_datasources jd
+                                JOIN jobs j ON j.id = jd.job_id
+                                WHERE jd.datasource_id = $1::uuid
+                                  AND j.status IN ('created', 'processing', 'paused', 'pending_review')
+                            )
+                            """,
+                            str(uuid_val),
+                        )
+                        if in_use:
+                            raise CredentialConnectorAttachedError(
+                                "End the sessions and jobs using this credential connector before deleting it"
+                            )
                     result = await conn.execute(
                         "DELETE FROM datasources WHERE id = $1",
                         uuid_val,
@@ -43636,7 +44495,7 @@ class PostgresDB:
         ``user_ssh_keys.id``) so a caller that later proves possession can
         mark it used without a second fingerprint lookup. ``id`` remains the
         USER id — every consumer (``user_can_access_ide_entity``,
-        ``_ssh_target_response``) reads it as such.
+        ``ssh_access.ssh_target_response``) reads it as such.
         """
         async with self.acquire() as conn:
             # One statement, deliberately. Two reasons:
@@ -43995,7 +44854,7 @@ class PostgresDB:
         """
         query = """
             SELECT id, user_id, label, base_url, api_key, key_prefix,
-                   created_at, updated_at
+                   transport_kind, created_at, updated_at
             FROM llm_endpoints
             WHERE id = $1
         """
@@ -44034,6 +44893,7 @@ class PostgresDB:
             rows = await conn.fetch(
                 """
                 SELECT id, provider, key_prefix, label, seeded_from,
+                       source, helm_value_hash, source_updated_at,
                        created_at, updated_at
                 FROM system_api_keys
                 ORDER BY provider
@@ -44057,25 +44917,40 @@ class PostgresDB:
         key_prefix: str,
         label: str | None = None,
         seeded_from: str | None = None,
+        *,
+        source: str | None = None,
+        helm_value_hash: str | None = None,
     ) -> Dict[str, Any]:
         """Create or replace the system-level API key for a provider.
 
         ``seeded_from`` is a breadcrumb set by the helm seed job; admin-UI
         edits pass ``None`` so subsequent re-seeds skip overwriting.
+
+        ``source`` records who is writing (see ``shared.helm_provenance``);
+        when omitted it is derived from ``seeded_from``. ``helm_value_hash``
+        is only ever set by the seed Job and survives admin rotations, so a
+        later reconcile can still tell "what Helm last applied".
         """
+        source = source or provenance_from_breadcrumb(seeded_from)
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
                 INSERT INTO system_api_keys
-                    (provider, api_key, key_prefix, label, seeded_from)
-                VALUES ($1, $2, $3, $4, $5)
+                    (provider, api_key, key_prefix, label, seeded_from,
+                     source, helm_value_hash, source_updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP)
                 ON CONFLICT (provider) DO UPDATE
                 SET api_key = EXCLUDED.api_key,
                     key_prefix = EXCLUDED.key_prefix,
                     label = EXCLUDED.label,
                     seeded_from = EXCLUDED.seeded_from,
+                    source = EXCLUDED.source,
+                    helm_value_hash = COALESCE(EXCLUDED.helm_value_hash,
+                                               system_api_keys.helm_value_hash),
+                    source_updated_at = CURRENT_TIMESTAMP,
                     updated_at = CURRENT_TIMESTAMP
                 RETURNING id, provider, key_prefix, label, seeded_from,
+                          source, helm_value_hash, source_updated_at,
                           created_at, updated_at
                 """,
                 provider,
@@ -44083,6 +44958,8 @@ class PostgresDB:
                 key_prefix,
                 label,
                 seeded_from,
+                source,
+                helm_value_hash,
             )
             return dict(row)
 
@@ -44167,6 +45044,26 @@ class PostgresDB:
 
     # ── Experts (User-Defined Experts, Slice 1) ───────────────────────────
 
+    async def _project_expert_row(self, row):
+        from orchestrator.services.manifest_experts import hydrate_expert_row
+
+        return await hydrate_expert_row(self, row)
+
+    async def _project_expert_rows(self, rows):
+        from orchestrator.services.manifest_experts import hydrate_expert_rows
+
+        return await hydrate_expert_rows(self, rows)
+
+    async def _persist_expert_resource(self, row):
+        from orchestrator.services.manifest_experts import persist_expert_resource
+
+        return await persist_expert_resource(self, dict(row))
+
+    async def _lock_expert_catalog(self):
+        from orchestrator.services.manifest_store import ManifestStore
+
+        await ManifestStore(self).lock_catalog()
+
     async def create_expert(
         self,
         *,
@@ -44181,36 +45078,58 @@ class PostgresDB:
         config: Dict[str, Any] | None = None,
         prompts: Dict[str, Any] | None = None,
         is_global: bool = False,
+        srw_layers: List[Dict[str, Any]] | None = None,
+        srw_config_name: str | None = None,
+        srw_asset_name: str | None = None,
     ) -> Dict[str, Any]:
         """Insert an owned expert. (name, owner_id) is unique — a personal fork
         named 'scholar' shadows the bundled one for that user only (decision 5)."""
-        row = await self.fetchrow(
-            """
-            INSERT INTO experts
-                (name, display_name, description, icon, color, tags, expert_type,
-                 config, prompts, owner_id, is_global)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10, $11)
-            RETURNING *
-            """,
-            name,
-            display_name,
-            description,
-            icon,
-            color,
-            tags or [],
-            expert_type,
-            json.dumps(config or {}),
-            json.dumps(prompts or {}),
-            UUID(str(owner_id)),
-            is_global,
-        )
-        return dict(row)
+        async with self.transaction_scope():
+            await self._lock_expert_catalog()
+            row = await self.fetchrow(
+                """
+                INSERT INTO experts
+                    (name, display_name, description, icon, color, tags, expert_type,
+                     config, prompts, owner_id, is_global)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10, $11)
+                RETURNING *
+                """,
+                name,
+                display_name,
+                description,
+                icon,
+                color,
+                tags or [],
+                expert_type,
+                json.dumps(config or {}),
+                json.dumps(prompts or {}),
+                UUID(str(owner_id)),
+                is_global,
+            )
+            return await self._persist_expert_resource(
+                {
+                    **dict(row),
+                    **(
+                        {"harness_config_layers": srw_layers}
+                        if srw_layers is not None
+                        else {}
+                    ),
+                    **{
+                        key: value
+                        for key, value in (
+                            ("harness_config_name", srw_config_name),
+                            ("harness_asset_name", srw_asset_name),
+                        )
+                        if value
+                    },
+                }
+            )
 
     async def get_expert_by_id(self, expert_id: str) -> Dict[str, Any] | None:
         row = await self.fetchrow(
             "SELECT * FROM experts WHERE id = $1", UUID(str(expert_id))
         )
-        return dict(row) if row else None
+        return await self._project_expert_row(row)
 
     async def get_expert_by_managed_key(
         self, managed_key: str
@@ -44218,7 +45137,7 @@ class PostgresDB:
         row = await self.fetchrow(
             "SELECT * FROM experts WHERE managed_key = $1", managed_key
         )
-        return dict(row) if row else None
+        return await self._project_expert_row(row)
 
     async def upsert_managed_expert(
         self,
@@ -44242,34 +45161,94 @@ class PostgresDB:
         an operator's DB copy remains authoritative until an explicit reset
         workflow is requested.
         """
-        row = await self.fetchrow(
-            """
-            INSERT INTO experts
-                (name, display_name, description, icon, color, tags, expert_type,
-                 config, prompts, owner_id, is_global, managed_key, seed_version)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb,
-                    NULL, TRUE, $10, $11)
-            ON CONFLICT (managed_key) WHERE managed_key IS NOT NULL DO NOTHING
-            RETURNING *
-            """,
-            name,
-            display_name,
-            description,
-            icon,
-            color,
-            tags or [],
-            expert_type,
-            json.dumps(config or {}),
-            json.dumps(prompts or {}),
-            managed_key,
-            seed_version,
-        )
-        if row:
-            return dict(row), True
-        existing = await self.get_expert_by_managed_key(managed_key)
-        if not existing:  # defensive: conflict target should make this impossible
-            raise RuntimeError(f"managed expert seed disappeared: {managed_key}")
-        return existing, False
+        async with self.transaction_scope():
+            await self._lock_expert_catalog()
+            row = await self.fetchrow(
+                """
+                INSERT INTO experts
+                    (name, display_name, description, icon, color, tags, expert_type,
+                     config, prompts, owner_id, is_global, managed_key, seed_version)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb,
+                        NULL, TRUE, $10, $11)
+                ON CONFLICT (managed_key) WHERE managed_key IS NOT NULL DO NOTHING
+                RETURNING *
+                """,
+                name,
+                display_name,
+                description,
+                icon,
+                color,
+                tags or [],
+                expert_type,
+                json.dumps(config or {}),
+                json.dumps(prompts or {}),
+                managed_key,
+                seed_version,
+            )
+            if row:
+                return await self._persist_expert_resource(row), True
+            existing = await self.get_expert_by_managed_key(managed_key)
+            if not existing:  # defensive: conflict target should make this impossible
+                raise RuntimeError(f"managed expert seed disappeared: {managed_key}")
+            return existing, False
+
+    async def upgrade_managed_expert_seed(
+        self,
+        *,
+        managed_key: str,
+        seed_version: int,
+        config_additions: Dict[str, Any],
+        expected_seed_version: int | None = None,
+        expected_subagents: Dict[str, Any] | None = None,
+        replacement_subagents: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any] | None:
+        """Additive seed upgrade (services.default_experts.upgrade_managed_seed).
+
+        Merges ``config_additions`` UNDER the row's config — ``$2 || config``
+        lets the row win every key it already has — and stamps
+        ``seed_version``. A no-op (``None``) for a row already at or past the
+        version, so a rolled-back orchestrator never re-runs an upgrade.
+        The optional repair triplet replaces only a matching roster subtree
+        at the exact expected seed version. PostgreSQL rechecks both after
+        waiting for a concurrent update; operator edits therefore win.
+        """
+        repair = (expected_seed_version, expected_subagents, replacement_subagents)
+        if any(value is not None for value in repair) and any(
+            value is None for value in repair
+        ):
+            raise ValueError("Managed seed repair requires version and both rosters")
+        async with self.transaction_scope():
+            await self._lock_expert_catalog()
+            raw = await self.fetchrow(
+                "SELECT * FROM experts WHERE managed_key=$1 FOR UPDATE",
+                managed_key,
+            )
+            current = await self._project_expert_row(raw)
+            if not current or int(current.get("seed_version") or 0) >= seed_version:
+                return None
+            config = current.get("config") or {}
+            if isinstance(config, str):
+                config = json.loads(config)
+            if expected_seed_version is not None and (
+                current.get("seed_version") != expected_seed_version
+                or config.get("subagents") != expected_subagents
+            ):
+                return None
+            config = {**(config_additions or {}), **config}
+            if replacement_subagents is not None:
+                config["subagents"] = replacement_subagents
+            row = await self.fetchrow(
+                "UPDATE experts SET seed_version=$2,version=version+1,updated_at=now() WHERE id=$1 RETURNING *",
+                current["id"],
+                seed_version,
+            )
+            return await self._persist_expert_resource(
+                {
+                    **dict(row),
+                    "config": config,
+                    "prompts": current.get("prompts") or {},
+                }
+            )
 
     async def get_expert_visible_by_id(
         self,
@@ -44301,7 +45280,7 @@ class PostgresDB:
             proj,
             is_admin,
         )
-        return dict(row) if row else None
+        return await self._project_expert_row(row)
 
     async def list_experts_visible(
         self,
@@ -44333,7 +45312,7 @@ class PostgresDB:
             proj,
             expert_type,
         )
-        return [dict(r) for r in rows]
+        return await self._project_expert_rows(rows)
 
     # ── Default expert pointers ──────────────────────────────────────────
 
@@ -44380,7 +45359,7 @@ class PostgresDB:
             """,
             expert_type,
         )
-        return dict(row) if row else None
+        return await self._project_expert_row(row)
 
     async def list_application_expert_defaults(self) -> List[Dict[str, Any]]:
         rows = await self.fetch(
@@ -44392,7 +45371,7 @@ class PostgresDB:
             ORDER BY d.expert_type
             """
         )
-        return [dict(r) for r in rows]
+        return await self._project_expert_rows(rows)
 
     async def set_application_expert_default(
         self, *, expert_type: str, expert_id: str, actor_user_id: str
@@ -44461,7 +45440,7 @@ class PostgresDB:
             UUID(str(user_id)),
             expert_type,
         )
-        return dict(row) if row else None
+        return await self._project_expert_row(row)
 
     async def list_user_expert_defaults(self, user_id: str) -> List[Dict[str, Any]]:
         rows = await self.fetch(
@@ -44477,7 +45456,7 @@ class PostgresDB:
             """,
             UUID(str(user_id)),
         )
-        return [dict(r) for r in rows]
+        return await self._project_expert_rows(rows)
 
     async def set_user_expert_default(
         self, *, user_id: str, expert_type: str, expert_id: str
@@ -44564,87 +45543,103 @@ class PostgresDB:
         source: Dict[str, Any],
     ) -> Dict[str, Any]:
         """Atomically fork a source expert and make the fork the personal default."""
-        uid = UUID(str(user_id))
-        base_name = str(source["name"])
-        config = source.get("config") or {}
-        prompts = source.get("prompts") or {}
-        if isinstance(config, str):
-            config = json.loads(config)
-        if isinstance(prompts, str):
-            prompts = json.loads(prompts)
-        async with self.acquire() as conn:
-            async with conn.transaction():
-                # Serialize fork naming for one principal; avoids a name race
-                # without letting a unique violation poison the transaction.
-                await conn.execute(
-                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-                    str(uid),
-                )
-                name = ""
-                for index in range(1, 100):
-                    suffix = "default" if index == 1 else f"default-{index}"
-                    candidate = f"{base_name}-{suffix}"[:100]
-                    exists = await conn.fetchval(
-                        "SELECT 1 FROM experts WHERE owner_id = $1 AND name = $2",
-                        uid,
-                        candidate,
+        async with self.transaction_scope():
+            await self._lock_expert_catalog()
+            uid = UUID(str(user_id))
+            base_name = str(source["name"])
+            config = source.get("config") or {}
+            prompts = source.get("prompts") or {}
+            if isinstance(config, str):
+                config = json.loads(config)
+            if isinstance(prompts, str):
+                prompts = json.loads(prompts)
+            async with self.acquire() as conn:
+                async with conn.transaction():
+                    # Serialize fork naming for one principal; avoids a name race
+                    # without letting a unique violation poison the transaction.
+                    await conn.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                        str(uid),
                     )
-                    if not exists:
-                        name = candidate
-                        break
-                if not name:
-                    raise ValueError("No free name for the personal default copy")
-                expert = await conn.fetchrow(
-                    """
-                    INSERT INTO experts
-                        (name, display_name, description, icon, color, tags,
-                         expert_type, config, prompts, owner_id, is_global)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb,
-                            $10, FALSE)
-                    RETURNING *
-                    """,
-                    name,
-                    f"{source['display_name']} (My Default)"[:200],
-                    source.get("description"),
-                    source.get("icon", "smart_toy"),
-                    source.get("color", "#6B7280"),
-                    source.get("tags") or [],
-                    expert_type,
-                    json.dumps(config),
-                    json.dumps(prompts),
-                    uid,
-                )
-                previous = await conn.fetchval(
-                    "SELECT expert_id FROM user_expert_defaults "
-                    "WHERE user_id = $1 AND expert_type = $2 FOR UPDATE",
-                    uid,
-                    expert_type,
-                )
-                await conn.execute(
-                    """
-                    INSERT INTO user_expert_defaults
-                        (user_id, expert_type, expert_id)
-                    VALUES ($1, $2, $3)
-                    ON CONFLICT (user_id, expert_type) DO UPDATE
-                    SET expert_id = EXCLUDED.expert_id, updated_at = NOW()
-                    """,
-                    uid,
-                    expert_type,
-                    expert["id"],
-                )
-                await conn.execute(
-                    """
-                    INSERT INTO expert_default_audit
-                        (actor_user_id, target_user_id, expert_type, scope_kind,
-                         old_expert_id, new_expert_id, action)
-                    VALUES ($1, $1, $2, 'user', $3, $4, 'set')
-                    """,
-                    uid,
-                    expert_type,
-                    previous,
-                    expert["id"],
-                )
-        return dict(expert)
+                    name = ""
+                    for index in range(1, 100):
+                        suffix = "default" if index == 1 else f"default-{index}"
+                        candidate = f"{base_name}-{suffix}"[:100]
+                        exists = await conn.fetchval(
+                            "SELECT 1 FROM experts WHERE owner_id = $1 AND name = $2",
+                            uid,
+                            candidate,
+                        )
+                        if not exists:
+                            name = candidate
+                            break
+                    if not name:
+                        raise ValueError("No free name for the personal default copy")
+                    expert = await conn.fetchrow(
+                        """
+                        INSERT INTO experts
+                            (name, display_name, description, icon, color, tags,
+                             expert_type, config, prompts, owner_id, is_global)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb,
+                                $10, FALSE)
+                        RETURNING *
+                        """,
+                        name,
+                        f"{source['display_name']} (My Default)"[:200],
+                        source.get("description"),
+                        source.get("icon", "smart_toy"),
+                        source.get("color", "#6B7280"),
+                        source.get("tags") or [],
+                        expert_type,
+                        json.dumps(config),
+                        json.dumps(prompts),
+                        uid,
+                    )
+                    previous = await conn.fetchval(
+                        "SELECT expert_id FROM user_expert_defaults "
+                        "WHERE user_id = $1 AND expert_type = $2 FOR UPDATE",
+                        uid,
+                        expert_type,
+                    )
+                    await conn.execute(
+                        """
+                        INSERT INTO user_expert_defaults
+                            (user_id, expert_type, expert_id)
+                        VALUES ($1, $2, $3)
+                        ON CONFLICT (user_id, expert_type) DO UPDATE
+                        SET expert_id = EXCLUDED.expert_id, updated_at = NOW()
+                        """,
+                        uid,
+                        expert_type,
+                        expert["id"],
+                    )
+                    await conn.execute(
+                        """
+                        INSERT INTO expert_default_audit
+                            (actor_user_id, target_user_id, expert_type, scope_kind,
+                             old_expert_id, new_expert_id, action)
+                        VALUES ($1, $1, $2, 'user', $3, $4, 'set')
+                        """,
+                        uid,
+                        expert_type,
+                        previous,
+                        expert["id"],
+                    )
+            return await self._persist_expert_resource(
+                {
+                    **dict(expert),
+                    **(
+                        {"harness_config_layers": source["harness_config_layers"]}
+                        if source.get("harness_config_layers")
+                        else {}
+                    ),
+                    **{
+                        key: source[key]
+                        for key in ("harness_config_name", "harness_asset_name")
+                        if source.get(key)
+                    },
+                }
+            )
 
     async def get_project_default_expert(
         self, *, project_id: str, expert_type: str
@@ -44660,7 +45655,27 @@ class PostgresDB:
             UUID(str(project_id)),
             expert_type,
         )
-        return dict(row) if row else None
+        projected = await self._project_expert_row(row)
+        if projected is None:
+            return None
+        from orchestrator.services.manifest_projects import (
+            project_expert_for_execution,
+            project_link_projection,
+        )
+
+        frozen = await project_expert_for_execution(
+            self, project_id, row["id"], expert_type
+        )
+        return await project_link_projection(
+            self,
+            project_id,
+            {
+                **(frozen or projected),
+                "default_for": row["default_for"],
+                "project_id": row["project_id"],
+                "config_override": row["config_override"],
+            },
+        )
 
     async def get_project_expert_link(
         self, *, project_id: str, expert_id: str
@@ -44670,7 +45685,9 @@ class PostgresDB:
             UUID(str(project_id)),
             UUID(str(expert_id)),
         )
-        return dict(row) if row else None
+        from orchestrator.services.manifest_projects import project_link_projection
+
+        return await project_link_projection(self, project_id, row)
 
     async def list_project_linked_experts(
         self, project_id: str
@@ -44686,7 +45703,14 @@ class PostgresDB:
             """,
             UUID(str(project_id)),
         )
-        return [dict(row) for row in rows]
+        from orchestrator.services.manifest_projects import project_link_projection
+
+        return [
+            await project_link_projection(
+                self, project_id, row, key="project_config_override"
+            )
+            for row in await self._project_expert_rows(rows)
+        ]
 
     async def get_project_linked_expert(
         self, project_id: str, expert_ref: str
@@ -44704,7 +45728,14 @@ class PostgresDB:
             UUID(str(project_id)),
             expert_ref,
         )
-        return dict(row) if row else None
+        from orchestrator.services.manifest_projects import project_link_projection
+
+        return await project_link_projection(
+            self,
+            project_id,
+            await self._project_expert_row(row),
+            key="project_config_override",
+        )
 
     async def set_project_default_expert(
         self,
@@ -44717,93 +45748,104 @@ class PostgresDB:
     ) -> Dict[str, Any]:
         pid, eid = UUID(str(project_id)), UUID(str(expert_id))
         actor = UUID(str(actor_user_id))
-        async with self.acquire() as conn:
-            async with conn.transaction():
-                target = await conn.fetchrow(
-                    "SELECT expert_type FROM experts WHERE id = $1 FOR SHARE", eid
-                )
-                if not target:
-                    raise ValueError("Expert not found")
-                if target["expert_type"] != expert_type:
-                    raise ValueError("Expert type does not match default slot")
-                previous = await conn.fetchval(
-                    "SELECT expert_id FROM project_experts "
-                    "WHERE project_id = $1 AND default_for = $2 FOR UPDATE",
-                    pid,
-                    expert_type,
-                )
-                await conn.execute(
-                    """
-                    UPDATE project_experts SET default_for = NULL
-                    WHERE project_id = $1 AND default_for = $2 AND expert_id <> $3
-                    """,
-                    pid,
-                    expert_type,
-                    eid,
-                )
-                row = await conn.fetchrow(
-                    """
-                    INSERT INTO project_experts
-                        (project_id, expert_id, default_for, config_override)
-                    VALUES ($1, $2, $3, $4::jsonb)
-                    ON CONFLICT (project_id, expert_id) DO UPDATE
-                    SET default_for = EXCLUDED.default_for,
-                        config_override = COALESCE(
-                            EXCLUDED.config_override, project_experts.config_override
-                        )
-                    RETURNING *
-                    """,
-                    pid,
-                    eid,
-                    expert_type,
-                    json.dumps(config_override)
-                    if config_override is not None
-                    else None,
-                )
-                await conn.execute(
-                    """
-                    INSERT INTO expert_default_audit
-                        (actor_user_id, target_project_id, expert_type, scope_kind,
-                         old_expert_id, new_expert_id, action)
-                    VALUES ($1, $2, $3, 'project', $4, $5, 'set')
-                    """,
-                    actor,
-                    pid,
-                    expert_type,
-                    previous,
-                    eid,
-                )
+        async with self.transaction_scope():
+            await self._lock_expert_catalog()
+            async with self.acquire() as conn:
+                async with conn.transaction():
+                    target = await conn.fetchrow(
+                        "SELECT expert_type FROM experts WHERE id = $1 FOR SHARE", eid
+                    )
+                    if not target:
+                        raise ValueError("Expert not found")
+                    if target["expert_type"] != expert_type:
+                        raise ValueError("Expert type does not match default slot")
+                    previous = await conn.fetchval(
+                        "SELECT expert_id FROM project_experts "
+                        "WHERE project_id = $1 AND default_for = $2 FOR UPDATE",
+                        pid,
+                        expert_type,
+                    )
+                    await conn.execute(
+                        """
+                        UPDATE project_experts SET default_for = NULL
+                        WHERE project_id = $1 AND default_for = $2 AND expert_id <> $3
+                        """,
+                        pid,
+                        expert_type,
+                        eid,
+                    )
+                    row = await conn.fetchrow(
+                        """
+                        INSERT INTO project_experts
+                            (project_id, expert_id, default_for, config_override)
+                        VALUES ($1, $2, $3, $4::jsonb)
+                        ON CONFLICT (project_id, expert_id) DO UPDATE
+                        SET default_for = EXCLUDED.default_for,
+                            config_override = COALESCE(
+                                EXCLUDED.config_override, project_experts.config_override
+                            )
+                        RETURNING *
+                        """,
+                        pid,
+                        eid,
+                        expert_type,
+                        json.dumps(config_override)
+                        if config_override is not None
+                        else None,
+                    )
+                    await conn.execute(
+                        """
+                        INSERT INTO expert_default_audit
+                            (actor_user_id, target_project_id, expert_type, scope_kind,
+                             old_expert_id, new_expert_id, action)
+                        VALUES ($1, $2, $3, 'project', $4, $5, 'set')
+                        """,
+                        actor,
+                        pid,
+                        expert_type,
+                        previous,
+                        eid,
+                    )
+            await self._persist_project_resource(
+                project_id,
+                link_changes={str(eid): config_override}
+                if config_override is not None
+                else {},
+            )
         return dict(row)
 
     async def clear_project_default_expert(
         self, *, project_id: str, expert_type: str, actor_user_id: str
     ) -> bool:
         pid, actor = UUID(str(project_id)), UUID(str(actor_user_id))
-        async with self.acquire() as conn:
-            async with conn.transaction():
-                previous = await conn.fetchval(
-                    """
-                    UPDATE project_experts SET default_for = NULL
-                    WHERE project_id = $1 AND default_for = $2
-                    RETURNING expert_id
-                    """,
-                    pid,
-                    expert_type,
-                )
-                if previous is None:
-                    return False
-                await conn.execute(
-                    """
-                    INSERT INTO expert_default_audit
-                        (actor_user_id, target_project_id, expert_type, scope_kind,
-                         old_expert_id, action)
-                    VALUES ($1, $2, $3, 'project', $4, 'clear')
-                    """,
-                    actor,
-                    pid,
-                    expert_type,
-                    previous,
-                )
+        async with self.transaction_scope():
+            await self._lock_expert_catalog()
+            async with self.acquire() as conn:
+                async with conn.transaction():
+                    previous = await conn.fetchval(
+                        """
+                        UPDATE project_experts SET default_for = NULL
+                        WHERE project_id = $1 AND default_for = $2
+                        RETURNING expert_id
+                        """,
+                        pid,
+                        expert_type,
+                    )
+                    if previous is None:
+                        return False
+                    await conn.execute(
+                        """
+                        INSERT INTO expert_default_audit
+                            (actor_user_id, target_project_id, expert_type, scope_kind,
+                             old_expert_id, action)
+                        VALUES ($1, $2, $3, 'project', $4, 'clear')
+                        """,
+                        actor,
+                        pid,
+                        expert_type,
+                        previous,
+                    )
+            await self._persist_project_resource(project_id, link_changes={})
         return True
 
     async def record_managed_expert_update(
@@ -44837,28 +45879,40 @@ class PostgresDB:
             "prompts",
             "is_global",
         }
-        sets, vals = [], []
-        for k, v in fields.items():
-            if k not in allowed:
-                continue
-            vals.append(json.dumps(v) if k in ("config", "prompts") else v)
-            cast = "::jsonb" if k in ("config", "prompts") else ""
-            sets.append(f"{k} = ${len(vals)}{cast}")
-        if not sets:
-            return await self.get_expert_by_id(expert_id)
-        vals.append(UUID(str(updated_by)))
-        vals.append(UUID(str(expert_id)))
-        row = await self.fetchrow(
-            f"""
-            UPDATE experts
-            SET {", ".join(sets)}, version = version + 1,
-                updated_by = ${len(vals) - 1}, updated_at = NOW()
-            WHERE id = ${len(vals)}
-            RETURNING *
-            """,
-            *vals,
-        )
-        return dict(row) if row else None
+        fields = {key: value for key, value in fields.items() if key in allowed}
+        async with self.transaction_scope():
+            await self._lock_expert_catalog()
+            raw = await self.fetchrow(
+                "SELECT * FROM experts WHERE id=$1 FOR UPDATE", UUID(str(expert_id))
+            )
+            current = await self._project_expert_row(raw)
+            if current is None or not fields:
+                return current
+            sets, values = [], []
+            for key, value in fields.items():
+                if key in ("config", "prompts"):
+                    continue
+                values.append(value)
+                sets.append(f"{key}=${len(values)}")
+            values.extend([UUID(str(updated_by)), UUID(str(expert_id))])
+            sets.extend(
+                [
+                    "version=version+1",
+                    "updated_at=now()",
+                    f"updated_by=${len(values) - 1}",
+                ]
+            )
+            updated = await self.fetchrow(
+                f"UPDATE experts SET {', '.join(sets)} WHERE id=${len(values)} RETURNING *",
+                *values,
+            )
+            return await self._persist_expert_resource(
+                {
+                    **dict(updated),
+                    "config": fields.get("config", current.get("config")),
+                    "prompts": fields.get("prompts", current.get("prompts")),
+                }
+            )
 
     async def expert_delete_blockers(self, expert_id: str) -> List[Dict[str, Any]]:
         """Live references that block deletion (decision 15).
@@ -44944,10 +45998,21 @@ class PostgresDB:
         return blockers
 
     async def delete_expert(self, expert_id: str) -> bool:
-        result = await self.execute(
-            "DELETE FROM experts WHERE id = $1", UUID(str(expert_id))
-        )
-        return result == "DELETE 1"
+        from orchestrator.services.manifest_store import ManifestStore
+
+        async with self.transaction_scope():
+            await self._lock_expert_catalog()
+            store = ManifestStore(self)
+            resource = await store.by_link("Expert", expert_id)
+            if resource:
+                await store.delete(
+                    resource, expected_version=resource["resource_version"]
+                )
+            result = await self.execute(
+                "DELETE FROM experts WHERE id=$1",
+                UUID(str(expert_id)),
+            )
+            return result == "DELETE 1"
 
     # ── Skills (Agent Skills, Slice 1: authoring foundation) ──────────────
     async def create_skill(
@@ -45141,7 +46206,9 @@ class PostgresDB:
         async with self.acquire() as conn:
             endpoint_rows = await conn.fetch(
                 """
-                SELECT id, label, base_url, key_prefix, created_at, updated_at
+                SELECT id, label, base_url, key_prefix, transport_kind,
+                       source, helm_value_hash, source_updated_at,
+                       created_at, updated_at
                 FROM llm_endpoints
                 WHERE user_id IS NULL
                 ORDER BY label
@@ -45158,7 +46225,8 @@ class PostgresDB:
             row = await conn.fetchrow(
                 """
                 SELECT id, label, base_url, api_key, key_prefix,
-                       created_at, updated_at
+                       transport_kind, source, helm_value_hash,
+                       source_updated_at, created_at, updated_at
                 FROM llm_endpoints
                 WHERE id = $1 AND user_id IS NULL
                 """,
@@ -45179,20 +46247,39 @@ class PostgresDB:
         base_url: str,
         api_key: str | None,
         key_prefix: str | None,
+        transport_kind: str | None = None,
+        *,
+        source: str | None = None,
+        helm_value_hash: str | None = None,
+        seeded_from: str | None = None,
     ) -> Dict[str, Any]:
-        """Create a new system-scoped LLM endpoint. Label must be globally unique."""
+        """Create a new system-scoped LLM endpoint. Label must be globally unique.
+
+        ``transport_kind`` is the stable routing marker (see
+        ``shared.subscription_routing``); NULL for an ordinary
+        OpenAI-compatible endpoint. ``source`` (see ``shared.helm_provenance``)
+        defaults to a derivation from ``seeded_from``, which this table does
+        not store — the breadcrumb only informs provenance here.
+        """
+        source = source or provenance_from_breadcrumb(seeded_from)
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
                 INSERT INTO llm_endpoints
-                    (user_id, label, base_url, api_key, key_prefix)
-                VALUES (NULL, $1, $2, $3, $4)
-                RETURNING id, label, base_url, key_prefix, created_at, updated_at
+                    (user_id, label, base_url, api_key, key_prefix, transport_kind,
+                     source, helm_value_hash, source_updated_at)
+                VALUES (NULL, $1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP)
+                RETURNING id, label, base_url, key_prefix, transport_kind,
+                          source, helm_value_hash, source_updated_at,
+                          created_at, updated_at
                 """,
                 label,
                 base_url,
                 _encrypt_optional(api_key),
                 key_prefix,
+                transport_kind,
+                source,
+                helm_value_hash,
             )
             return dict(row)
 
@@ -45204,14 +46291,29 @@ class PostgresDB:
         api_key: str | None = None,
         key_prefix: str | None = None,
         clear_api_key: bool = False,
+        transport_kind: str | None = None,
+        source: str | None = None,
+        helm_value_hash: str | None = None,
     ) -> Dict[str, Any] | None:
         """Patch a system endpoint. Only non-None fields are updated.
 
-        Returns None if no row matches (endpoint missing or user-scoped).
+        ``source`` stamps who is writing (``shared.helm_provenance``) and
+        bumps ``source_updated_at``; ``helm_value_hash`` is set by the seed
+        Job only. Returns None if no row matches (endpoint missing or
+        user-scoped).
         """
         sets: List[str] = []
         args: List[Any] = [UUID(endpoint_id)]
         param_idx = 2
+        if source is not None:
+            sets.append(f"source = ${param_idx}")
+            sets.append("source_updated_at = CURRENT_TIMESTAMP")
+            args.append(source)
+            param_idx += 1
+        if helm_value_hash is not None:
+            sets.append(f"helm_value_hash = ${param_idx}")
+            args.append(helm_value_hash)
+            param_idx += 1
         if label is not None:
             sets.append(f"label = ${param_idx}")
             args.append(label)
@@ -45219,6 +46321,10 @@ class PostgresDB:
         if base_url is not None:
             sets.append(f"base_url = ${param_idx}")
             args.append(base_url)
+            param_idx += 1
+        if transport_kind is not None:
+            sets.append(f"transport_kind = ${param_idx}")
+            args.append(transport_kind)
             param_idx += 1
         if clear_api_key:
             sets.append("api_key = NULL")
@@ -45237,7 +46343,9 @@ class PostgresDB:
             async with self.acquire() as conn:
                 row = await conn.fetchrow(
                     """
-                    SELECT id, label, base_url, key_prefix, created_at, updated_at
+                    SELECT id, label, base_url, key_prefix, transport_kind,
+                           source, helm_value_hash, source_updated_at,
+                           created_at, updated_at
                     FROM llm_endpoints
                     WHERE id = $1 AND user_id IS NULL
                     """,
@@ -45250,7 +46358,9 @@ class PostgresDB:
             UPDATE llm_endpoints
             SET {", ".join(sets)}
             WHERE id = $1 AND user_id IS NULL
-            RETURNING id, label, base_url, key_prefix, created_at, updated_at
+            RETURNING id, label, base_url, key_prefix, transport_kind,
+                      source, helm_value_hash, source_updated_at,
+                      created_at, updated_at
         """
         async with self.acquire() as conn:
             row = await conn.fetchrow(query, *args)
@@ -45285,7 +46395,8 @@ class PostgresDB:
     _MODEL_FIELDS = (
         "id, provider_kind, provider_ref, model_id, display_label, "
         "capabilities, family, context_window, reasoning_level, "
-        "params_json, enabled, seeded_from, notes, created_at, updated_at"
+        "params_json, enabled, seeded_from, notes, "
+        "source, helm_value_hash, source_updated_at, created_at, updated_at"
     )
 
     @staticmethod
@@ -45412,8 +46523,13 @@ class PostgresDB:
         seeded_from: str | None = None,
         notes: str | None = None,
         on_conflict_do_nothing: bool = False,
+        source: str | None = None,
+        helm_value_hash: str | None = None,
     ) -> Dict[str, Any] | None:
         """Insert a catalog row.
+
+        ``source`` (``shared.helm_provenance``) defaults to a derivation from
+        ``seeded_from``; ``helm_value_hash`` is set by the seed Job only.
 
         ``context_window=0`` and ``params_json={"temperature": 0}`` round-trip
         as themselves — only literal ``None`` is treated as "use default".
@@ -45430,6 +46546,7 @@ class PostgresDB:
         canonical = self._canonicalize_capabilities(
             capability=capability, capabilities=capabilities
         )
+        source = source or provenance_from_breadcrumb(seeded_from)
         on_conflict = (
             "ON CONFLICT (provider_kind, provider_ref, model_id) DO NOTHING"
             if on_conflict_do_nothing
@@ -45441,8 +46558,10 @@ class PostgresDB:
                 INSERT INTO models
                     (provider_kind, provider_ref, model_id, display_label,
                      capabilities, family, context_window,
-                     reasoning_level, params_json, enabled, seeded_from, notes)
-                VALUES ($1, $2, $3, $4, $5::TEXT[], $6, $7, $8, $9, $10, $11, $12)
+                     reasoning_level, params_json, enabled, seeded_from, notes,
+                     source, helm_value_hash, source_updated_at)
+                VALUES ($1, $2, $3, $4, $5::TEXT[], $6, $7, $8, $9, $10, $11, $12,
+                        $13, $14, CURRENT_TIMESTAMP)
                 {on_conflict}
                 RETURNING {self._MODEL_FIELDS}
                 """,
@@ -45458,6 +46577,8 @@ class PostgresDB:
                 enabled,
                 seeded_from,
                 notes,
+                source,
+                helm_value_hash,
             )
         return self._row_to_model(row) if row else None
 
@@ -45485,6 +46606,11 @@ class PostgresDB:
             "params_json",
             "enabled",
             "notes",
+            # Provenance (shared.helm_provenance): ``source`` stamps who is
+            # writing and bumps source_updated_at; ``helm_value_hash`` is set
+            # by the seed Job only.
+            "source",
+            "helm_value_hash",
         }
         # Capability changes are coupled — canonicalize singular/array
         # spellings into the array form before writing.
@@ -45511,6 +46637,8 @@ class PostgresDB:
             idx += 1
         if not sets:
             return await self.get_model(model_id)
+        if "source" in fields:
+            sets.append("source_updated_at = CURRENT_TIMESTAMP")
         sets.append("updated_at = CURRENT_TIMESTAMP")
         async with self.acquire() as conn:
             row = await conn.fetchrow(
@@ -45562,7 +46690,8 @@ class PostgresDB:
                     ule.id       AS endpoint_id,
                     ule.label    AS endpoint_label,
                     ule.base_url AS endpoint_base_url,
-                    ule.api_key  AS endpoint_api_key
+                    ule.api_key  AS endpoint_api_key,
+                    ule.transport_kind AS endpoint_transport_kind
                 FROM models m
                 LEFT JOIN system_api_keys ska
                     ON m.provider_kind = 'system' AND m.provider_ref = ska.provider
@@ -45719,13 +46848,28 @@ class PostgresDB:
         model: str | None,
         *,
         updated_by: str | None = None,
+        source: str | None = None,
+        helm_value_hash: str | None = None,
     ) -> None:
-        """Set or clear the default model ID for ``kind``."""
+        """Set or clear the default model ID for ``kind``.
+
+        ``source`` / ``helm_value_hash`` are the provenance columns
+        (``shared.helm_provenance``), forwarded to the settings upsert.
+        """
         key = self._default_llm_model_key(kind)
         if model is None or model == "":
             await self.delete_system_setting(key)
             return
-        await self.upsert_system_setting(key, {"model": model}, updated_by=updated_by)
+        # Forward provenance only when given so callers (and their mocks)
+        # that never set it keep the original call shape.
+        extra: Dict[str, Any] = {}
+        if source is not None:
+            extra["source"] = source
+        if helm_value_hash is not None:
+            extra["helm_value_hash"] = helm_value_hash
+        await self.upsert_system_setting(
+            key, {"model": model}, updated_by=updated_by, **extra
+        )
 
     # Catalog capabilities that support a "first-enabled-alphabetical" fallback
     # when the admin pin is missing or dangling. Whisper/tts gained catalog
@@ -45740,6 +46884,7 @@ class PostgresDB:
             "tts",
             "search",
             "fetch",
+            "rerank",
         }
     )
 
@@ -46190,108 +47335,115 @@ class PostgresDB:
         Returns:
             Full user dict
         """
-        async with self.acquire() as conn:
-            # Try to link to existing user by email (handles pre-seeded admin)
-            if email:
-                existing = await conn.fetchrow(
-                    """
-                    SELECT id, display_name, avatar_color, email, default_project_id,
-                           is_admin, can_use_vm, keycloak_sub, created_at
-                    FROM users
-                    WHERE LOWER(email) = LOWER($1) AND keycloak_sub IS NULL
-                    """,
-                    email,
-                )
-                if existing:
-                    updated = await conn.fetchrow(
-                        """
-                        UPDATE users
-                        SET keycloak_sub = $1,
-                            is_admin = $2,
-                            is_approved = (is_approved OR $3),
-                            preferred_username = COALESCE($4, preferred_username)
-                        WHERE id = $5
-                        RETURNING is_approved, preferred_username
-                        """,
-                        sub,
-                        is_admin,
-                        is_approved,
-                        preferred_username,
-                        existing["id"],
-                    )
-                    result = dict(existing)
-                    result["keycloak_sub"] = sub
-                    result["is_admin"] = is_admin
-                    result["is_approved"] = updated["is_approved"]
-                    result["preferred_username"] = updated["preferred_username"]
-                    return result
-
-            # Check if keycloak_sub already linked (concurrent request)
-            existing_sub = await conn.fetchrow(
-                """
-                SELECT id, display_name, avatar_color, email, default_project_id,
-                       is_admin, can_use_vm, is_approved, preferred_username,
-                       keycloak_sub, created_at
-                FROM users WHERE keycloak_sub = $1
-                """,
-                sub,
-            )
-            if existing_sub:
-                return dict(existing_sub)
-
-            # Create new user + project atomically (constraint requires default_project_id)
-            try:
-                row = await conn.fetchrow(
-                    """
-                    WITH new_project AS (
-                        INSERT INTO projects (name, description, is_default)
-                        VALUES ($1 || '''s Project', 'Default project', true)
-                        RETURNING id
-                    ),
-                    new_user AS (
-                        INSERT INTO users (display_name, avatar_color, email, is_admin,
-                                          is_approved, approved_at, preferred_username,
-                                          keycloak_sub, default_project_id)
-                        VALUES ($1, '#89b4fa', $2, $3, $4,
-                                CASE WHEN $4 THEN NOW() ELSE NULL END, $5, $6,
-                                (SELECT id FROM new_project))
-                        RETURNING id, display_name, avatar_color, email, default_project_id,
-                                  is_admin, can_use_vm, is_approved, preferred_username,
-                                  keycloak_sub, created_at
-                    ),
-                    membership AS (
-                        INSERT INTO project_members (project_id, user_id, role)
-                        SELECT (SELECT id FROM new_project), id, 'owner'
-                        FROM new_user
-                    )
-                    SELECT * FROM new_user
-                    """,
-                    display_name,
-                    email,
-                    is_admin,
-                    is_approved,
-                    preferred_username,
-                    sub,
-                )
-                return dict(row)
-            except Exception as e:
-                if "unique" in str(e).lower() or "duplicate" in str(e).lower():
-                    # Race condition: concurrent request already created this user.
-                    # Retry lookup by keycloak_sub or email.
-                    retry = await conn.fetchrow(
+        async with self.transaction_scope():
+            await self._lock_expert_catalog()
+            async with self.acquire() as conn:
+                # Try to link to existing user by email (handles pre-seeded admin)
+                if email:
+                    existing = await conn.fetchrow(
                         """
                         SELECT id, display_name, avatar_color, email, default_project_id,
-                               is_admin, can_use_vm, is_approved, preferred_username,
-                               keycloak_sub, created_at
-                        FROM users WHERE keycloak_sub = $1 OR LOWER(email) = LOWER($2)
-                        LIMIT 1
+                               is_admin, can_use_vm, keycloak_sub, created_at
+                        FROM users
+                        WHERE LOWER(email) = LOWER($1) AND keycloak_sub IS NULL
                         """,
-                        sub,
                         email,
                     )
-                    if retry:
-                        return dict(retry)
-                raise
+                    if existing:
+                        updated = await conn.fetchrow(
+                            """
+                            UPDATE users
+                            SET keycloak_sub = $1,
+                                is_admin = $2,
+                                is_approved = (is_approved OR $3),
+                                preferred_username = COALESCE($4, preferred_username)
+                            WHERE id = $5
+                            RETURNING is_approved, preferred_username
+                            """,
+                            sub,
+                            is_admin,
+                            is_approved,
+                            preferred_username,
+                            existing["id"],
+                        )
+                        result = dict(existing)
+                        result["keycloak_sub"] = sub
+                        result["is_admin"] = is_admin
+                        result["is_approved"] = updated["is_approved"]
+                        result["preferred_username"] = updated["preferred_username"]
+                        return result
+
+                # Check if keycloak_sub already linked (concurrent request)
+                existing_sub = await conn.fetchrow(
+                    """
+                    SELECT id, display_name, avatar_color, email, default_project_id,
+                           is_admin, can_use_vm, is_approved, preferred_username,
+                           keycloak_sub, created_at
+                    FROM users WHERE keycloak_sub = $1
+                    """,
+                    sub,
+                )
+                if existing_sub:
+                    return dict(existing_sub)
+
+                # Create new user + project atomically (constraint requires default_project_id)
+                try:
+                    async with conn.transaction():
+                        row = await conn.fetchrow(
+                            """
+                            WITH new_project AS (
+                                INSERT INTO projects (name, description, is_default)
+                                VALUES ($1 || '''s Project', 'Default project', true)
+                                RETURNING id
+                            ),
+                            new_user AS (
+                                INSERT INTO users (display_name, avatar_color, email, is_admin,
+                                                  is_approved, approved_at, preferred_username,
+                                                  keycloak_sub, default_project_id)
+                                VALUES ($1, '#89b4fa', $2, $3, $4,
+                                        CASE WHEN $4 THEN NOW() ELSE NULL END, $5, $6,
+                                        (SELECT id FROM new_project))
+                                RETURNING id, display_name, avatar_color, email, default_project_id,
+                                          is_admin, can_use_vm, is_approved, preferred_username,
+                                          keycloak_sub, created_at
+                            ),
+                            membership AS (
+                                INSERT INTO project_members (project_id, user_id, role)
+                                SELECT (SELECT id FROM new_project), id, 'owner'
+                                FROM new_user
+                            )
+                            SELECT * FROM new_user
+                            """,
+                            display_name,
+                            email,
+                            is_admin,
+                            is_approved,
+                            preferred_username,
+                            sub,
+                        )
+                        async with self.using_connection(conn):
+                            await self._persist_project_resource(
+                                row["default_project_id"], owner_id=row["id"]
+                            )
+                        return dict(row)
+                except Exception as e:
+                    if "unique" in str(e).lower() or "duplicate" in str(e).lower():
+                        # Race condition: concurrent request already created this user.
+                        # Retry lookup by keycloak_sub or email.
+                        retry = await conn.fetchrow(
+                            """
+                            SELECT id, display_name, avatar_color, email, default_project_id,
+                                   is_admin, can_use_vm, is_approved, preferred_username,
+                                   keycloak_sub, created_at
+                            FROM users WHERE keycloak_sub = $1 OR LOWER(email) = LOWER($2)
+                            LIMIT 1
+                            """,
+                            sub,
+                            email,
+                        )
+                        if retry:
+                            return dict(retry)
+                    raise
 
     async def get_user_by_email(self, email: str) -> Dict[str, Any] | None:
         """Get a user by email (case-insensitive).
@@ -46406,6 +47558,10 @@ class PostgresDB:
                     project_row["id"],
                     user_row["id"],
                 )
+                async with self.using_connection(conn):
+                    await self._persist_project_resource(
+                        project_row["id"], owner_id=user_row["id"]
+                    )
 
         return dict(user_row), dict(project_row)
 
@@ -46682,6 +47838,12 @@ class PostgresDB:
 
         async with self.acquire() as conn:
             async with conn.transaction():
+                from orchestrator.services.manifest_user_retirement import (
+                    retire_user_manifests,
+                )
+
+                if not await retire_user_manifests(conn, uuid_val):
+                    return False
                 # No FK cascade fires on capability_grants.scope_id (polymorphic);
                 # delete the user's grant rows in-band so removal stays atomic.
                 await self.delete_grants_for_scope(
@@ -46712,6 +47874,11 @@ class PostgresDB:
     # PROJECT OPERATIONS
     # =========================================================================
 
+    async def _persist_project_resource(self, project_id, **kwargs):
+        from orchestrator.services.manifest_projects import persist_project_resource
+
+        return await persist_project_resource(self, project_id, **kwargs)
+
     async def create_project(
         self,
         name: str,
@@ -46720,6 +47887,8 @@ class PostgresDB:
         is_default: bool = False,
         default_config_name: str | None = None,
         default_config_override: Dict[str, Any] | None = None,
+        *,
+        manifest_project_id: UUID | None = None,
     ) -> Dict[str, Any]:
         """Create a new project.
 
@@ -46740,8 +47909,8 @@ class PostgresDB:
                     """
                     INSERT INTO projects (name, description, goal, is_default,
                                           default_config_name,
-                                          default_config_override)
-                    VALUES ($1, $2, $3, $4, $5, $6)
+                                          default_config_override, id)
+                    VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7::uuid, gen_random_uuid()))
                     RETURNING id, name, description, goal, status, is_default,
                               default_config_name, default_config_override,
                               nextcloud_folder_id, cloud_storage_read_only,
@@ -46758,6 +47927,7 @@ class PostgresDB:
                     json.dumps(default_config_override)
                     if default_config_override
                     else None,
+                    manifest_project_id,
                 )
                 # Every century has a post, whether or not an officer holds
                 # it (officer_post.md §2): the vacant project_officers row is
@@ -46788,7 +47958,7 @@ class PostgresDB:
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT id, name, description, goal, status, is_default,
+                SELECT id, name, description, goal, status, is_default, manifest_resource_id,
                        default_config_name, default_config_override,
                        nextcloud_folder_id, cloud_storage_read_only,
                        main_cloud_backend, main_cloud_backend_instance_id,
@@ -46802,7 +47972,9 @@ class PostgresDB:
                 uuid_val,
             )
 
-        return dict(row) if row else None
+        from orchestrator.services.manifest_projects import hydrate_project_row
+
+        return await hydrate_project_row(self, row)
 
     async def get_workspace_network_tier(
         self, work_id: str, kind: str
@@ -46886,7 +48058,7 @@ class PostgresDB:
             rows = await conn.fetch(
                 f"""
                 SELECT p.id, p.name, p.description, p.goal, p.status,
-                       p.is_default, p.default_config_name,
+                       p.is_default, p.default_config_name, p.manifest_resource_id,
                        p.nextcloud_folder_id, p.cloud_storage_read_only,
                        p.main_cloud_backend, p.main_cloud_backend_instance_id,
                        p.main_cloud_folder_handle,
@@ -46904,7 +48076,9 @@ class PostgresDB:
                 *params,
             )
 
-        return [dict(row) for row in rows]
+        from orchestrator.services.manifest_projects import hydrate_project_row
+
+        return [await hydrate_project_row(self, row) for row in rows]
 
     async def park_project_jobs_for_archive(self, project_id: str) -> int:
         """Park every not-yet-started job in ``project_id``. Returns the count.
@@ -47015,9 +48189,21 @@ class PostgresDB:
 
         query = f"UPDATE projects SET {', '.join(updates)} WHERE id = ${param_count}"
 
-        async with self.acquire() as conn:
-            result = await conn.execute(query, *values)
-
+        async with self.transaction_scope():
+            await self._lock_expert_catalog()
+            result = await self.execute(query, *values)
+            if result == "UPDATE 1" and set(kwargs) & {
+                "name",
+                "description",
+                "default_config_name",
+                "default_config_override",
+            }:
+                await self._persist_project_resource(
+                    project_id,
+                    project_changes={
+                        key: value for key, value in kwargs.items() if value is not None
+                    },
+                )
         return result == "UPDATE 1"
 
     async def delete_project(self, project_id: str) -> bool:
@@ -47036,6 +48222,11 @@ class PostgresDB:
 
         async with self.acquire() as conn:
             async with conn.transaction():
+                from orchestrator.services.manifest_retirement import (
+                    retire_project_resources,
+                )
+
+                await retire_project_resources(conn, uuid_val)
                 # No FK cascade fires on capability_grants.scope_id (polymorphic);
                 # delete the project's grant rows in-band so removal stays atomic.
                 await self.delete_grants_for_scope(
@@ -47088,6 +48279,8 @@ class PostgresDB:
         project_id: str,
         user_id: str,
         role: str = "editor",
+        *,
+        defer_manifest: bool = False,
     ) -> Dict[str, Any]:
         """Add a member to a project.
 
@@ -47102,23 +48295,31 @@ class PostgresDB:
         project_uuid = UUID(project_id)
         user_uuid = UUID(user_id)
 
-        async with self.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                INSERT INTO project_members (project_id, user_id, role)
-                VALUES ($1, $2, $3)
-                RETURNING project_id, user_id, role, added_at AS joined_at
-                """,
-                project_uuid,
-                user_uuid,
-                role,
-            )
+        async with self.transaction_scope():
+            await self._lock_expert_catalog()
+            async with self.acquire() as conn:
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO project_members (project_id, user_id, role)
+                    VALUES ($1, $2, $3)
+                    RETURNING project_id, user_id, role, added_at AS joined_at
+                    """,
+                    project_uuid,
+                    user_uuid,
+                    role,
+                )
 
-            # Fetch user info for display
-            user_row = await conn.fetchrow(
-                "SELECT display_name, avatar_color FROM users WHERE id = $1",
-                user_uuid,
-            )
+                # Fetch user info for display
+                user_row = await conn.fetchrow(
+                    "SELECT display_name, avatar_color FROM users WHERE id = $1",
+                    user_uuid,
+                )
+
+            if role == "owner" and not defer_manifest:
+                from orchestrator.services.manifest_store import ManifestStore
+
+                if await ManifestStore(self).by_link("Project", project_uuid) is None:
+                    await self._persist_project_resource(project_id, owner_id=user_id)
 
         result = dict(row)
         if user_row:
@@ -50530,42 +51731,46 @@ class PostgresDB:
         """
         user_uuid = UUID(user_id)
 
-        async with self.acquire() as conn:
-            # Create the project
-            project_row = await conn.fetchrow(
-                """
-                INSERT INTO projects (name, description, is_default)
-                VALUES ($1, $2, TRUE)
-                RETURNING id, name, description, goal, status, is_default,
-                          default_config_name, default_config_override,
-                          nextcloud_folder_id, cloud_storage_read_only,
-                          main_cloud_backend,
-                          main_cloud_backend_instance_id,
-                          main_cloud_folder_handle,
-                          created_at, updated_at
-                """,
-                f"{display_name}'s Workspace",
-                f"Default workspace for {display_name}",
-            )
+        async with self.transaction_scope():
+            await self._lock_expert_catalog()
+            async with self.acquire() as conn:
+                # Create the project
+                project_row = await conn.fetchrow(
+                    """
+                    INSERT INTO projects (name, description, is_default)
+                    VALUES ($1, $2, TRUE)
+                    RETURNING id, name, description, goal, status, is_default,
+                              default_config_name, default_config_override,
+                              nextcloud_folder_id, cloud_storage_read_only,
+                              main_cloud_backend,
+                              main_cloud_backend_instance_id,
+                              main_cloud_folder_handle,
+                              created_at, updated_at
+                    """,
+                    f"{display_name}'s Workspace",
+                    f"Default workspace for {display_name}",
+                )
 
-            project_id = project_row["id"]
+                project_id = project_row["id"]
 
-            # Add user as owner
-            await conn.execute(
-                """
-                INSERT INTO project_members (project_id, user_id, role)
-                VALUES ($1, $2, 'owner')
-                """,
-                project_id,
-                user_uuid,
-            )
+                # Add user as owner
+                await conn.execute(
+                    """
+                    INSERT INTO project_members (project_id, user_id, role)
+                    VALUES ($1, $2, 'owner')
+                    """,
+                    project_id,
+                    user_uuid,
+                )
 
-            # Update user's default_project_id
-            await conn.execute(
-                "UPDATE users SET default_project_id = $1 WHERE id = $2",
-                project_id,
-                user_uuid,
-            )
+                # Update user's default_project_id
+                await conn.execute(
+                    "UPDATE users SET default_project_id = $1 WHERE id = $2",
+                    project_id,
+                    user_uuid,
+                )
+
+            await self._persist_project_resource(project_id, owner_id=user_id)
 
         return dict(project_row)
 
@@ -50588,7 +51793,7 @@ class PostgresDB:
                 """
                 SELECT p.id, p.name, p.description, p.goal, p.status,
                        p.is_default, p.default_config_name,
-                       p.default_config_override, p.created_at, p.updated_at
+                       p.default_config_override, p.manifest_resource_id, p.created_at, p.updated_at
                 FROM projects p
                 JOIN users u ON u.default_project_id = p.id
                 WHERE u.id = $1
@@ -50596,7 +51801,9 @@ class PostgresDB:
                 uuid_val,
             )
 
-        return dict(row) if row else None
+        from orchestrator.services.manifest_projects import hydrate_project_row
+
+        return await hydrate_project_row(self, row)
 
     # =========================================================================
     # SCHEMA MANAGEMENT
@@ -50613,26 +51820,33 @@ class PostgresDB:
         Raises:
             RuntimeError: If database name cannot be extracted from connection string.
         """
-        # Extract database name from connection string
-        # Format: postgresql://user:pass@host:port/dbname
-        db_name = self._connection_string.rsplit("/", 1)[-1].split("?")[0]
+        # Parse the database name out of the DSN rather than slicing it: a
+        # fallback DATABASE_URL is not URL-quoted, so a "/" in the password
+        # makes rsplit land inside the credentials.
+        try:
+            db_name = postgres_database_name(self._connection_string)
+        except ValueError:
+            raise RuntimeError(
+                "Could not extract database name from connection string"
+            ) from None
         if not db_name:
             raise RuntimeError("Could not extract database name from connection string")
 
         # Connect to postgres database to create the target database
-        base_conn_str = self._connection_string.rsplit("/", 1)[0] + "/postgres"
-
-        conn = await asyncpg.connect(base_conn_str)
+        # The explicit database argument overrides both path and query targets
+        # while preserving credentials, SSL options and all other DSN settings.
+        conn = await asyncpg.connect(self._connection_string, database="postgres")
         try:
             exists = await conn.fetchval(
                 "SELECT 1 FROM pg_database WHERE datname = $1", db_name
             )
             if not exists:
                 # Use quoted identifier to handle special characters
-                await conn.execute(f'CREATE DATABASE "{db_name}"')
-                logger.info(f"Created database: {db_name}")
+                quoted_name = db_name.replace('"', '""')
+                await conn.execute(f'CREATE DATABASE "{quoted_name}"')
+                logger.info("Created configured database")
                 return True
-            logger.debug(f"Database already exists: {db_name}")
+            logger.debug("Configured database already exists")
             return False
         finally:
             await conn.close()
@@ -53133,7 +54347,8 @@ class PostgresDB:
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT key, value, credentials_ref, updated_at, updated_by
+                SELECT key, value, credentials_ref, updated_at, updated_by,
+                       source, helm_value_hash, source_updated_at
                 FROM system_settings WHERE key = $1
                 """,
                 key,
@@ -53156,32 +54371,51 @@ class PostgresDB:
         *,
         credentials_ref: Optional[str] = None,
         updated_by: Optional[str] = None,
+        source: Optional[str] = None,
+        helm_value_hash: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Create or replace a system_settings row.
 
-        Returns the post-write row (after the DB-side updated_at is set).
+        ``source`` (``shared.helm_provenance``) records who is writing; when
+        omitted it is derived from ``updated_by`` — a ``helm:`` actor is the
+        seed Job, anything else (an admin id, or no actor) counts as the
+        application/UI. Boot-time seeders pass ``source='default'``
+        explicitly. ``helm_value_hash`` is set by the seed Job only and
+        survives later writes. Returns the post-write row (after the DB-side
+        updated_at is set).
         """
         # ``updated_by`` is a TEXT column; coerce non-str actor ids (e.g. a
         # UUID) so callers passing a raw uuid don't trip asyncpg's type check.
         if updated_by is not None:
             updated_by = str(updated_by)
+        if source is None:
+            source = "helm" if (updated_by or "").startswith("helm:") else "ui"
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
                 INSERT INTO system_settings
-                    (key, value, credentials_ref, updated_at, updated_by)
-                VALUES ($1, $2::jsonb, $3, CURRENT_TIMESTAMP, $4)
+                    (key, value, credentials_ref, updated_at, updated_by,
+                     source, helm_value_hash, source_updated_at)
+                VALUES ($1, $2::jsonb, $3, CURRENT_TIMESTAMP, $4,
+                        $5, $6, CURRENT_TIMESTAMP)
                 ON CONFLICT (key) DO UPDATE SET
                     value = EXCLUDED.value,
                     credentials_ref = EXCLUDED.credentials_ref,
                     updated_at = CURRENT_TIMESTAMP,
-                    updated_by = EXCLUDED.updated_by
-                RETURNING key, value, credentials_ref, updated_at, updated_by
+                    updated_by = EXCLUDED.updated_by,
+                    source = EXCLUDED.source,
+                    helm_value_hash = COALESCE(EXCLUDED.helm_value_hash,
+                                               system_settings.helm_value_hash),
+                    source_updated_at = CURRENT_TIMESTAMP
+                RETURNING key, value, credentials_ref, updated_at, updated_by,
+                          source, helm_value_hash, source_updated_at
                 """,
                 key,
                 json.dumps(value),
                 credentials_ref,
                 updated_by,
+                source,
+                helm_value_hash,
             )
         d = self._row_to_dict(row) or {}
         raw_value = d.get("value")

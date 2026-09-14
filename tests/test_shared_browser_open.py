@@ -162,13 +162,13 @@ def route_client(monkeypatch):
             ),
         )
 
-    monkeypatch.setattr(routes, "_get_db", lambda: db)
     monkeypatch.setattr(routes, "require_thread_owner", owner)
     monkeypatch.setattr(routes, "browser_capability", lambda thread: _capability())
     monkeypatch.setattr(routes, "prepare_browser_canvas", prepare)
     monkeypatch.setattr(routes, "commit_browser_canvas", commit)
     monkeypatch.setattr(routes, "_represent", represent)
     app = FastAPI()
+    app.state.store = db
     app.include_router(routes.router)
     return SimpleNamespace(
         client=TestClient(app),

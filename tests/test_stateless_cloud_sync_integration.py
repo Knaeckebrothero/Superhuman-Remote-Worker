@@ -148,6 +148,10 @@ async def test_stateless_start_recovers_then_strict_pulls_then_arms(monkeypatch)
                 AsyncMock(return_value=True),
             ),
             patch(
+                "shared.cloud_sync_generations.adopt_push_ownership",
+                AsyncMock(return_value={}),
+            ),
+            patch(
                 "shared.cloud_sync_generations.load_cloud_sync_requirements",
                 AsyncMock(return_value={}),
             ),
@@ -201,6 +205,10 @@ async def test_stateless_pull_failure_blocks_arm_and_turn_start(monkeypatch):
             patch(
                 "shared.cloud_sync_generations.cloud_sync_lease_is_current",
                 AsyncMock(return_value=True),
+            ),
+            patch(
+                "shared.cloud_sync_generations.adopt_push_ownership",
+                AsyncMock(return_value={}),
             ),
             patch(
                 "shared.cloud_sync_generations.load_cloud_sync_requirements",
@@ -308,7 +316,10 @@ async def test_turn_end_task_captures_token_and_requirement_snapshot(monkeypatch
         overlay_mount_manager=None,
     )
 
-    async def record_task(_sync, _turn_id, *, requirements=None, claim=None) -> None:
+    async def record_task(
+        _sync, _turn_id, *, requirements=None, claim=None, staged_event=None
+    ) -> None:
+        del staged_event
         await release.wait()
         observed.append((requirements, claim))
 
@@ -455,6 +466,7 @@ async def test_workspace_poll_preserves_generation(
 @pytest.mark.asyncio
 async def test_internal_workspace_payload_exposes_private_binding_generation():
     import orchestrator.main as orch_main
+    from orchestrator.services import thread_workspace_delivery
 
     thread = {
         "id": THREAD_ID,
@@ -508,8 +520,8 @@ async def test_internal_workspace_payload_exposes_private_binding_generation():
             orch_main, "_resolve_thread_repositories", AsyncMock(return_value=None)
         ),
         patch.object(
-            orch_main,
-            "_agent_canvas_workspace_capabilities",
+            thread_workspace_delivery,
+            "agent_canvas_workspace_capabilities",
             return_value=(False, False, False),
         ),
         patch.object(
@@ -536,11 +548,14 @@ async def test_internal_workspace_payload_exposes_private_binding_generation():
             side_effect=lambda value, **_kwargs: value,
         ),
     ):
-        response = await orch_main._agent_get_thread_workspace_locked(
-            THREAD_ID,
-            presented_agent_id=AGENT_ID,
-            presented_runtime_generation=RUNTIME_GENERATION,
-            presented_attach_token=RUNTIME_ATTACH_TOKEN,
+        response = (
+            await orch_main.thread_workspace_delivery.agent_get_thread_workspace_locked(
+                THREAD_ID,
+                presented_agent_id=AGENT_ID,
+                presented_runtime_generation=RUNTIME_GENERATION,
+                presented_attach_token=RUNTIME_ATTACH_TOKEN,
+                dependencies=orch_main._thread_workspace_delivery_dependencies(),
+            )
         )
 
     assert response["workspace_generation"] == WORKSPACE_GENERATION
@@ -576,6 +591,7 @@ async def _internal_workspace_response_for_lite_thread(
     thread_reads=None,
 ):
     import orchestrator.main as orch_main
+    from orchestrator.services import thread_workspace_delivery
 
     def _with_live_runtime(row):
         normalized = dict(row)
@@ -630,8 +646,8 @@ async def _internal_workspace_response_for_lite_thread(
             orch_main, "_resolve_thread_repositories", AsyncMock(return_value=None)
         ),
         patch.object(
-            orch_main,
-            "_agent_canvas_workspace_capabilities",
+            thread_workspace_delivery,
+            "agent_canvas_workspace_capabilities",
             return_value=(False, False, False),
         ),
         patch.object(
@@ -660,11 +676,14 @@ async def _internal_workspace_response_for_lite_thread(
             side_effect=lambda value, **_kwargs: value,
         ),
     ):
-        return await orch_main._agent_get_thread_workspace_locked(
-            THREAD_ID,
-            presented_agent_id=AGENT_ID if pinned else None,
-            presented_runtime_generation=RUNTIME_GENERATION if pinned else None,
-            presented_attach_token=RUNTIME_ATTACH_TOKEN if pinned else None,
+        return (
+            await orch_main.thread_workspace_delivery.agent_get_thread_workspace_locked(
+                THREAD_ID,
+                presented_agent_id=AGENT_ID if pinned else None,
+                presented_runtime_generation=RUNTIME_GENERATION if pinned else None,
+                presented_attach_token=RUNTIME_ATTACH_TOKEN if pinned else None,
+                dependencies=orch_main._thread_workspace_delivery_dependencies(),
+            )
         )
 
 
@@ -806,7 +825,8 @@ async def test_internal_workspace_stale_ready_is_local_nonready_and_single_fligh
 
     probe = AsyncMock(return_value=False)
     ensure = AsyncMock(side_effect=_ensure)
-    orch_main._stateless_workspace_ensure_tasks.pop(THREAD_ID, None)
+    # R1.B05 moved the module dict into an application-owned registry.
+    orch_main._stateless_workspace_ensure_registry.discard(THREAD_ID)
     with (
         patch.object(orch_main.container_provisioner, "workspace_pod_live", probe),
         patch.object(orch_main, "ensure_session_workspace", ensure),
@@ -815,7 +835,8 @@ async def test_internal_workspace_stale_ready_is_local_nonready_and_single_fligh
             _stateless_sandbox_thread()
         )
         await started.wait()
-        task = orch_main._stateless_workspace_ensure_tasks[THREAD_ID]
+        task = orch_main._stateless_workspace_ensure_registry.get(THREAD_ID)
+        assert task is not None
         second = await _internal_workspace_response_for_lite_thread(
             _stateless_sandbox_thread()
         )
@@ -834,7 +855,7 @@ async def test_internal_workspace_stale_ready_is_local_nonready_and_single_fligh
         await task
         await asyncio.sleep(0)
 
-    assert THREAD_ID not in orch_main._stateless_workspace_ensure_tasks
+    assert orch_main._stateless_workspace_ensure_registry.get(THREAD_ID) is None
 
 
 @pytest.mark.asyncio

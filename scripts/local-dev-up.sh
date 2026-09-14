@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Local development bootstrap: k3d cluster + cert-manager + mkcert ClusterIssuer
-# + namespace + local runtime Secrets + vendored Helm chart dependencies.
+# Local development bootstrap: k3d cluster + cert-manager + KEDA + mkcert
+# ClusterIssuer + namespace + local runtime Secrets + vendored Helm chart
+# dependencies.
 #
 # Idempotent: re-runs are safe. Skips anything that already exists.
 #
@@ -26,6 +27,7 @@ NAMESPACE="${NAMESPACE:-srw}"
 KUBE_CONTEXT="k3d-${CLUSTER_NAME}"
 MKCERT_CAROOT="${MKCERT_CAROOT:-$HOME/.local/share/mkcert}"
 CERT_MANAGER_VERSION="${CERT_MANAGER_VERSION:-v1.16.2}"
+KEDA_VERSION="${KEDA_VERSION:-2.20.2}"
 
 log()  { printf '\033[1;34m[bootstrap]\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m[ok]\033[0m %s\n' "$*"; }
@@ -72,6 +74,29 @@ else
   $KCTL -n cert-manager rollout status deploy/cert-manager-webhook --timeout=180s
   $KCTL -n cert-manager rollout status deploy/cert-manager-cainjector --timeout=180s
   ok "cert-manager ready"
+fi
+
+# --- 2b. KEDA (queue-driven autoscaling of the stateless agent pool) --------
+# Cluster-level prerequisite for `agent.stateless.autoscaling.enabled`
+# (helm/templates/agent/stateless-scaledobject.yaml). Its own release in its
+# own namespace, deliberately outside the srw chart and outside Tilt's `srw`
+# resource — same footing as cert-manager above. Dev gets it from the HomeLab
+# Fleet bundle deployments_managed/keda/.
+if $KCTL -n keda get deploy keda-operator >/dev/null 2>&1; then
+  skip "KEDA already installed"
+else
+  log "installing KEDA $KEDA_VERSION"
+  helm repo add kedacore https://kedacore.github.io/charts --force-update >/dev/null
+  helm repo update >/dev/null
+  helm upgrade --install keda kedacore/keda \
+    --kube-context "$KUBE_CONTEXT" \
+    --namespace keda --create-namespace \
+    --version "$KEDA_VERSION" >/dev/null
+  log "waiting for KEDA to be ready"
+  $KCTL -n keda rollout status deploy/keda-operator --timeout=180s
+  $KCTL -n keda rollout status deploy/keda-operator-metrics-apiserver --timeout=180s
+  $KCTL -n keda rollout status deploy/keda-admission-webhooks --timeout=180s
+  ok "KEDA ready"
 fi
 
 # --- 3. mkcert CA Secret + ClusterIssuer ------------------------------------

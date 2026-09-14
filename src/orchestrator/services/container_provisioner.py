@@ -4041,6 +4041,7 @@ class ContainerProvisioner:
                         else None
                     ),
                     admission_source=admission_source,
+                    _mutation_guard_held=True,
                 )
                 if captured is None:
                     captured = await self.prepare_workspace_cleanup_intent(
@@ -4050,6 +4051,7 @@ class ContainerProvisioner:
                         reclaim_shared_resources=False,
                         allow_stale_predecessor=True,
                         admission_source=admission_source,
+                        _mutation_guard_held=True,
                     )
                 if captured is None:
                     captured = await self.prepare_workspace_cleanup_intent(
@@ -4059,6 +4061,7 @@ class ContainerProvisioner:
                         reclaim_shared_resources=False,
                         allow_orphan=True,
                         admission_source=admission_source,
+                        _mutation_guard_held=True,
                     )
             elif non_pinned:
                 captured = await self.prepare_ide_cleanup_intent(
@@ -5269,6 +5272,17 @@ class ContainerProvisioner:
             else None
         )
 
+    def workspace_cleanup_location(self, owner: WorkspaceOwner) -> dict[str, str]:
+        """The exact names this provisioner observes during cleanup capture."""
+
+        return {
+            "namespace": self._namespace,
+            "pod": owner.pod_name,
+            "seedConfigMap": self._seed_configmap_name(owner.pod_name),
+            "pvc": _pvc_name_for(owner),
+            "service": owner.pod_name,
+        }
+
     async def prepare_workspace_cleanup_intent(
         self,
         owner: WorkspaceOwner,
@@ -5282,6 +5296,7 @@ class ContainerProvisioner:
         allow_orphan: bool = False,
         allow_stale_predecessor: bool = False,
         admission_source: Literal["automatic", "explicit"] = "explicit",
+        _mutation_guard_held: bool = False,
     ) -> dict[str, Any] | None:
         """Capture and persist exact cleanup authority before Kubernetes I/O."""
 
@@ -5323,7 +5338,15 @@ class ContainerProvisioner:
             if not automatic_admission_enabled:
                 return None
         if not allow_stale_predecessor:
-            cancellation = await self.request_workspace_creation_cancellation(
+            # Reconciliation, finalizer release and exact deletion already own
+            # this physical mutation domain on a dedicated DB connection.
+            # Re-entering the public wrapper would wait on that same owner.
+            cancel_creation = (
+                self._request_workspace_creation_cancellation_guarded
+                if _mutation_guard_held
+                else self.request_workspace_creation_cancellation
+            )
+            cancellation = await cancel_creation(
                 owner,
                 target_disposition=target_disposition,
                 reclaim_shared_resources=reclaim_shared_resources,
@@ -5425,6 +5448,7 @@ class ContainerProvisioner:
             seed_configmap_uid=identity.seed_configmap_uid,
             pvc_uid=identity.pvc_uid,
             service_uid=identity.service_uid,
+            resource_location=self.workspace_cleanup_location(owner),
         )
         return captured if isinstance(captured, dict) else claimed
 
@@ -5752,6 +5776,7 @@ class ContainerProvisioner:
                 ),
                 snapshot_restore_required=bool(intent.get("snapshot_restore_required")),
                 allow_orphan=(str(intent.get("intent_source")) == "orphan"),
+                _mutation_guard_held=True,
             )
             if (
                 not isinstance(intent, dict)
@@ -5861,6 +5886,40 @@ class ContainerProvisioner:
                 )
                 service_absent = service_outcome.captured_absent
             if not service_absent:
+                return _WORKSPACE_CLEANUP_RETRYABLE
+        else:
+            # The headless Service goes on EVERY settled cleanup, not only a
+            # terminal reclaim. ``release_workspace`` rules on this in its own
+            # docstring — it is 409-idempotent to recreate on the next
+            # ``create_workspace``, so unlike the volume it costs nothing to
+            # lose — and both sibling teardown paths already honour it
+            # (``release_absent_workspace`` unconditionally,
+            # ``_release_pinned_retirement_workspace`` on the captured uid
+            # alone). Keeping it only here left a Service outliving its Pod
+            # after every non-permanent End, and a Service that survives its
+            # Pod is a stale selector waiting to name a successor.
+            #
+            # The volume is the opposite case and stays gated: an ``ended``
+            # thread is resumable, so its PVC is reclaimed only once the thread
+            # row itself is gone (``workspace_manager._is_volume_reclaimable``).
+            #
+            # Fences, in order: the Pod for this exact incarnation is already
+            # proven gone (``deletion.current_deleted`` above came from a
+            # ``wait_for_exact_absence`` delete), the mutation guard is held,
+            # and the delete names the captured Service uid so a successor's
+            # Service is never touched. ``_delete_service`` — not the stricter
+            # ``captured_absent`` the terminal branch needs — is deliberate and
+            # matches ``_release_pinned_retirement_workspace``: a same-name
+            # replacement means our captured Service is already gone, which is
+            # success here, while a refused API call still fails closed. The
+            # terminal branch must instead prove exact absence, because settling
+            # a reclaim is irreversible.
+            service_uid = intent.get("service_uid")
+            if service_uid is not None and not await self._delete_service(
+                owner,
+                require_exact_owner=True,
+                expected_uid=str(service_uid),
+            ):
                 return _WORKSPACE_CLEANUP_RETRYABLE
 
         if not await self._cleanup_claim_is_current(intent, claimant=claimant):
@@ -6893,6 +6952,7 @@ class ContainerProvisioner:
                     target_disposition=target_disposition,
                     reclaim_shared_resources=reclaim_shared_resources,
                     suspended_at=suspended_at,
+                    _mutation_guard_held=True,
                 )
                 if cleanup_intent is None:
                     cleanup_intent = await self.prepare_workspace_cleanup_intent(
@@ -6901,6 +6961,7 @@ class ContainerProvisioner:
                         target_disposition="deleted",
                         reclaim_shared_resources=False,
                         allow_stale_predecessor=True,
+                        _mutation_guard_held=True,
                     )
                 if (
                     not isinstance(cleanup_intent, dict)

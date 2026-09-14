@@ -5,9 +5,11 @@ Covers the two halves of knowledge-base/knowledge/issues/project_page_open_block
 * ``services.cloud.identity`` — cache-first semantics: positive resolutions
   persist (once per user per backend), negatives never do, the ``peek``
   helper is pure DB, and the home-URL cache short-circuits the backend.
-* ``main._fire_background_repair`` / ``main.get_project`` — the lazy-heal and
-  home-URL resolution run as throttled fire-and-forget tasks, never on the
-  request path.
+* ``project_provisioning.fire_background_repair`` /
+  ``projects.get_project`` (R1.B03: extracted out of ``main``) — the lazy-heal
+  and home-URL resolution run as throttled fire-and-forget tasks, never on the
+  request path. Both are driven through ``main``'s own dependency factories, so
+  the module-level patches below still bind exactly what production binds.
 """
 
 import asyncio
@@ -166,67 +168,94 @@ class TestHomeBrowserUrlCached:
 
 
 # =============================================================================
-# main.py — fire-and-forget repair plumbing and the de-blocked get_project
+# Fire-and-forget repair plumbing and the de-blocked get_project
+#
+# The handlers moved to ``orchestrator.routers.projects`` /
+# ``orchestrator.services.projects`` (R1.B03), but the app-owned repair state is
+# still one instance: ``main._project_repair_state``, which is what
+# ``main._project_provisioning_dependencies()`` hands every call. These tests
+# keep driving that live instance — the throttle they pin is a property of the
+# shared state, not of a freshly-built one.
 # =============================================================================
+
+
+def _repair_state():
+    import orchestrator.main
+
+    return orchestrator.main._project_repair_state
+
+
+def _provisioning_deps():
+    """main's own factory, read inside the patch context it is called in."""
+    from orchestrator.main import _project_provisioning_dependencies
+
+    return _project_provisioning_dependencies()
+
+
+def _projects_deps():
+    """main's own factory, read inside the patch context it is called in."""
+    from orchestrator.main import _projects_dependencies
+
+    return _projects_dependencies()
 
 
 @pytest.fixture(autouse=True)
 def _reset_repair_state():
-    import orchestrator.main
-
-    orchestrator.main._bg_repair_last.clear()
+    _repair_state().bg_repair_last.clear()
     yield
-    orchestrator.main._bg_repair_last.clear()
+    _repair_state().bg_repair_last.clear()
 
 
 async def _drain_repair_tasks():
-    import orchestrator.main
-
-    if orchestrator.main._bg_repair_tasks:
-        await asyncio.gather(
-            *list(orchestrator.main._bg_repair_tasks), return_exceptions=True
-        )
+    tasks = _repair_state().bg_repair_tasks
+    if tasks:
+        await asyncio.gather(*list(tasks), return_exceptions=True)
 
 
 class TestFireBackgroundRepair:
     @pytest.mark.asyncio
     async def test_first_fire_schedules_and_runs(self):
-        from orchestrator.main import _fire_background_repair
+        from orchestrator.services.project_provisioning import fire_background_repair
 
         ran = asyncio.Event()
 
         async def work():
             ran.set()
 
-        assert _fire_background_repair("k1", work()) is True
+        assert (
+            fire_background_repair("k1", work(), dependencies=_provisioning_deps())
+            is True
+        )
         await _drain_repair_tasks()
         assert ran.is_set()
 
     @pytest.mark.asyncio
     async def test_second_fire_within_cooldown_throttled(self):
-        from orchestrator.main import _fire_background_repair
+        from orchestrator.services.project_provisioning import fire_background_repair
 
         runs = []
 
         async def work(tag):
             runs.append(tag)
 
-        assert _fire_background_repair("k1", work("first")) is True
-        assert _fire_background_repair("k1", work("second")) is False
+        deps = _provisioning_deps()
+        assert fire_background_repair("k1", work("first"), dependencies=deps) is True
+        assert fire_background_repair("k1", work("second"), dependencies=deps) is False
         await _drain_repair_tasks()
         assert runs == ["first"]
 
     @pytest.mark.asyncio
     async def test_distinct_keys_fire_independently(self):
-        from orchestrator.main import _fire_background_repair
+        from orchestrator.services.project_provisioning import fire_background_repair
 
         runs = []
 
         async def work(tag):
             runs.append(tag)
 
-        assert _fire_background_repair("k1", work("a")) is True
-        assert _fire_background_repair("k2", work("b")) is True
+        deps = _provisioning_deps()
+        assert fire_background_repair("k1", work("a"), dependencies=deps) is True
+        assert fire_background_repair("k2", work("b"), dependencies=deps) is True
         await _drain_repair_tasks()
         assert sorted(runs) == ["a", "b"]
 
@@ -255,23 +284,29 @@ class TestGetProjectOffCriticalPath:
     ):
         """The request must not block on the heal — the old inline await cost
         2.3-5s per page open."""
-        from orchestrator.main import get_project
+        from orchestrator.routers.projects import get_project
 
         heal_started = asyncio.Event()
         heal_release = asyncio.Event()
 
-        async def slow_heal(project):
+        async def slow_heal(project, *, dependencies):
             heal_started.set()
             await heal_release.wait()
             return project
 
         with (
             _patch_caller_and_db(user_a, fake_db),
-            patch("orchestrator.main._ensure_project_cloud_resources", slow_heal),
+            patch(
+                "orchestrator.services.projects.project_provisioning"
+                ".ensure_project_cloud_resources",
+                slow_heal,
+            ),
             patch("orchestrator.main.main_cloud_router") as router,
         ):
             router.for_project_optional.return_value.is_initialized = False
-            result = await get_project(fake_request, str(project_a["id"]))
+            result = await get_project(
+                fake_request, str(project_a["id"]), dependencies=_projects_deps()
+            )
             # Returned while the heal is parked on the event.
             assert result["id"] == project_a["id"]
             assert not heal_release.is_set()
@@ -283,17 +318,25 @@ class TestGetProjectOffCriticalPath:
     async def test_heal_throttled_across_repeat_opens(
         self, user_a, project_a, fake_db, fake_request
     ):
-        from orchestrator.main import get_project
+        from orchestrator.routers.projects import get_project
 
-        heal = AsyncMock(side_effect=lambda p: p)
+        heal = AsyncMock(side_effect=lambda p, **_kwargs: p)
         with (
             _patch_caller_and_db(user_a, fake_db),
-            patch("orchestrator.main._ensure_project_cloud_resources", heal),
+            patch(
+                "orchestrator.services.projects.project_provisioning"
+                ".ensure_project_cloud_resources",
+                heal,
+            ),
             patch("orchestrator.main.main_cloud_router") as router,
         ):
             router.for_project_optional.return_value.is_initialized = False
-            await get_project(fake_request, str(project_a["id"]))
-            await get_project(fake_request, str(project_a["id"]))
+            await get_project(
+                fake_request, str(project_a["id"]), dependencies=_projects_deps()
+            )
+            await get_project(
+                fake_request, str(project_a["id"]), dependencies=_projects_deps()
+            )
             await _drain_repair_tasks()
         assert heal.await_count == 1
 
@@ -302,7 +345,7 @@ class TestGetProjectOffCriticalPath:
         self, user_a, project_a, fake_db, fake_request
     ):
         """Cached home URL → no backend identity calls on the request."""
-        from orchestrator.main import get_project
+        from orchestrator.routers.projects import get_project
 
         project_a["is_default"] = True
         owner = {
@@ -322,7 +365,9 @@ class TestGetProjectOffCriticalPath:
             patch("orchestrator.main.main_cloud_router") as router,
         ):
             router.for_project_optional.return_value = backend
-            result = await get_project(fake_request, str(project_a["id"]))
+            result = await get_project(
+                fake_request, str(project_a["id"]), dependencies=_projects_deps()
+            )
             await _drain_repair_tasks()
 
         assert result["cloud_storage_url"] == "https://cloud/home"
@@ -334,7 +379,7 @@ class TestGetProjectOffCriticalPath:
         self, user_a, project_a, fake_db, fake_request
     ):
         """Cold cache: serve the generic home URL now, resolve in background."""
-        from orchestrator.main import get_project
+        from orchestrator.routers.projects import get_project
 
         project_a["is_default"] = True
         owner = {
@@ -355,7 +400,9 @@ class TestGetProjectOffCriticalPath:
             patch("orchestrator.main.main_cloud_router") as router,
         ):
             router.for_project_optional.return_value = backend
-            result = await get_project(fake_request, str(project_a["id"]))
+            result = await get_project(
+                fake_request, str(project_a["id"]), dependencies=_projects_deps()
+            )
             # This open serves the fallback; the resolve runs off-path.
             assert result["cloud_storage_url"] == "https://cloud/default"
             await _drain_repair_tasks()

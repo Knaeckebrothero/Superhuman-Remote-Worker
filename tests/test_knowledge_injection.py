@@ -214,6 +214,46 @@ def _store(results_by_kb, *, failures=()):
 
 class TestBoundKnowledgeRetrieval:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("native", [False, True])
+    async def test_embedding_failure_still_injects_attributed_lexical_hits(
+        self, native
+    ):
+        binding = _binding("docs", native=native)
+        note_row = uuid.uuid4()
+        db = AsyncMock()
+        db.fetch.side_effect = [
+            [{"note_row": note_row, "arms": ["sparse", "recency"]}],
+            [
+                {
+                    "id": note_row,
+                    "kb_id": binding.kb_id,
+                    "note_id": "deploy",
+                    "title": "Deployment",
+                    "note_type": "learning",
+                    "content": "deploy safely",
+                }
+            ],
+        ]
+        embedder = SimpleNamespace(
+            model="missing-model",
+            expected_dimensions=16,
+            embed=AsyncMock(side_effect=ConnectionError("offline")),
+        )
+        store = KnowledgeStore(db=db, embedding_service=embedder)
+        store.get_watermark = AsyncMock(return_value=None)
+
+        selection = await retrieve_bound_knowledge(store, [binding], "deploy safely")
+        block = KnowledgeStore.assemble_knowledge_block(
+            selection.notes,
+            bindings=selection.bindings,
+        )
+
+        assert [note.note_id for note in selection.notes] == ["deploy"]
+        assert "deploy safely" in block
+        assert "⟨sparse+recency⟩" in block
+        assert "dense" not in block
+
+    @pytest.mark.asyncio
     async def test_protects_three_native_and_two_external_slots(self):
         native = _binding("project", native=True)
         external = _binding("docs")

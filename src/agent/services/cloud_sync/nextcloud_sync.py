@@ -9,7 +9,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional
 from urllib.parse import unquote, urlparse
 
-from agent.services.cloud_sync.base import WorkspaceSyncBase, _normalize_dav_listing
+from agent.services.cloud_sync.base import (
+    CloudSyncFenceLost,
+    WorkspaceSyncBase,
+    _normalize_dav_listing,
+)
 
 if TYPE_CHECKING:
     from shared.runtime.core.workspace_backend import WorkspaceBackend
@@ -25,6 +29,80 @@ _TREE_PROPFIND_BODY = (
     "<d:prop><d:getetag/><d:getcontentlength/><d:resourcetype/></d:prop>"
     "</d:propfind>"
 )
+
+
+def _precondition_headers(if_match: Optional[str], if_none_match: bool) -> list[str]:
+    """RFC 4918 preconditions as webdav3 ``headers_ext`` entries.
+
+    ``If-Match`` on a known etag and ``If-None-Match: *`` for a believed-absent
+    path are the hard fence of commit-then-effects: a stale push owner whose
+    DB token was bumped can still have ONE write in flight; the server refuses
+    it with 412 instead of clobbering the successor's newer bytes.
+    """
+
+    headers: list[str] = []
+    if if_match:
+        headers.append(f"If-Match: {if_match}")
+    elif if_none_match:
+        headers.append("If-None-Match: *")
+    return headers
+
+
+def _raise_if_precondition_failed(exc: BaseException, rel_path: str) -> None:
+    code = getattr(exc, "code", None)
+    if code == 412:
+        raise CloudSyncFenceLost(
+            f"cloud write precondition failed for {rel_path} (412)"
+        ) from exc
+
+
+def _conditional_put(
+    client: Any,
+    rel_path: str,
+    local_path: str,
+    if_match: Optional[str],
+    if_none_match: bool,
+) -> Optional[str]:
+    """PUT one file through webdav3 with preconditions; return the new ETag.
+
+    ``Client.upload_sync`` has no header hook, so this mirrors its file
+    branch on ``execute_request`` directly (same action, same URN quoting).
+    """
+
+    from webdav3.urn import Urn
+
+    urn = Urn(rel_path)
+    headers = _precondition_headers(if_match, if_none_match)
+    try:
+        with open(local_path, "rb") as handle:
+            response = client.execute_request(
+                action="upload",
+                path=urn.quote(),
+                data=handle,
+                headers_ext=headers or None,
+            )
+    except Exception as exc:
+        _raise_if_precondition_failed(exc, rel_path)
+        raise
+    try:
+        etag = response.headers.get("ETag") or response.headers.get("OC-ETag")
+    except Exception:
+        etag = None
+    return str(etag) if etag else None
+
+
+def _conditional_delete(client: Any, rel_path: str, if_match: Optional[str]) -> None:
+    from webdav3.urn import Urn
+
+    urn = Urn(rel_path)
+    headers = _precondition_headers(if_match, False)
+    try:
+        client.execute_request(
+            action="clean", path=urn.quote(), headers_ext=headers or None
+        )
+    except Exception as exc:
+        _raise_if_precondition_failed(exc, rel_path)
+        raise
 
 
 class NextcloudWorkspaceSync(WorkspaceSyncBase):
@@ -94,14 +172,19 @@ class NextcloudWorkspaceSync(WorkspaceSyncBase):
         local_path: str,
         *,
         before_write: Optional[Callable[[], Awaitable[None]]] = None,
-    ) -> None:
+        if_match: Optional[str] = None,
+        if_none_match: bool = False,
+    ) -> Optional[str]:
         if before_write is not None:
             await before_write()
         client = self._get_client()
-        await asyncio.to_thread(
-            client.upload_sync,
-            remote_path=rel_path,
-            local_path=local_path,
+        return await asyncio.to_thread(
+            _conditional_put,
+            client,
+            rel_path,
+            local_path,
+            if_match,
+            if_none_match,
         )
 
     async def _delete_remote_file(
@@ -109,15 +192,27 @@ class NextcloudWorkspaceSync(WorkspaceSyncBase):
         rel_path: str,
         *,
         before_write: Optional[Callable[[], Awaitable[None]]] = None,
+        if_match: Optional[str] = None,
     ) -> None:
         if before_write is not None:
             await before_write()
         client = self._get_client()
         try:
-            await asyncio.to_thread(client.clean, rel_path)
+            await asyncio.to_thread(_conditional_delete, client, rel_path, if_match)
         except Exception as exc:
             if not self._marker_missing(exc):
                 raise
+
+    async def _remote_etag(self, rel_path: str) -> Optional[str]:
+        client = self._get_client()
+        try:
+            info = await asyncio.to_thread(client.info, rel_path)
+        except Exception as exc:
+            if self._marker_missing(exc):
+                return None
+            raise
+        etag = (info or {}).get("etag") if isinstance(info, dict) else None
+        return str(etag) if etag else None
 
     async def _list_remote_files(self, rel_dir: str = "") -> list[dict]:
         client = self._get_client()

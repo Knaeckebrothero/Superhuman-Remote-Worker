@@ -28,6 +28,71 @@ def _session_stub() -> MagicMock:
     return session
 
 
+@pytest.mark.asyncio
+async def test_off_slot_transmit_failure_never_restages_detached_workspace(monkeypatch):
+    from agent.services.cloud_sync.coordinator import CloudSyncError
+    from shared import cloud_sync_generations
+
+    claim = papp._CloudGenerationClaim(
+        thread_id="11111111-1111-4111-8111-111111111111",
+        lease_token=1,
+        workspace_generation="workspace",
+        postgres=object(),
+        lease_handle=None,
+    )
+    sync = MagicMock()
+    sync.stage_generation = AsyncMock(
+        side_effect=[[], AssertionError("workspace is detached")]
+    )
+
+    async def failed_transmit(*args, **kwargs):
+        claim.fence.kind = "push"
+        claim.fence.push_owner_token = 2
+        raise CloudSyncError("generation_push", [("mount", "/", OSError("transient"))])
+
+    sync.transmit_generation = AsyncMock(side_effect=failed_transmit)
+    failed = AsyncMock()
+    monkeypatch.setattr(cloud_sync_generations, "record_push_failure", failed)
+    monkeypatch.setattr(papp, "_broadcast", MagicMock())
+    staged = asyncio.Event()
+    await papp._run_turn_end_cloud_push(
+        sync, 1, requirements={}, claim=claim, staged_event=staged
+    )
+    assert staged.is_set()
+    assert sync.stage_generation.await_count == 1
+    assert sync.transmit_generation.await_count == 1
+    failed.assert_awaited_once()
+    assert failed.call_args.kwargs["push_owner_token"] == 2
+
+
+@pytest.mark.asyncio
+async def test_foreground_staging_failure_still_retries_before_handoff(monkeypatch):
+    from agent.services.cloud_sync.coordinator import CloudSyncError
+
+    claim = papp._CloudGenerationClaim(
+        thread_id="11111111-1111-4111-8111-111111111111",
+        lease_token=1,
+        workspace_generation="workspace",
+        postgres=object(),
+        lease_handle=None,
+    )
+    sync = MagicMock()
+    sync.stage_generation = AsyncMock(
+        side_effect=[
+            CloudSyncError("generation_stage", [("mount", "/", OSError("transient"))]),
+            [],
+        ]
+    )
+    sync.transmit_generation = AsyncMock()
+    monkeypatch.setattr(papp, "_broadcast", MagicMock())
+    monkeypatch.setattr(papp.asyncio, "sleep", AsyncMock())
+    await papp._run_turn_end_cloud_push(
+        sync, 1, requirements={}, claim=claim, staged_event=asyncio.Event()
+    )
+    assert sync.stage_generation.await_count == 2
+    sync.transmit_generation.assert_awaited_once()
+
+
 @pytest.fixture(autouse=True)
 def _clear_pending_task():
     papp._pending_cloud_push_task = None

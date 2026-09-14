@@ -16,6 +16,7 @@
 #   unscoped               — no gate detected; CI snapshot test will fail
 
 GET    /api/actions/pending                                                             gated:require_approved_user
+GET    /api/admin/capacity                                                              admin:_require_admin
 POST   /api/admin/completion-commands/{command_id}/force-resolve                        admin:_require_admin
 POST   /api/admin/completion-commands/{command_id}/unpark                               admin:_require_admin
 GET    /api/admin/config/bundled/{family}/{kind}/{name}                                 admin:_require_admin
@@ -32,6 +33,7 @@ GET    /api/admin/families/detect                                               
 GET    /api/admin/grants                                                                admin:_require_admin
 DELETE /api/admin/grants/{scope_kind}/{scope_id}/{key}                                  admin:_require_admin
 PUT    /api/admin/grants/{scope_kind}/{scope_id}/{key}                                  admin:_require_admin
+GET    /api/admin/helm-managed                                                          admin:_require_admin
 GET    /api/admin/projects/{project_id}/officer/runtime-verification                    admin:_require_admin
 POST   /api/admin/projects/{project_id}/officer/runtime-verification                    admin:_require_admin
 POST   /api/admin/projects/{project_id}/officer/runtime-verification/{plan_id}/{action} admin:_require_admin
@@ -43,6 +45,7 @@ POST   /api/admin/providers/endpoints                                           
 DELETE /api/admin/providers/endpoints/{endpoint_id}                                     admin:_require_admin
 PATCH  /api/admin/providers/endpoints/{endpoint_id}                                     admin:_require_admin
 POST   /api/admin/providers/endpoints/{endpoint_id}/discover                            admin:_require_admin
+POST   /api/admin/providers/endpoints/{endpoint_id}/models/import                       admin:_require_admin
 POST   /api/admin/providers/endpoints/{endpoint_id}/test                                admin:_require_admin
 GET    /api/admin/providers/keys                                                        admin:_require_admin
 DELETE /api/admin/providers/keys/{provider}                                             admin:_require_admin
@@ -54,6 +57,7 @@ POST   /api/admin/providers/models                                              
 DELETE /api/admin/providers/models/{catalog_id}                                         admin:_require_admin
 PATCH  /api/admin/providers/models/{catalog_id}                                         admin:_require_admin
 POST   /api/admin/providers/models/{catalog_id}/test                                    admin:_require_admin
+GET    /api/admin/providers/subscriptions/availability                                  admin:_require_admin
 GET    /api/admin/run-queue                                                             admin:_require_admin
 POST   /api/admin/run-queue/{unit_id}/unpark                                            admin:_require_admin
 GET    /api/admin/security-events                                                       admin:_require_admin
@@ -62,6 +66,7 @@ GET    /api/admin/system-settings/main_cloud                                    
 PUT    /api/admin/system-settings/main_cloud                                            admin:_require_admin
 POST   /api/admin/system-settings/main_cloud/backfill-instance-authority                admin:_require_admin
 POST   /api/admin/system-settings/main_cloud/reload                                     admin:_require_admin
+POST   /api/admin/system-settings/main_cloud/repair-thread-mounts                       admin:_require_admin
 POST   /api/admin/system-settings/main_cloud/test                                       admin:_require_admin
 GET    /api/admin/system-settings/tts_library                                           admin:_require_admin
 PUT    /api/admin/system-settings/tts_library                                           admin:_require_admin
@@ -298,6 +303,11 @@ GET    /api/jobs/{job_id}/usage                                                 
 GET    /api/jobs/{job_id}/version                                                       gated:require_job_access
 GET    /api/jobs/{job_id}/workspace-status                                              internal:require_internal
 POST   /api/jobs/{target_job_id}/verification/rounds                                    internal:require_internal
+POST   /api/manifests/apply                                                             gated:require_approved_user
+POST   /api/manifests/export                                                            gated:require_approved_user
+POST   /api/manifests/preview                                                           gated:require_approved_user
+GET    /api/manifests/schema                                                            gated:require_approved_user
+POST   /api/manifests/validate                                                          gated:require_approved_user
 GET    /api/mcp-tokens                                                                  gated:require_approved_user
 POST   /api/mcp-tokens                                                                  gated:require_approved_user
 DELETE /api/mcp-tokens/{token_id}                                                       gated:require_approved_user
@@ -315,6 +325,7 @@ PATCH  /api/notifications/{notification_id}/read                                
 GET    /api/officers                                                                    gated:require_approved_user
 GET    /api/persistent/threads                                                          gated:require_approved_user
 POST   /api/persistent/threads                                                          gated:require_approved_user
+POST   /api/persistent/threads/preview                                                  gated:require_approved_user
 DELETE /api/persistent/threads/{thread_id}                                              gated:require_thread_owner
 GET    /api/persistent/threads/{thread_id}                                              gated:require_thread_owner
 PATCH  /api/persistent/threads/{thread_id}                                              gated:require_thread_owner
@@ -344,6 +355,8 @@ POST   /api/persistent/threads/{thread_id}/input                                
 POST   /api/persistent/threads/{thread_id}/interrupt                                    gated:require_thread_owner
 GET    /api/persistent/threads/{thread_id}/logs                                         gated:require_thread_owner
 GET    /api/persistent/threads/{thread_id}/messages                                     gated:require_thread_owner
+GET    /api/persistent/threads/{thread_id}/queue                                        gated:require_thread_owner
+POST   /api/persistent/threads/{thread_id}/queue/retry                                  gated:require_thread_owner
 POST   /api/persistent/threads/{thread_id}/resume                                       gated:require_thread_owner
 GET    /api/persistent/threads/{thread_id}/state                                        gated:require_thread_owner
 GET    /api/persistent/threads/{thread_id}/stream                                       gated:require_thread_owner
@@ -417,6 +430,11 @@ POST   /api/projects/{project_id}/repositories                                  
 DELETE /api/projects/{project_id}/repositories/{repo_id}                                gated:require_project_owner
 PATCH  /api/projects/{project_id}/repositories/{repo_id}                                gated:require_project_owner
 GET    /api/requests/{doc_id}                                                           gated:require_job_access
+PUT    /api/resource-secrets/{name}                                                     gated:require_approved_user
+GET    /api/resources                                                                   gated:require_approved_user
+DELETE /api/resources/{resource_id}                                                     gated:require_approved_user
+GET    /api/resources/{resource_id}                                                     gated:require_approved_user
+POST   /api/resources/{resource_id}/outcome                                             gated:require_approved_user
 POST   /api/runtime-actors/authorize                                                    internal:require_internal
 POST   /api/runtime-actors/refresh                                                      internal:require_internal
 GET    /api/sessions/{thread_id}/connection                                             gated:require_approved_user
@@ -453,6 +471,14 @@ GET    /api/stats/daily                                                         
 GET    /api/stats/jobs                                                                  gated:require_approved_user
 GET    /api/stats/session-wakes                                                         admin:_require_admin
 GET    /api/stats/stuck                                                                 gated:require_approved_user
+GET    /api/subscriptions/accounts                                                      admin:_require_admin
+DELETE /api/subscriptions/accounts/{account_id}                                         admin:_require_admin
+GET    /api/subscriptions/accounts/{account_id}/usage                                   admin:_require_admin
+POST   /api/subscriptions/logins                                                        admin:_require_admin
+DELETE /api/subscriptions/logins/{login_id}                                             admin:_require_admin
+GET    /api/subscriptions/logins/{login_id}                                             admin:_require_admin
+POST   /api/subscriptions/logins/{login_id}/callback                                    admin:_require_admin
+GET    /api/subscriptions/status                                                        admin:_require_admin
 GET    /api/sudo/events                                                                 gated:user_can_access_job_or_thread
 GET    /api/sudo/requests                                                               gated:require_job_access
 GET    /api/sudo/requests/{request_id}                                                  gated:user_can_access_job_or_thread
@@ -488,6 +514,10 @@ POST   /api/vms                                                                 
 DELETE /api/vms/{job_id}                                                                gated:require_job_access
 GET    /api/vms/{job_id}                                                                gated:require_job_access
 GET    /api/voice/capabilities                                                          gated:require_approved_user
+GET    /api/workspace-cache                                                             gated:require_approved_user
+DELETE /api/workspace-cache/{artifact_id}                                               gated:require_approved_user
+DELETE /api/workspace-instances/{instance_id}                                           gated:require_approved_user
+GET    /api/workspace-instances/{instance_id}                                           gated:require_approved_user
 GET    /api/workspace/status                                                            admin:_require_admin
 POST   /auth/backchannel-logout                                                         public:OIDC back-channel logout — authenticated by Keycloak's signed logout_token
 GET    /auth/callback                                                                   public:OIDC redirect_uri — authenticates by exchanging the Keycloak code

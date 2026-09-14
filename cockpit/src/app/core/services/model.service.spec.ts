@@ -18,6 +18,7 @@ function createService(mockHttp?: any) {
       embedding_models: [{id: 'text-embedding-3-small', label: 'TE3 Small', dimensions: 1536, configured: true}],
       search_models: [{id: 'tavily', label: 'Tavily', configured: true}],
       fetch_models: [{id: 'tavily', label: 'Tavily', configured: true}],
+      rerank_models: [{id: 'qwen3-reranker-8b', label: 'Qwen3 Reranker', configured: true}],
       configured_providers: ['openai'],
     })),
   };
@@ -63,6 +64,7 @@ describe('ModelService', () => {
       expect(service.embeddingModels()).toHaveLength(1);
       expect(service.searchModels()).toHaveLength(1);
       expect(service.fetchModels()).toHaveLength(1);
+      expect(service.rerankModels()).toHaveLength(1);
       expect(service.embeddingModels()[0].dimensions).toBe(1536);
       expect(service.providers()).toEqual(['openai']);
       expect(service.loaded()).toBe(true);

@@ -1,9 +1,9 @@
 // Primitive design tokens emitted as CSS custom properties.
 //
 // These are the runtime contract for shape and typography across the cockpit.
-// Default values mirror the Sass scalars in _variables.scss; theme files
-// override individual tokens under their scoped selectors (e.g. Roman themes
-// flatten --radius-sm to 0 in _shape-overrides.scss).
+// Default values mirror the Sass scalars in _variables.scss; theme files may
+// override individual tokens under their scoped selectors (the active themes
+// use the radius scale as-is — see the note in _roman-accents.scss).
 //
 // Components should not read these directly. They consume role tokens from
 // _semantic-tokens.scss (--radius-control, --font-primary, etc.), which alias
@@ -12,6 +12,7 @@
 
 :root {
   // --- Radii ---
+  // rem-based on the browser's 16px root (styles.scss keeps html at 100%).
   --radius-sm:   0.25rem; //  4px
   --radius-md:   0.5rem;  //  8px
   --radius-lg:   0.75rem; // 12px
@@ -31,8 +32,10 @@
     ubuntu,
     sans-serif;
 
-  // Display family defaults to the base; Roman themes override to Cinzel via
-  // _shape-overrides.scss. Loaded in cockpit/src/index.html.
+  // Display family defaults to the base; the two active themes bind it to
+  // Cinzel (read only by the rail brand block, the chat hero title and the
+  // vexillum lettering) via
+  // _roman-accents.scss. Loaded in cockpit/src/index.html.
   --font-family-display: var(--font-family-base);
   --font-family-mono:
     'JetBrains Mono',

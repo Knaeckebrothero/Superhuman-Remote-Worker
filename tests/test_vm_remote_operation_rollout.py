@@ -51,6 +51,8 @@ def test_vm_protocol_defaults_dark_and_rolls_when_other_cutovers_are_dark() -> N
             "orchestrator.workspaceLifecycleProtocolCutoverEnabled=false",
             "--set",
             "orchestrator.workspaceCleanupReconciliationEnabled=false",
+            "--set",
+            "orchestrator.manifestContractCutoverEnabled=false",
         )
     )
     assert deployment["spec"]["strategy"]["type"] == "RollingUpdate"

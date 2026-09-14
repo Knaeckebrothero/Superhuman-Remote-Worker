@@ -306,7 +306,7 @@ def test_long_description_stays_within_the_user_data_budget(render):
 
 
 @pytest.mark.asyncio
-async def test_create_job_strips_surrounding_whitespace():
+async def test_create_job_strips_surrounding_whitespace(monkeypatch):
     """create_job normalizes the description before it is persisted.
 
     Defence in depth, not the fix: all six orchestrator entry points funnel
@@ -315,8 +315,13 @@ async def test_create_job_strips_surrounding_whitespace():
     """
     from orchestrator.database.postgres import PostgresDB
 
+    monkeypatch.setattr(
+        "orchestrator.services.manifest_execution_snapshot.capture_execution",
+        AsyncMock(),
+    )
     db = PostgresDB.__new__(PostgresDB)
     conn = MagicMock()
+    conn.execute = AsyncMock(return_value="SELECT 1")
     conn.fetchrow = AsyncMock(return_value={"id": "job-1", "status": "created"})
 
     acquired = MagicMock()

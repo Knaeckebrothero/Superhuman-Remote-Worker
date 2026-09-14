@@ -2794,6 +2794,7 @@ class PersistentSession:
             clone_repository_datasources,
             datasource_tool_categories,
             inject_workspace_facts,
+            install_workspace_credentials,
             process_datasources,
             resolve_repo_clone_names,
         )
@@ -2809,6 +2810,9 @@ class PersistentSession:
 
         new_configs = list(new_datasources or [])
         old_configs = list(self.datasource_configs or [])
+        await asyncio.to_thread(
+            install_workspace_credentials, new_configs, self.workspace_manager
+        )
 
         # The internal payload strips datasource ids, so identity for the
         # add/remove summary is (type, name) — unique enough for display and
@@ -3381,6 +3385,14 @@ class PersistentSession:
             and not getattr(new_backend, "is_connected", lambda: False)()
         ):
             new_backend.connect()
+
+        # ENV files belong to the physical workspace. Restore the bindings on
+        # the new host before retiring the old one or exposing its tools.
+        from shared.credential_connectors import collect_credential_env
+
+        credential_env = collect_credential_env(self.datasource_configs or [])
+        if credential_env:
+            new_backend.install_credential_environment(credential_env)
 
         # This is a genuine backend retirement, not a queue-claim detach. The
         # deterministic tmux session belongs to the old workspace and must not

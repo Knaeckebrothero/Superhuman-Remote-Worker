@@ -44,6 +44,7 @@ from shared.runtime_actor import (
     RuntimeAuthorizationResult,
 )
 from agent.tools.knowledge.knowledge_tools import create_kb_tools
+from orchestrator.services import session_create_overrides
 
 _MIGRATION = (
     Path(__file__).resolve().parents[1]
@@ -616,14 +617,15 @@ class TestConferenceConfig:
     def test_private_post_snapshot_materializes_safe_exact_authority(self):
         import orchestrator.main
 
-        cleaned = orchestrator.main._validated_post_owned_officer_create_fragment(
+        cleaned = session_create_overrides.validated_post_owned_officer_create_fragment(
             {
                 "officer": {
                     "auto_pull": True,
                     "worker_spend_ceiling_daily": 12.5,
                     "slots": {"line": {"count": 1, "spend_ceiling_daily": 4.5}},
                 }
-            }
+            },
+            validated_officer_post_patch=orchestrator.main._validated_officer_post_patch,
         )
         assert cleaned == {
             "auto_pull": True,

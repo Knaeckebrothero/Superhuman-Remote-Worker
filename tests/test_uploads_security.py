@@ -100,7 +100,6 @@ def cookie_users(user_a, user_b, user_admin, monkeypatch):
         return sessions.get(session_id)
 
     monkeypatch.setattr("orchestrator.security.auth._resolve_from_cookie", _resolve)
-    monkeypatch.setattr(orchestrator.uploads, "_get_db", lambda: MagicMock())
     return users
 
 
@@ -108,6 +107,10 @@ def cookie_users(user_a, user_b, user_admin, monkeypatch):
 def app(uploads_dir, internal_key, cookie_users):
     application = FastAPI()
     application.include_router(orchestrator.uploads.router)
+    # The router reads its store from the application handling the request
+    # (`app.state.store`), not from `orchestrator.main` — R1.B03 closed that
+    # caller. Publishing it here is what composition does in production.
+    application.state.store = MagicMock()
     return application
 
 
@@ -587,7 +590,8 @@ class TestCreateJobUploadOwnership:
     async def test_another_users_upload_is_403(
         self, uploads_dir, user_a, user_b, fake_db, fake_request
     ):
-        from orchestrator.main import JobCreate, create_job
+        from orchestrator.main import JobCreate
+        from tests._b09_control_seams import create_job
 
         upload_id = _mint()
         _write_upload(uploads_dir, upload_id, owner=str(user_a["id"]))
@@ -610,7 +614,8 @@ class TestCreateJobUploadOwnership:
     ):
         """The dispatcher reads the ids from ``jobs.context``; a body that
         sets them there directly must meet the same check."""
-        from orchestrator.main import JobCreate, create_job
+        from orchestrator.main import JobCreate
+        from tests._b09_control_seams import create_job
 
         upload_id = _mint("config" if key == "config_upload_id" else "documents")
         _write_upload(uploads_dir, upload_id, owner=str(user_a["id"]))
@@ -628,7 +633,8 @@ class TestCreateJobUploadOwnership:
     async def test_malformed_and_missing_upload_ids_are_refused(
         self, uploads_dir, user_a, fake_db, fake_request
     ):
-        from orchestrator.main import JobCreate, create_job
+        from orchestrator.main import JobCreate
+        from tests._b09_control_seams import create_job
 
         fake_request.headers = {}
         fake_request.cookies = {}
@@ -646,7 +652,8 @@ class TestCreateJobUploadOwnership:
         """Sentinel on the step right after the ownership check: reaching it
         proves the owner's own upload was accepted. An HTTPException subclass
         so ``create_job``'s ``except Exception`` → 500 wrapper lets it out."""
-        from orchestrator.main import JobCreate, create_job
+        from orchestrator.main import JobCreate
+        from tests._b09_control_seams import create_job
 
         class _PastTheUploadCheck(HTTPException):
             pass

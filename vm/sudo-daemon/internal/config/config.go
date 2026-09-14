@@ -69,7 +69,8 @@ type RateLimitConfig struct {
 
 // TimeoutConfig holds timeout durations.
 type TimeoutConfig struct {
-	// NATSRequest is how long the daemon waits for an orchestrator reply.
+	// NATSRequest is the total decision budget for HTTP and legacy NATS.
+	// Keep it 30s above the orchestrator TTL and 15s below the plugin timeout.
 	NATSRequest time.Duration `yaml:"nats_request"`
 	// SocketRead is how long to wait for the plugin to send a complete request.
 	SocketRead time.Duration `yaml:"socket_read"`
@@ -92,7 +93,7 @@ func Defaults() *Config {
 			Burst:             3,
 		},
 		Timeouts: TimeoutConfig{
-			NATSRequest:      300 * time.Second,
+			NATSRequest:      1830 * time.Second,
 			SocketRead:       10 * time.Second,
 			GracefulShutdown: 30 * time.Second,
 		},

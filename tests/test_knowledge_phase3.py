@@ -153,14 +153,14 @@ class TestKnowledgeAPIModels:
     """Tests for the Pydantic models used by knowledge API endpoints."""
 
     def test_search_request_model(self):
-        from orchestrator.main import KnowledgeSearchRequest
+        from orchestrator.schemas.knowledge import KnowledgeSearchRequest
 
         req = KnowledgeSearchRequest(query="test query", limit=5)
         assert req.query == "test query"
         assert req.limit == 5
 
     def test_note_update_model(self):
-        from orchestrator.main import KnowledgeNoteUpdate
+        from orchestrator.schemas.knowledge import KnowledgeNoteUpdate
 
         update = KnowledgeNoteUpdate(status="superseded", add_tags=["deprecated"])
         assert update.status == "superseded"

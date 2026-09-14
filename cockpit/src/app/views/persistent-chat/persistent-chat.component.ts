@@ -21,10 +21,11 @@ import {
 import {DatePipe, NgTemplateOutlet, TitleCasePipe} from '@angular/common';
 import {HttpClient} from '@angular/common/http';
 import {FormsModule} from '@angular/forms';
-import {Router, RouterLink} from '@angular/router';
+import {Router} from '@angular/router';
 import {firstValueFrom, Subscription} from 'rxjs';
 import {MarkdownComponent} from 'ngx-markdown';
 import {CitationRefDirective} from '../../core/markdown/citation-ref.directive';
+import {WorkspaceFileLinkDirective} from '../../core/markdown/workspace-file-link.directive';
 import {KatexDirective} from '../../core/markdown/katex.directive';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {ChatAttachment, PermissionRequest, PersistentChatService, RunningToolInfo, ToolCallInfo,} from '../../core/services/persistent-chat.service';
@@ -81,6 +82,7 @@ import {CitationsPanelComponent} from './citations-panel/citations-panel.compone
 import {CloudReviewDialogComponent} from '../job-diff-review/cloud-review-dialog.component';
 import {CloudReviewBannerComponent} from './cloud-review-banner/cloud-review-banner.component';
 import {SshConnectPanelComponent} from './ssh-connect-panel/ssh-connect-panel.component';
+import {ChatEmptyStateComponent, type DisplayedSuggestion} from './chat-empty-state/chat-empty-state.component';
 import {CapabilitiesService} from '../../core/services/capabilities.service';
 import {AppSelectComponent} from '../../ui/select';
 import {AppIconComponent} from '../../ui/icon';
@@ -90,8 +92,11 @@ import {JobBatchCardComponent} from '../../ui/tool-card/job-batch-card.component
 import {AppReadAloudComponent} from '../../ui/read-aloud';
 import {AppInlineEditableTextComponent} from '../../ui/inline-editable-text';
 import {AppToastService} from '../../ui/toast';
+import {copyText} from '../../ui/copy-field';
+import {queueParkReasonKey} from '../../core/models/queue-park-reason';
 import {ErrorMessageService} from '../../core/services/error-message.service';
 import {ExternalImageDirective} from '../../ui/external-image';
+import {SessionListService} from '../../core/services/session-list.service';
 
 interface SlashCommand {
     command: string;
@@ -102,11 +107,6 @@ interface Suggestion {
     icon: string;
     en: string;
     de: string;
-}
-
-interface DisplayedSuggestion {
-    icon: string;
-    text: string;
 }
 
 const SLASH_COMMANDS: SlashCommand[] = [
@@ -308,6 +308,24 @@ const CATEGORY_LABELS: Record<string, string> = {
  */
 export function isStartupBannerVisible(isStartingSession: boolean, turnCount: number): boolean {
     return isStartingSession && turnCount > 0;
+}
+
+/** Queued-turn bubble escalation: NN/g's 10 s attention limit, then an
+ *  elapsed counter from 60 s. Time-based only — never a queue position. */
+export const QUEUE_BUSY_AFTER_MS = 10_000;
+export const QUEUE_ELAPSED_AFTER_MS = 60_000;
+export type QueueWaitTier = 'fresh' | 'busy' | 'long';
+
+export function queueWaitTier(elapsedMs: number): QueueWaitTier {
+    if (elapsedMs >= QUEUE_ELAPSED_AFTER_MS) return 'long';
+    if (elapsedMs >= QUEUE_BUSY_AFTER_MS) return 'busy';
+    return 'fresh';
+}
+
+/** m:ss for the queued-turn elapsed counter. */
+export function formatQueueWait(elapsedMs: number): string {
+    const s = Math.max(0, Math.floor(elapsedMs / 1000));
+    return `${Math.floor(s / 60)}:${(s % 60).toString().padStart(2, '0')}`;
 }
 
 /**
@@ -871,10 +889,10 @@ export function clearDraft(threadId: string | null): void {
         NgTemplateOutlet,
         TitleCasePipe,
         DatePipe,
-        RouterLink,
         MarkdownComponent,
         ExternalImageDirective,
         CitationRefDirective,
+        WorkspaceFileLinkDirective,
         KatexDirective,
         SidebarToggleComponent,
         TranslocoPipe,
@@ -895,6 +913,7 @@ export function clearDraft(threadId: string | null): void {
         CloudReviewDialogComponent,
         CloudReviewBannerComponent,
         SshConnectPanelComponent,
+        ChatEmptyStateComponent,
     ],
     template: `
     <div class="chat-container"
@@ -914,10 +933,6 @@ export function clearDraft(threadId: string | null): void {
       <div class="chat-header" #chatHeaderEl>
         <div class="header-left">
           <app-sidebar-toggle />
-          <a class="back-link" routerLink="/sessions">
-            <app-icon size="md" class="back-icon">arrow_back</app-icon>
-          </a>
-          <app-icon size="md" class="header-icon">smart_toy</app-icon>
           <span class="header-title">
             @if (chat.threadId(); as tid) {
               <app-inline-editable-text
@@ -930,119 +945,86 @@ export function clearDraft(threadId: string | null): void {
               {{ chat.sessionTitle() || ('chat.defaultTitle' | transloco) }}
             }
           </span>
-          @if (chat.threadId(); as tid) {
-            <span class="header-session-id" title="Session ID">{{ tid.slice(0, 8) }}</span>
-          }
-          <span class="status-dot" [class]="connectionClass()"
-                [title]="headerCompact() ? connectionLabel() : null"></span>
-          @if (!headerCompact()) {
-            <span class="status-label">{{ connectionLabel() }}</span>
+          <span class="status-dot" [class]="connectionClass()" [title]="connectionLabel()"></span>
+          <span class="status-announce">{{ connectionLabel() }}</span>
+
+          @if (chat.isConnected()) {
+            <!-- Danger first, deliberately: app-badge is flex-shrink:0 +
+                 white-space:nowrap and .header-left has no overflow
+                 fallback, so under width pressure the title ellipsizes to
+                 nothing and then the LAST badges clip silently. A degraded
+                 cloud sync (the user's files may not be saving) must never
+                 be the one that clips. -->
+            @if (chat.cloudSyncDegraded()) {
+              <app-badge tone="danger" size="sm" [title]="'chat.status.cloudSyncOffTooltip' | transloco">
+                {{ 'chat.status.cloudSyncOff' | transloco }}
+              </app-badge>
+            }
+            @if (chat.modelName()) {
+              <app-badge tone="accent" size="sm" role="button" tabindex="0"
+                         [title]="'chat.header.settingsTooltip' | transloco"
+                         (click)="settingsRequested.emit('model')"
+                         (keydown.enter)="settingsRequested.emit('model')">{{ chat.modelName() }}</app-badge>
+            }
+            <app-badge tone="accent" size="sm" role="button" tabindex="0"
+                       [title]="'chat.header.settingsTooltip' | transloco"
+                       (click)="settingsRequested.emit(undefined)"
+                       (keydown.enter)="settingsRequested.emit(undefined)">{{ chat.permissionMode() | titlecase }}</app-badge>
+
+            <!-- Transient conditions: conditional and usually absent, so they cost
+                 nothing when nothing is wrong. -->
+            @if (chat.agentSilenceSeconds() >= 30 && !chat.compaction()) {
+              <app-badge tone="warning" size="sm">{{ 'chat.status.agentQuiet' | transloco:{ seconds: chat.agentSilenceSeconds() } }}</app-badge>
+            }
+            @if (chat.compaction(); as comp) {
+              <app-badge tone="warning" size="sm">{{ 'chat.compactionLive.footer' | transloco:{ current: comp.currentPass > 0 ? comp.currentPass : 1, total: comp.nPasses, elapsed: compactionElapsed() } }}</app-badge>
+            }
           }
         </div>
         <div class="header-right" #headerActionsEl>
           <ng-content select="[chatHeaderAction]" />
           @if (chat.isConnected()) {
-            @if (headerCompact()) {
-              <!-- Narrow header (mobile, or the canvas/settings pane eating the
-                   chat pane): fold the secondary controls into one overflow menu
-                   so the header stays a single row; Disconnect stays reachable. -->
-              <app-icon-button
-                size="sm"
-                [ariaLabel]="'chat.header.moreActions' | transloco"
-                [appMenuTrigger]="headerMenu"
-                menuPlacement="bottom-end"
-              >
-                <app-icon size="sm">more_vert</app-icon>
-              </app-icon-button>
-              <app-menu #headerMenu>
-                <app-menu-item (activated)="settingsRequested.emit(undefined)">{{ 'chat.header.settingsTooltip' | transloco }}</app-menu-item>
-                <app-menu-item (activated)="showViewMenu.update(v => !v)">{{ 'chat.header.viewMenuTooltip' | transloco }}</app-menu-item>
-                @if (chat.citationsByCid().size > 0) {
-                  <app-menu-item (activated)="showCitations.update(v => !v)">{{ 'chat.header.citationsButton' | transloco }}</app-menu-item>
-                }
-                @if (chat.verifiedProjectFolder()) {
-                  <app-menu-item (activated)="openProjectFiles()">{{ 'chat.header.projectFilesButton' | transloco }}</app-menu-item>
-                }
-                @if (chat.cloudSessionUrl() || chat.ncSessionFolder()) {
-                  <app-menu-item (activated)="openSessionFiles()">{{ sessionFilesLabelKey() | transloco }}</app-menu-item>
-                }
-                @if (ideStatus(); as ide) {
-                  @if (ide.gitea_url) {
-                    <app-menu-item (activated)="openIde(ide.gitea_url!)">{{ 'chat.header.gitButton' | transloco }}</app-menu-item>
-                  }
-                  @if (ide.status === 'active' && ide.code_server_url) {
-                    <app-menu-item (activated)="openCodeServer()">{{ 'chat.header.ideButton' | transloco }}</app-menu-item>
-                  } @else if (ide.status === 'restoring') {
-                    <app-menu-item [disabled]="true">{{ 'chat.header.ideLoadingTooltip' | transloco }}</app-menu-item>
-                  }
-                }
-                @if (sshButtonVisible()) {
-                  <app-menu-item (activated)="showSshPanel.update(v => !v)">{{ 'chat.header.sshButton' | transloco }}</app-menu-item>
-                }
-              </app-menu>
-            } @else {
-              <button class="settings-btn" (click)="settingsRequested.emit(undefined)"
-                      [title]="'chat.header.settingsTooltip' | transloco">
-                <app-icon size="sm" class="settings-icon">tune</app-icon>
-              </button>
-
-              <button class="settings-btn" (click)="showViewMenu.update(v => !v)"
-                      [class.active]="showViewMenu()" [title]="'chat.header.viewMenuTooltip' | transloco">
-                <app-icon size="sm" class="settings-icon">visibility</app-icon>
-              </button>
-
-              @if (chat.citationsByCid().size > 0) {
-                <button class="settings-btn" (click)="showCitations.update(v => !v)"
-                        [class.active]="showCitations()" [title]="'chat.header.citationsTooltip' | transloco">
-                  <app-icon size="sm" class="settings-icon">format_quote</app-icon>
-                </button>
+            <!-- Secondary controls always fold into one overflow menu now
+                 (used to be conditional on headerCompact(), which survives
+                 for the ended-session buttons below). Disconnect stays its
+                 own visible button, not folded in. -->
+            <app-icon-button
+              size="sm"
+              [ariaLabel]="'chat.header.moreActions' | transloco"
+              [appMenuTrigger]="headerMenu"
+              menuPlacement="bottom-end"
+            >
+              <app-icon size="sm">more_vert</app-icon>
+            </app-icon-button>
+            <app-menu #headerMenu>
+              @if (chat.threadId(); as tid) {
+                <app-menu-item (activated)="copyThreadId()">{{ 'chat.header.copySessionId' | transloco:{ id: tid.slice(0, 8) } }}</app-menu-item>
               }
-
-              <!-- PC-19. Two unambiguous actions, never one guess: the
-                   project folder the protected diff actually applies to, and
-                   the session scratch folder. The project action only exists
-                   once the mount has been cross-checked against the diff
-                   summary (chat.verifiedProjectFolder). -->
-              @if (chat.verifiedProjectFolder(); as folder) {
-                <button class="ide-btn" (click)="openProjectFiles()"
-                        [title]="'chat.header.projectFilesTooltip' | transloco:{ name: folder.name }">
-                  <app-icon size="sm" class="ide-icon">folder_shared</app-icon>
-                  {{ 'chat.header.projectFilesButton' | transloco }}
-                </button>
+              <app-menu-item (activated)="settingsRequested.emit(undefined)">{{ 'chat.header.settingsTooltip' | transloco }}</app-menu-item>
+              <app-menu-item (activated)="showViewMenu.update(v => !v)">{{ 'chat.header.viewMenuTooltip' | transloco }}</app-menu-item>
+              @if (chat.citationsByCid().size > 0) {
+                <app-menu-item (activated)="showCitations.update(v => !v)">{{ 'chat.header.citationsButton' | transloco }}</app-menu-item>
+              }
+              @if (chat.verifiedProjectFolder()) {
+                <app-menu-item (activated)="openProjectFiles()">{{ 'chat.header.projectFilesButton' | transloco }}</app-menu-item>
               }
               @if (chat.cloudSessionUrl() || chat.ncSessionFolder()) {
-                <button class="ide-btn" (click)="openSessionFiles()" [title]="'chat.header.filesTooltip' | transloco">
-                  <app-icon size="sm" class="ide-icon">cloud</app-icon>
-                  {{ sessionFilesLabelKey() | transloco }}
-                </button>
+                <app-menu-item (activated)="openSessionFiles()">{{ sessionFilesLabelKey() | transloco }}</app-menu-item>
               }
               @if (ideStatus(); as ide) {
                 @if (ide.gitea_url) {
-                  <button class="ide-btn gitea-btn" (click)="openIde(ide.gitea_url!)" [title]="'chat.header.gitTooltip' | transloco">
-                    <app-icon size="sm" class="ide-icon">history</app-icon>
-                    {{ 'chat.header.gitButton' | transloco }}
-                  </button>
+                  <app-menu-item (activated)="openIde(ide.gitea_url!)">{{ 'chat.header.gitButton' | transloco }}</app-menu-item>
                 }
                 @if (ide.status === 'active' && ide.code_server_url) {
-                  <button class="ide-btn" (click)="openCodeServer()" [title]="'chat.header.ideActiveTooltip' | transloco">
-                    <app-icon size="sm" class="ide-icon">code</app-icon>
-                    {{ 'chat.header.ideButton' | transloco }}
-                  </button>
+                  <app-menu-item (activated)="openCodeServer()">{{ 'chat.header.ideButton' | transloco }}</app-menu-item>
                 } @else if (ide.status === 'restoring') {
-                  <button class="ide-btn ide-loading" disabled [title]="'chat.header.ideLoadingTooltip' | transloco">
-                    <span class="ide-spinner"></span>
-                    {{ 'chat.header.ideButton' | transloco }}
-                  </button>
+                  <app-menu-item [disabled]="true">{{ 'chat.header.ideLoadingTooltip' | transloco }}</app-menu-item>
                 }
               }
               @if (sshButtonVisible()) {
-                <button class="ide-btn" (click)="showSshPanel.update(v => !v)"
-                        [title]="'chat.header.sshTooltip' | transloco">
-                  <app-icon size="sm" class="ide-icon">terminal</app-icon>
-                  {{ 'chat.header.sshButton' | transloco }}
-                </button>
+                <app-menu-item (activated)="showSshPanel.update(v => !v)">{{ 'chat.header.sshButton' | transloco }}</app-menu-item>
               }
-            }
+            </app-menu>
             <app-button variant="ghost" size="sm"
                         [loading]="isDisconnecting()"
                         [ariaLabel]="(isDisconnecting() ? 'chat.header.disconnecting' : 'chat.header.disconnect') | transloco"
@@ -1100,53 +1082,12 @@ export function clearDraft(threadId: string | null): void {
         </div>
       </div>
 
-      <!-- Status bar -->
-      @if (chat.isConnected()) {
-        <div class="status-bar">
-          @if (chat.modelName()) {
-            <app-badge tone="accent" size="sm" role="button" tabindex="0"
-                       [title]="'chat.header.settingsTooltip' | transloco"
-                       (click)="settingsRequested.emit('model')"
-                       (keydown.enter)="settingsRequested.emit('model')">{{ chat.modelName() }}</app-badge>
-          }
-          @if (chat.temperature()) {
-            <app-badge tone="neutral" size="sm" role="button" tabindex="0"
-                       [title]="'chat.header.settingsTooltip' | transloco"
-                       (click)="settingsRequested.emit('model')"
-                       (keydown.enter)="settingsRequested.emit('model')">{{ 'chat.status.temp' | transloco:{ value: chat.temperature() } }}</app-badge>
-          }
-          <app-badge tone="neutral" size="sm">{{ 'chat.status.turn' | transloco:{ count: chat.turnCount() } }}</app-badge>
-          @if (chat.agentSilenceSeconds() >= 30 && !chat.compaction()) {
-            <app-badge tone="warning" size="sm">{{ 'chat.status.agentQuiet' | transloco:{ seconds: chat.agentSilenceSeconds() } }}</app-badge>
-          }
-          @if (chat.compaction(); as comp) {
-            <app-badge tone="warning" size="sm">{{ 'chat.compactionLive.footer' | transloco:{ current: comp.currentPass > 0 ? comp.currentPass : 1, total: comp.nPasses, elapsed: compactionElapsed() } }}</app-badge>
-          }
-          @if (chat.cloudSyncDegraded()) {
-            <app-badge tone="danger" size="sm"
-                       [title]="'chat.status.cloudSyncOffTooltip' | transloco">
-              {{ 'chat.status.cloudSyncOff' | transloco }}
-            </app-badge>
-          }
-          <!-- The staged-cloud-changes entry point used to live here. It was
-               a passive-looking badge, keyboard-unreachable (role="button"
-               with no tabindex), and — fatally — inside this
-               isConnected()-gated bar, so an ended session could never reach
-               a genuine pending review (PC-23, PC-25). It is now
-               the cloud-review banner below, outside the gate. -->
-          <app-badge tone="accent" size="sm" role="button" tabindex="0"
-                     [title]="'chat.header.settingsTooltip' | transloco"
-                     (click)="settingsRequested.emit(undefined)"
-                     (keydown.enter)="settingsRequested.emit(undefined)">{{ chat.permissionMode() | titlecase }}</app-badge>
-        </div>
-      }
-
       <!-- Pending protected-cloud review. Deliberately OUTSIDE the
            isConnected() gate above: the review API serves ended threads on
            purpose, and gating the only entry point on the live agent turned a
            recoverable duplicate stage into a trap whose only exit was Resume
            (PC-25). Its own component so no rules land in
-           persistent-chat.component.scss, which is already 41kB of a 48kB
+           persistent-chat.component.scss, which is already 39.38kB of a 48kB
            anyComponentStyle error budget. -->
       <app-cloud-review-banner
         [protectedCloud]="chat.protectedCloud()"
@@ -1335,8 +1276,9 @@ export function clearDraft(threadId: string | null): void {
             </span>
           </summary>
           <div class="thinking-content" [class.streaming-block]="event.status === 'streaming'">
-            <markdown appCitationRef appKatex [data]="event.content"
-                      [katexDefer]="event.status === 'streaming'"></markdown>
+            <markdown appCitationRef appKatex appWorkspaceFileLink [data]="event.content"
+                      [katexDefer]="event.status === 'streaming'"
+                      (workspaceFileOpen)="workspaceFileRequested.emit($event)"></markdown>
           </div>
         </details>
       </ng-template>
@@ -1419,7 +1361,8 @@ export function clearDraft(threadId: string | null): void {
                        class (its base styles are benign; the bubble styling is gated on
                        .message-user/.message-assistant, which this isn't). -->
                   <div class="compaction-summary-body message-body">
-                    <markdown appKatex [data]="turn.summary"></markdown>
+                    <markdown appKatex appWorkspaceFileLink [data]="turn.summary"
+                              (workspaceFileOpen)="workspaceFileRequested.emit($event)"></markdown>
                   </div>
                 </details>
               }
@@ -1601,7 +1544,8 @@ export function clearDraft(threadId: string | null): void {
                            renders growing text too — gate its DOM post-processing
                            + KaTeX off the turn's streaming status. -->
                       <div class="event-text turn-final-answer" [class.streaming-block]="streaming">
-                        <markdown appCitationRef appKatex [data]="answer" [katexDefer]="streaming"></markdown>
+                        <markdown appCitationRef appKatex appWorkspaceFileLink [data]="answer" [katexDefer]="streaming"
+                                  (workspaceFileOpen)="workspaceFileRequested.emit($event)"></markdown>
                       </div>
                     } @else {
                       <span class="turn-headline">{{ collapsedHeadline(turn) }}</span>
@@ -1672,8 +1616,9 @@ export function clearDraft(threadId: string | null): void {
                           }
                           @case ('text') {
                             <div class="event-text" [class.streaming-block]="group.event.status === 'streaming'">
-                              <markdown appCitationRef appKatex [data]="group.event.content"
-                                        [katexDefer]="group.event.status === 'streaming'"></markdown>
+                              <markdown appCitationRef appKatex appWorkspaceFileLink [data]="group.event.content"
+                                        [katexDefer]="group.event.status === 'streaming'"
+                                        (workspaceFileOpen)="workspaceFileRequested.emit($event)"></markdown>
                             </div>
                           }
                           @case ('compaction') {
@@ -1689,7 +1634,8 @@ export function clearDraft(threadId: string | null): void {
                               <details class="compaction-summary">
                                 <summary>{{ 'chat.compaction.viewSummary' | transloco }}</summary>
                                 <div class="compaction-summary-body message-body">
-                                  <markdown appKatex [data]="group.event.summary"></markdown>
+                                  <markdown appKatex appWorkspaceFileLink [data]="group.event.summary"
+                                            (workspaceFileOpen)="workspaceFileRequested.emit($event)"></markdown>
                                 </div>
                               </details>
                             }
@@ -1730,64 +1676,23 @@ export function clearDraft(threadId: string | null): void {
           @if (!chat.isStreaming()) {
             <div class="empty-state">
               @if (chat.sessionReady()) {
-                <div class="empty-inner">
-                  <img class="empty-mark" src="assets/icons/icon-mark.svg" alt="" />
-                  <h2 class="empty-title">{{ 'chat.empty.title' | transloco }}</h2>
-                  <p class="empty-subtitle">{{ 'chat.empty.subtitle' | transloco }}</p>
-                  @if (displayedSuggestions().length > 0) {
-                    <div class="suggestion-grid">
-                      @for (s of displayedSuggestions(); track $index) {
-                        <button type="button" class="suggestion-chip"
-                                (click)="pickSuggestion(s)">
-                          <app-icon size="lg" class="suggestion-icon">{{ s.icon }}</app-icon>
-                          <span class="suggestion-text">{{ s.text }}</span>
-                        </button>
-                      }
-                    </div>
-                  }
-                </div>
+                <app-chat-empty-state
+                  variant="ready"
+                  [suggestions]="displayedSuggestions()"
+                  (suggestionPicked)="pickSuggestion($event)"
+                />
               } @else if (chat.isDraftSession()) {
-                <div class="empty-inner">
-                  <img class="empty-mark" src="assets/icons/icon-mark.svg" alt="" />
-                  <h2 class="empty-title">{{ 'chat.draft.title' | transloco }}</h2>
-                  <p class="empty-subtitle">{{ 'chat.draft.subtitle' | transloco }}</p>
-                  <div class="draft-connectors" role="group" [attr.aria-label]="'chat.draft.connectorsLabel' | transloco">
-                    @if (chat.draftDefaultsLoading()) {
-                      <span class="draft-connectors-state">{{ 'chat.draft.connectorsLoading' | transloco }}</span>
-                    } @else if (chat.draftDefaultsError()) {
-                      <span class="draft-connectors-state draft-connectors-error">
-                        {{ 'chat.draft.connectorsFailed' | transloco }}
-                        <button type="button" (click)="chat.retryDraftDefaults()">
-                          {{ 'chat.draft.connectorsRetry' | transloco }}
-                        </button>
-                      </span>
-                    } @else {
-                      <label class="draft-connectors-toggle">
-                        <input
-                          type="checkbox"
-                          [checked]="chat.draftConnectorsEnabled()"
-                          (change)="chat.setDraftConnectorsEnabled($any($event.target).checked)"
-                        >
-                        <span>
-                          {{ 'chat.draft.connectorsCount'
-                            | transloco: {count: chat.draftDatasourceIds()?.length ?? 0} }}
-                        </span>
-                      </label>
-                    }
-                  </div>
-                  @if (displayedSuggestions().length > 0) {
-                    <div class="suggestion-grid">
-                      @for (s of displayedSuggestions(); track $index) {
-                        <button type="button" class="suggestion-chip"
-                                (click)="pickSuggestion(s)">
-                          <app-icon size="lg" class="suggestion-icon">{{ s.icon }}</app-icon>
-                          <span class="suggestion-text">{{ s.text }}</span>
-                        </button>
-                      }
-                    </div>
-                  }
-                  <a class="draft-advanced" routerLink="/sessions/new">{{ 'chat.draft.advanced' | transloco }}</a>
-                </div>
+                <app-chat-empty-state
+                  variant="draft"
+                  [suggestions]="displayedSuggestions()"
+                  [connectorsLoading]="chat.draftDefaultsLoading()"
+                  [connectorsError]="chat.draftDefaultsError()"
+                  [connectorsEnabled]="chat.draftConnectorsEnabled()"
+                  [datasourceCount]="chat.draftDatasourceIds()?.length ?? 0"
+                  (suggestionPicked)="pickSuggestion($event)"
+                  (connectorsToggled)="chat.setDraftConnectorsEnabled($event)"
+                  (retryRequested)="chat.retryDraftDefaults()"
+                />
               } @else if (chat.isStartingSession()) {
                 <div class="startup-wrapper">
                   <ng-container *ngTemplateOutlet="startupCardTpl"></ng-container>
@@ -1797,21 +1702,67 @@ export function clearDraft(threadId: string | null): void {
           }
         }
 
-        <!-- Accepted-but-not-yet-started turn: the agent queued the input
-             (e.g. the previous turn's cloud push is still flushing). Shown
-             standalone because no turn object exists until turn.started —
-             without it the queued send reads as swallowed. -->
-        @if (chat.isAwaitingTurn()) {
-          <div class="message message-assistant turn-bubble">
+        @if (chat.isDraftSession() && chat.outbox().length > 0) {
+          <app-chat-empty-state
+            variant="recovery"
+            [suggestions]="[]"
+            [connectorsLoading]="chat.draftDefaultsLoading()"
+            [connectorsError]="chat.draftDefaultsError()"
+            [connectorsEnabled]="chat.draftConnectorsEnabled()"
+            [datasourceCount]="chat.draftDatasourceIds()?.length ?? 0"
+            [workspaceBackend]="chat.draftWorkspaceBackend()"
+            (connectorsToggled)="chat.setDraftConnectorsEnabled($event)"
+            (workspaceChanged)="chat.setDraftWorkspaceBackend($event)"
+            (retryRequested)="chat.retryDraftDefaults()"
+            (sendRetried)="chat.retryDraftSession()"
+          />
+        }
+
+        <!-- Parked unit: the input was accepted but nothing can claim it until
+             it is retried (attach failures, a maintenance interruption, a
+             settlement failure). Rendered from the durable queue block, so a
+             reload shows it too. Never the waiting/busy copy: this is a
+             failure with a way out, not a queue. -->
+        @if (chat.isParked()) {
+          <div class="message message-assistant turn-bubble parked-turn" role="alert" data-testid="chat-parked">
             <div class="avatar">
-              <app-icon size="sm" class="avatar-icon">smart_toy</app-icon>
+              <app-icon size="sm" class="avatar-icon parked-icon">error_outline</app-icon>
             </div>
-            <div class="message-body turn-body">
-              <div class="thinking">
-                <span class="thinking-dot"></span>
-                <span class="thinking-dot"></span>
-                <span class="thinking-dot"></span>
-              </div>
+            <div class="message-body turn-body parked-body">
+              <div class="parked-line">{{ 'chat.parked.title' | transloco }}</div>
+              <div class="parked-reason">{{ parkedReasonKey() | transloco }}</div>
+              @if (chat.queueState()?.retryable) {
+                <div class="parked-actions">
+                  <app-button variant="ghost" size="sm" data-testid="chat-parked-retry"
+                              [disabled]="retryingParked()"
+                              (clicked)="retryParked()">
+                    {{ (retryingParked() ? 'chat.parked.retrying' : 'chat.parked.retry') | transloco }}
+                  </app-button>
+                </div>
+              }
+            </div>
+          </div>
+        }
+
+        <!-- Accepted-but-not-yet-started turn: the input is durably queued
+             but no agent has claimed it yet (pool busy, or the previous
+             turn's cloud push still flushing). Shown standalone because no
+             turn object exists until turn.started, and deliberately NOT the
+             thinking dots: queued is not working. Escalates after 10 s /
+             60 s; never shows a queue position. -->
+        @if (chat.isAwaitingTurn()) {
+          <div class="message message-assistant turn-bubble queued-turn" role="status" aria-live="polite">
+            <div class="avatar">
+              <app-icon size="sm" class="avatar-icon queued-icon">hourglass_top</app-icon>
+            </div>
+            <div class="message-body turn-body queued-body">
+              <div class="queued-line">{{ 'chat.queue.waiting' | transloco }}</div>
+              @if (queuedTier() !== 'fresh') {
+                <div class="queued-busy">{{ 'chat.queue.busy' | transloco }}</div>
+              }
+              @if (queuedTier() === 'long') {
+                <div class="queued-elapsed">{{ 'chat.queue.elapsed' | transloco: {time: queuedWaitLabel()} }}</div>
+              }
             </div>
           </div>
         }
@@ -2467,6 +2418,9 @@ export function clearDraft(threadId: string | null): void {
 })
 export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDestroy {
     readonly canvasRequested = output<void>();
+    /** An agent-written workspace path was activated in rendered Markdown.
+     *  The host chat-page decides what a file can be shown in. */
+    readonly workspaceFileRequested = output<string>();
     /** Open the session settings pane (host chat-page owns it). The optional
      *  payload names a section to focus — 'model' from the model/temp chips. */
     readonly settingsRequested = output<string | undefined>();
@@ -2490,6 +2444,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     private readonly router = inject(Router);
     private readonly toast = inject(AppToastService);
     private readonly errors = inject(ErrorMessageService);
+    private readonly sessionList = inject(SessionListService);
     private readonly injector = inject(Injector);
     private readonly destroyRef = inject(DestroyRef);
 
@@ -2513,6 +2468,23 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
 
     // --- Live compaction progress (knowledge-base/knowledge/features/context_summarization_rework.md S3)
     /** 1s tick driving the elapsed timer; interval runs only mid-compaction. */
+    /** Escalation tier + m:ss label for the queued-turn bubble. */
+    readonly queuedTier = computed(() => queueWaitTier(this.chat.awaitingElapsedMs()));
+    readonly queuedWaitLabel = computed(() => formatQueueWait(this.chat.awaitingElapsedMs()));
+    /** Reason line under the parked bubble, keyed by run_queue.park_reason. */
+    readonly parkedReasonKey = computed(() => queueParkReasonKey(this.chat.queueState()?.park_reason));
+    readonly retryingParked = signal(false);
+
+    async retryParked(): Promise<void> {
+        if (this.retryingParked()) return;
+        this.retryingParked.set(true);
+        try {
+            await this.chat.retryParked();
+        } finally {
+            this.retryingParked.set(false);
+        }
+    }
+
     private readonly compactionNow = signal(Date.now());
     private compactionTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -2700,7 +2672,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     readonly slashSelectedIndex = signal(0);
     readonly filteredCommands = signal<SlashCommand[]>([]);
 
-    // Empty-state suggestions (loaded once, picked once per mount)
+    // Empty-state suggestions (loaded once per mount; the whole set renders, nothing is picked)
     private readonly pickedSuggestions = signal<Suggestion[]>([]);
     readonly displayedSuggestions = computed<DisplayedSuggestion[]>(() => {
         const lang = this.i18n.activeLang();
@@ -2887,12 +2859,11 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
             }
         });
 
-        // Load empty-state suggestions and pick 4 at random for this mount
+        // Load the empty-state suggestions. The set is deliberately NOT shuffled:
+        // picking 4 of 8 at random per mount meant a chip seen once could not be
+        // found again, which read as the list being broken.
         this.http.get<Suggestion[]>('assets/suggestions.json').subscribe({
-            next: (data) => {
-                const shuffled = [...data].sort(() => Math.random() - 0.5);
-                this.pickedSuggestions.set(shuffled.slice(0, Math.min(4, shuffled.length)));
-            },
+            next: (list) => this.pickedSuggestions.set(list ?? []),
             error: () => this.pickedSuggestions.set([]),
         });
 
@@ -3172,12 +3143,20 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         if (this.chat.isStartingSession()) return this.transloco.translate('chat.input.sessionStarting');
         if (!this.chat.isConnected()) return this.transloco.translate('chat.input.connect');
         if (this.chat.isInterrupting()) return this.transloco.translate('chat.input.stopping');
-        // isAwaitingTurn: the send is accepted but its turn hasn't started
-        // (agent still flushing the previous turn) — same "working" surface,
-        // or the queued message reads as swallowed.
-        if (this.chat.isStreaming() || this.chat.isAwaitingTurn()) {
-            return this.transloco.translate('chat.input.working');
+        if (this.chat.isStreaming()) return this.transloco.translate('chat.input.working');
+        // A parked unit needs a retry — say so, not "waiting". A park an owner
+        // may NOT revive (claim-loss hold, stop markers, a non-retryable
+        // reason) renders no Retry button, so it must not name a retry either:
+        // only an operator's admin unpark clears it.
+        if (this.chat.isParked()) {
+            return this.transloco.translate(
+                this.chat.queueState()?.retryable ? 'chat.input.parked' : 'chat.input.parkedBlocked',
+            );
         }
+        // isAwaitingTurn: the send is accepted but no agent has picked it up
+        // yet — say "waiting", not "working"; the queued bubble carries the
+        // escalation copy.
+        if (this.chat.isAwaitingTurn()) return this.transloco.translate('chat.input.queued');
         // Mobile keyboards send newline on Enter, so the desktop key hints are wrong there.
         return this.transloco.translate(
             this.viewport.isMobile() ? 'chat.input.defaultMobile' : 'chat.input.default',
@@ -3527,7 +3506,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         video.srcObject = stream;
         video.autoplay = true;
         video.playsInline = true;
-        video.style.cssText = 'max-width:90vw;max-height:70vh;border-radius:8px;background:#000;';
+        video.style.cssText = 'max-width:90vw;max-height:70vh;border-radius:var(--radius-control);background:#000;';
         const buttons = document.createElement('div');
         buttons.style.cssText = 'display:flex;gap:12px;';
         const captureBtn = document.createElement('button');
@@ -3535,13 +3514,13 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         captureBtn.textContent = this.transloco.translate('chat.composer.capturePhoto');
         captureBtn.style.cssText =
             'padding:10px 20px;font-size:14px;font-weight:500;border:none;' +
-            'border-radius:6px;background:#3399D6;color:#fff;cursor:pointer;';
+            'border-radius:var(--radius-control);background:#3399D6;color:#fff;cursor:pointer;';
         const cancelBtn = document.createElement('button');
         cancelBtn.type = 'button';
         cancelBtn.textContent = this.transloco.translate('common.cancel');
         cancelBtn.style.cssText =
             'padding:10px 20px;font-size:14px;font-weight:500;border:none;' +
-            'border-radius:6px;background:#444;color:#fff;cursor:pointer;';
+            'border-radius:var(--radius-control);background:#444;color:#fff;cursor:pointer;';
         buttons.appendChild(captureBtn);
         buttons.appendChild(cancelBtn);
         overlay.appendChild(video);
@@ -3717,6 +3696,10 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
 
     pickSuggestion(s: DisplayedSuggestion): void {
         this.inputText = s.text;
+        // inputText is a plain ngModel field, so this assignment fires no
+        // ngModelChange and onInputChange never runs — the draft must be saved by
+        // hand or a reload eats it. Same hazard denyOffer() documents below.
+        saveDraft(this.chat.threadId(), this.inputText);
         setTimeout(() => {
             this.inputEl?.nativeElement?.focus();
             this.autoResizeInput();
@@ -4019,8 +4002,27 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     async onRenameSession(threadId: string, title: string): Promise<void> {
         try {
             await this.chat.renameThread(threadId, title);
+            // The rail has its own copy of the thread list (SessionListService)
+            // and only refreshes it on NavigationEnd — a rename never navigates,
+            // so without this the rail shows the old title until the user
+            // leaves and comes back.
+            this.sessionList.renameLocal(threadId, title);
         } catch (e) {
             this.toast.danger(this.errors.translate(e, 'errors.sessions.renameFailed'));
+        }
+    }
+
+    /** ⋮ menu "Copy session ID …" row. Spec §6: the id is a debugging
+     *  affordance, not wayfinding, so it lives behind the overflow menu
+     *  instead of costing a permanent header chip — but it copies the full
+     *  id, not the truncated one the menu label shows. */
+    async copyThreadId(): Promise<void> {
+        const threadId = this.chat.threadId();
+        if (!threadId) return;
+        if (await copyText(threadId)) {
+            this.toast.success(this.transloco.translate('common.copied'));
+        } else {
+            this.toast.danger(this.transloco.translate('common.copyFailed'));
         }
     }
 

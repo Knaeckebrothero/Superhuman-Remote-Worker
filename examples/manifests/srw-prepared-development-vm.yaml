@@ -1,0 +1,29 @@
+# Requires enabled same-cluster VM preparation; applying the template builds nothing.
+apiVersion: srw/v1alpha1
+kind: WorkspaceTemplate
+metadata:
+  name: srw-prepared-development
+spec:
+  backend: vm
+  resources:
+    cpu: 12
+    memory: 24Gi
+    storage: 120Gi
+  environment:
+    # SRW development VM: Docker, k3d, Tilt, kubectl and the SSH guest contract.
+    image: ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base@sha256:db1015a32173c4553d1ad432bdb48760fdb8ba0782d25ae20349d4aaaf26c28f
+    pullPolicy: IfNotPresent
+    cache: Reuse
+    prepare:
+      # Root inside an isolated, offline disk appliance; no Job credentials.
+      # Add project-wide system packages here if the operator enables networking.
+      - command:
+          - sh
+          - -c
+          - |
+            install -d -m 0755 /opt/srw-project
+            printf '%s\n' 'development-tools-v1' > /opt/srw-project/toolchain-version
+  initialize:
+    # Runs as agent-host once per workspace, after cloning the prepared disk.
+    - command: [mkdir, -p, .cache/project]
+  retention: Delete

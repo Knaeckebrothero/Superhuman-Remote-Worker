@@ -69,7 +69,10 @@ def test_runtime_authority_migration_defaults_to_rolling_refusal() -> None:
     # migration gate stays empty either way, so a rolling rollout can never
     # silently pick up the maintenance-gated migration.
     rolling = _render_orchestrator(
-        "--set", "orchestrator.workspaceLifecycleProtocolCutoverEnabled=false"
+        "--set",
+        "orchestrator.workspaceLifecycleProtocolCutoverEnabled=false",
+        "--set",
+        "orchestrator.manifestContractCutoverEnabled=false",
     )
     assert rolling["spec"]["strategy"] == {"type": "RollingUpdate"}
     assert _orchestrator_env(rolling)["MIGRATION_MAINTENANCE_GATES"] == ""

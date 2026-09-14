@@ -1895,7 +1895,10 @@ class TestCreateVmDiskSize:
 
     @pytest.mark.asyncio
     async def test_http_create_forwards_disk_size(self, provisioner_disabled):
+        from shared.workspace_initialization import initialization_request
+
         prov = self._http_provisioner(provisioner_disabled)
+        initialization = initialization_request([{"command": ["true"]}])
         await prov._create_http(
             job_id="job-disk",
             agent_config="developer",
@@ -1904,9 +1907,11 @@ class TestCreateVmDiskSize:
             memory="24Gi",
             description="",
             disk_size="120Gi",
+            initialization=initialization,
         )
         payload = prov._http_client.post.await_args.kwargs["json"]
         assert payload["disk_size"] == "120Gi"
+        assert payload["initialization"] == initialization
 
     @pytest.mark.asyncio
     async def test_http_create_omits_disk_size_when_unset(self, provisioner_disabled):

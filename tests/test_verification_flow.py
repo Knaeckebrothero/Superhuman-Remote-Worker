@@ -83,7 +83,9 @@ class TestRecordVerificationRound:
     async def test_first_round_assigns_ids_and_computes_returned(
         self, fake_db, ledger_state
     ):
-        from orchestrator.main import _record_verification_round_impl
+        from tests.b08_completion_helpers import (
+            record_verification_round as _record_verification_round_impl,
+        )
 
         result = await _record_verification_round_impl(
             postgres_db=fake_db,
@@ -105,7 +107,9 @@ class TestRecordVerificationRound:
         self, fake_db, ledger_state
     ):
         """The rule that makes the incident impossible."""
-        from orchestrator.main import _record_verification_round_impl
+        from tests.b08_completion_helpers import (
+            record_verification_round as _record_verification_round_impl,
+        )
 
         ledger_state["rounds"].append(
             {
@@ -139,7 +143,9 @@ class TestRecordVerificationRound:
     async def test_returned_with_no_findings_raises_409(self, fake_db):
         from fastapi import HTTPException
 
-        from orchestrator.main import _record_verification_round_impl
+        from tests.b08_completion_helpers import (
+            record_verification_round as _record_verification_round_impl,
+        )
 
         with pytest.raises(HTTPException) as exc:
             await _record_verification_round_impl(
@@ -158,7 +164,9 @@ class TestRecordVerificationRound:
         """One guaranteed-rejected submission (returned with no findings)."""
         from fastapi import HTTPException
 
-        from orchestrator.main import _record_verification_round_impl
+        from tests.b08_completion_helpers import (
+            record_verification_round as _record_verification_round_impl,
+        )
 
         with pytest.raises(HTTPException) as exc:
             await _record_verification_round_impl(
@@ -181,7 +189,9 @@ class TestRecordVerificationRound:
         import orchestrator.main as main_module
 
         escalate = AsyncMock()
-        monkeypatch.setattr(main_module, "_escalate_target", escalate)
+        monkeypatch.setattr(
+            main_module.subjob_completion_operations, "escalate_target", escalate
+        )
 
         for _ in range(2):
             exc = await self._submit_invalid(fake_db, "c1")
@@ -199,7 +209,9 @@ class TestRecordVerificationRound:
         import orchestrator.main as main_module
 
         escalate = AsyncMock()
-        monkeypatch.setattr(main_module, "_escalate_target", escalate)
+        monkeypatch.setattr(
+            main_module.subjob_completion_operations, "escalate_target", escalate
+        )
 
         await self._submit_invalid(fake_db, "c1")
         await self._submit_invalid(fake_db, "c1")
@@ -221,7 +233,9 @@ class TestRecordVerificationRound:
         import orchestrator.main as main_module
 
         escalate = AsyncMock()
-        monkeypatch.setattr(main_module, "_escalate_target", escalate)
+        monkeypatch.setattr(
+            main_module.subjob_completion_operations, "escalate_target", escalate
+        )
 
         for _ in range(3):
             await self._submit_invalid(fake_db, "c1")
@@ -235,7 +249,9 @@ class TestRecordVerificationRound:
     async def test_missing_disposition_raises_409(self, fake_db, ledger_state):
         from fastapi import HTTPException
 
-        from orchestrator.main import _record_verification_round_impl
+        from tests.b08_completion_helpers import (
+            record_verification_round as _record_verification_round_impl,
+        )
 
         ledger_state["rounds"].append(
             {
@@ -267,7 +283,9 @@ class TestRecordVerificationRound:
     async def test_duplicate_append_returns_existing_verdict(
         self, fake_db, ledger_state
     ):
-        from orchestrator.main import _record_verification_round_impl
+        from tests.b08_completion_helpers import (
+            record_verification_round as _record_verification_round_impl,
+        )
 
         kwargs = dict(
             postgres_db=fake_db,
@@ -292,7 +310,9 @@ class TestRecordVerificationRound:
         of the first."""
         from fastapi import HTTPException
 
-        from orchestrator.main import _record_verification_round_impl
+        from tests.b08_completion_helpers import (
+            record_verification_round as _record_verification_round_impl,
+        )
 
         with pytest.raises(HTTPException) as exc:
             await _record_verification_round_impl(
@@ -321,7 +341,9 @@ class TestRecordVerificationRoundCleanApproval:
     async def test_no_open_blocking_findings_computes_approved(
         self, fake_db, ledger_state
     ):
-        from orchestrator.main import _record_verification_round_impl
+        from tests.b08_completion_helpers import (
+            record_verification_round as _record_verification_round_impl,
+        )
 
         result = await _record_verification_round_impl(
             postgres_db=fake_db,
@@ -352,7 +374,9 @@ class TestExplicitReturnAtNonBlockingSeverity:
     async def test_returned_with_only_medium_findings_records_returned(
         self, fake_db, ledger_state
     ):
-        from orchestrator.main import _record_verification_round_impl
+        from tests.b08_completion_helpers import (
+            record_verification_round as _record_verification_round_impl,
+        )
 
         result = await _record_verification_round_impl(
             postgres_db=fake_db,
@@ -374,7 +398,9 @@ class TestExplicitReturnAtNonBlockingSeverity:
         """The contrast case: the server computes STRICTER than the model, never
         laxer. Without this, an implementation that returns on any open finding
         at all would pass the test above."""
-        from orchestrator.main import _record_verification_round_impl
+        from tests.b08_completion_helpers import (
+            record_verification_round as _record_verification_round_impl,
+        )
 
         result = await _record_verification_round_impl(
             postgres_db=fake_db,
@@ -398,7 +424,9 @@ class TestReturnWithNoNewFindingsButPriorOpen:
     async def test_returned_with_empty_opened_and_prior_open_is_accepted(
         self, fake_db, ledger_state
     ):
-        from orchestrator.main import _record_verification_round_impl
+        from tests.b08_completion_helpers import (
+            record_verification_round as _record_verification_round_impl,
+        )
 
         ledger_state["rounds"].append(
             {
@@ -440,7 +468,9 @@ class TestReturnWithNoNewFindingsButPriorOpen:
         relaxation this shape was a hard 409, so it is newly reachable, and
         the critic brief now actively teaches the empty-`findings` return.
         """
-        from orchestrator.main import _record_verification_round_impl
+        from tests.b08_completion_helpers import (
+            record_verification_round as _record_verification_round_impl,
+        )
 
         ledger_state["rounds"].append(
             {
@@ -477,7 +507,9 @@ class TestReturnWithNoNewFindingsButPriorOpen:
         no prior open findings has nothing to return ON."""
         from fastapi import HTTPException
 
-        from orchestrator.main import _record_verification_round_impl
+        from tests.b08_completion_helpers import (
+            record_verification_round as _record_verification_round_impl,
+        )
 
         with pytest.raises(HTTPException) as exc:
             await _record_verification_round_impl(
@@ -511,7 +543,9 @@ class TestCriticMustBelongToTheTarget:
     ):
         from fastapi import HTTPException
 
-        from orchestrator.main import _record_verification_round_impl
+        from tests.b08_completion_helpers import (
+            record_verification_round as _record_verification_round_impl,
+        )
 
         ledger_state["critic_targets"]["c-elsewhere"] = "some-other-job"
 
@@ -535,7 +569,9 @@ class TestCriticMustBelongToTheTarget:
         delegation child, or an ordinary job id typed by the model."""
         from fastapi import HTTPException
 
-        from orchestrator.main import _record_verification_round_impl
+        from tests.b08_completion_helpers import (
+            record_verification_round as _record_verification_round_impl,
+        )
 
         ledger_state["critic_targets"]["not-a-critic"] = ""
 
@@ -557,7 +593,9 @@ class TestCriticMustBelongToTheTarget:
     async def test_missing_critic_job_is_rejected(self, fake_db, ledger_state):
         from fastapi import HTTPException
 
-        from orchestrator.main import _record_verification_round_impl
+        from tests.b08_completion_helpers import (
+            record_verification_round as _record_verification_round_impl,
+        )
 
         ledger_state["critic_targets"]["ghost"] = None  # get_job returns None
 
@@ -579,7 +617,9 @@ class TestCriticMustBelongToTheTarget:
     async def test_the_right_critic_still_records(self, fake_db, ledger_state):
         """Contrast case: an implementation that rejects everything would pass
         the three tests above."""
-        from orchestrator.main import _record_verification_round_impl
+        from tests.b08_completion_helpers import (
+            record_verification_round as _record_verification_round_impl,
+        )
 
         result = await _record_verification_round_impl(
             postgres_db=fake_db,
@@ -604,7 +644,9 @@ class TestCriticMustBelongToTheTarget:
         """
         import json
 
-        from orchestrator.main import _record_verification_round_impl
+        from tests.b08_completion_helpers import (
+            record_verification_round as _record_verification_round_impl,
+        )
 
         async def _get_job(job_id):
             if job_id == TARGET_ID:
@@ -642,7 +684,9 @@ class TestRecordVerificationRoundContentTree:
 
     @pytest.mark.asyncio
     async def test_target_freeze_content_tree_is_recorded(self, fake_db, ledger_state):
-        from orchestrator.main import _record_verification_round_impl
+        from tests.b08_completion_helpers import (
+            record_verification_round as _record_verification_round_impl,
+        )
 
         ledger_state["freeze_data"] = {
             "head_commit": "target-sha",
@@ -666,7 +710,9 @@ class TestRecordVerificationRoundContentTree:
     async def test_falls_back_to_caller_supplied_content_tree(
         self, fake_db, ledger_state
     ):
-        from orchestrator.main import _record_verification_round_impl
+        from tests.b08_completion_helpers import (
+            record_verification_round as _record_verification_round_impl,
+        )
 
         ledger_state["freeze_data"] = {"summary": "older freeze, no content_tree"}
 
@@ -700,7 +746,9 @@ class TestRecordVerificationRoundHeadCommitAuthority:
     async def test_target_freeze_head_commit_wins_over_caller_supplied(
         self, fake_db, ledger_state
     ):
-        from orchestrator.main import _record_verification_round_impl
+        from tests.b08_completion_helpers import (
+            record_verification_round as _record_verification_round_impl,
+        )
 
         ledger_state["freeze_data"] = {"head_commit": "target-sha"}
 
@@ -720,7 +768,9 @@ class TestRecordVerificationRoundHeadCommitAuthority:
     async def test_falls_back_to_caller_supplied_when_target_has_no_freeze_data(
         self, fake_db, ledger_state
     ):
-        from orchestrator.main import _record_verification_round_impl
+        from tests.b08_completion_helpers import (
+            record_verification_round as _record_verification_round_impl,
+        )
 
         ledger_state["freeze_data"] = None  # target hasn't completed yet
 
@@ -741,7 +791,9 @@ class TestRecordVerificationRoundHeadCommitAuthority:
         self, fake_db, ledger_state
     ):
         """An older freeze recorded before this field existed."""
-        from orchestrator.main import _record_verification_round_impl
+        from tests.b08_completion_helpers import (
+            record_verification_round as _record_verification_round_impl,
+        )
 
         ledger_state["freeze_data"] = {"summary": "pre-existing freeze, no head_commit"}
 
@@ -798,7 +850,9 @@ class TestLedgerIsNotPubliclySeedable:
 
 class TestVerificationGateDecision:
     def test_first_round_spawns(self):
-        from orchestrator.main import _verification_gate_decision
+        from tests.b08_completion_helpers import (
+            verification_gate_decision as _verification_gate_decision,
+        )
 
         action, _ = _verification_gate_decision([], content_tree="aaa", max_rounds=3)
         assert action == "spawn"
@@ -810,7 +864,9 @@ class TestVerificationGateDecision:
         approved by a fresh critic. Identical HEAD + an open blocking finding
         must never reach a judge again.
         """
-        from orchestrator.main import _verification_gate_decision
+        from tests.b08_completion_helpers import (
+            verification_gate_decision as _verification_gate_decision,
+        )
 
         rounds = [
             {
@@ -832,7 +888,9 @@ class TestVerificationGateDecision:
         assert "no progress" in reason.lower()
 
     def test_changed_head_with_open_blocking_spawns(self):
-        from orchestrator.main import _verification_gate_decision
+        from tests.b08_completion_helpers import (
+            verification_gate_decision as _verification_gate_decision,
+        )
 
         rounds = [
             {
@@ -853,7 +911,9 @@ class TestVerificationGateDecision:
         assert action == "spawn"
 
     def test_cap_reached_with_open_blocking_escalates(self):
-        from orchestrator.main import _verification_gate_decision
+        from tests.b08_completion_helpers import (
+            verification_gate_decision as _verification_gate_decision,
+        )
 
         rounds = [
             {
@@ -888,7 +948,9 @@ class TestVerificationGateDecision:
         The guard abstains — "cannot determine progress", spawn normally — and
         the round cap still bounds the loop.
         """
-        from orchestrator.main import _verification_gate_decision
+        from tests.b08_completion_helpers import (
+            verification_gate_decision as _verification_gate_decision,
+        )
 
         rounds = [
             {
@@ -909,7 +971,9 @@ class TestVerificationGateDecision:
     def test_legacy_rounds_still_hit_the_round_cap(self):
         """Abstaining on no-progress must not disable the OTHER guard: a
         legacy job still escalates at the cap."""
-        from orchestrator.main import _verification_gate_decision
+        from tests.b08_completion_helpers import (
+            verification_gate_decision as _verification_gate_decision,
+        )
 
         rounds = [
             {
@@ -937,7 +1001,9 @@ class TestVerificationGateDecision:
         content hash, judged against a legacy row that has none, must ABSTAIN
         (spawn) rather than manufacture a comparison.
         """
-        from orchestrator.main import _verification_gate_decision
+        from tests.b08_completion_helpers import (
+            verification_gate_decision as _verification_gate_decision,
+        )
 
         rounds = [
             {
@@ -967,7 +1033,9 @@ class TestVerificationGateDecision:
         and the no-progress check, with no terminal state at all. The guards
         run on the OPEN set; only a genuinely empty open set spawns freely.
         """
-        from orchestrator.main import _verification_gate_decision
+        from tests.b08_completion_helpers import (
+            verification_gate_decision as _verification_gate_decision,
+        )
 
         rounds = [
             {
@@ -990,7 +1058,9 @@ class TestVerificationGateDecision:
         assert "round limit" in reason.lower()
 
     def test_no_progress_applies_to_non_blocking_open_findings_too(self):
-        from orchestrator.main import _verification_gate_decision
+        from tests.b08_completion_helpers import (
+            verification_gate_decision as _verification_gate_decision,
+        )
 
         rounds = [
             {
@@ -1015,7 +1085,9 @@ class TestVerificationGateDecision:
         """Contrast case: nothing is open, so nothing is being re-litigated —
         the cap must not fire and strand a job whose findings were all
         resolved."""
-        from orchestrator.main import _verification_gate_decision
+        from tests.b08_completion_helpers import (
+            verification_gate_decision as _verification_gate_decision,
+        )
 
         rounds = [
             {
@@ -1035,7 +1107,9 @@ class TestVerificationGateDecision:
         assert action == "spawn"
 
     def test_unlimited_rounds_never_hits_cap(self):
-        from orchestrator.main import _verification_gate_decision
+        from tests.b08_completion_helpers import (
+            verification_gate_decision as _verification_gate_decision,
+        )
 
         rounds = [
             {
@@ -1064,7 +1138,7 @@ class TestEscalateTarget:
     @pytest.mark.asyncio
     async def test_ordinary_job_escalates_to_pending_review(self, monkeypatch):
         import orchestrator.main as main_module
-        from orchestrator.main import _escalate_target
+        from tests.b08_completion_helpers import escalate_target as _escalate_target
 
         update_mock = AsyncMock()
         monkeypatch.setattr(main_module.postgres_db, "update_job_status", update_mock)
@@ -1082,7 +1156,7 @@ class TestEscalateTarget:
         self, monkeypatch
     ):
         import orchestrator.main as main_module
-        from orchestrator.main import _escalate_target
+        from tests.b08_completion_helpers import escalate_target as _escalate_target
 
         update_mock = AsyncMock()
         monkeypatch.setattr(main_module.postgres_db, "update_job_status", update_mock)
@@ -1124,7 +1198,7 @@ class TestEscalateTargetWakesAndNotifies:
     @pytest.mark.asyncio
     async def test_wakes_the_creating_session(self, monkeypatch):
         import orchestrator.main as main_module
-        from orchestrator.main import _escalate_target
+        from tests.b08_completion_helpers import escalate_target as _escalate_target
 
         _, wake_mock, kick_mock, _ = _patch_escalation_collaborators(
             monkeypatch, main_module
@@ -1141,7 +1215,7 @@ class TestEscalateTargetWakesAndNotifies:
     @pytest.mark.asyncio
     async def test_wake_uses_the_loop_terminal_status(self, monkeypatch):
         import orchestrator.main as main_module
-        from orchestrator.main import _escalate_target
+        from tests.b08_completion_helpers import escalate_target as _escalate_target
 
         _, wake_mock, _, _ = _patch_escalation_collaborators(monkeypatch, main_module)
 
@@ -1153,7 +1227,7 @@ class TestEscalateTargetWakesAndNotifies:
     @pytest.mark.asyncio
     async def test_notifies_the_owner_with_the_reason(self, monkeypatch):
         import orchestrator.main as main_module
-        from orchestrator.main import _escalate_target
+        from tests.b08_completion_helpers import escalate_target as _escalate_target
 
         _, _, _, notify_mock = _patch_escalation_collaborators(monkeypatch, main_module)
 
@@ -1173,7 +1247,7 @@ class TestEscalateTargetWakesAndNotifies:
         retro from ``error_message``. Paging a human per iteration is noise,
         not signal."""
         import orchestrator.main as main_module
-        from orchestrator.main import _escalate_target
+        from tests.b08_completion_helpers import escalate_target as _escalate_target
 
         _, _, _, notify_mock = _patch_escalation_collaborators(monkeypatch, main_module)
 
@@ -1185,7 +1259,7 @@ class TestEscalateTargetWakesAndNotifies:
     @pytest.mark.asyncio
     async def test_ownerless_job_is_not_notified_and_still_escalates(self, monkeypatch):
         import orchestrator.main as main_module
-        from orchestrator.main import _escalate_target
+        from tests.b08_completion_helpers import escalate_target as _escalate_target
 
         update_mock, _, _, notify_mock = _patch_escalation_collaborators(
             monkeypatch, main_module
@@ -1204,7 +1278,7 @@ class TestEscalateTargetWakesAndNotifies:
         """The status write is the load-bearing part. A notifier outage must
         not leave the target in 'reviewing' — the wedge this design removes."""
         import orchestrator.main as main_module
-        from orchestrator.main import _escalate_target
+        from tests.b08_completion_helpers import escalate_target as _escalate_target
 
         update_mock, _, _, notify_mock = _patch_escalation_collaborators(
             monkeypatch, main_module
@@ -1220,7 +1294,7 @@ class TestEscalateTargetWakesAndNotifies:
     @pytest.mark.asyncio
     async def test_wake_failure_does_not_break_the_escalation(self, monkeypatch):
         import orchestrator.main as main_module
-        from orchestrator.main import _escalate_target
+        from tests.b08_completion_helpers import escalate_target as _escalate_target
 
         update_mock, wake_mock, _, _ = _patch_escalation_collaborators(
             monkeypatch, main_module
@@ -1292,7 +1366,9 @@ class TestTriggerVerificationContentTreeWiring:
         """THE INCIDENT REGRESSION TEST, exercised through the real trigger
         function instead of the decision function directly."""
         import orchestrator.main as main_module
-        from orchestrator.main import _trigger_verification_on_complete
+        from tests.b08_completion_helpers import (
+            trigger_verification_on_complete as _trigger_verification_on_complete,
+        )
 
         update_mock = AsyncMock()
         monkeypatch.setattr(main_module.postgres_db, "update_job_status", update_mock)
@@ -1331,7 +1407,9 @@ class TestTriggerVerificationContentTreeWiring:
         implementation that always escalates (or never reads content_tree at
         all) would pass the test above but must fail this one."""
         import orchestrator.main as main_module
-        from orchestrator.main import _trigger_verification_on_complete
+        from tests.b08_completion_helpers import (
+            trigger_verification_on_complete as _trigger_verification_on_complete,
+        )
 
         update_mock = AsyncMock()
         monkeypatch.setattr(main_module.postgres_db, "update_job_status", update_mock)
@@ -1382,7 +1460,9 @@ class TestTriggerVerificationContentTreeWiring:
         (never ``pending_review``) even on a no-progress escalation, or it
         wedges the loop's advance hook forever."""
         import orchestrator.main as main_module
-        from orchestrator.main import _trigger_verification_on_complete
+        from tests.b08_completion_helpers import (
+            trigger_verification_on_complete as _trigger_verification_on_complete,
+        )
 
         update_mock = AsyncMock()
         monkeypatch.setattr(main_module.postgres_db, "update_job_status", update_mock)
@@ -1443,7 +1523,9 @@ class TestUndeliveredCompletionSkipsTheCritic:
         self, monkeypatch
     ):
         import orchestrator.main as main_module
-        from orchestrator.main import _trigger_verification_on_complete
+        from tests.b08_completion_helpers import (
+            trigger_verification_on_complete as _trigger_verification_on_complete,
+        )
 
         update_mock = AsyncMock()
         create_mock = AsyncMock(return_value={"id": "critic-999"})
@@ -1472,7 +1554,9 @@ class TestUndeliveredCompletionSkipsTheCritic:
     async def test_delivered_completion_still_spawns(self, monkeypatch):
         """Contrast: proves the check reads the flag rather than always firing."""
         import orchestrator.main as main_module
-        from orchestrator.main import _trigger_verification_on_complete
+        from tests.b08_completion_helpers import (
+            trigger_verification_on_complete as _trigger_verification_on_complete,
+        )
 
         update_mock = AsyncMock()
         monkeypatch.setattr(main_module.postgres_db, "update_job_status", update_mock)
@@ -1507,7 +1591,9 @@ class TestUndeliveredCompletionSkipsTheCritic:
     async def test_undelivered_loop_job_escalates_to_completed(self, monkeypatch):
         """The loop-job status rule must hold on this path too, or the loop wedges."""
         import orchestrator.main as main_module
-        from orchestrator.main import _trigger_verification_on_complete
+        from tests.b08_completion_helpers import (
+            trigger_verification_on_complete as _trigger_verification_on_complete,
+        )
 
         update_mock = AsyncMock()
         monkeypatch.setattr(main_module.postgres_db, "update_job_status", update_mock)
@@ -1566,7 +1652,9 @@ class TestNoDuplicateCriticSpawn:
     @pytest.mark.asyncio
     async def test_second_trigger_does_not_spawn_a_second_critic(self, monkeypatch):
         import orchestrator.main as main_module
-        from orchestrator.main import _trigger_verification_on_complete
+        from tests.b08_completion_helpers import (
+            trigger_verification_on_complete as _trigger_verification_on_complete,
+        )
 
         create_job_mock = self._patch(monkeypatch, main_module, live_critic=True)
 
@@ -1584,7 +1672,9 @@ class TestNoDuplicateCriticSpawn:
         """Contrast case: an implementation that never spawns would pass the
         test above and disable verification entirely."""
         import orchestrator.main as main_module
-        from orchestrator.main import _trigger_verification_on_complete
+        from tests.b08_completion_helpers import (
+            trigger_verification_on_complete as _trigger_verification_on_complete,
+        )
 
         create_job_mock = self._patch(monkeypatch, main_module, live_critic=False)
 
@@ -1601,7 +1691,9 @@ class TestNoDuplicateCriticSpawn:
     async def test_the_guard_runs_before_creating_the_critic(self, monkeypatch):
         """A guard consulted only AFTER create_job would be useless."""
         import orchestrator.main as main_module
-        from orchestrator.main import _trigger_verification_on_complete
+        from tests.b08_completion_helpers import (
+            trigger_verification_on_complete as _trigger_verification_on_complete,
+        )
 
         order: list[str] = []
 
@@ -1640,7 +1732,9 @@ class TestCriticDatasourceFailureUnblocksTarget:
     @pytest.mark.asyncio
     async def test_revoked_inherited_connector_escalates_target(self, monkeypatch):
         import orchestrator.main as main_module
-        from orchestrator.main import _trigger_verification_on_complete
+        from tests.b08_completion_helpers import (
+            trigger_verification_on_complete as _trigger_verification_on_complete,
+        )
 
         monkeypatch.setattr(
             main_module.postgres_db,
@@ -1658,7 +1752,9 @@ class TestCriticDatasourceFailureUnblocksTarget:
             ),
         )
         escalate = AsyncMock(return_value="pending_review")
-        monkeypatch.setattr(main_module, "_escalate_target", escalate)
+        monkeypatch.setattr(
+            main_module.subjob_completion_operations, "escalate_target", escalate
+        )
 
         job = _make_completion_job(freeze_content_tree="aaa", verification_rounds=[])
         actions: list[str] = []
@@ -1761,7 +1857,9 @@ class TestTriggerVerificationInstructionsWiring:
         self, monkeypatch
     ):
         import orchestrator.main as main_module
-        from orchestrator.main import _trigger_verification_on_complete
+        from tests.b08_completion_helpers import (
+            trigger_verification_on_complete as _trigger_verification_on_complete,
+        )
 
         create_job_mock = AsyncMock(return_value={"id": "critic-999"})
         monkeypatch.setattr(main_module.postgres_db, "create_job", create_job_mock)
@@ -1824,7 +1922,9 @@ class TestTriggerVerificationInstructionsWiring:
         renderer — and was being told "This is a first review."
         """
         import orchestrator.main as main_module
-        from orchestrator.main import _trigger_verification_on_complete
+        from tests.b08_completion_helpers import (
+            trigger_verification_on_complete as _trigger_verification_on_complete,
+        )
 
         create_job_mock = AsyncMock(return_value={"id": "critic-999"})
         monkeypatch.setattr(main_module.postgres_db, "create_job", create_job_mock)
@@ -1884,7 +1984,9 @@ class TestFailClosedVerdictHandling:
         Without the verification_target discriminator it hits the implicit
         approval branch and advances its parent before siblings finish.
         """
-        from orchestrator.main import _is_verification_critic
+        from orchestrator.services.verification_workflow import (
+            is_verification_critic as _is_verification_critic,
+        )
 
         assert (
             _is_verification_critic({"context": {"verification_target": "t1"}}) is True
@@ -1898,7 +2000,9 @@ class TestFailClosedVerdictHandling:
 
     def test_completed_critic_without_ledger_record_escalates(self, ledger_state):
         """No verdict must never mean approval."""
-        from orchestrator.main import _resolve_critic_outcome
+        from orchestrator.services.verification_workflow import (
+            resolve_critic_outcome as _resolve_critic_outcome,
+        )
 
         outcome, reason = _resolve_critic_outcome(
             critic_job_id="c1", critic_status="completed", rounds=[]
@@ -1908,7 +2012,9 @@ class TestFailClosedVerdictHandling:
 
     def test_failed_critic_with_verdict_still_escalates(self):
         """A critic that failed must not approve its target."""
-        from orchestrator.main import _resolve_critic_outcome
+        from orchestrator.services.verification_workflow import (
+            resolve_critic_outcome as _resolve_critic_outcome,
+        )
 
         outcome, _ = _resolve_critic_outcome(
             critic_job_id="c1",
@@ -1918,7 +2024,9 @@ class TestFailClosedVerdictHandling:
         assert outcome == "escalate"
 
     def test_completed_critic_with_record_uses_computed_verdict(self):
-        from orchestrator.main import _resolve_critic_outcome
+        from orchestrator.services.verification_workflow import (
+            resolve_critic_outcome as _resolve_critic_outcome,
+        )
 
         outcome, _ = _resolve_critic_outcome(
             critic_job_id="c1",
@@ -1988,7 +2096,9 @@ class TestHandleCriticVerdictOnCompleteWiring:
         delegation child's own ordinary completion freeze, which would
         advance the parent before its siblings finish."""
         import orchestrator.main as main_module
-        from orchestrator.main import _handle_critic_verdict_on_complete
+        from tests.b08_completion_helpers import (
+            handle_critic_verdict_on_complete as _handle_critic_verdict_on_complete,
+        )
 
         get_job_mock = AsyncMock()
         update_mock = AsyncMock()
@@ -2018,7 +2128,9 @@ class TestHandleCriticVerdictOnCompleteWiring:
         yank it out from under a critic that may still deliver a real
         verdict on its own once it resumes."""
         import orchestrator.main as main_module
-        from orchestrator.main import _handle_critic_verdict_on_complete
+        from tests.b08_completion_helpers import (
+            handle_critic_verdict_on_complete as _handle_critic_verdict_on_complete,
+        )
 
         get_job_mock = AsyncMock()
         update_mock = AsyncMock()
@@ -2038,7 +2150,9 @@ class TestHandleCriticVerdictOnCompleteWiring:
     @pytest.mark.asyncio
     async def test_approved_sets_target_autonomy_status(self, monkeypatch):
         import orchestrator.main as main_module
-        from orchestrator.main import _handle_critic_verdict_on_complete
+        from tests.b08_completion_helpers import (
+            handle_critic_verdict_on_complete as _handle_critic_verdict_on_complete,
+        )
 
         target = _make_target_job(
             rounds=[
@@ -2058,7 +2172,9 @@ class TestHandleCriticVerdictOnCompleteWiring:
         )
         set_status_mock = AsyncMock(return_value="completed")
         monkeypatch.setattr(
-            main_module, "_set_target_to_autonomy_status", set_status_mock
+            main_module.subjob_completion_operations,
+            "set_target_to_autonomy_status",
+            set_status_mock,
         )
 
         job = _make_critic_job()
@@ -2066,13 +2182,15 @@ class TestHandleCriticVerdictOnCompleteWiring:
 
         await _handle_critic_verdict_on_complete(job, actions)
 
-        set_status_mock.assert_awaited_once_with("target-1")
+        assert set_status_mock.await_args.args == ("target-1",)
         assert any("approved" in a for a in actions)
 
     @pytest.mark.asyncio
     async def test_returned_resumes_target_with_rendered_findings(self, monkeypatch):
         import orchestrator.main as main_module
-        from orchestrator.main import _handle_critic_verdict_on_complete
+        from tests.b08_completion_helpers import (
+            handle_critic_verdict_on_complete as _handle_critic_verdict_on_complete,
+        )
 
         target = _make_target_job(
             rounds=[
@@ -2093,7 +2211,11 @@ class TestHandleCriticVerdictOnCompleteWiring:
             main_module.postgres_db, "get_job", AsyncMock(return_value=target)
         )
         resume_mock = AsyncMock()
-        monkeypatch.setattr(main_module, "_internal_resume_job", resume_mock)
+        monkeypatch.setattr(
+            main_module.job_control_operations.JobControlOperations,
+            "internal_resume_job",
+            resume_mock,
+        )
 
         job = _make_critic_job()
         actions: list[str] = []
@@ -2124,7 +2246,9 @@ class TestHandleCriticVerdictOnCompleteWiring:
         tests/test_queue_job_for_resume.py).
         """
         import orchestrator.main as main_module
-        from orchestrator.main import _handle_critic_verdict_on_complete
+        from tests.b08_completion_helpers import (
+            handle_critic_verdict_on_complete as _handle_critic_verdict_on_complete,
+        )
 
         target = _make_target_job(
             rounds=[
@@ -2173,7 +2297,9 @@ class TestHandleCriticVerdictOnCompleteWiring:
         able to produce it.
         """
         import orchestrator.main as main_module
-        from orchestrator.main import _handle_critic_verdict_on_complete
+        from tests.b08_completion_helpers import (
+            handle_critic_verdict_on_complete as _handle_critic_verdict_on_complete,
+        )
 
         target = _make_target_job(
             rounds=[
@@ -2196,7 +2322,11 @@ class TestHandleCriticVerdictOnCompleteWiring:
             main_module.postgres_db, "get_job", AsyncMock(return_value=target)
         )
         resume_mock = AsyncMock()
-        monkeypatch.setattr(main_module, "_internal_resume_job", resume_mock)
+        monkeypatch.setattr(
+            main_module.job_control_operations.JobControlOperations,
+            "internal_resume_job",
+            resume_mock,
+        )
 
         job = _make_critic_job()
         actions: list[str] = []
@@ -2213,7 +2343,9 @@ class TestHandleCriticVerdictOnCompleteWiring:
     @pytest.mark.asyncio
     async def test_completed_with_no_ledger_record_escalates_target(self, monkeypatch):
         import orchestrator.main as main_module
-        from orchestrator.main import _handle_critic_verdict_on_complete
+        from tests.b08_completion_helpers import (
+            handle_critic_verdict_on_complete as _handle_critic_verdict_on_complete,
+        )
 
         target = _make_target_job(rounds=[])
         monkeypatch.setattr(
@@ -2236,7 +2368,9 @@ class TestHandleCriticVerdictOnCompleteWiring:
         """Escalation is status-aware: a project-loop target must resolve
         'completed' (never 'pending_review'), reusing _escalate_target."""
         import orchestrator.main as main_module
-        from orchestrator.main import _handle_critic_verdict_on_complete
+        from tests.b08_completion_helpers import (
+            handle_critic_verdict_on_complete as _handle_critic_verdict_on_complete,
+        )
 
         target = _make_target_job(rounds=[], is_loop=True)
         monkeypatch.setattr(
@@ -2263,7 +2397,9 @@ class TestHandleCriticVerdictOnCompleteWiring:
         unblock the parent'); the critic handler previously had no
         equivalent gate."""
         import orchestrator.main as main_module
-        from orchestrator.main import _handle_critic_verdict_on_complete
+        from tests.b08_completion_helpers import (
+            handle_critic_verdict_on_complete as _handle_critic_verdict_on_complete,
+        )
 
         target = _make_target_job(
             rounds=[
@@ -2285,7 +2421,9 @@ class TestHandleCriticVerdictOnCompleteWiring:
         monkeypatch.setattr(main_module.postgres_db, "update_job_status", update_mock)
         set_status_mock = AsyncMock()
         monkeypatch.setattr(
-            main_module, "_set_target_to_autonomy_status", set_status_mock
+            main_module.subjob_completion_operations,
+            "set_target_to_autonomy_status",
+            set_status_mock,
         )
 
         job = _make_critic_job(status="failed")
@@ -2313,7 +2451,9 @@ class TestMultiRoundContinuity:
     ):
         """The gap that made the incident possible: nothing carried findings
         from one round to the next."""
-        from orchestrator.main import _record_verification_round_impl
+        from tests.b08_completion_helpers import (
+            record_verification_round as _record_verification_round_impl,
+        )
         from orchestrator.services.verification_ledger import (
             fold_open_findings,
             render_prior_findings,
@@ -2354,7 +2494,9 @@ class TestMultiRoundContinuity:
         "You may not close a finding by re-judging it"). The computed
         verdict must stay 'returned' regardless of what the critic asserted.
         """
-        from orchestrator.main import _record_verification_round_impl
+        from tests.b08_completion_helpers import (
+            record_verification_round as _record_verification_round_impl,
+        )
 
         await _record_verification_round_impl(
             postgres_db=fake_db,

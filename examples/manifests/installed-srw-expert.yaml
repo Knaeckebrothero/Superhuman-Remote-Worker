@@ -1,0 +1,13 @@
+apiVersion: srw/v1alpha1
+kind: Expert
+metadata:
+  name: installed-srw-helper
+  scope: {kind: Account, name: personal}
+spec:
+  runtime:
+    # The installation supplies the SRW worker image and manages its upgrades.
+    adapter: srw/v1
+    config:
+      config_name: worker_base
+      prompts:
+        persona: Implement the assigned change and verify the result.

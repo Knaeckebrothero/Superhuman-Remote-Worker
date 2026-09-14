@@ -1901,6 +1901,25 @@ def _request(req: bytes, timeout: float) -> bytes:
 
 def run_client(action: str, args: dict, timeout: float) -> int:
     """Send one action; print the JSON reply to stdout. Returns exit code."""
+    if action == "type" and "env_var" in args:
+        name = args["env_var"]
+        if "text" in args or not isinstance(name, str) or not name:
+            print(
+                json.dumps(
+                    {"error": "Supply exactly one of text or a nonempty env_var"}
+                )
+            )
+            return 1
+        value = os.environ.get(name)
+        if value is None:
+            print(
+                json.dumps(
+                    {"error": f"Workspace environment variable {name} is not set"}
+                )
+            )
+            return 1
+        args = {key: value for key, value in args.items() if key != "env_var"}
+        args["text"] = value
     req = json.dumps({"action": action, "args": args}).encode() + b"\n"
 
     # Shutdown is idempotent and must never cold-start the daemon it is trying

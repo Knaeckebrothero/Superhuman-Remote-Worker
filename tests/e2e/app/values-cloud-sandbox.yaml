@@ -1,0 +1,95 @@
+# Profile overlay for R1.B04. Layered ON TOP of values-e2e.yaml,
+# values-stateless-sandbox.yaml and values-forge-sandbox.yaml, never instead of
+# them.
+#
+# B04 owns the cloud half of the workspace surface — agent cloud mounts, the
+# protected-cloud engage/await path, staged cloud-diff review, and the
+# admin-only main-cloud configuration/reload endpoints. None of that is
+# exercised by a forge fixture: the forge answers repository reads, the cloud
+# backend answers mounts, staging and installation authority. `forge-sandbox`
+# ships `nextcloud.enabled: false`, so on that profile every main-cloud read is
+# either "no backend bound" or a refusal, and `MAIN_CLOUD_BACKEND` is unset.
+#
+# The shared baseline stays cloud-less for the same reason it stays forge-less:
+# enabling a dependency in values-e2e.yaml is what broke the journey's
+# determinism contract when SearXNG was tried there. An overlay keeps the cheap
+# pinned/virtual baseline exactly as it was.
+nextcloud:
+  enabled: true
+  # Bundled, not external: the point is a real backend instance the
+  # orchestrator can attest, activate and reload against, so
+  # `MAIN_CLOUD_BACKEND` resolves to "nextcloud" through the configmap's
+  # bundled branch rather than through `cloud.externalBackend`.
+  internal: true
+  replicas: 1
+  # Filesystem storage on the pod's own PVC. The chart default is S3 via
+  # OBJECTSTORE_S3_*, which needs an external bucket (prod uses MinIO); a
+  # disposable k3d cluster has none. This is the same choice
+  # deployment/values-local.yaml.example makes for local k3d.
+  objectStore:
+    enabled: false
+  storageSize: 2Gi
+  resources:
+    requests: {memory: 256Mi, cpu: 100m}
+    limits: {memory: 1Gi, cpu: 1}
+  protectedEffect:
+    # `enabled` stays unset on purpose: the chart derives the lane from
+    # `agent.protectedCloudModeEnabled` below on a bundled, internal Nextcloud,
+    # and asserting the same decision twice is what its tri-state exists to
+    # avoid. Only the Secret needs naming — `secrets.create` is false on this
+    # stack (the harness mints every Secret itself), so the chart cannot
+    # generate the adoption-once effect root and requires a dedicated name.
+    # The harness mints it unconditionally, with the same reasoning as the
+    # Gitea/Nextcloud keys: an identical secret topology on every profile, so a
+    # profile that needs a key never stalls on one nothing created. It is a
+    # dedicated Secret rather than a key in the application bundle because
+    # dynamic agent Pods mount that bundle wholesale through `envFrom`.
+    hmacSecretName: srw-e2e-protected-effect
+
+# The chart default is opencloud:enabled=true, and the configmap prefers
+# opencloud over nextcloud, so this override is what makes the bundled
+# Nextcloud the selected backend rather than a second one nobody reaches.
+# OpenCloud additionally needs a Keycloak client and a hostAliases entry that a
+# disposable cluster does not have.
+opencloud:
+  enabled: false
+
+# Nextcloud stores its own metadata in SQLite on the PVC above (the chart's
+# nextcloud Deployment sets SQLITE_DATABASE), so no extra database renders.
+cloud:
+  # Leave the external hooks empty: the bundled branch above supplies the URLs.
+  externalBackend: ""
+  externalUrl: ""
+  # rclone/FUSE mounts are the data plane B04's mount builders emit. k3d
+  # containerd needs the unconfined workspace profile the baseline already sets.
+  workspaceDriver: "rclone_mount"
+  rcloneMount:
+    allowContainer: true
+
+agent:
+  # Protected cloud mode is the half of B04's cloud surface that a bound
+  # backend alone does not reach: with the mode off every protected route
+  # answers the "disabled" refusal, no RO reader is ever provisioned, and
+  # `_build_protected_cloud_mount` is never asked for a payload — which is
+  # exactly the gap B04's acceptance recorded. Turning it on also stands up the
+  # protected-effect lane's fpm/nginx sidecars, because the chart derives that
+  # lane from this flag.
+  protectedCloudModeEnabled: "true"
+
+garage:
+  # The shared baseline turns the bundled object store off and runs the virtual
+  # tier on the in-process `memory` store, which is right for a profile that
+  # never needs a durable blob. Protected cloud does: staging a captured
+  # overlay writes a tar through `snapshot_service.upload_blob_file`, and with
+  # no store that call returns False and the stage ends as
+  # "stage: tar upload failed" — a scheduled restage that produces an empty
+  # diff, with the review surface answering 200 and nothing to review.
+  #
+  # Sized for a disposable cluster: one replica, one small PVC, capacity
+  # advertised strictly below it because meta and data share the volume.
+  enabled: true
+  dataStorageSize: 4Gi
+  capacityBytes: 2147483648
+  resources:
+    requests: {memory: 128Mi, cpu: 50m}
+    limits: {memory: 512Mi, cpu: 500m}

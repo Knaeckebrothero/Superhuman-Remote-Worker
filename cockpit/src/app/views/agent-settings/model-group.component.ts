@@ -135,8 +135,13 @@ type StorageKey = keyof typeof STORAGE_KEYS;
               [disabled]="disabled()"
             >
               @for (opt of sessionReasoningOptions(); track opt.value) {
+                <!-- "(default)" names the FAMILY default and never moves: a
+                     pinned level is shown by being selected, not by borrowing
+                     the marker. It used to follow resolvedSessionReasoning(),
+                     so pinning max re-labelled max as "(default)" — the
+                     family default had not changed, only the label. -->
                 <option [value]="opt.value">
-                  {{ opt.value === resolvedSessionReasoning()
+                  {{ opt.value === familyReasoningDefault()
                     ? ('agentSettings.model.reasoningDefaultOption' | transloco: {label: opt.label})
                     : opt.label }}
                 </option>
@@ -177,7 +182,7 @@ type StorageKey = keyof typeof STORAGE_KEYS;
       font-size: 11px;
       font-weight: 600;
       text-transform: uppercase;
-      letter-spacing: 0.5px;
+      letter-spacing: 0.06em;
       color: var(--text-muted);
       margin-bottom: 12px;
       padding-bottom: 6px;
@@ -346,6 +351,13 @@ export class ModelGroupComponent {
     if (pin && options.some((o) => o.value === pin)) return pin;
     return defaultSelectableReasoning(this.sessionReasoningCap());
   });
+  // The family default of the model in effect — the option that carries the
+  // "(default)" marker. Deliberately blind to any config pin: the pin decides
+  // what is SELECTED (resolvedSessionReasoning), the family decides what is
+  // labelled default, and the two only coincide when nothing is pinned.
+  readonly familyReasoningDefault = computed(() =>
+    defaultSelectableReasoning(this.sessionReasoningCap()),
+  );
 
   // Server-resolved effective slot ({model, source}) or null when unavailable.
   readonly effectiveModel = computed(() => this.effectiveModels()?.model ?? null);

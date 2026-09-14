@@ -29,6 +29,7 @@ import yaml
 
 from agent.core.datasource_setup import DATASOURCE_TOOL_MAP
 from shared.runtime.core.session_tool_overrides import SESSION_TOOL_OVERRIDE_NAMES
+from shared.runtime.core.srw_manifest_config import srw_config_fragment
 from shared.orch_surface.jobs import JOB_DESCRIPTORS
 from agent.tools.registry import (
     CODE_GRANTED_CATEGORIES,
@@ -143,6 +144,7 @@ def _shipped_config_tool_names() -> dict[str, list[str]]:
         data = yaml.safe_load(path.read_text()) or {}
         if not isinstance(data, dict):
             continue
+        data = srw_config_fragment(data)
         tools = data.get("tools")
         if not isinstance(tools, dict):
             continue

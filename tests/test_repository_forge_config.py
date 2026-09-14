@@ -6,44 +6,42 @@ import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
-from orchestrator.main import _normalize_repository_config
+from orchestrator.services.datasource_config import normalize_repository_config
 
 
 def test_explicit_forge_is_kept():
-    out = _normalize_repository_config(
+    out = normalize_repository_config(
         {"forge": "gitea"}, "https://git.example.com/acme/widget"
     )
     assert out["forge"] == "gitea"
 
 
 def test_github_com_is_inferred():
-    out = _normalize_repository_config({}, "https://github.com/acme/widget")
+    out = normalize_repository_config({}, "https://github.com/acme/widget")
     assert out["forge"] == "github"
 
 
 def test_gitlab_com_is_inferred():
-    out = _normalize_repository_config(None, "https://gitlab.com/acme/widget")
+    out = normalize_repository_config(None, "https://gitlab.com/acme/widget")
     assert out["forge"] == "gitlab"
 
 
 def test_self_hosted_host_cannot_be_inferred():
     """A self-hosted Gitea and a self-hosted GitLab look identical by URL."""
     with pytest.raises(HTTPException) as exc:
-        _normalize_repository_config({}, "https://git.example.com/acme/widget")
+        normalize_repository_config({}, "https://git.example.com/acme/widget")
     assert exc.value.status_code == 400
     assert "forge" in str(exc.value.detail)
 
 
 def test_unknown_forge_is_rejected():
     with pytest.raises(HTTPException) as exc:
-        _normalize_repository_config(
-            {"forge": "bitbucket"}, "https://bitbucket.org/a/b"
-        )
+        normalize_repository_config({"forge": "bitbucket"}, "https://bitbucket.org/a/b")
     assert exc.value.status_code == 400
 
 
 def test_unrelated_config_keys_survive():
-    out = _normalize_repository_config(
+    out = normalize_repository_config(
         {"forge": "github", "path": "sub/dir"}, "https://github.com/a/b"
     )
     assert out["path"] == "sub/dir"
@@ -52,7 +50,7 @@ def test_unrelated_config_keys_survive():
 # =============================================================================
 # Endpoint-level: exercises the real HTTP routes, not just the helper.
 #
-# The helper tests above call ``_normalize_repository_config`` directly and
+# The helper tests above call ``normalize_repository_config`` directly and
 # would keep passing even if ``create_datasource``/``update_datasource`` never
 # wired the helper into their type-dispatch chain — both routes end in a
 # catch-all that 400s any non-empty config for a type it doesn't recognize,
@@ -62,7 +60,9 @@ def test_unrelated_config_keys_survive():
 # with a real TestClient (no ``with`` block, so the ``lifespan`` startup that
 # dials real Postgres/Keycloak/NATS never runs); only the DB layer and the
 # auth resolvers are monkeypatched, so routing, Pydantic body validation, and
-# the type-dispatch branching in orchestrator/main.py all run for real.
+# the type-dispatch branching in orchestrator/services/datasources.py all run
+# for real — including main's ``_datasources_dependencies`` factory, which is
+# what wires the route to that service.
 # =============================================================================
 
 

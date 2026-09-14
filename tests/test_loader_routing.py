@@ -15,6 +15,7 @@ from shared.runtime.core.loader import (
     _create_codex_llm,
     detect_reasoning_method,
     reasoning_capability,
+    resolve_reasoning_plan,
     supports_parallel_tool_calls,
 )
 
@@ -35,6 +36,9 @@ def _make_config(**overrides):
     config.max_output_tokens = overrides.get("max_output_tokens", None)
     config.model_max_context_tokens = overrides.get("model_max_context_tokens", None)
     config.extra_body = overrides.get("extra_body", None)
+    # Real value, not MagicMock truthiness — the factory's header arm gates on
+    # `if config.extra_headers`.
+    config.extra_headers = overrides.get("extra_headers", None)
     # Real attribute, not MagicMock truthiness — the factory's cache-key arm
     # gates on `if config.prompt_cache_key`.
     config.prompt_cache_key = overrides.get("prompt_cache_key", None)
@@ -157,9 +161,15 @@ class TestShouldUseReasoningSummary:
         assert _should_use_reasoning_summary("gpt-5.2-pro") is True
         assert _should_use_reasoning_summary("gpt-5") is True
 
+    def test_gpt6_model(self):
+        # Astra serves tool calls ONLY on the Responses API, and `max` effort
+        # exists only there — so it must take the reasoning-summary path.
+        assert _should_use_reasoning_summary("gpt-6-astra") is True
+
     def test_case_insensitive(self):
         assert _should_use_reasoning_summary("GPT-5.2-pro") is True
         assert _should_use_reasoning_summary("O3-mini") is True
+        assert _should_use_reasoning_summary("GPT-6-Astra") is True
 
     def test_proxy_models_excluded(self):
         """Models with / are proxy models and should not use Responses API."""
@@ -458,6 +468,202 @@ class TestGpt56Reasoning:
         assert call_kwargs["reasoning"] == {"effort": "xhigh", "summary": "auto"}
 
 
+class TestGpt6Reasoning:
+    """gpt-6 (Astra): xhigh/max are declared in the matrix and reach the codex
+    (Responses API) path un-clamped, with the reasoning summary requested."""
+
+    def test_capability_lists_xhigh_and_max(self):
+        cap = reasoning_capability("gpt-6-astra")
+        assert cap["method"] == "effort_enum"
+        assert cap["default"] == "high"
+        assert cap["options"] == ["low", "medium", "high", "xhigh", "max"]
+
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
+    def test_max_reaches_codex_responses_api(self, mock_chat):
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model="gpt-6-astra", reasoning_level="max")
+
+        _create_codex_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        # Responses-API shape, NOT a Chat-Completions `reasoning_effort`:
+        # `max` is Responses-only, so the flat form would silently degrade it.
+        assert call_kwargs["reasoning"] == {"effort": "max", "summary": "auto"}
+        assert "model_kwargs" not in call_kwargs or (
+            "reasoning_effort" not in call_kwargs.get("model_kwargs", {})
+        )
+
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
+    def test_xhigh_reaches_codex_responses_api(self, mock_chat):
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model="codex/gpt-6-astra", reasoning_level="xhigh")
+
+        _create_codex_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["reasoning"] == {"effort": "xhigh", "summary": "auto"}
+
+    def test_none_injects_nothing_rather_than_400ing(self):
+        """Astra rejects `none` with HTTP 400 — the plan must inject nothing
+        instead of putting the literal on the wire."""
+        config = _make_config(model="gpt-6-astra", reasoning_level="none")
+        plan = resolve_reasoning_plan(config)
+        assert plan["method"] == "effort_enum"
+        assert plan["value"] is None
+
+
+class TestClaudeOpus5Reasoning:
+    """claude-opus-5 is its own matrix family: it is the only Opus that accepts
+    the full effort ladder, and both OpenAI-shaped factories must carry xhigh /
+    max through un-clamped while the generic `claude-opus` family stays at
+    low/medium/high for the 4.x rows it still serves."""
+
+    def test_capability_lists_xhigh_and_max(self):
+        cap = reasoning_capability("claude-opus-5")
+        assert cap["method"] == "effort_enum"
+        assert cap["default"] == "high"
+        assert cap["options"] == ["low", "medium", "high", "xhigh", "max"]
+
+    def test_older_opus_rows_stay_on_the_narrow_ladder(self):
+        # Regression guard: widening the shared family instead of splitting it
+        # would offer 4.x Opus rows a level their wire rejects.
+        assert reasoning_capability("claude-opus-4-8")["options"] == [
+            "low",
+            "medium",
+            "high",
+        ]
+
+    def test_settings_match_the_generic_opus_family(self):
+        # A family block falls through to `default`, never to a sibling — if the
+        # settings were dropped here Opus 5 would silently become non-multimodal
+        # with a 128k window.
+        from shared.runtime.core.loader import _apply_settings_matrix
+
+        five = {"llm": {"model": "claude-opus-5"}}
+        four = {"llm": {"model": "claude-opus-4-8"}}
+        _apply_settings_matrix(five, expert_llm_keys=set())
+        _apply_settings_matrix(four, expert_llm_keys=set())
+        five["llm"].pop("model")
+        four["llm"].pop("model")
+        assert five == four
+
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
+    def test_xhigh_survives_the_chat_completions_factory(self, mock_chat):
+        # Subscription-proxy Claude rows speak openai-chat; CLIProxyAPI maps
+        # `reasoning_effort` onto Anthropic thinking + output_config.effort.
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model="claude-opus-5", reasoning_level="xhigh")
+
+        _create_openai_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["model_kwargs"]["reasoning_effort"] == "xhigh"
+
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
+    def test_max_survives_the_codex_factory_as_a_flat_effort(self, mock_chat):
+        # A proxy row left on openai-responses still routes here. Claude is not
+        # a reasoning-summary model, so the flat Chat-Completions field is the
+        # correct shape — what matters is that `max` is not clamped away.
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model="claude-opus-5", reasoning_level="max")
+
+        _create_codex_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["model_kwargs"]["reasoning_effort"] == "max"
+
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
+    def test_xhigh_on_an_older_opus_still_clamps(self, mock_chat):
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model="claude-opus-4-8", reasoning_level="xhigh")
+
+        _create_openai_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["model_kwargs"]["reasoning_effort"] == "high"
+
+
+class TestClaudeFableReasoning:
+    """claude-fable covers Fable 5 and 5.1 in one family: identical matrix
+    knobs, and the full effort ladder on both."""
+
+    def test_capability_lists_the_full_ladder(self):
+        cap = reasoning_capability("claude-fable-5")
+        assert cap["method"] == "effort_enum"
+        assert cap["default"] == "high"
+        assert cap["options"] == ["low", "medium", "high", "xhigh", "max"]
+
+    def test_five_and_five_one_share_the_family(self):
+        assert reasoning_capability("claude-fable-5-1") == reasoning_capability(
+            "claude-fable-5"
+        )
+
+    def test_settings_are_declared_not_inherited(self):
+        # Falling through to `default` would make Fable non-multimodal on a
+        # 128k window — the trap every Claude family block here exists to avoid.
+        from shared.runtime.core.loader import _apply_settings_matrix
+
+        data = {"llm": {"model": "claude-fable-5-1"}}
+        _apply_settings_matrix(data, expert_llm_keys=set())
+        assert data["llm"]["multimodal"] is True
+        assert data["llm"]["model_max_context_tokens"] == 1_000_000
+        assert data["limits"]["image_tokens"]["mode"] == "anthropic_patches"
+
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
+    def test_max_survives_the_chat_completions_factory(self, mock_chat):
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model="claude-fable-5", reasoning_level="max")
+
+        _create_openai_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["model_kwargs"]["reasoning_effort"] == "max"
+
+
+class TestFallThroughLadderIncludesXhigh:
+    """The `default` family declares xhigh (2026-09-11), so a model with no
+    family block of its own can be run at xhigh instead of being clamped down
+    to high. `max` is deliberately still out — it clamps to xhigh, not high."""
+
+    def test_unknown_model_offers_xhigh(self):
+        cap = reasoning_capability("some-unknown-model")
+        assert cap["options"] == ["low", "medium", "high", "xhigh"]
+
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
+    def test_xhigh_reaches_the_wire_unclamped(self, mock_chat):
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model="some-unknown-model", reasoning_level="xhigh")
+
+        _create_openai_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["model_kwargs"]["reasoning_effort"] == "xhigh"
+
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
+    def test_max_clamps_to_xhigh_not_high(self, mock_chat):
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model="some-unknown-model", reasoning_level="max")
+
+        _create_openai_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["model_kwargs"]["reasoning_effort"] == "xhigh"
+
+    def test_narrow_families_are_unaffected(self):
+        # Widening the fall-through must not leak into a family that declares
+        # its own (narrower) ladder.
+        assert reasoning_capability("gpt-5.2-pro")["options"] == [
+            "low",
+            "medium",
+            "high",
+        ]
+        assert reasoning_capability("claude-opus-4-8")["options"] == [
+            "low",
+            "medium",
+            "high",
+        ]
+
+
 class TestOpenAIReasoningClamping:
     """Integration tests verifying clamping reaches ReasoningChatOpenAI for OpenAI."""
 
@@ -698,7 +904,7 @@ class TestFamilyCenteredReasoning:
         assert reasoning_capability("gpt-5.2-pro")["method"] == "effort_enum"
         assert reasoning_capability("openai/gpt-oss-120b")["delivery"] == "prompt"
         assert reasoning_capability("minimax-m2.7")["method"] == "none"
-        assert reasoning_capability("claude-opus-4-8")["method"] == "none"
+        assert reasoning_capability("claude-opus-4-8")["method"] == "effort_enum"
         # Unknown family falls through to the `default` block (effort_enum).
         assert reasoning_capability("some-unknown-model")["method"] == "effort_enum"
 
@@ -706,9 +912,75 @@ class TestFamilyCenteredReasoning:
         assert detect_reasoning_method("gpt-5.2-pro") == "api"
         assert detect_reasoning_method("openai/gpt-oss-120b") == "prompt"
         assert detect_reasoning_method("gemma-4-moe") == "none"
-        assert detect_reasoning_method("claude-opus-4-8") == "none"
+        assert detect_reasoning_method("claude-opus-4-8") == "api"
         # Explicit override still wins.
         assert detect_reasoning_method("gemma-4-moe", explicit_method="api") == "api"
+
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
+    def test_claude_requests_an_effort_level(self, mock_chat):
+        """Claude reaches adaptive thinking via `reasoning_effort`.
+
+        Sending nothing is not "provider default": it leaves `thinking.type`
+        unset, so the subscription proxy never asks for a visible summary and
+        Claude reasons invisibly (thinking_tokens billed, empty blocks
+        returned). Verified live 2026-09-07 — see
+        knowledge-base/knowledge/features/subscription_proxy.md §13.
+        """
+        mock_chat.return_value = MagicMock()
+        config = _make_config(
+            model="claude-opus-5",
+            base_url="http://srw-codex-proxy:8317/v1",
+            reasoning_level="high",
+        )
+
+        _create_openai_llm(config, limits=None)
+
+        assert mock_chat.call_args[1]["model_kwargs"]["reasoning_effort"] == "high"
+
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
+    def test_claude_unset_level_injects_nothing(self, mock_chat):
+        """Shared effort_enum contract: an unset level is not re-defaulted here,
+        so a caller that never asked for reasoning does not silently start
+        paying for it. Claude then behaves as it does today — it still thinks,
+        just invisibly."""
+        mock_chat.return_value = MagicMock()
+        config = _make_config(
+            model="claude-opus-5",
+            base_url="http://srw-codex-proxy:8317/v1",
+            reasoning_level=None,
+        )
+
+        _create_openai_llm(config, limits=None)
+
+        assert "reasoning_effort" not in (
+            mock_chat.call_args[1].get("model_kwargs") or {}
+        )
+
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
+    def test_route_headers_reach_the_client(self, mock_chat):
+        """Dispatch-injected transport headers become the client's
+        default_headers — the other half of the Claude reasoning fix."""
+        mock_chat.return_value = MagicMock()
+        config = _make_config(
+            model="claude-opus-5",
+            base_url="http://srw-codex-proxy:8317/v1",
+            extra_headers={"Anthropic-Beta": "claude-code-20250219"},
+        )
+
+        _create_openai_llm(config, limits=None)
+
+        assert mock_chat.call_args[1]["default_headers"] == {
+            "Anthropic-Beta": "claude-code-20250219"
+        }
+
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
+    def test_no_route_headers_leaves_the_client_untouched(self, mock_chat):
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model="gpt-5.6-sol", base_url="http://proxy/v1")
+
+        _create_openai_llm(config, limits=None)
+
+        assert "default_headers" not in mock_chat.call_args[1]
 
     @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_gemma_enables_thinking_no_effort(self, mock_chat):

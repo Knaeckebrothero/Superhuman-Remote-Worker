@@ -59,7 +59,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       <!-- Data Table -->
       @if (state.tableData().length > 0) {
         <div class="table-wrapper">
-          <table class="data-table">
+          <table class="data-table app-table">
             <thead>
               <tr>
                 @for (col of state.columns(); track col.name) {
@@ -284,41 +284,9 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       }
 
       /* Data Table */
-      .data-table {
-        width: 100%;
-        border-collapse: collapse;
-        font-size: 12px;
-      }
-
       .data-table th,
       .data-table td {
-        padding: 8px 12px;
-        text-align: left;
-        border-bottom: 1px solid var(--border-color);
-        max-width: 300px;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-
-      .data-table th {
-        position: sticky;
-        top: 0;
-        background: var(--panel-header-bg);
-        color: var(--text-secondary);
-        font-weight: 600;
-        text-transform: uppercase;
-        font-size: 11px;
-        letter-spacing: 0.5px;
-        z-index: 1;
-      }
-
-      .data-table td {
         color: var(--text-primary);
-      }
-
-      .data-table tbody tr:hover {
-        background: var(--surface-0);
       }
 
       /* Column type styling */

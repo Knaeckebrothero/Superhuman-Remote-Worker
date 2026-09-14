@@ -101,7 +101,7 @@ const INHERIT = '__inherit__';
           }
 
           @if (scopeReady()) {
-            <table class="grid">
+            <table class="grid app-table">
               <thead><tr><th>Capability</th><th>Default</th><th>Grant</th></tr></thead>
               <tbody>
                 @for (k of catalogKeys(); track k) {
@@ -149,7 +149,7 @@ const INHERIT = '__inherit__';
        the grants table (the newest capability rows) was clipped away with no
        scrollbar. Same shape every other admin screen uses. */
     :host { display: block; height: 100%; overflow: auto; }
-    .admin-container { padding: 1rem 1.5rem; max-width: var(--content-max-width); margin: 0 auto; }
+    .admin-container { padding: 32px; max-width: var(--content-max-width); margin: 0 auto; }
     .page-header { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 1rem; }
     .page-title { margin: 0; color: var(--text-primary); }
     .admin-section {
@@ -166,10 +166,8 @@ const INHERIT = '__inherit__';
       padding: 0.35rem 0.5rem; background: var(--surface-0); color: var(--text-primary);
       border: 1px solid var(--border-color); border-radius: var(--radius-surface);
     }
-    .grid { width: 100%; border-collapse: collapse; }
-    .grid th, .grid td { text-align: left; padding: 0.5rem; border-bottom: 1px solid var(--border-color); color: var(--text-primary); }
     .grid .muted, .muted { color: var(--text-muted); }
-    .banner { margin-top: 1rem; padding: 0.5rem 0.75rem; border-radius: 6px; }
+    .banner { margin-top: 1rem; padding: 0.5rem 0.75rem; border-radius: var(--radius-control); }
     .banner.err { background: var(--danger-tint); color: var(--danger); }
     .banner.info {
       margin: 0 0 1rem; background: var(--surface-0);

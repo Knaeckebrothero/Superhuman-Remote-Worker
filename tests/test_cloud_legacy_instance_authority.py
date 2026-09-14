@@ -112,7 +112,8 @@ class TestGetProjectOnLegacyRow:
         project_a["main_cloud_backend_instance_id"] = None
         project_a["main_cloud_folder_handle"] = "nextcloud:12345"
 
-        from orchestrator.main import get_project
+        from orchestrator.main import _projects_dependencies
+        from orchestrator.routers.projects import get_project
 
         real_router = _router()
         with (
@@ -126,12 +127,19 @@ class TestGetProjectOnLegacyRow:
             ),
             patch("orchestrator.main.postgres_db", fake_db),
             patch(
-                "orchestrator.main._ensure_project_cloud_resources",
-                AsyncMock(side_effect=lambda p: p),
+                "orchestrator.services.projects.project_provisioning"
+                ".ensure_project_cloud_resources",
+                AsyncMock(side_effect=lambda p, **_kwargs: p),
             ),
             patch("orchestrator.main.main_cloud_router", real_router),
         ):
-            result = await get_project(fake_request, str(project_a["id"]))
+            # main's own factory, so the patched module globals above are what
+            # the handler is wired to — exactly as in production.
+            result = await get_project(
+                fake_request,
+                str(project_a["id"]),
+                dependencies=_projects_dependencies(),
+            )
 
         assert result["id"] == project_a["id"]
         # The deep-link is the one thing that degrades; the cockpit hides the
@@ -158,7 +166,9 @@ class TestAddMemberOnLegacyRow:
         project_a["main_cloud_backend"] = "nextcloud"
         project_a["main_cloud_backend_instance_id"] = None
 
-        from orchestrator.main import ProjectMemberAdd, add_project_member
+        from orchestrator.main import _projects_dependencies
+        from orchestrator.routers.projects import add_project_member
+        from orchestrator.schemas.projects import ProjectMemberAdd
 
         fake_db.add_project_member = AsyncMock(
             side_effect=AssertionError("member row written despite refusal")
@@ -176,6 +186,7 @@ class TestAddMemberOnLegacyRow:
                     str(project_a["id"]),
                     ProjectMemberAdd(user_id=str(user_b["id"]), role="editor"),
                     fake_request,
+                    dependencies=_projects_dependencies(),
                 )
 
         assert exc.value.status_code == 409

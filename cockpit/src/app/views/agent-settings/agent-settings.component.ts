@@ -454,7 +454,10 @@ export class AgentSettingsComponent {
 
     // Execution group reads from the config input directly (via computed signals),
     // but we should reset user overrides since the expert changed
+    const workspace = this.executionGroup?.workspaceBackend() ?? null;
     this.executionGroup?.resetAll();
+    // Workspace selection belongs to this execution and survives Expert edits.
+    this.executionGroup?.workspaceBackend.set(workspace);
 
     // Prefill execution overrides from expert
     const autonomy = config['autonomy'] as string | undefined;

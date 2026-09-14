@@ -2,24 +2,60 @@
 
 import sys
 import textwrap
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID
 
 import pytest
 from fastapi import HTTPException
 
 from orchestrator.main import (
-    DatasourceCreate,
-    DatasourceUpdate,
     _build_datasource_tool_override,
     _build_datasources_payload,
     _mcp_datasources_enabled,
     _mcp_stdio_enabled,
     _validate_mcp_datasource,
+)
+from orchestrator.routers.datasources import (
     create_datasource,
     test_datasource as probe_datasource_endpoint,
     update_datasource,
 )
+from orchestrator.schemas.datasources import DatasourceCreate, DatasourceUpdate
+
+
+def _route_deps(*, store=None, gates=None):
+    """Compose the connector router's collaborators as main's
+    ``_datasources_dependencies`` factory does.
+
+    The three pieces this file used to patch on ``orchestrator.main`` — the
+    store and the two auth gates — are injected here instead, because the
+    router reads them off this dataclass rather than off a module global.
+    ``mcp_datasources_enabled`` / ``validate_mcp_datasource`` stay main's own
+    functions and are still called per request, so the env-var feature gates
+    behave exactly as they did.
+    """
+    from orchestrator.routers.datasources import DatasourcesDependencies
+    from orchestrator.services.datasources import DatasourceDependencies
+    from orchestrator.services.kb_task_registry import KbDatasourceTaskRegistry
+    from orchestrator.services.knowledge_index import KnowledgeIndexDependencies
+
+    db = MagicMock() if store is None else store
+    operations = DatasourceDependencies(
+        store=db,
+        vector_db=MagicMock(),
+        knowledge_index=KnowledgeIndexDependencies(
+            store=db,
+            vector_db=MagicMock(),
+            gitea_client=MagicMock(),
+            logger=MagicMock(),
+            tasks=KbDatasourceTaskRegistry(),
+            inject_system_kb_embedding_profile=AsyncMock(return_value=None),
+        ),
+        mcp_datasources_enabled=_mcp_datasources_enabled,
+        validate_mcp_datasource=_validate_mcp_datasource,
+    )
+    return DatasourcesDependencies(store=db, operations=operations, **(gates or {}))
+
 
 ECHO_SERVER = textwrap.dedent(
     """
@@ -99,16 +135,16 @@ async def test_mcp_create_rejected_before_auth_when_gate_off(monkeypatch):
         credentials={"transport": "http"},
     )
 
-    with (
-        patch(
-            "orchestrator.main.require_approved_user",
-            AsyncMock(side_effect=AssertionError("auth ran before feature gate")),
-        ),
-        pytest.raises(HTTPException) as exc,
-    ):
-        await create_datasource(body, object())
+    approve = AsyncMock(side_effect=AssertionError("auth ran before feature gate"))
+    with pytest.raises(HTTPException) as exc:
+        await create_datasource(
+            body,
+            object(),
+            dependencies=_route_deps(gates={"require_approved_user": approve}),
+        )
 
     assert exc.value.status_code == 403
+    approve.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -130,22 +166,21 @@ async def test_remote_mcp_create_passes_credentials_to_encrypted_db_path(monkeyp
         }
     )
 
-    with (
-        patch(
-            "orchestrator.main.require_approved_user",
-            AsyncMock(return_value={"id": UUID(int=1)}),
+    result = await create_datasource(
+        DatasourceCreate(
+            name="GitHub",
+            type="mcp",
+            connection_url="https://example.test/mcp",
+            credentials=credentials,
         ),
-        patch("orchestrator.main.postgres_db", db),
-    ):
-        result = await create_datasource(
-            DatasourceCreate(
-                name="GitHub",
-                type="mcp",
-                connection_url="https://example.test/mcp",
-                credentials=credentials,
-            ),
-            object(),
-        )
+        object(),
+        dependencies=_route_deps(
+            store=db,
+            gates={
+                "require_approved_user": AsyncMock(return_value={"id": UUID(int=1)})
+            },
+        ),
+    )
 
     assert "credentials" not in result
     assert db.create_datasource.await_args.kwargs["credentials"] == credentials
@@ -160,27 +195,26 @@ async def test_stdio_create_normalizes_connection_url_to_none(monkeypatch):
         return_value={"id": UUID(int=2), "name": "Local", "type": "mcp"}
     )
 
-    with (
-        patch(
-            "orchestrator.main.require_approved_user",
-            AsyncMock(return_value={"id": UUID(int=1)}),
+    await create_datasource(
+        DatasourceCreate(
+            name="Local",
+            type="mcp",
+            connection_url="https://stale.example/mcp",
+            credentials={
+                "transport": "stdio",
+                "command": "npx",
+                "args": ["-y", "@modelcontextprotocol/server-everything"],
+                "env": {},
+            },
         ),
-        patch("orchestrator.main.postgres_db", db),
-    ):
-        await create_datasource(
-            DatasourceCreate(
-                name="Local",
-                type="mcp",
-                connection_url="https://stale.example/mcp",
-                credentials={
-                    "transport": "stdio",
-                    "command": "npx",
-                    "args": ["-y", "@modelcontextprotocol/server-everything"],
-                    "env": {},
-                },
-            ),
-            object(),
-        )
+        object(),
+        dependencies=_route_deps(
+            store=db,
+            gates={
+                "require_approved_user": AsyncMock(return_value={"id": UUID(int=1)})
+            },
+        ),
+    )
 
     assert db.create_datasource.await_args.kwargs["connection_url"] is None
 
@@ -202,26 +236,23 @@ async def test_update_validates_merged_shape_and_can_clear_url(monkeypatch):
     db.list_datasource_projects = AsyncMock(return_value=[])
     db.get_datasource = AsyncMock(return_value=existing)
 
-    with (
-        patch(
-            "orchestrator.main.require_datasource_owner",
-            AsyncMock(return_value=({}, existing)),
+    result = await update_datasource(
+        object(),
+        datasource_id,
+        DatasourceUpdate(
+            connection_url=None,
+            credentials={
+                "transport": "stdio",
+                "command": "npx",
+                "args": [],
+                "env": {},
+            },
         ),
-        patch("orchestrator.main.postgres_db", db),
-    ):
-        result = await update_datasource(
-            object(),
-            datasource_id,
-            DatasourceUpdate(
-                connection_url=None,
-                credentials={
-                    "transport": "stdio",
-                    "command": "npx",
-                    "args": [],
-                    "env": {},
-                },
-            ),
-        )
+        dependencies=_route_deps(
+            store=db,
+            gates={"require_datasource_owner": AsyncMock(return_value=({}, existing))},
+        ),
+    )
 
     assert result["id"] == datasource_id
     kwargs = db.update_datasource.await_args.kwargs
@@ -296,11 +327,15 @@ class TestMcpConnectionTest:
             },
         }
 
-        with patch(
-            "orchestrator.main.require_datasource_owner",
-            AsyncMock(return_value=({}, datasource)),
-        ):
-            result = await probe_datasource_endpoint(object(), datasource_id)
+        result = await probe_datasource_endpoint(
+            object(),
+            datasource_id,
+            dependencies=_route_deps(
+                gates={
+                    "require_datasource_owner": AsyncMock(return_value=({}, datasource))
+                }
+            ),
+        )
 
         assert result["status"] == "ok"
         assert "echo" in result["message"]
@@ -316,11 +351,15 @@ class TestMcpConnectionTest:
             "credentials": {"transport": "http"},
         }
 
-        with patch(
-            "orchestrator.main.require_datasource_owner",
-            AsyncMock(return_value=({}, datasource)),
-        ):
-            result = await probe_datasource_endpoint(object(), datasource_id)
+        result = await probe_datasource_endpoint(
+            object(),
+            datasource_id,
+            dependencies=_route_deps(
+                gates={
+                    "require_datasource_owner": AsyncMock(return_value=({}, datasource))
+                }
+            ),
+        )
 
         assert result["status"] == "error"
         assert "MCP" in result["message"]
@@ -341,11 +380,15 @@ class TestMcpConnectionTest:
             },
         }
 
-        with patch(
-            "orchestrator.main.require_datasource_owner",
-            AsyncMock(return_value=({}, datasource)),
-        ):
-            result = await probe_datasource_endpoint(object(), datasource_id)
+        result = await probe_datasource_endpoint(
+            object(),
+            datasource_id,
+            dependencies=_route_deps(
+                gates={
+                    "require_datasource_owner": AsyncMock(return_value=({}, datasource))
+                }
+            ),
+        )
 
         assert result["status"] == "ok"
         assert "untested" in result["message"].lower()

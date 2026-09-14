@@ -22,6 +22,8 @@ import {ViewportService} from '../../core/services/viewport.service';
 import {Datasource, Project, ProjectCreateRequest, ProjectStatus} from '../../core/models/api.model';
 import {AppInlineEditableTextComponent} from '../../ui/inline-editable-text';
 import {AppTabBarComponent, AppTabComponent} from '../../ui/tab-bar';
+import {AppButtonComponent} from '../../ui/button';
+import {AppBadgeComponent} from '../../ui/badge';
 import {ProjectListPageComponent} from './project-list.component';
 
 // The real catalogue, so the specs also prove the `projects.externalKb.*`
@@ -41,6 +43,31 @@ import en from '../../../assets/i18n/en.json';
  * decorator inputs, which JIT does see, and keep the contract this page depends
  * on: the selected value in, a click on a tab out.
  */
+@Component({
+  selector: 'app-button',
+  standalone: true,
+  template: `<button type="button" [disabled]="disabled" (click)="clicked.emit($event)"><ng-content></ng-content></button>`,
+})
+class ButtonStub {
+  @Input() variant = 'primary';
+  @Input() size = 'md';
+  @Input() disabled = false;
+  @Input() loading = false;
+  @Input() ariaLabel = '';
+  @Output() clicked = new EventEmitter<MouseEvent>();
+}
+
+@Component({
+  selector: 'app-badge',
+  standalone: true,
+  template: `<ng-content></ng-content>`,
+})
+class BadgeStub {
+  @Input() tone = 'neutral';
+  @Input() size = 'sm';
+  @Input() shape = 'rounded';
+}
+
 @Component({
   selector: 'app-tab-bar',
   standalone: true,
@@ -157,8 +184,8 @@ async function mount(api: ReturnType<typeof stubApi>, router = {navigate: vi.fn(
     ],
   });
   TestBed.overrideComponent(ProjectListPageComponent, {
-    remove: {imports: [AppTabBarComponent, AppTabComponent, AppInlineEditableTextComponent]},
-    add: {imports: [TabBarStub, TabStub, InlineEditableTextStub]},
+    remove: {imports: [AppTabBarComponent, AppTabComponent, AppInlineEditableTextComponent, AppButtonComponent, AppBadgeComponent]},
+    add: {imports: [TabBarStub, TabStub, InlineEditableTextStub, ButtonStub, BadgeStub]},
   });
   await TestBed.compileComponents();
   const fixture = TestBed.createComponent(ProjectListPageComponent);
@@ -170,7 +197,7 @@ async function mount(api: ReturnType<typeof stubApi>, router = {navigate: vi.fn(
 
 function openCreateForm(fixture: ComponentFixture<ProjectListPageComponent>): void {
   const newProject = fixture.nativeElement.querySelector(
-    '.header-actions .btn-primary',
+    '.header-actions app-button[data-testid="projects-new"] button',
   ) as HTMLButtonElement;
   newProject.click();
   fixture.detectChanges();
@@ -218,7 +245,7 @@ function pickConnector(
 function submitButton(
   fixture: ComponentFixture<ProjectListPageComponent>,
 ): HTMLButtonElement {
-  return fixture.nativeElement.querySelector('.form-actions .btn-primary') as HTMLButtonElement;
+  return fixture.nativeElement.querySelector('.form-actions app-button[data-testid="projects-create"] button') as HTMLButtonElement;
 }
 
 function createdBody(api: ReturnType<typeof stubApi>): ProjectCreateRequest {
@@ -341,7 +368,7 @@ describe('ProjectListPageComponent — external knowledge base', () => {
     // Nothing to attach yet, so the project cannot be created this way.
     expect(submitButton(fixture).disabled).toBe(true);
 
-    (fixture.nativeElement.querySelector('.create-form .kb-connector-link') as HTMLButtonElement).click();
+    (fixture.nativeElement.querySelector('.create-form .kb-connector-link button') as HTMLButtonElement).click();
     expect(router.navigate).toHaveBeenCalledWith(['/datasources']);
   });
 
@@ -451,7 +478,7 @@ describe('ProjectListPageComponent — archived lifecycle', () => {
   function unarchiveButtons(
     fixture: ComponentFixture<ProjectListPageComponent>,
   ): HTMLButtonElement[] {
-    return Array.from(fixture.nativeElement.querySelectorAll('.project-card .card-action'));
+    return Array.from(fixture.nativeElement.querySelectorAll('.project-card .card-action button'));
   }
 
   it('asks the server for active projects only, and for the archived count beside it', async () => {
@@ -557,7 +584,7 @@ describe('ProjectListPageComponent — archived lifecycle', () => {
       .fn()
       .mockReturnValue(throwError(() => new HttpErrorResponse({status: 500, error: {}})));
 
-    (fixture.nativeElement.querySelector('.header-actions .btn-ghost') as HTMLButtonElement).click();
+    (fixture.nativeElement.querySelector('.header-actions app-button[data-testid="projects-refresh"] button') as HTMLButtonElement).click();
     fixture.detectChanges();
 
     expect(fixture.nativeElement.querySelector('.empty-state')).toBeNull();

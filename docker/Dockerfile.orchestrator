@@ -107,6 +107,8 @@ RUN python -c "import orchestrator.services.infrastructure_metering.compute_acti
 RUN python -c "import orchestrator.services.session_memory_executor"
 # Exercise the installed image namespace and lean dependency set directly.
 RUN python -c "import orchestrator.services.email, orchestrator.services.headless_notifications"
+# The manifest API must find its authored schema in the installed package.
+RUN --network=none python -I -c "from shared.manifests import load_schema; assert load_schema()['properties']['apiVersion']['const'] == 'srw/v1alpha1'"
 # The legacy-authority operator must be executable in the same installed
 # namespace operators get through ``kubectl exec``.  Keep this as ``--help``:
 # image construction must never connect to storage or initialize the forge.

@@ -1,6 +1,133 @@
 # Agent Configuration
 
-This directory contains agent configuration files and templates.
+This directory contains the reference SRW harness's manifests and private assets.
+Bundled `experts/*/config.yaml` and `subagents/*/config.yaml` are now
+`srw/v1alpha1` **Expert manifests**. Their existing settings live under
+`spec.runtime.config.config`; the inheritance, model, prompt and tool behavior
+described below belongs to the explicitly selected `srw/v1` harness adapter.
+Other harnesses own their private configuration language.
+
+```yaml
+apiVersion: srw/v1alpha1
+kind: Expert
+metadata:
+  name: application-helper
+  scope: {kind: Account, name: personal}
+spec:
+  runtime:
+    adapter: srw/v1
+    config:
+      config_name: worker_base
+      asset_name: developer
+      config:
+        llm: {model: your-model}
+        tools: {workspace: [read_file, write_file]}
+      prompts:
+        persona: Help implement and verify the assigned change.
+```
+
+With `adapter: srw/v1`, omit `image` to use the installed SRW harness. Bundled and
+new editor-created Experts use this binding, so Helm/Tilt image upgrades do not
+require editing every Expert or Project. Generic hosting still requires an image.
+An explicit SRW `image` is an admission constraint: it must match the installed
+image, and a mismatch is rejected on Job, Session and roster admission. Choose
+generic hosting to launch an arbitrary image.
+
+Earlier imports stored a concrete installation image. Remove that field through
+a versioned resource update to adopt the installed binding. Restarting or rerunning
+the importer preserves existing authored definitions. Active Projects keep frozen
+Expert content and need a complete Project update to adopt the new binding.
+Migrated Projects also retain a server-owned editor recipe; public export/reapply
+adopts native authoring and re-resolves references, so review that transition before
+using it to update a migrated Project. Existing execution generations remain unchanged.
+
+The reference adapter launches the installation-managed worker image, including
+on later stateless attachments. Each new execution snapshot records the concrete
+image selected at admission. This is provenance: it does not select an old image
+from the pool after a rollout. Generic hosting separately pins observed image
+digests for retries and workspace handoffs.
+
+Within this private contract, `config_name` selects the actual configuration
+base. Optional `asset_name` selects an installed Expert or subagent directory
+for prompt files, model-family matrices and skills only. For example, a bundled
+Developer uses `config_name: worker_base` and `asset_name: developer`; its authored
+settings remain solely in `config`. Removing a setting from the saved manifest
+therefore cannot restore it from Developer's original file.
+Experts with these asset selections or ordered layers use manifest export; the
+old fragment export cannot represent those inputs and explicitly refuses them.
+Server-side SRW roster selection resolves installed names to Catalog revisions
+before rendering, so edited or retired named definitions cannot fall back to
+their original files. The execution snapshot preserves those selected revisions.
+Stored roster targets currently require `config_name` to name `expert_base`,
+`worker_base`, `session_base` or `subagent_base` (including their legacy aliases).
+Their authored settings are re-rooted onto the subagent role. Other private bases
+remain available to top-level Experts; roster selection reports them as
+unsupported instead of silently ignoring their inherited settings.
+
+The SRW adapter also accepts `runtime.config.layers`, an ordered array of private
+config objects. It applies the Expert leaf and then these layers above the
+execution owner's account defaults. Project composition uses this to freeze
+shared and per-Expert overrides without flattening their null-as-delete behavior
+or copying one account's model defaults into everyone else's Project. A null
+remains authored data in the manifest; only this adapter interprets it during
+resolution. Later request overrides still apply last. This private field has no
+meaning to a generic harness.
+
+Saved expert IDs, grants and default references remain stable. Their canonical
+payload lives in the resource store; the old `experts.config` and
+`experts.prompts` payloads are emptied during migration. Existing expert editing
+and selection APIs project the SRW private settings from that resource.
+`scripts/migrate-expert-resources.py` previews pending stored conversions;
+`--apply` performs the migration after schema migration, using the installed
+harness binding. Optional `--image <trusted-image>` adds an explicit image constraint.
+It preserves existing resource edits on reruns. Imported bundled resources are
+also preserved on restart; upgrading one uses an explicit resource update.
+
+Deleting an application user retires personal definitions and preserves completed
+execution and workspace history. Shared Project definitions keep their existing
+membership authority. Unfinished work, retained workspaces and shared defaults
+must be resolved first; Project Experts need a remaining Project owner. User
+deletion does not provision, transfer or delete external cloud accounts.
+
+Projects now freeze their available Expert definitions and worker/session defaults
+in one active revision. The migration retains Project IDs and membership, moves
+shared and per-Expert overrides into ordered SRW private layers, and clears the
+old Project override columns. Existing editors project those authored overrides
+from the active resource; changing a default publishes a complete new revision.
+Changing a source Expert alone leaves an active Project's composition unchanged.
+
+Startup defers an unclaimed legacy Project when it has no members and no user
+selecting it as their default. Its data stays intact and a warning identifies
+the Project; explicitly establishing ownership makes it eligible on a later run.
+A Project with members but no owner still requires ownership repair before
+migration. Startup never invents ownership or discards a Project to complete
+the conversion.
+
+Historical cloud-backed Projects and Sessions may also need their missing
+installation authority repaired before upgrading. The admin operation
+`POST /api/admin/system-settings/main_cloud/backfill-instance-authority` previews
+the mapping and verifies it against the live installation; inspect that preview
+before repeating with `?apply=true`. Ambiguous installation history is rejected.
+Do not fill those references with a guessed instance or relax the database checks.
+
+The existing Officer kit is represented by
+`team.controller: {type: srw/officer-v1, config: ...}`. Its private payload contains
+`config` and `communicationPolicy`; thread IDs, leases, holds and observed state
+stay in runtime tables. Authorized Officer kit edits update this Project revision
+in the same transaction. Automatic commissioning, native fixed-Expert slots and
+global Project limits are not implemented by this controller and are rejected
+when applied. Existing commissioning and hold/release operations still own those
+lifecycle transitions.
+
+Referencing a bundled Catalog Expert as a typed Project default lazily binds one
+stable global Expert ID to that same source resource. The picker shows it once;
+the Project continues to borrow the source through its authored `ref`.
+
+The standalone file conversion is repeatable with
+`scripts/migrate-bundled-expert-manifests.py --check`. Prompt files, model-family
+matrices and skill assets remain beside each bundled manifest. See
+[manifest examples](../examples/manifests/README.md) for the generic resource
+contract and the other building blocks.
 
 ## Directory Structure
 
@@ -16,14 +143,14 @@ config/
 ├── README.md                    # This file
 ├── experts/                     # Bundled roles and application-default seed bundles
 │   └── <expert>/
-│       ├── config.yaml              # Expert overlay (`$extends: worker_base` or `session_base`)
+│       ├── config.yaml              # Expert manifest; private overlay under runtime.config.config
 │       ├── model_config_matrix.yaml # Expert-level matrix override (optional)
 │       └── skills/                  # Expert-local skill overrides (optional)
 │           ├── strategic-phase/SKILL.md
 │           └── tactical-phase/SKILL.md
 ├── subagents/                   # Subagent library — small experts a roster references by name (see subagents/README.md)
 │   └── <name>/
-│       ├── config.yaml              # `$extends: expert_base`, `tags: [subagent]`, read-only tools, `llm: {model: inherit}`
+│       ├── config.yaml              # Expert manifest; SRW private leaf extends expert_base
 │       └── persona.txt              # Prompt files next to the config, like an expert's
 ├── skills/                      # Bundled skills, including the two hidden worker phase skills
 │   ├── strategic-phase/SKILL.md
@@ -83,22 +210,72 @@ session for `session`, a roster entry for `subagent` — the loader
 (`load_and_merge_config(path, role=...)`) replaces the link that ends the chain
 with that role's overlay. So a session expert dispatched as a job gains the
 worker keys underneath it, and a worker expert used in a session sits on the
-session overlay; the expert's own values always win ("expert wins").
+session overlay; the expert's own behavioral values win. The orchestrator binds execution-owned
+infrastructure separately after this private merge.
 
-**Session account layer — `workspace.backend` needs an owner.** For sessions
-the orchestrator inserts an *account* layer between the merged role base and
-the expert's own file: the owner's saved `settings.persistent_agent.
-workspace_backend`, else the platform default `virtual`. That layer always
-emits `workspace.backend`, so `expert_base`'s `backend: sandbox` never reaches
-a session. An expert whose role needs a shell (build, run, browser, git) must
-declare `workspace.backend` in its **own** `config.yaml`; the New Session form
-then shows it like an expert-pinned model and the user may still change it.
-An expert that lists shell tools without declaring a backend starts on the
-lite tier with shell/browser/git stripped — a tripwire in
-`tests/test_expert_defaults.py::TestShellBoundBundledExpertsPinTheirTier`
-fails on that unless the expert is on its documented exception list
-(`scholar`). Jobs ignore the key: the workspace contract stamps a job's tier
-from `config_override` (default `sandbox`).
+**Workspace ownership.** A Job or Session selects its workspace independently
+of its Expert. Infrastructure fields (`workspace.backend` and `workspace.vm`)
+in an SRW Expert's private configuration do not select or size that workspace.
+Behavioral workspace settings, such as Git versioning, remain private settings.
+Selection precedence is explicit execution choice, then the active Project's
+workspace default, then account/role defaults (worker: sandbox, session: virtual).
+An explicit `workspace: null` means no workspace.
+
+The managed role defaults are defined in
+`shared.runtime.core.workspace_selection.execution_workspace_config`.
+`expert_base.yaml` contains harness behavior and does not select infrastructure.
+
+Experts can publish `spec.workspacePreference: {backend: sandbox}`. The creation
+forms show this recommendation and materialize it as an explicit execution choice
+when no Project default or manual selection takes precedence. API callers must
+choose to follow recommendations themselves. Listing shell tools never allocates
+a machine: the SRW harness filters tools for the actual backend and retains the
+existing authorized workspace-upgrade flow.
+
+The existing Job and Session endpoints accept a top-level `workspace` using the
+manifest binding shape, for example `{"template":{"ref":{"name":"build-env"}}}`.
+References resolve in the selected Project/Account scope; use `ref.scope` when
+selecting a template from another scope. Inline templates work too. Existing
+`config_override.workspace` requests remain compatible, but cannot be combined
+with a second top-level backend selection.
+Selected template and Project revisions are captured at admission; source edits
+do not change existing execution snapshots. Children keep their existing
+workspace inheritance.
+
+VM WorkspaceTemplates support prebuilt `environment.image` references and
+`resources: {cpu: 12, memory: 24Gi, storage: 120Gi}`. CPU is a whole core count;
+memory/storage use `Mi`, `Gi`, or `Ti`. The controller applies its rootdisk
+minimum to storage requests. Pin images by digest for reproducible selection.
+Same-cluster VM hosting can enable `environment.prepare`, digest-aware pull
+policies and scoped `Reuse`/`Rebuild` caching. Each workspace clones the prepared
+disk before its own initialization. See [workspace preparation](../examples/manifests/workspace-preparation.md)
+for operator prerequisites, cache behavior and the prepared-template example.
+Same-cluster VM templates support ordered, unprivileged `initialize` commands
+before agent dispatch. Completed setup survives resume on the same persistent
+rootdisk. See the [initialized VM example](../examples/manifests/srw-initialized-development-vm.yaml)
+and its [runtime limits](../examples/manifests/README.md#execution-owned-workspace-selection).
+Jobs can select `retention: Retain` for a same-cluster VM, then reuse its disk
+through `workspace.instanceRef.uid` after the instance becomes `Detached`.
+`GET /api/jobs/{id}` exposes `workspace_instance_id`; instance status and explicit
+storage deletion use `/api/workspace-instances/{uid}`. Reuse is exclusive and
+limited to the same Account or Project. Successful initialization persists across
+Jobs, while each attachment gets a new VM and SSH host identity. Sessions keep
+their existing suspend/resume behavior; retained-instance selection for Sessions
+is rejected. See the [first assignment](../examples/manifests/srw-retained-development-vm.yaml)
+and [reuse example](../examples/manifests/srw-retained-job.yaml).
+Images must implement the SRW VM guest/SSH contract. See the
+[development VM template](../examples/manifests/srw-development-vm.yaml) and
+[selection examples](../examples/manifests/README.md#execution-owned-workspace-selection).
+The selected VM image/resources are captured with execution policy, independently
+of the typed harness settings, and reused for Job dispatch and Session resume.
+
+Bundled Experts now declare advisory preferences. For stored SRW Experts, run
+`scripts/migrate-workspace-preferences.py` to preview versioned changes, then
+`--apply --plan-revision <returned-revision>` against the intended database.
+The migration preserves execution history and active Project generations;
+managed Experts require an explicit update of their owning Project. Generic
+harness configuration remains opaque. See the
+[workspace examples](../examples/manifests/srw-workspace-selection.yaml).
 
 **Ignored keys.** A role overlay may declare `$ignore_keys`, a list of dotted
 paths its role never reads. They are pruned from the merged config after every
@@ -115,6 +292,10 @@ Use `load_role_base(role)` (the merged `expert_base` + overlay) from
 `src/shared/runtime/core/loader.py`.
 
 ## Creating a Custom Agent Config
+
+For orchestrator-managed Experts, use the manifest structure at the top of this
+guide. The file examples below configure a directly launched SRW harness and its
+private assets.
 
 ### Option 1: Single File Config
 
@@ -187,7 +368,15 @@ Once the filename is resolved, the loader checks the expert directory first for 
 
 ### Resolved Config JSONB
 
-On first run, the fully resolved config (agent config + all prompt/instruction content) is frozen into a `resolved_config` JSONB column on the jobs table. On resume, the agent loads from this snapshot instead of resolving from disk. This prevents config drift and makes jobs reproducible.
+For orchestrated work, the orchestrator records resolved SRW settings, prompt and
+instruction content, and admitted policy in the canonical execution snapshot
+before delivery. Jobs freeze at admission; Sessions retain versioned configuration
+generations. Delivery reads that snapshot, rechecks current authority, and supplies
+transient workspace and connector bindings. It does not resolve edited Expert
+files again. The authoritative records are `srw_execution_specs` and their revision
+history. Older `resolved_config` columns remain explicit compatibility and
+historical inputs; the migration never reconstructs missing past settings from
+today's defaults.
 
 ## Configuration Reference
 

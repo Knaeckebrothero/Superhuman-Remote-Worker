@@ -15,27 +15,43 @@ step 1 (2026-06-11):
   the workspace and pod are torn down (memory_bugs.md B11 addendum).
 """
 
+from tests import _b09_control_seams as control_seams
+
 import asyncio
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+from orchestrator.services import (  # noqa: E402
+    thread_datasource_authorization,
+)
 from fastapi import HTTPException
 
 import orchestrator.main as orch_main
+
+# R1.B05 lane P: the tier constants keep their owner; main no longer
+# re-exports them.
+from orchestrator.services import session_workspace_policy
+from orchestrator.services import thread_workspace_delivery
+from orchestrator.routers import (
+    agent_thread_workspace as agent_thread_workspace_routes,
+)
 from orchestrator.services.cloud.protected_reader_authority import (
     ProtectedNextcloudReaderGrantPlan,
 )
 from orchestrator.services.cloud_staging.source_identity import (
     ProtectedMountSourceIdentity,
 )
+from orchestrator.services.pinned_retirement import PinnedRetirementOperations
 from agent.api.persistent_app import _load_expert_config
 from shared.runtime.core.tool_policy import (
     ToolPolicyError,
     validate_tool_override_fragment,
 )
 from shared.runtime_actor import RuntimeActorContext
+from orchestrator.services import session_attach_payload
 
 
 _ATTACH_THREAD_ID = "10000000-0000-4000-8000-000000000001"
@@ -251,8 +267,8 @@ class TestSessionWorkspaceBackendOverride:
         # vm must remain a per-session opt-in, never an implicit/saved default:
         # it is excluded from SESSION_WORKSPACE_BACKENDS (the default-chain +
         # settings-PATCH set) but present in the create-time allowlist.
-        assert "vm" not in orch_main.SESSION_WORKSPACE_BACKENDS
-        assert "vm" in orch_main.SESSION_CREATE_WORKSPACE_BACKENDS
+        assert "vm" not in session_workspace_policy.SESSION_WORKSPACE_BACKENDS
+        assert "vm" in session_workspace_policy.SESSION_CREATE_WORKSPACE_BACKENDS
 
     def test_unknown_backend_rejected(self):
         with pytest.raises(orch_main.HTTPException) as exc:
@@ -283,26 +299,26 @@ class TestSessionReadyTimeout:
 
     def test_non_vm_uses_fast_default(self, monkeypatch):
         monkeypatch.delenv("WS_READY_TIMEOUT_S", raising=False)
-        assert orch_main._session_ready_timeout_s("sandbox") == 180
-        assert orch_main._session_ready_timeout_s("virtual") == 180
-        assert orch_main._session_ready_timeout_s(None) == 180
+        assert session_workspace_policy.session_ready_timeout_s("sandbox") == 180
+        assert session_workspace_policy.session_ready_timeout_s("virtual") == 180
+        assert session_workspace_policy.session_ready_timeout_s(None) == 180
 
     def test_vm_uses_extended_budget(self, monkeypatch):
         monkeypatch.delenv("VM_WS_READY_TIMEOUT_S", raising=False)
-        assert orch_main._session_ready_timeout_s("vm") == 960
+        assert session_workspace_policy.session_ready_timeout_s("vm") == 960
 
     def test_budgets_are_env_tunable(self, monkeypatch):
         monkeypatch.setenv("WS_READY_TIMEOUT_S", "200")
         monkeypatch.setenv("VM_WS_READY_TIMEOUT_S", "1200")
-        assert orch_main._session_ready_timeout_s("sandbox") == 200
-        assert orch_main._session_ready_timeout_s("vm") == 1200
+        assert session_workspace_policy.session_ready_timeout_s("sandbox") == 200
+        assert session_workspace_policy.session_ready_timeout_s("vm") == 1200
 
     def test_vm_budget_exceeds_non_vm(self):
         # Nested-budget invariant: the server ready wait must outlast a cold VM
         # boot, so vm must be strictly larger than the sandbox default.
-        assert orch_main._session_ready_timeout_s(
+        assert session_workspace_policy.session_ready_timeout_s(
             "vm"
-        ) > orch_main._session_ready_timeout_s("sandbox")
+        ) > session_workspace_policy.session_ready_timeout_s("sandbox")
 
 
 class TestThreadWorkspaceBackend:
@@ -339,10 +355,10 @@ class TestSessionWorkspaceBackendDefaultChain:
     platform default (virtual). Sessions are never implicitly sandbox."""
 
     def test_platform_default_is_virtual(self):
-        assert orch_main.SESSION_DEFAULT_WORKSPACE_BACKEND == "virtual"
+        assert session_workspace_policy.SESSION_DEFAULT_WORKSPACE_BACKEND == "virtual"
         assert (
-            orch_main.SESSION_DEFAULT_WORKSPACE_BACKEND
-            in orch_main.SESSION_WORKSPACE_BACKENDS
+            session_workspace_policy.SESSION_DEFAULT_WORKSPACE_BACKEND
+            in session_workspace_policy.SESSION_WORKSPACE_BACKENDS
         )
 
     def test_no_settings_falls_back_to_platform_default(self):
@@ -508,7 +524,7 @@ class TestSessionWorkspaceBackendDefaultChain:
             resolved = asyncio.run(orch_main._resolve_preference_defaults())
         assert (
             resolved["persistent_agent"]["workspace_backend"]
-            == orch_main.SESSION_DEFAULT_WORKSPACE_BACKEND
+            == session_workspace_policy.SESSION_DEFAULT_WORKSPACE_BACKEND
         )
 
     def test_fleet_management_tools_override_passes_through(self):
@@ -696,8 +712,8 @@ class TestSendSessionAttachPayload:
                 AsyncMock(return_value=thread),
             ),
             patch.object(
-                orch_main,
-                "_assemble_session_attach_payload",
+                session_attach_payload,
+                "assemble_session_attach_payload",
                 AsyncMock(
                     return_value={
                         "thread_id": self.thread_id,
@@ -799,8 +815,8 @@ class TestSendSessionAttachPayload:
                 AsyncMock(return_value=thread),
             ),
             patch.object(
-                orch_main,
-                "_assemble_session_attach_payload",
+                session_attach_payload,
+                "assemble_session_attach_payload",
                 AsyncMock(
                     return_value={
                         "thread_id": self.thread_id,
@@ -835,8 +851,8 @@ class TestSendSessionAttachPayload:
                 AsyncMock(return_value=thread),
             ),
             patch.object(
-                orch_main,
-                "_assemble_session_attach_payload",
+                session_attach_payload,
+                "assemble_session_attach_payload",
                 AsyncMock(
                     return_value={
                         "thread_id": self.thread_id,
@@ -878,8 +894,8 @@ class TestSendSessionAttachPayload:
                 AsyncMock(return_value=thread),
             ),
             patch.object(
-                orch_main,
-                "_assemble_session_attach_payload",
+                session_attach_payload,
+                "assemble_session_attach_payload",
                 AsyncMock(
                     return_value={
                         "thread_id": self.thread_id,
@@ -909,8 +925,8 @@ class TestSendSessionAttachPayload:
                 AsyncMock(return_value=thread),
             ),
             patch.object(
-                orch_main,
-                "_assemble_session_attach_payload",
+                session_attach_payload,
+                "assemble_session_attach_payload",
                 AsyncMock(
                     return_value={
                         "thread_id": self.thread_id,
@@ -940,8 +956,8 @@ class TestSendSessionAttachPayload:
                 AsyncMock(return_value=thread),
             ),
             patch.object(
-                orch_main,
-                "_assemble_session_attach_payload",
+                session_attach_payload,
+                "assemble_session_attach_payload",
                 AsyncMock(
                     return_value={
                         "thread_id": self.thread_id,
@@ -1061,7 +1077,10 @@ class TestSendSessionAttachPayload:
                 orch_main, "_resolve_session_config", AsyncMock(return_value=resolved)
             ),
         ):
-            payload = await orch_main._assemble_session_attach_payload(self.thread_id)
+            payload = await session_attach_payload.assemble_session_attach_payload(
+                self.thread_id,
+                dependencies=orch_main._session_attach_payload_dependencies(),
+            )
 
         interactive = payload["resolved_config"]["agent"]["interactive"]
         assert interactive == {
@@ -1102,8 +1121,10 @@ class TestSendSessionAttachPayload:
                 orch_main, "_resolve_session_config", AsyncMock(return_value=None)
             ),
         ):
-            payload = await orch_main._assemble_session_attach_payload(
-                self.thread_id, config_override={"llm": {"model": "m"}}
+            payload = await session_attach_payload.assemble_session_attach_payload(
+                self.thread_id,
+                config_override={"llm": {"model": "m"}},
+                dependencies=orch_main._session_attach_payload_dependencies(),
             )
 
         assert payload["resolved_config"] is None
@@ -1156,9 +1177,10 @@ class TestSendSessionAttachPayload:
                 orch_main, "_resolve_session_config", AsyncMock(return_value=None)
             ),
         ):
-            payload = await orch_main._assemble_session_attach_payload(
+            payload = await session_attach_payload.assemble_session_attach_payload(
                 self.thread_id,
                 config_override={"workspace": {"backend": "virtual"}},
+                dependencies=orch_main._session_attach_payload_dependencies(),
             )
 
         assert payload is not None
@@ -1206,9 +1228,10 @@ class TestSendSessionAttachPayload:
                 orch_main, "_resolve_session_config", AsyncMock(return_value=None)
             ),
         ):
-            payload = await orch_main._assemble_session_attach_payload(
+            payload = await session_attach_payload.assemble_session_attach_payload(
                 self.thread_id,
                 config_override={"workspace": {"backend": "sandbox"}},
+                dependencies=orch_main._session_attach_payload_dependencies(),
             )
 
         assert payload is None
@@ -1266,9 +1289,13 @@ class TestSendSessionAttachPayload:
                 "get_thread",
                 AsyncMock(return_value=thread),
             ),
+            # R1.B06: `resolve_authorized_thread_datasources` moved into
+            # services/thread_datasource_authorization and now calls its
+            # module-local revalidator, so the double belongs there —
+            # patching main would be green but inert.
             patch.object(
-                orch_main,
-                "_revalidate_thread_datasource_selection",
+                thread_datasource_authorization,
+                "revalidate_thread_datasource_selection",
                 AsyncMock(side_effect=denied),
             ) as revalidate,
             patch.object(
@@ -1293,11 +1320,11 @@ class TestSendSessionAttachPayload:
             )
 
         assert ok is False
-        revalidate.assert_awaited_once_with(
-            thread,
-            [datasource_id],
-            target_project_ids=[],
-        )
+        # R1.B06: the call now carries the service's injected ``dependencies``.
+        # Assert the subject, not the plumbing.
+        revalidate.assert_awaited_once()
+        assert revalidate.await_args.args == (thread, [datasource_id])
+        assert revalidate.await_args.kwargs["target_project_ids"] == []
         assert _FakeAsyncClient.calls == []
 
     @pytest.mark.asyncio
@@ -1317,9 +1344,13 @@ class TestSendSessionAttachPayload:
                 "get_thread",
                 AsyncMock(return_value=thread),
             ),
+            # R1.B06: `resolve_authorized_thread_datasources` moved into
+            # services/thread_datasource_authorization and now calls its
+            # module-local revalidator, so the double belongs there —
+            # patching main would be green but inert.
             patch.object(
-                orch_main,
-                "_revalidate_thread_datasource_selection",
+                thread_datasource_authorization,
+                "revalidate_thread_datasource_selection",
                 AsyncMock(return_value=([], {})),
             ),
             patch.object(
@@ -1386,9 +1417,13 @@ class TestSendSessionAttachPayload:
                 "_revalidate_thread_project_ids",
                 AsyncMock(return_value=[project_id]),
             ),
+            # R1.B06: `resolve_authorized_thread_datasources` moved into
+            # services/thread_datasource_authorization and now calls its
+            # module-local revalidator, so the double belongs there —
+            # patching main would be green but inert.
             patch.object(
-                orch_main,
-                "_revalidate_thread_datasource_selection",
+                thread_datasource_authorization,
+                "revalidate_thread_datasource_selection",
                 AsyncMock(return_value=([current_id], {current_id: 2})),
             ),
             patch.object(
@@ -1552,8 +1587,8 @@ class TestColdSessionDatasourceDelivery:
                 AsyncMock(return_value=[]),
             ),
             patch.object(
-                orch_main,
-                "_agent_canvas_workspace_capabilities",
+                thread_workspace_delivery,
+                "agent_canvas_workspace_capabilities",
                 return_value=(False, False, False),
             ),
             patch.object(
@@ -1588,7 +1623,7 @@ class TestColdSessionDatasourceDelivery:
             ),
         ):
             with pytest.raises(HTTPException) as denied:
-                await orch_main._agent_get_thread_workspace_locked(
+                await control_seams.agent_get_thread_workspace_locked(
                     thread_id,
                     presented_agent_id=agent_a,
                     presented_runtime_generation=generation_a,
@@ -1760,8 +1795,8 @@ class TestColdSessionDatasourceDelivery:
                 AsyncMock(return_value=[]),
             ),
             patch.object(
-                orch_main,
-                "_agent_canvas_workspace_capabilities",
+                thread_workspace_delivery,
+                "agent_canvas_workspace_capabilities",
                 return_value=(False, False, False),
             ),
             patch.object(
@@ -1794,7 +1829,7 @@ class TestColdSessionDatasourceDelivery:
             ),
         ):
             with pytest.raises(HTTPException) as denied:
-                await orch_main._agent_get_thread_workspace_locked(
+                await control_seams.agent_get_thread_workspace_locked(
                     thread_id,
                     presented_agent_id=agent_id,
                     presented_runtime_generation=generation,
@@ -1868,8 +1903,8 @@ class TestColdSessionDatasourceDelivery:
             patch.object(orch_main, "require_internal", AsyncMock()),
             patch.object(orch_main, "_thread_project_ids", AsyncMock(return_value=[])),
             patch.object(
-                orch_main,
-                "_agent_canvas_workspace_capabilities",
+                thread_workspace_delivery,
+                "agent_canvas_workspace_capabilities",
                 return_value=(False, False, False),
             ),
             patch.object(
@@ -1888,7 +1923,12 @@ class TestColdSessionDatasourceDelivery:
             writer = asyncio.create_task(save_detach())
             await writer_entered.wait()
             cold_response = asyncio.create_task(
-                orch_main.agent_get_thread_workspace(
+                # R1.B05 moved this route to `routers/agent_thread_workspace`.
+                # It resolves its collaborators from the application handling
+                # the request, so the fake request carries the same factory the
+                # real app registers — which is what makes the `orch_main`
+                # patches above still reach the handler.
+                agent_thread_workspace_routes.agent_get_thread_workspace(
                     SimpleNamespace(
                         headers={
                             "X-Agent-ID": _ATTACH_AGENT_ID,
@@ -1896,7 +1936,14 @@ class TestColdSessionDatasourceDelivery:
                                 _ATTACH_RUNTIME_GENERATION
                             ),
                             "X-Session-Runtime-Attach-Token": _ATTACH_TOKEN,
-                        }
+                        },
+                        app=SimpleNamespace(
+                            state=SimpleNamespace(
+                                thread_workspace_delivery_dependencies_factory=(
+                                    orch_main._thread_workspace_delivery_dependencies
+                                )
+                            )
+                        ),
                     ),
                     thread_id,
                 )
@@ -1970,7 +2017,7 @@ class TestColdSessionDatasourceDelivery:
     def test_warm_resume_uses_canonical_thread_mount_projects(self):
         import inspect
 
-        source = inspect.getsource(orch_main.resume_thread)
+        source = inspect.getsource(orch_main.thread_resume_operations.resume_thread)
         assert "pids = await _thread_project_ids(tid)" in source
         assert 'pids = thread.get("project_ids")' not in source
 
@@ -2043,7 +2090,7 @@ class TestDetachAgentSession:
             patch.object(orch_main, "postgres_db", db),
             patch.object(orch_main.httpx, "AsyncClient", _FakeAsyncClient),
         ):
-            assert await orch_main._detach_agent_session("t1") is False
+            assert await control_seams.detach_agent_session("t1") is False
         assert _FakeAsyncClient.calls == []
 
     @pytest.mark.asyncio
@@ -2057,7 +2104,7 @@ class TestDetachAgentSession:
             patch.object(orch_main, "postgres_db", db),
             patch.object(orch_main.httpx, "AsyncClient", _FakeAsyncClient),
         ):
-            assert await orch_main._detach_agent_session("t1") is False
+            assert await control_seams.detach_agent_session("t1") is False
         assert _FakeAsyncClient.calls == []
 
     @pytest.mark.asyncio
@@ -2088,7 +2135,7 @@ class TestDetachAgentSession:
             patch.object(orch_main, "postgres_db", db),
             patch.object(orch_main.httpx, "AsyncClient", _FakeAsyncClient),
         ):
-            assert await orch_main._detach_agent_session(_ATTACH_THREAD_ID) is True
+            assert await control_seams.detach_agent_session(_ATTACH_THREAD_ID) is True
         assert _FakeAsyncClient.calls[0]["url"] == "http://10.0.0.2:8001/session/detach"
 
     @pytest.mark.asyncio
@@ -2103,7 +2150,7 @@ class TestDetachAgentSession:
             patch.object(orch_main, "postgres_db", db),
             patch.object(orch_main.httpx, "AsyncClient", _FakeAsyncClient),
         ):
-            assert await orch_main._detach_agent_session("t1") is False
+            assert await control_seams.detach_agent_session("t1") is False
 
     @pytest.mark.asyncio
     async def test_release_runs_detach_before_workspace_cleanup(self):
@@ -2111,11 +2158,11 @@ class TestDetachAgentSession:
         the workspace alive) before the workspace archive/cleanup step."""
         order: list = []
 
-        async def _detach(thread_id, timeout=150.0):
+        async def _detach(thread_id, timeout=150.0, **_kwargs):
             order.append("detach")
             return True
 
-        async def _archive(thread_id, entity_type, *, reclaim_volume=True):
+        async def _archive(thread_id, entity_type, *, reclaim_volume=True, **_kwargs):
             order.append("workspace")
 
         provisioner = SimpleNamespace(
@@ -2125,11 +2172,17 @@ class TestDetachAgentSession:
             ),
         )
         with (
-            patch.object(orch_main, "_detach_agent_session", _detach),
-            patch.object(orch_main, "_archive_and_cleanup_workspace", _archive),
+            patch.object(
+                orch_main.thread_retirement_operations, "detach_agent_session", _detach
+            ),
+            patch.object(
+                orch_main.thread_retirement_operations,
+                "archive_and_cleanup_workspace",
+                _archive,
+            ),
             patch.object(orch_main, "agent_provisioner", provisioner),
         ):
-            await orch_main._release_thread_resources("t1")
+            await control_seams.release_thread_resources("t1")
         assert order == ["detach", "workspace", "pod"]
 
 
@@ -2254,27 +2307,34 @@ class TestEndedSessionKeepsItsVolume:
                 AsyncMock(return_value=({"sub": "u1"}, thread)),
             ),
             patch.object(
-                orch_main, "_thread_turn_in_flight", AsyncMock(return_value=False)
+                orch_main.thread_retirement_operations,
+                "thread_turn_in_flight",
+                AsyncMock(return_value=False),
             ),
             patch.object(orch_main, "_conclude_conference_if_any", AsyncMock()),
             patch.object(orch_main, "postgres_db", db),
             patch.object(
-                orch_main,
+                PinnedRetirementOperations,
+                "pinned_retirement_is_current",
+                AsyncMock(return_value=True),
+            ),
+            patch.object(
+                PinnedRetirementOperations,
                 "_pinned_retirement_is_current",
                 AsyncMock(return_value=True),
             ),
             patch.object(
-                orch_main,
+                PinnedRetirementOperations,
                 "_reconcile_workspace_provision_intent_for_retirement",
                 AsyncMock(return_value=False),
             ),
             patch.object(
-                orch_main,
+                PinnedRetirementOperations,
                 "_stop_captured_retirement_agent",
                 AsyncMock(),
             ),
             patch.object(
-                orch_main,
+                PinnedRetirementOperations,
                 "_reconcile_agent_workspace_claim_for_retirement",
                 AsyncMock(),
             ),
@@ -2291,7 +2351,7 @@ class TestEndedSessionKeepsItsVolume:
                 orch_main, "gitea_client", SimpleNamespace(is_initialized=False)
             ),
         ):
-            result = await orch_main.end_thread(
+            result = await control_seams.end_thread(
                 self.thread_id,
                 SimpleNamespace(),
                 permanent=permanent,
@@ -2391,7 +2451,9 @@ class TestEndedSessionKeepsItsVolume:
             ),
             patch.object(orch_main, "_conclude_conference_if_any", AsyncMock()),
             patch.object(
-                orch_main, "_release_thread_resources", AsyncMock()
+                orch_main.thread_retirement_operations,
+                "release_thread_resources",
+                AsyncMock(),
             ) as release,
             patch.object(orch_main, "postgres_db", db),
             patch.object(
@@ -2402,7 +2464,7 @@ class TestEndedSessionKeepsItsVolume:
             ),
             pytest.raises(HTTPException) as exc,
         ):
-            await orch_main.end_thread(
+            await control_seams.end_thread(
                 "t1", SimpleNamespace(), permanent=False, force=True
             )
 
@@ -2445,14 +2507,20 @@ class TestEndedSessionKeepsItsVolume:
                 AsyncMock(return_value=({"sub": "u1"}, initial)),
             ),
             patch.object(
-                orch_main, "_thread_turn_in_flight", AsyncMock(return_value=False)
+                orch_main.thread_retirement_operations,
+                "thread_turn_in_flight",
+                AsyncMock(return_value=False),
             ),
             patch.object(orch_main, "_conclude_conference_if_any", AsyncMock()),
-            patch.object(orch_main, "_release_thread_resources", release),
+            patch.object(
+                orch_main.thread_retirement_operations,
+                "release_thread_resources",
+                release,
+            ),
             patch.object(orch_main, "postgres_db", db),
             pytest.raises(HTTPException) as exc,
         ):
-            await orch_main.end_thread(
+            await control_seams.end_thread(
                 "t1", SimpleNamespace(), permanent=False, force=True
             )
 
@@ -2472,13 +2540,21 @@ class TestEndedSessionKeepsItsVolume:
         about the user's intent to keep their files."""
         captured: dict = {}
 
-        async def _archive(thread_id, entity_type, *, reclaim_volume=True):
+        async def _archive(thread_id, entity_type, *, reclaim_volume=True, **_kwargs):
             captured["entity_type"] = entity_type
             captured["reclaim_volume"] = reclaim_volume
 
         with (
-            patch.object(orch_main, "_detach_agent_session", AsyncMock()),
-            patch.object(orch_main, "_archive_and_cleanup_workspace", _archive),
+            patch.object(
+                orch_main.thread_retirement_operations,
+                "detach_agent_session",
+                AsyncMock(),
+            ),
+            patch.object(
+                orch_main.thread_retirement_operations,
+                "archive_and_cleanup_workspace",
+                _archive,
+            ),
             patch.object(
                 orch_main, "agent_provisioner", SimpleNamespace(is_available=False)
             ),
@@ -2486,7 +2562,7 @@ class TestEndedSessionKeepsItsVolume:
                 orch_main, "persistent_provisioner", SimpleNamespace(is_available=False)
             ),
         ):
-            await orch_main._release_thread_resources("t1")
+            await control_seams.release_thread_resources("t1")
 
         assert captured == {"entity_type": "threads", "reclaim_volume": False}
 
@@ -2494,12 +2570,20 @@ class TestEndedSessionKeepsItsVolume:
     async def test_release_forwards_an_explicit_reclaim(self):
         captured: dict = {}
 
-        async def _archive(thread_id, entity_type, *, reclaim_volume=True):
+        async def _archive(thread_id, entity_type, *, reclaim_volume=True, **_kwargs):
             captured["reclaim_volume"] = reclaim_volume
 
         with (
-            patch.object(orch_main, "_detach_agent_session", AsyncMock()),
-            patch.object(orch_main, "_archive_and_cleanup_workspace", _archive),
+            patch.object(
+                orch_main.thread_retirement_operations,
+                "detach_agent_session",
+                AsyncMock(),
+            ),
+            patch.object(
+                orch_main.thread_retirement_operations,
+                "archive_and_cleanup_workspace",
+                _archive,
+            ),
             patch.object(
                 orch_main, "agent_provisioner", SimpleNamespace(is_available=False)
             ),
@@ -2507,7 +2591,7 @@ class TestEndedSessionKeepsItsVolume:
                 orch_main, "persistent_provisioner", SimpleNamespace(is_available=False)
             ),
         ):
-            await orch_main._release_thread_resources("t1", reclaim_volume=True)
+            await control_seams.release_thread_resources("t1", reclaim_volume=True)
 
         assert captured["reclaim_volume"] is True
 
@@ -2545,7 +2629,7 @@ class TestEndedSessionKeepsItsVolume:
                     orch_main, "vm_provisioner", SimpleNamespace(is_available=False)
                 ),
             ):
-                await orch_main._archive_and_cleanup_workspace(
+                await control_seams.archive_and_cleanup_workspace(
                     "t1", entity_type="threads", reclaim_volume=reclaim
                 )
 
@@ -2586,7 +2670,7 @@ class TestEndedSessionKeepsItsVolume:
             ),
         ):
             with pytest.raises(RuntimeError, match="exact teardown is incomplete"):
-                await orch_main._archive_and_cleanup_workspace(
+                await control_seams.archive_and_cleanup_workspace(
                     "t1", entity_type="threads", reclaim_volume=False
                 )
 

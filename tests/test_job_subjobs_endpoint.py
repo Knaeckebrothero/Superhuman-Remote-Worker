@@ -28,6 +28,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 import orchestrator.main as m  # noqa: E402
+from orchestrator.routers import job_inspection as job_inspection_routes
 
 UTC = timezone.utc
 NOW = datetime(2026, 8, 23, 12, 0, 0, tzinfo=UTC)
@@ -70,7 +71,9 @@ def route_env(monkeypatch):
     monkeypatch.setattr(m, "require_job_access", guard)
 
     async def call():
-        return await m.get_job_subjobs(SimpleNamespace(), job_id)
+        return await job_inspection_routes.get_job_subjobs(
+            SimpleNamespace(), job_id, dependencies=m._job_inspection_dependencies()
+        )
 
     return SimpleNamespace(job_id=job_id, job=job, db=db, guard=guard, call=call)
 
@@ -85,8 +88,10 @@ class TestFilterIndependence:
         built to remove, and no behavioural test would notice a parameter that
         merely exists and defaults to "everything".
         """
-        params = set(inspect.signature(m.get_job_subjobs).parameters)
-        assert params == {"request", "job_id"}
+        params = set(
+            inspect.signature(job_inspection_routes.get_job_subjobs).parameters
+        )
+        assert params == {"request", "job_id", "dependencies"}
 
     @pytest.mark.asyncio
     async def test_it_does_not_go_through_the_list_query(self, route_env):

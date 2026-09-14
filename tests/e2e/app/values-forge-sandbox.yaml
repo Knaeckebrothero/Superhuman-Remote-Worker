@@ -1,0 +1,30 @@
+# Profile overlay for R1.B03. Layered ON TOP of values-e2e.yaml and
+# values-stateless-sandbox.yaml, never instead of them: B03's central lifecycle
+# (project provisioning, project repositories, knowledge-vault materialisation)
+# goes through the forge, and its knowledge/citation work needs the
+# workspace-backed sandbox the stateless overlay provides.
+#
+# The shared baseline stays forge-less on purpose. Enabling a dependency in
+# values-e2e.yaml is what broke the journey's determinism contract when SearXNG
+# was tried there (see codebase_restructure_r1_b02_reporting_identity_2026_09_07);
+# an overlay keeps the cheap pinned/virtual baseline exactly as it was.
+gitea:
+  enabled: true
+  internal: true
+  # sqlite3, deliberately. The chart's default `postgres` would add a whole
+  # `srw-giteadb` StatefulSet to a disposable cluster that creates a handful of
+  # repositories and then dies. Git object data lives on the Gitea PVC either
+  # way, so this changes only where repo/user metadata is kept. It is NOT a
+  # supported switch for an existing install (that is a data migration).
+  database:
+    type: sqlite3
+  storageSize: 2Gi
+  resources:
+    requests: {memory: 192Mi, cpu: 100m}
+    limits: {memory: 768Mi, cpu: 1}
+
+# The bundled Gitea metadata database stays off: `gitea.database.type: sqlite3`
+# above means nothing renders a Postgres for it.
+databases:
+  gitea:
+    enabled: false

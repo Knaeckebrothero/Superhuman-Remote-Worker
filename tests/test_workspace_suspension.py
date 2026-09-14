@@ -825,6 +825,40 @@ class TestExtractSnapshotScopedHome:
     """
 
     @pytest.mark.asyncio
+    async def test_snapshot_identity_cannot_control_local_temporary_path(
+        self, tmp_path, monkeypatch
+    ):
+        from pathlib import Path
+        import tempfile
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        svc = make_service()
+        entity_id = "../outside/"
+        downloaded = []
+
+        async def download(identity, path, **kwargs):
+            assert identity == entity_id
+            assert kwargs["entity_type"] == "threads"
+            target = Path(path)
+            assert target.parent == tmp_path
+            target.write_bytes(b"snapshot")
+            downloaded.append(target)
+            return True
+
+        svc._snapshot_service.download_snapshot.side_effect = download
+        with patch(
+            "orchestrator.services.workspace_suspension.stream_extract_snapshot",
+            new=AsyncMock(return_value=(0, b"")),
+        ) as stream:
+            assert await svc._extract_snapshot(
+                entity_id, "10.0.0.9", entity_type="threads"
+            )
+
+        assert len(downloaded) == 1
+        assert stream.call_args.args[2] == str(downloaded[0])
+        assert not downloaded[0].exists()
+
+    @pytest.mark.asyncio
     async def test_pod_extract_uses_home_only_command(self):
         svc = make_service()
         with patch(
@@ -2372,6 +2406,27 @@ class TestVmRestoreEndsAtTheCreate:
         thread["metadata"]["vm"]["rootdisk"] = "kept"
         thread["metadata"]["vm"]["status"] = "deleted"
         return thread
+
+    @pytest.mark.asyncio
+    async def test_resume_preserves_custom_image_and_resources(self, monkeypatch):
+        monkeypatch.setenv("VM_PERSISTENT_ROOTDISK", "true")
+        svc, vm_prov = make_vm_service()
+        before = self._kept_thread()
+        before["metadata"]["config_override"]["workspace"]["vm"] = {
+            "image": "registry.example/dev-vm:v1",
+            "cpu_cores": 12,
+            "memory": "24Gi",
+            "disk_size": "120Gi",
+        }
+        svc._db.get_thread = AsyncMock(return_value=before)
+        svc._extract_snapshot = AsyncMock()
+        assert await svc.restore_thread_workspace("tid-vm") is True
+        options = vm_prov.create_thread_vm.await_args.kwargs
+        assert options["vm_image"] == "registry.example/dev-vm:v1"
+        assert options["cpu_cores"] == 12
+        assert options["memory"] == "24Gi"
+        assert options["disk_size"] == "120Gi"
+        svc._extract_snapshot.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_kept_disk_restore_succeeds_without_ssh_host(self, monkeypatch):

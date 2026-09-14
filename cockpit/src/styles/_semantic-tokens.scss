@@ -7,20 +7,21 @@
 //
 // Each role token defaults to a primitive token. Theme files override the
 // role directly when the change is global; they override the primitive when
-// the change cascades through every role that references it (e.g. Roman
-// themes set --radius-sm: 0, which automatically flattens --radius-tag).
+// the change cascades through every role that references it (e.g. setting
+// --radius-sm: 0 under a theme would automatically flatten --radius-tag).
 
 :root {
   // --- Radii roles ---
   --radius-control: var(--radius-md);   // buttons, inputs, selects, chips, badges, tabs, icon-buttons
-  --radius-surface: var(--radius-md);   // cards, dialogs, menus, toasts, panels
+  --radius-surface: var(--radius-lg);   // cards, dialogs, menus, toasts, panels — one step softer than controls
   --radius-pill:    var(--radius-full); // pill-shaped chips, status pills
   --radius-tag:     var(--radius-sm);   // small inline markers, checkbox tile
 
   // --- Typography roles ---
-  --font-primary: var(--font-family-base); // primary-variant buttons; Roman themes override to display
+  --font-primary: var(--font-family-base); // primary-variant buttons; no active theme rebinds it (Cinzel is brand-only since 2026-09-10)
   --font-control: var(--font-family-base); // body of buttons, inputs, labels
   --font-mono:    var(--font-family-mono); // code, tool args, workbench surfaces
+  --font-heading: var(--font-family-base); // page/section titles; type.heading()
 
   // --- Layout roles ---
   --content-max-width:      var(--width-content);      // centered page content: forms, settings, lists, grids

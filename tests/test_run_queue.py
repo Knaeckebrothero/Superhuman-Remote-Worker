@@ -55,17 +55,21 @@ from shared.run_queue import (
     UNIT_KIND_BG_TASK,
     UNIT_KIND_SESSION_TURN,
     UNIT_KIND_WORKER_BATCH,
+    attach_failure_backoff_seconds,
     claim_unit,
     close_interrupt_admission,
     complete_unit,
     enqueue_unit,
     fence_lease,
     heartbeat_unit,
+    list_parked,
     list_active,
     open_interrupt_admission,
     park_unit,
     queue_depth_for,
+    queue_state_for,
     reap_expired,
+    record_attach_failure,
     record_control_seq,
     record_input_seq,
     release_unit,
@@ -126,6 +130,9 @@ MIGRATION_FILES = [
     _MIGRATIONS_DIR / "0127_thread_interrupt_inbox.sql",
     _MIGRATIONS_DIR / "0128_thread_interrupt_receipt_idx.notx.sql",
     _MIGRATIONS_DIR / "0129_thread_interrupt_validate_constraints.sql",
+    _MIGRATIONS_DIR / "0231_run_queue_park_lifecycle.sql",
+    _MIGRATIONS_DIR / "0232_thread_cloud_sync_push_ownership.sql",
+    _MIGRATIONS_DIR / "0233_run_queue_bg_tasks.sql",
 ]
 
 SESSION = UNIT_KIND_SESSION_TURN
@@ -159,25 +166,45 @@ async def _apply_schema() -> None:
         await conn.execute("DROP TABLE IF EXISTS thread_events CASCADE")
         await conn.execute("DROP TABLE IF EXISTS thread_control_requests CASCADE")
         await conn.execute("DROP TABLE IF EXISTS thread_interrupt_requests CASCADE")
+        await conn.execute("DROP TABLE IF EXISTS run_queue_bg_tasks CASCADE")
         await conn.execute("DROP TABLE IF EXISTS run_queue CASCADE")
         await conn.execute("DROP TABLE IF EXISTS canvases CASCADE")
+        await conn.execute("DROP TABLE IF EXISTS thread_input_deliveries CASCADE")
+        await conn.execute("DROP TABLE IF EXISTS thread_messages CASCADE")
         await conn.execute("DROP TABLE IF EXISTS threads CASCADE")
+        await conn.execute("DROP TABLE IF EXISTS users CASCADE")
         await conn.execute("DROP TABLE IF EXISTS agents CASCADE")
         await conn.execute('CREATE EXTENSION IF NOT EXISTS "uuid-ossp"')
         # Minimal prerequisite stubs: 0115 ALTERs threads and 0119 ALTERs
         # thread_events. The queue API does not otherwise touch either table;
         # they exist here only so the queue-shaping migrations apply verbatim.
         await conn.execute("CREATE TABLE agents (id UUID PRIMARY KEY, thread_id UUID)")
+        # Stubs for the tables the queue statements JOIN since 0191 / 0231:
+        # _COMPLETE_SQL re-queues on a pending stateless delivery (deliveries +
+        # messages), the parked worklist joins the owner (users, threads.title).
+        await conn.execute(
+            "CREATE TABLE users (id UUID PRIMARY KEY, preferred_username TEXT)"
+        )
         await conn.execute(
             "CREATE TABLE threads ("
-            "id UUID PRIMARY KEY, user_id UUID, agent_id UUID, "
+            "id UUID PRIMARY KEY, user_id UUID, agent_id UUID, title TEXT, "
             "status TEXT NOT NULL DEFAULT 'active', "
             "permission_mode TEXT NOT NULL DEFAULT 'supervised', "
             "metadata JSONB NOT NULL DEFAULT '{}'::jsonb, "
             "total_turns INTEGER NOT NULL DEFAULT 0, "
             "awaiting_user_since TIMESTAMPTZ, "
             "extend_count INTEGER NOT NULL DEFAULT 0, "
-            "last_activity TIMESTAMPTZ NOT NULL DEFAULT now()"
+            "last_activity TIMESTAMPTZ NOT NULL DEFAULT now(), "
+            # 0185 gave a pinned thread its runtime authority triple and
+            # the control-inbox fences read all three: adoption and
+            # finalization both require the request's generation to match
+            # the thread's, with no retirement token, on top of the
+            # reciprocal agents.thread_id binding. The queue-shaping
+            # migrations this suite replays do not include 0185, so the
+            # stub carries them the same way it carries 0191's column.
+            "runtime_generation UUID, "
+            "runtime_attach_token UUID, "
+            "runtime_retirement_token UUID"
             ")"
         )
         await conn.execute(
@@ -194,8 +221,38 @@ async def _apply_schema() -> None:
             "source_version VARCHAR(71), UNIQUE (thread_id, canvas_id)"
             ")"
         )
+        await conn.execute(
+            "CREATE TABLE thread_messages ("
+            "id UUID PRIMARY KEY, thread_id UUID, seq BIGINT, "
+            "turn_number INTEGER, role TEXT, rewound_at TIMESTAMPTZ"
+            ")"
+        )
+        await conn.execute(
+            "CREATE TABLE thread_input_deliveries ("
+            "delivery_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(), "
+            "thread_id UUID, message_id UUID, "
+            "execution_lane TEXT NOT NULL DEFAULT 'pinned', "
+            "state TEXT NOT NULL DEFAULT 'persisted', "
+            # 0191 adds this; the suite replays only the queue-shaping
+            # migrations, so the stub has to carry it. _COMPLETE_SQL
+            # reads delivery.owner_run_queue_lease_token.
+            "owner_run_queue_lease_token BIGINT"
+            ")"
+        )
         for migration in MIGRATION_FILES:
             await conn.execute(migration.read_text())
+        # 0191 adds this to run_queue; the suite replays only the queue-shaping
+        # migrations, so mirror that one column here.
+        await conn.execute(
+            "ALTER TABLE run_queue "
+            "ADD COLUMN IF NOT EXISTS input_delivery_capable_lease_token BIGINT"
+        )
+        # Same reason: 0185 adds this to thread_control_requests and
+        # finalize/adopt both compare it against threads.runtime_generation.
+        await conn.execute(
+            "ALTER TABLE thread_control_requests "
+            "ADD COLUMN IF NOT EXISTS runtime_generation UUID"
+        )
     finally:
         await conn.close()
 
@@ -1535,6 +1592,11 @@ class TestControlFinalization:
         new_agent = uuid4()
         request_id = uuid4()
         client_request_id = uuid4()
+        # One runtime incarnation, shared by the thread and the request. The
+        # fence compares the two, so a request minted under a different
+        # generation is not adoptable by the current owner at all -- which is
+        # the property being exercised here, not an incidental fixture value.
+        generation = uuid4()
         await conn.execute(
             "INSERT INTO agents (id, thread_id) VALUES ($1, $2), ($3, $2)",
             old_agent,
@@ -1542,22 +1604,24 @@ class TestControlFinalization:
             new_agent,
         )
         await conn.execute(
-            "INSERT INTO threads (id, user_id, agent_id, execution_lane) "
-            "VALUES ($1, $2, $3, 'pinned')",
+            "INSERT INTO threads (id, user_id, agent_id, execution_lane, "
+            "runtime_generation) VALUES ($1, $2, $3, 'pinned', $4)",
             thread_id,
             owner_id,
             new_agent,
+            generation,
         )
         await conn.execute(
             "INSERT INTO thread_control_requests ("
             "id, thread_id, request_seq, client_request_id, verb, payload, "
-            "requested_by, accepted_agent_id"
-            ") VALUES ($1, $2, 1, $3, 'narration.set', $4::jsonb, 'owner', $5)",
+            "requested_by, accepted_agent_id, runtime_generation"
+            ") VALUES ($1, $2, 1, $3, 'narration.set', $4::jsonb, 'owner', $5, $6)",
             request_id,
             thread_id,
             client_request_id,
             '{"mode":"silent"}',
             old_agent,
+            generation,
         )
         await conn.execute(
             "INSERT INTO thread_events ("
@@ -1581,6 +1645,7 @@ class TestControlFinalization:
                 conn,
                 request_id=request_id,
                 agent_id=old_agent,
+                runtime_generation=generation,
             )
         assert result == "lost_owner"
         assert (
@@ -1599,6 +1664,7 @@ class TestControlFinalization:
                 conn,
                 request_id=request_id,
                 agent_id=new_agent,
+                runtime_generation=generation,
             )
         assert result == "applied"
         terminal = await conn.fetchrow(
@@ -1627,22 +1693,24 @@ class TestControlFinalization:
             thread_id,
             new_agent,
         )
+        generation = uuid4()
         await conn.execute(
-            "INSERT INTO threads (id, user_id, agent_id, execution_lane) "
-            "VALUES ($1, $2, $3, 'pinned')",
+            "INSERT INTO threads (id, user_id, agent_id, execution_lane, "
+            "runtime_generation) VALUES ($1, $2, $3, 'pinned', $4)",
             thread_id,
             owner_id,
             new_agent,
+            generation,
         )
         first_id = uuid4()
         second_id = uuid4()
         await conn.execute(
             "INSERT INTO thread_control_requests ("
             "id, thread_id, request_seq, client_request_id, verb, payload, "
-            "requested_by, accepted_agent_id"
+            "requested_by, accepted_agent_id, runtime_generation"
             ") VALUES "
-            "($1, $3, 1, $4, 'mode.set', $5::jsonb, 'owner', $6), "
-            "($2, $3, 2, $7, 'narration.set', $8::jsonb, 'owner', $9)",
+            "($1, $3, 1, $4, 'mode.set', $5::jsonb, 'owner', $6, $10), "
+            "($2, $3, 2, $7, 'narration.set', $8::jsonb, 'owner', $9, $10)",
             first_id,
             second_id,
             thread_id,
@@ -1652,22 +1720,32 @@ class TestControlFinalization:
             uuid4(),
             '{"mode":"silent"}',
             new_agent,
+            generation,
         )
 
         # Global order wins over per-agent filtering: seq2 is not visible
         # while the older handoff request still belongs to the dead owner.
         assert (
             await fetch_next_control_request(
-                conn, thread_id=thread_id, agent_id=new_agent
+                conn,
+                thread_id=thread_id,
+                agent_id=new_agent,
+                runtime_generation=generation,
             )
             is None
         )
         async with conn.transaction():
             assert await adopt_next_pinned_control_request(
-                conn, thread_id=thread_id, agent_id=new_agent
+                conn,
+                thread_id=thread_id,
+                agent_id=new_agent,
+                runtime_generation=generation,
             )
         first = await fetch_next_control_request(
-            conn, thread_id=thread_id, agent_id=new_agent
+            conn,
+            thread_id=thread_id,
+            agent_id=new_agent,
+            runtime_generation=generation,
         )
         assert first is not None
         assert first.id == first_id
@@ -2956,3 +3034,189 @@ class TestCanvasEditorAwareness:
             thread_id,
         )
         assert await conn.fetchval("SELECT COUNT(*) FROM canvas_editor_awareness") == 0
+
+
+# =============================================================================
+# Attach-failure lifecycle (stateless_turn_resilience.md step 2)
+# =============================================================================
+
+
+class TestAttachFailureLifecycle:
+    async def _claim(self, conn, u):
+        claimed = await claim_unit(conn, unit_kind=SESSION, pod_name="p1")
+        assert claimed is not None and claimed.unit_id == u
+        return claimed
+
+    async def _fail(
+        self, conn, u, claimed, *, signature="ValueError:boom", backoff=0.0
+    ):
+        return await record_attach_failure(
+            conn,
+            unit_id=u,
+            lease_token=claimed.lease_token,
+            error="boom " + signature,
+            signature=signature,
+            backoff_seconds=backoff,
+        )
+
+    async def test_schema_has_the_lifecycle_columns(self, conn):
+        cols = {
+            r["column_name"]
+            for r in await conn.fetch(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'run_queue'"
+            )
+        }
+        assert {
+            "park_reason",
+            "parked_at",
+            "last_error",
+            "last_error_signature",
+            "attach_failures",
+        } <= cols
+
+    async def test_requeues_with_backoff_and_records_the_failure(self, conn):
+        u = uuid4()
+        await enqueue_unit(conn, unit_id=u, unit_kind=SESSION)
+        claimed = await self._claim(conn, u)
+        row = await self._fail(conn, u, claimed, backoff=3600)
+        assert row["state"] == STATE_QUEUED
+        assert row["attempts_since_completion"] == 1  # the claim's own count
+        assert row["attach_failures"] == 1
+        assert row["park_reason"] is None
+        stored = await _row(conn, u)
+        assert stored["last_error_signature"] == "ValueError:boom"
+        assert stored["last_error"].startswith("boom")
+        assert stored["leased_by"] is None and stored["last_leased_by"] is None
+        # backoff gates the next claim
+        assert await claim_unit(conn, unit_kind=SESSION, pod_name="p1") is None
+        await _clear_backoff(conn, u)
+        assert await claim_unit(conn, unit_kind=SESSION, pod_name="p1") is not None
+
+    async def test_same_signature_three_times_parks(self, conn):
+        u = uuid4()
+        await enqueue_unit(conn, unit_id=u, unit_kind=SESSION)
+        await conn.execute(
+            "UPDATE run_queue SET max_attempts = 50 WHERE unit_id = $1", u
+        )
+        for expected_failures in (1, 2):
+            claimed = await self._claim(conn, u)
+            row = await self._fail(conn, u, claimed)
+            assert row["state"] == STATE_QUEUED
+            assert row["attach_failures"] == expected_failures
+            await _clear_backoff(conn, u)
+        claimed = await self._claim(conn, u)
+        row = await self._fail(conn, u, claimed)
+        assert row["state"] == STATE_PARKED
+        assert row["attach_failures"] == 3
+        assert row["park_reason"] == "attach_failed"
+        stored = await _row(conn, u)
+        assert stored["parked_at"] is not None
+        assert await claim_unit(conn, unit_kind=SESSION, pod_name="p1") is None
+
+    async def test_signature_change_resets_the_consecutive_counter(self, conn):
+        u = uuid4()
+        await enqueue_unit(conn, unit_id=u, unit_kind=SESSION)
+        await conn.execute(
+            "UPDATE run_queue SET max_attempts = 50 WHERE unit_id = $1", u
+        )
+        for sig in ("A", "A", "B", "B"):
+            claimed = await self._claim(conn, u)
+            row = await self._fail(conn, u, claimed, signature=sig)
+            assert row["state"] == STATE_QUEUED, sig
+            await _clear_backoff(conn, u)
+        assert (await _row(conn, u))["attach_failures"] == 2
+
+    async def test_max_attempts_parks_on_the_claim_count(self, conn):
+        u = uuid4()
+        await enqueue_unit(conn, unit_id=u, unit_kind=SESSION)
+        await conn.execute(
+            "UPDATE run_queue SET max_attempts = 2 WHERE unit_id = $1", u
+        )
+        claimed = await self._claim(conn, u)  # attempts 1
+        row = await self._fail(conn, u, claimed, signature="X")
+        assert row["state"] == STATE_QUEUED
+        await _clear_backoff(conn, u)
+        claimed = await self._claim(conn, u)  # attempts 2 >= 2
+        row = await self._fail(conn, u, claimed, signature="Y")
+        assert row["state"] == STATE_PARKED and row["park_reason"] == "attach_failed"
+
+    async def test_stale_token_is_a_no_op(self, conn):
+        u = uuid4()
+        await enqueue_unit(conn, unit_id=u, unit_kind=SESSION)
+        claimed = await self._claim(conn, u)
+        assert (
+            await record_attach_failure(
+                conn,
+                unit_id=u,
+                lease_token=claimed.lease_token - 1,
+                error="e",
+                signature="s",
+                backoff_seconds=0.0,
+            )
+            is None
+        )
+        assert (await _row(conn, u))["state"] == STATE_LEASED
+
+    async def test_unpark_and_completion_clear_the_record(self, conn):
+        u = uuid4()
+        await enqueue_unit(conn, unit_id=u, unit_kind=SESSION)
+        await conn.execute(
+            "UPDATE run_queue SET max_attempts = 1 WHERE unit_id = $1", u
+        )
+        claimed = await self._claim(conn, u)
+        row = await self._fail(conn, u, claimed)
+        assert row["state"] == STATE_PARKED
+        state = await queue_state_for(conn, unit_id=u)
+        assert (
+            state["state"] == STATE_PARKED and state["park_reason"] == "attach_failed"
+        )
+        assert state["parked_at"] is not None and state["attach_failures"] == 1
+        parked = await list_parked(conn, limit=10)
+        assert [r["unit_id"] for r in parked if r["unit_id"] == u] == [u]
+        assert await unpark_unit(conn, unit_id=u)
+        stored = await _row(conn, u)
+        assert stored["park_reason"] is None and stored["parked_at"] is None
+        assert stored["last_error"] is None and stored["last_error_signature"] is None
+        assert (
+            stored["attach_failures"] == 0 and stored["attempts_since_completion"] == 0
+        )
+        # a completed turn also wipes the failure record
+        claimed = await self._claim(conn, u)
+        await conn.execute(
+            "UPDATE run_queue SET last_error = 'x', last_error_signature = 'x', "
+            "attach_failures = 2 WHERE unit_id = $1",
+            u,
+        )
+        await complete_unit(
+            conn,
+            unit_id=u,
+            lease_token=claimed.lease_token,
+            consumed_seq=claimed.input_seq,
+        )
+        stored = await _row(conn, u)
+        assert stored["attach_failures"] == 0 and stored["last_error"] is None
+
+    async def test_reaper_park_is_named(self, conn):
+        u = uuid4()
+        await enqueue_unit(conn, unit_id=u, unit_kind=SESSION)
+        await conn.execute(
+            "UPDATE run_queue SET max_attempts = 1 WHERE unit_id = $1", u
+        )
+        claimed = await self._claim(conn, u)
+        await _expire(conn, u)
+        stolen = await reap_expired(conn, grace_seconds=0.0)
+        assert [s.unit_id for s in stolen] == [u] and stolen[0].state == STATE_PARKED
+        stored = await _row(conn, u)
+        assert stored["park_reason"] == "reaper_max_attempts"
+        assert stored["parked_at"] is not None
+        assert claimed.lease_token < stored["lease_token"]
+
+    def test_backoff_schedule(self):
+        assert [attach_failure_backoff_seconds(n) for n in (1, 2, 3, 4, 5)] == [
+            5.0,
+            15.0,
+            45.0,
+            135.0,
+            135.0,
+        ]

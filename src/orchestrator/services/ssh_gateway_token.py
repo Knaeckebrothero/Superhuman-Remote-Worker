@@ -17,12 +17,13 @@ presents changed.
 
 CONSTRUCTION IS DELIBERATELY NOT NOVEL. It is the same stateless HMAC-SHA256
 token plan 1 already ships for SSH-key registration
-(``main._mint_ssh_key_challenge`` / ``_verify_ssh_key_challenge``): a version
-clause, a nonce, the user id, an expiry and a hex MAC over all of them, keyed
-with ``SESSION_JWT_SECRET`` and colon-joined. Stateless is a requirement, not
-a shortcut: the orchestrator runs ``orchestrator.replicas: 2`` with no session
-affinity and the gateway is a *separate Deployment* from the minter, so there
-is no shared memory anywhere on this path. Every replica shares
+(``services.ssh_access.mint_ssh_key_challenge`` /
+``verify_ssh_key_challenge``): a version clause, a nonce, the user id, an
+expiry and a hex MAC over all of them, keyed with ``SESSION_JWT_SECRET`` and
+colon-joined. Stateless is a requirement, not a shortcut: the orchestrator
+runs ``orchestrator.replicas: 2`` with no session affinity and the gateway is
+a *separate Deployment* from the minter, so there is no shared memory
+anywhere on this path. Every replica shares
 ``SESSION_JWT_SECRET`` through one Kubernetes Secret; none of them share a
 dict. Do not "improve" this into a nonce store.
 
@@ -56,16 +57,16 @@ import secrets
 import time
 from typing import Optional
 
-# Distinct from main's ``srw-ssh1``. See the module docstring: this string is
-# the entire domain separation between two tokens signed with one key.
+# Distinct from ``ssh_access``'s ``srw-ssh1``. See the module docstring: this
+# string is the entire domain separation between two tokens signed with one key.
 ATTACH_TOKEN_VERSION = "srw-sshws1"
 
-# Matches _SSH_CHALLENGE_TTL_SECONDS. Long enough to survive a user fetching a
-# token and then running ssh, plus modest clock skew between the orchestrator
-# and gateway pods; short enough that a token captured from a laptop's
-# filesystem is worthless within minutes. The token is checked once, at the
-# WebSocket handshake — an established session is not torn down when its token
-# expires, exactly like the SSH certificate the inner hop mints.
+# Matches ssh_access.SSH_CHALLENGE_TTL_SECONDS. Long enough to survive a user
+# fetching a token and then running ssh, plus modest clock skew between the
+# orchestrator and the gateway pods; short enough that a token captured from a
+# laptop's filesystem is worthless within minutes. The token is checked once,
+# at the WebSocket handshake — an established session is not torn down when
+# its token expires, exactly like the SSH certificate the inner hop mints.
 ATTACH_TOKEN_TTL_SECONDS = 300
 
 # Bounds the work an unauthenticated header value can buy before the MAC runs.
@@ -106,7 +107,8 @@ def verify_attach_token(
     authenticated; the gateway logs it, and a future authorization step can
     use it.
 
-    Check order matches ``_verify_ssh_key_challenge`` and is load-bearing:
+    Check order matches ``ssh_access.verify_ssh_key_challenge`` and is
+    load-bearing:
 
     1. It is a ``str``, within the length cap, and ASCII.
        ``hmac.compare_digest`` raises ``TypeError`` on a non-ASCII ``str``,

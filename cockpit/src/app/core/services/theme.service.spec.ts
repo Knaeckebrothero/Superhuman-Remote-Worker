@@ -215,4 +215,42 @@ describe('ThemeService', () => {
       expect(service.resolved()).toBe('travertine');
     });
   });
+  describe('accent axis', () => {
+    it('defaults to tyrian and stamps accent-tyrian on body', () => {
+      const service = makeService();
+      expect(service.accent()).toBe('tyrian');
+      expect(document.body.classList.contains('accent-tyrian')).toBe(true);
+    });
+
+    it('reads a stored accent from localStorage', () => {
+      window.localStorage.setItem('cockpit:accent', 'graphite');
+      const service = makeService();
+      expect(service.accent()).toBe('graphite');
+      expect(document.body.classList.contains('accent-graphite')).toBe(true);
+    });
+
+    it('ignores an unknown stored accent and falls back to tyrian', () => {
+      window.localStorage.setItem('cockpit:accent', 'teal');
+      expect(makeService().accent()).toBe('tyrian');
+    });
+
+    it('setAccent swaps the accent class, persists, and leaves the theme class alone', () => {
+      const service = makeService();
+      service.setPreference('senate');
+      service.setAccent('porphyry');
+      TestBed.tick();
+      expect(document.body.classList.contains('accent-porphyry')).toBe(true);
+      expect(document.body.classList.contains('accent-tyrian')).toBe(false);
+      expect(document.body.classList.contains('theme-senate')).toBe(true);
+      expect(window.localStorage.getItem('cockpit:accent')).toBe('porphyry');
+    });
+
+    it('setAccent rejects values outside the accent set', () => {
+      const service = makeService();
+      service.setAccent('teal' as never);
+      TestBed.tick();
+      expect(service.accent()).toBe('tyrian');
+      expect(document.body.classList.contains('accent-tyrian')).toBe(true);
+    });
+  });
 });

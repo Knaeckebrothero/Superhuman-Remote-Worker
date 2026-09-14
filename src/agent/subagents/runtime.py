@@ -1803,13 +1803,26 @@ class SubagentRuntime:
                         terminal_before_restart = (
                             row.get("recovery_kind") == "terminal_foreground"
                         )
+                        # The durable listing row carries BOTH the thread
+                        # status ("ended") and the child's own terminal
+                        # status ("completed", ...). The orchestrator refuses
+                        # a terminal retry whose status differs from the
+                        # stored one, so send the child's, never the thread's.
                         terminal_status = (
-                            str(row.get("status") or "error")
+                            str(
+                                row.get("subagent_status")
+                                or row.get("status")
+                                or "error"
+                            )
                             if terminal_before_restart
                             else "interrupted"
                         )
                         terminal_outcome = (
-                            str(row.get("outcome") or terminal_status)
+                            str(
+                                row.get("subagent_outcome")
+                                or row.get("outcome")
+                                or terminal_status
+                            )
                             if terminal_before_restart
                             else "interrupted:parent_restart"
                         )
@@ -1832,7 +1845,9 @@ class SubagentRuntime:
                                 tokens=int(row.get("total_tokens") or 0),
                                 report_path=row.get("report_path") or None,
                                 error=(
-                                    row.get("error") or None
+                                    row.get("subagent_error")
+                                    or row.get("error")
+                                    or None
                                     if terminal_before_restart
                                     else "the parent runtime restarted"
                                 ),

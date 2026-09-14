@@ -10,6 +10,13 @@ requires-python = ">=3.11"
 # Images install their existing, separate requirements before --no-deps -e .
 dependencies = []
 
+[project.scripts]
+srw = "orchestrator.operator_cli.manifest_resources:main"
+
+[project.optional-dependencies]
+manifests = ["PyYAML>=6.0", "jsonschema>=4.18,<5"]
+cli = ["httpx>=0.27,<1", "PyYAML>=6.0", "jsonschema>=4.18,<5"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 include = [
@@ -31,7 +38,7 @@ orchestrator = [
   "config/prompts/*.md",
 ]
 mcp_server = ["templates/*.html"]
-shared = ["**/*.sql"]
+shared = ["**/*.sql", "manifests/schema.json"]
 
 [tool.ruff]
 # Preserve the formatter/linter target used before packaging metadata existed.
@@ -72,6 +79,41 @@ source_modules = ["shared.*"]
 forbidden_modules = ["shared.runtime"]
 
 [[tool.importlinter.contracts]]
+name = "Generic manifest operations do not load application startup or the legacy harness"
+type = "forbidden"
+source_modules = ["orchestrator.routers.manifests", "orchestrator.schemas.manifests", "orchestrator.services.manifests"]
+forbidden_modules = ["orchestrator.main", "shared.runtime", "orchestrator.services.manifest_legacy"]
+
+[[tool.importlinter.contracts]]
+name = "Native resource orchestration does not import application startup"
+type = "forbidden"
+source_modules = [
+  "orchestrator.services.manifest_authority",
+  "orchestrator.services.manifest_resolution",
+  "orchestrator.services.manifest_resources",
+  "orchestrator.services.manifest_retirement",
+  "orchestrator.services.manifest_store",
+  "orchestrator.services.manifest_execution",
+  "orchestrator.services.manifest_execution_snapshot",
+  "orchestrator.services.manifest_session_delivery",
+  "orchestrator.services.manifest_experts",
+  "orchestrator.services.manifest_projects",
+  "orchestrator.services.manifest_workspaces",
+]
+forbidden_modules = ["orchestrator.main"]
+# Existing shared authorization helpers retain indirect composition lookups.
+allow_indirect_imports = true
+
+[[tool.importlinter.contracts]]
+name = "Generic image hosting does not load the reference harness"
+type = "forbidden"
+source_modules = [
+  "orchestrator.services.generic_harness_runtime",
+  "orchestrator.services.manifest_workspace_runtime",
+]
+forbidden_modules = ["orchestrator.main", "shared.runtime", "orchestrator.services.manifest_legacy"]
+
+[[tool.importlinter.contracts]]
 name = "Contacts router does not import application startup"
 type = "forbidden"
 source_modules = ["orchestrator.routers.contacts"]
@@ -103,8 +145,336 @@ allow_indirect_imports = true
 [[tool.importlinter.contracts]]
 name = "Job creation schemas and ingress policy do not import application startup"
 type = "forbidden"
-source_modules = ["orchestrator.schemas.job_create", "orchestrator.services.job_create_ingress", "orchestrator.services.job_admission_scope", "orchestrator.services.job_admission_config"]
+source_modules = ["orchestrator.schemas.job_create", "orchestrator.services.job_create_ingress", "orchestrator.services.job_admission_scope", "orchestrator.services.job_admission_config", "orchestrator.services.job_admission_officer", "orchestrator.services.job_admission_workspace", "orchestrator.services.job_admission", "orchestrator.services.job_admission_datasources", "orchestrator.services.job_admission_delivery", "orchestrator.services.job_admission_creation", "orchestrator.services.job_admission_creator", "orchestrator.services.datasource_policy_errors", "orchestrator.services.officer_metadata"]
 forbidden_modules = ["orchestrator.main"]
+ignore_imports = [
+    # B10 owns this one (services/session_wake.py:919, a lazy import inside a
+    # function). Reached from the workspace selection path through
+    # manifest_workspace_selection -> manifest_authority -> security.access ->
+    # sudo_gate -> session_wake, the same shape the registration and
+    # child-thread services reach it by via managed_repository_authority.
+    "orchestrator.services.session_wake -> orchestrator.main",
+]
+unmatched_ignore_imports_alerting = "warn"
+
+[[tool.importlinter.contracts]]
+name = "Job read router does not import application startup"
+type = "forbidden"
+source_modules = [
+    "orchestrator.routers.job_reads",
+    "orchestrator.routers.job_inspection",
+    "orchestrator.routers.job_audit",
+    "orchestrator.routers.job_artifacts",
+]
+forbidden_modules = ["orchestrator.main"]
+# Existing authorization helpers retain indirect composition lookups.
+allow_indirect_imports = true
+
+[[tool.importlinter.contracts]]
+name = "Job read services do not import application startup"
+type = "forbidden"
+source_modules = [
+    "orchestrator.services.job_queries",
+    "orchestrator.services.job_projection",
+    "orchestrator.services.job_reads",
+]
+forbidden_modules = ["orchestrator.main"]
+
+[[tool.importlinter.contracts]]
+name = "Catalogue and inspection operations and schemas do not import application startup"
+type = "forbidden"
+source_modules = [
+    "orchestrator.schemas",
+    "orchestrator.services.catalogue_resources",
+    "orchestrator.services.expert_catalog_contracts",
+    "orchestrator.services.expert_catalog",
+    "orchestrator.services.expert_authoring",
+    "orchestrator.services.provider_catalog",
+    "orchestrator.services.model_catalog",
+    "orchestrator.services.config_catalog",
+    "orchestrator.services.job_inspection",
+    "orchestrator.services.job_audit",
+    "orchestrator.services.job_artifacts",
+    "orchestrator.services.diagnostics",
+    "orchestrator.services.subagent_projection",
+    "orchestrator.routers.expert_catalog",
+    "orchestrator.routers.provider_catalog",
+    "orchestrator.routers.model_catalog",
+    "orchestrator.routers.config_catalog",
+    "orchestrator.routers.diagnostics",
+]
+forbidden_modules = ["orchestrator.main"]
+
+[[tool.importlinter.contracts]]
+name = "Reporting, identity and operational administration do not import application startup"
+type = "forbidden"
+source_modules = [
+    "orchestrator.services.infrastructure_activation_policy",
+    "orchestrator.services.usage_reporting",
+    "orchestrator.services.infrastructure_admin",
+    "orchestrator.services.identity",
+    "orchestrator.services.access_tokens",
+    "orchestrator.services.ssh_access",
+    "orchestrator.services.provider_credentials",
+    "orchestrator.services.subscription_management",
+    "orchestrator.services.voice",
+    "orchestrator.services.system_settings",
+    "orchestrator.services.user_administration",
+    "orchestrator.services.job_diagnostics",
+    "orchestrator.routers.usage_reporting",
+    "orchestrator.routers.infrastructure_admin",
+    "orchestrator.routers.identity",
+    "orchestrator.routers.access_tokens",
+    "orchestrator.routers.ssh_access",
+    "orchestrator.routers.provider_credentials",
+    "orchestrator.routers.subscription_management",
+    "orchestrator.routers.voice",
+    "orchestrator.routers.system_settings",
+    "orchestrator.routers.user_administration",
+    "orchestrator.routers.job_diagnostics",
+]
+forbidden_modules = ["orchestrator.main"]
+# This contract passed the synthetic tree in tests/test_import_boundaries.py but
+# has been BROKEN against the real source since it was written: every router
+# here imports orchestrator.security.access, which reaches main indirectly
+# through services.sudo_gate -> services.session_wake. No B02 module imports
+# main directly. Ignoring the exact ledgered edges keeps every other transitive
+# path checked; the real fix is B06/B07/B10 closing their own callers, at which
+# point these entries can come off.
+ignore_imports = [
+    "orchestrator.services.session_wake -> orchestrator.main",
+]
+unmatched_ignore_imports_alerting = "warn"
+
+[[tool.importlinter.contracts]]
+name = "Projects, datasources, knowledge and citations do not import application startup"
+type = "forbidden"
+source_modules = [
+    "orchestrator.services.datasource_config",
+    "orchestrator.services.datasources",
+    "orchestrator.services.kb_task_registry",
+    "orchestrator.services.knowledge_index",
+    "orchestrator.services.knowledge_projection",
+    "orchestrator.services.knowledge_operations",
+    "orchestrator.services.citations",
+    "orchestrator.services.projects",
+    "orchestrator.services.project_provisioning",
+    "orchestrator.routers.datasources",
+    "orchestrator.routers.knowledge",
+    "orchestrator.routers.citations",
+    "orchestrator.routers.media",
+    "orchestrator.routers.projects",
+    "orchestrator.schemas.media",
+]
+forbidden_modules = ["orchestrator.main"]
+# Two *indirect* chains reach main from here, both through a module another
+# batch owns and both already recorded in the caller ledger. Ignoring the two
+# exact edges — rather than setting `allow_indirect_imports` — keeps every
+# other transitive path checked, so a new one would still fail this contract.
+# No B03 module imports main directly; that is what the poisoned-import cases
+# in tests/test_import_boundaries.py exercise.
+ignore_imports = [
+    # B10 owns this one (services/session_wake.py:919, a lazy import inside a
+    # function). Reached from every router through orchestrator.security.access
+    # -> services.sudo_gate.
+    "orchestrator.services.session_wake -> orchestrator.main",
+]
+# tests/test_import_boundaries.py lints a synthetic tree that contains only the
+# stub modules a contract names, so none of the four edges above exists there.
+# Warn rather than error on an unmatched ignore, or the poisoned-import cases
+# could never run. The real-tree run is what these entries are for.
+unmatched_ignore_imports_alerting = "warn"
+
+[[tool.importlinter.contracts]]
+name = "Workspace access, files, IDE proxy and cloud do not import application startup"
+type = "forbidden"
+source_modules = [
+    "orchestrator.services.ide_proxy_gateway",
+    "orchestrator.services.workspace_access",
+    "orchestrator.services.thread_files",
+    "orchestrator.services.job_repo_reads",
+    "orchestrator.services.job_diff_review",
+    "orchestrator.services.job_export",
+    "orchestrator.services.job_review_session",
+    "orchestrator.services.cloud_stage_authority",
+    "orchestrator.services.cloud_task_registry",
+    "orchestrator.services.agent_cloud_mounts",
+    "orchestrator.services.protected_cloud_engage",
+    "orchestrator.services.thread_cloud_diff",
+    "orchestrator.services.main_cloud_settings",
+    "orchestrator.routers.ide",
+    "orchestrator.routers.workspace_access",
+    "orchestrator.routers.thread_files",
+    "orchestrator.routers.job_repo",
+    "orchestrator.routers.job_diff",
+    "orchestrator.routers.job_review",
+    "orchestrator.routers.agent_cloud_stage",
+    "orchestrator.routers.thread_cloud_diff",
+    "orchestrator.routers.main_cloud_settings",
+    "orchestrator.schemas.workspace_access",
+]
+forbidden_modules = ["orchestrator.main"]
+# No B04 module imports main directly. The indirect edges below are the same
+# ones B02/B03 recorded, reached from every router through
+# orchestrator.security.access -> services.sudo_gate. Each exact edge is ignored
+# rather than setting `allow_indirect_imports`, so any NEW transitive path to
+# main would still break this contract.
+ignore_imports = [
+    # B10 owns this one (services/session_wake.py, a lazy import in a function).
+    "orchestrator.services.session_wake -> orchestrator.main",
+]
+unmatched_ignore_imports_alerting = "warn"
+
+[[tool.importlinter.contracts]]
+name = "Configuration, credentials, payload and preparation do not import application startup"
+type = "forbidden"
+source_modules = [
+    "orchestrator.services.agent_datasource_payload",
+    "orchestrator.services.agent_toolset_probe",
+    "orchestrator.services.deployment_gates",
+    "orchestrator.services.dispatch_credentials",
+    "orchestrator.services.grant_enforcement",
+    "orchestrator.services.job_datasource_selection",
+    "orchestrator.services.job_dispatch_credentials",
+    "orchestrator.services.job_start_bundle",
+    "orchestrator.services.job_workspace_authority",
+    "orchestrator.services.job_workspace_runtime",
+    "orchestrator.services.session_attach_payload",
+    "orchestrator.services.session_class_policy",
+    "orchestrator.services.session_config_resolution",
+    "orchestrator.services.session_tool_policy",
+    "orchestrator.services.stateless_workspace_scheduler",
+    "orchestrator.services.thread_mount_rows",
+    "orchestrator.services.thread_workspace_delivery",
+    "orchestrator.services.vm_workspace_policy",
+    "orchestrator.services.workspace_tier_policy",
+    "orchestrator.routers.agent_thread_workspace",
+    "orchestrator.routers.job_assignment",
+]
+forbidden_modules = ["orchestrator.main"]
+# No B05 module imports main directly. The indirect edges below are the same
+# ones B02/B03/B04 recorded, reached through
+# orchestrator.security.access -> services.sudo_gate. Each exact edge is
+# ignored rather than setting `allow_indirect_imports`, so any NEW transitive
+# path to main would still break this contract.
+ignore_imports = [
+    # B10 owns this one (services/session_wake.py, a lazy import in a function).
+    "orchestrator.services.session_wake -> orchestrator.main",
+]
+unmatched_ignore_imports_alerting = "warn"
+
+[[tool.importlinter.contracts]]
+name = "Agent authority, child APIs, session admission and claim bundles do not import application startup"
+type = "forbidden"
+source_modules = [
+    "orchestrator.routers.agent_child_threads",
+    "orchestrator.routers.agent_registration",
+    "orchestrator.routers.agent_thread_status",
+    "orchestrator.routers.officer_runtime_verification",
+    "orchestrator.routers.run_queue_admin",
+    "orchestrator.routers.thread_admission",
+    "orchestrator.routers.thread_config",
+    "orchestrator.routers.unit_claim",
+    "orchestrator.schemas.agent_child_threads",
+    "orchestrator.schemas.agent_registration",
+    "orchestrator.schemas.agent_thread_status",
+    "orchestrator.schemas.officer_runtime_verification",
+    "orchestrator.schemas.run_queue_admin",
+    "orchestrator.schemas.thread_admission",
+    "orchestrator.schemas.thread_config",
+    "orchestrator.services.agent_child_threads",
+    "orchestrator.services.agent_registration",
+    "orchestrator.services.agent_thread_status",
+    "orchestrator.services.commissioned_officer_provisioning",
+    "orchestrator.services.officer_runtime_verification",
+    "orchestrator.services.pinned_session_mutation_target",
+    "orchestrator.services.run_queue_admin",
+    "orchestrator.services.session_attach_binding",
+    "orchestrator.services.session_attach_recovery",
+    "orchestrator.services.session_runtime_identity",
+    "orchestrator.services.thread_admission",
+    "orchestrator.services.thread_config_update",
+    "orchestrator.services.thread_datasource_authorization",
+    "orchestrator.services.thread_project_authorization",
+    "orchestrator.services.unit_claim_bundle",
+]
+forbidden_modules = ["orchestrator.main"]
+# No B06 module imports main directly. The indirect edges below are the same
+# ones B02-B05 recorded, reached through orchestrator.security.access ->
+# services.sudo_gate. Each exact edge is ignored rather than setting
+# `allow_indirect_imports`, so a NEW transitive path to main still breaks this.
+# B06's own two edges are now closed: session_lifecycle takes the caller's
+# store and provision_or_assign takes a constructed
+# ProvisionOrAssignDependencies, so neither reaches main any more.
+#
+# One indirect edge remains, and it is B10's: every module here imports
+# orchestrator.security.access, which reaches main through
+# services.sudo_gate -> services.session_wake. B02-B05 all ledger that same
+# edge; this contract was written without it and so was BROKEN against the
+# real tree from the day it landed (tests/test_import_boundaries.py lints a
+# synthetic tree, which is why it stayed green there). Ignoring the exact
+# edge rather than setting `allow_indirect_imports` keeps a NEW path to main
+# breaking the contract.
+ignore_imports = [
+    # B10 owns this one (services/session_wake.py:919, a lazy import in a
+    # function). Comes off when B10 closes its caller.
+    "orchestrator.services.session_wake -> orchestrator.main",
+]
+unmatched_ignore_imports_alerting = "warn"
+
+[[tool.importlinter.contracts]]
+name = "Message routing, notifications, Officer post and loop operations do not import application startup"
+type = "forbidden"
+source_modules = [
+    "orchestrator.services.agent_messaging",
+    "orchestrator.services.inbound_reply",
+    "orchestrator.services.officer_message_actions",
+    "orchestrator.services.job_freeze_notifications",
+    "orchestrator.services.job_guidance",
+    "orchestrator.services.message_thread_reads",
+    "orchestrator.services.pending_actions",
+    "orchestrator.services.notification_api",
+    "orchestrator.services.notification_actions",
+    "orchestrator.services.officer_conference",
+    "orchestrator.services.officer_notices",
+    "orchestrator.services.officer_paging",
+    "orchestrator.services.officer_post_lifecycle",
+    "orchestrator.services.officer_post_policy",
+    "orchestrator.services.officer_post_views",
+    "orchestrator.services.officer_watchdog",
+    "orchestrator.services.project_loop_spawn",
+    "orchestrator.services.project_loop_advance",
+    "orchestrator.services.loop_plan_filing",
+    "orchestrator.services.curation_final_pass",
+    "orchestrator.services.cron_dispatcher",
+    "orchestrator.services.sitrep",
+    "orchestrator.services.project_backlog",
+    "orchestrator.routers.messaging",
+    "orchestrator.routers.actions",
+    "orchestrator.routers.notifications",
+    "orchestrator.routers.officers",
+    "orchestrator.routers.agent_officer",
+    "orchestrator.routers.loop_plan",
+    "orchestrator.routers.automations",
+    "orchestrator.routers.project_loops",
+    "orchestrator.schemas.messaging",
+    "orchestrator.schemas.notifications",
+    "orchestrator.schemas.officer_post",
+    "orchestrator.schemas.project_loops",
+]
+forbidden_modules = ["orchestrator.main"]
+# One indirect chain remains, and it is not this batch's: every router-adjacent
+# module imports orchestrator.security.access, which reaches main through
+# services.sudo_gate -> services.session_wake. B10 owns that lazy import.
+# Ignoring the exact edge rather than setting `allow_indirect_imports` keeps
+# every other transitive path checked, so a new one would still fail here.
+# B07's own two — services.sitrep and services.project_backlog — are gone for
+# real: the sitrep takes its reporting handles from an explicit startup bind,
+# and the backlog's ticket mirror takes the store from its caller.
+ignore_imports = [
+    "orchestrator.services.session_wake -> orchestrator.main",
+]
+unmatched_ignore_imports_alerting = "warn"
 
 [[tool.importlinter.contracts]]
 name = "Shared initializer stays lightweight"
@@ -113,6 +483,71 @@ type = "forbidden"
 source_modules = ["shared"]
 forbidden_modules = ["shared.runtime", "shared.runtime.**"]
 as_packages = false
+
+[[tool.importlinter.contracts]]
+name = "Completion verification delegation and recovery do not import application startup"
+type = "forbidden"
+source_modules = [
+    "orchestrator.routers.job_completion",
+    "orchestrator.routers.verification",
+    "orchestrator.services.job_completion",
+    "orchestrator.services.legacy_job_completion",
+    "orchestrator.services.completion_runtime",
+    "orchestrator.services.completion_session_memory",
+    "orchestrator.services.completion_effects",
+    "orchestrator.services.completion_recovery",
+    "orchestrator.services.completion_control",
+    "orchestrator.services.completion_finalizer",
+    "orchestrator.services.completion_monitor",
+    "orchestrator.services.completion_sweep_router",
+    "orchestrator.services.completion_command_resolution",
+    "orchestrator.services.job_completion_commands",
+    "orchestrator.services.completion_effect_policy",
+    "orchestrator.services.completion_effect_reconciliation",
+    "orchestrator.services.completion_lifecycle",
+    "orchestrator.services.completion_teardown_authority",
+    "orchestrator.services.verification_workflow",
+    "orchestrator.services.verification_ledger",
+    "orchestrator.services.subjob_completion",
+    "orchestrator.services.subjob_output",
+]
+forbidden_modules = ["orchestrator.main"]
+ignore_imports = [
+    # B10 owns the remaining lazy application lookup, reached through the
+    # shared authorization chain. Keep every other transitive path checked.
+    "orchestrator.services.session_wake -> orchestrator.main",
+]
+unmatched_ignore_imports_alerting = "warn"
+
+[[tool.importlinter.contracts]]
+name = "Job and thread controls assignment delivery and retirement do not import application startup"
+type = "forbidden"
+source_modules = [
+    "orchestrator.routers.bench",
+    "orchestrator.routers.job_assignment",
+    "orchestrator.routers.job_controls",
+    "orchestrator.routers.job_lifecycle",
+    "orchestrator.routers.thread_lifecycle",
+    "orchestrator.schemas.job_controls",
+    "orchestrator.schemas.thread_lifecycle",
+    "orchestrator.services.bench",
+    "orchestrator.services.job_assignment",
+    "orchestrator.services.job_control_delivery",
+    "orchestrator.services.job_controls",
+    "orchestrator.services.job_mutation_controls",
+    "orchestrator.services.job_mutation_target",
+    "orchestrator.services.manifest_execution_retirement",
+    "orchestrator.services.pinned_retirement",
+    "orchestrator.services.thread_resume",
+    "orchestrator.services.thread_retirement",
+]
+forbidden_modules = ["orchestrator.main"]
+ignore_imports = [
+    # B10 owns the one remaining lazy lookup reached through the shared
+    # authorization/session-wake chain. Every other indirect path remains gated.
+    "orchestrator.services.session_wake -> orchestrator.main",
+]
+unmatched_ignore_imports_alerting = "warn"
 
 [[tool.importlinter.contracts]]
 name = "MCP and VM controller do not depend on shared runtime"

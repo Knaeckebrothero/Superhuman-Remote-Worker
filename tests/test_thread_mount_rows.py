@@ -3,8 +3,8 @@
 Phase 2 of ``knowledge-base/knowledge/features/cloud_collaboration_model.md`` §9 introduces the
 ``project_default`` row shape — default projects mount the owner's cloud
 home at the workspace root rather than under ``projects/<slug>/``. These
-tests cover the builder helpers (``_build_thread_mount_rows`` and
-``_build_default_project_mount_row``) directly so the wiring is exercised
+tests cover the builder helpers (``build_thread_mount_rows`` and
+``build_default_project_mount_row``) directly so the wiring is exercised
 without standing up the full thread-create path.
 """
 
@@ -13,6 +13,9 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+import orchestrator.main as orch_main
+from orchestrator.services import thread_mount_rows as thread_mount_rows_service
 
 import orchestrator.main
 from orchestrator.main import _build_protected_cloud_mount
@@ -96,7 +99,9 @@ async def test_default_project_emits_user_home_row():
     the owner's home Space's webdav URL. ``target_user_sub`` carries the
     Keycloak ``sub`` of the owner so the agent can do RFC 8693 exchange.
     """
-    from orchestrator.main import _build_default_project_mount_row
+    from orchestrator.services.thread_mount_rows import (
+        build_default_project_mount_row,
+    )
 
     project = _project(project_id="p-default", is_default=True, name="Default")
     backend = _backend()
@@ -112,7 +117,9 @@ async def test_default_project_emits_user_home_row():
         patch("orchestrator.main.postgres_db", fake_db),
         patch("orchestrator.main.main_cloud_router", router),
     ):
-        row = await _build_default_project_mount_row("p-default", project)
+        row = await build_default_project_mount_row(
+            "p-default", project, dependencies=orch_main._thread_mount_dependencies()
+        )
 
     assert row is not None
     assert row["mount_kind"] == "project_default"
@@ -130,7 +137,9 @@ async def test_default_project_emits_user_home_row():
 @pytest.mark.asyncio
 async def test_default_project_no_owner_returns_none():
     """Owner missing from the project → fall back to legacy session folder."""
-    from orchestrator.main import _build_default_project_mount_row
+    from orchestrator.services.thread_mount_rows import (
+        build_default_project_mount_row,
+    )
 
     project = _project(project_id="p", is_default=True)
     fake_db = _fake_db()
@@ -145,7 +154,9 @@ async def test_default_project_no_owner_returns_none():
         patch("orchestrator.main.postgres_db", fake_db),
         patch("orchestrator.main.main_cloud_router", router),
     ):
-        row = await _build_default_project_mount_row("p", project)
+        row = await build_default_project_mount_row(
+            "p", project, dependencies=orch_main._thread_mount_dependencies()
+        )
     assert row is None
 
 
@@ -155,7 +166,9 @@ async def test_default_project_owner_missing_keycloak_sub_returns_none():
     sub yet → can't do token-exchange → no row. Caller falls back to
     legacy session folder so the thread still has SOMETHING.
     """
-    from orchestrator.main import _build_default_project_mount_row
+    from orchestrator.services.thread_mount_rows import (
+        build_default_project_mount_row,
+    )
 
     project = _project(project_id="p", is_default=True)
     fake_db = _fake_db()
@@ -172,7 +185,9 @@ async def test_default_project_owner_missing_keycloak_sub_returns_none():
         patch("orchestrator.main.postgres_db", fake_db),
         patch("orchestrator.main.main_cloud_router", router),
     ):
-        row = await _build_default_project_mount_row("p", project)
+        row = await build_default_project_mount_row(
+            "p", project, dependencies=orch_main._thread_mount_dependencies()
+        )
     assert row is None
 
 
@@ -181,7 +196,9 @@ async def test_default_project_user_home_unresolvable_returns_none():
     """Owner exists on the backend but ``get_user_home`` returns None
     (e.g. drive not yet provisioned) → fall back, no row.
     """
-    from orchestrator.main import _build_default_project_mount_row
+    from orchestrator.services.thread_mount_rows import (
+        build_default_project_mount_row,
+    )
 
     project = _project(project_id="p", is_default=True)
     backend = _backend()
@@ -200,13 +217,17 @@ async def test_default_project_user_home_unresolvable_returns_none():
         patch("orchestrator.main.postgres_db", fake_db),
         patch("orchestrator.main.main_cloud_router", router),
     ):
-        row = await _build_default_project_mount_row("p", project)
+        row = await build_default_project_mount_row(
+            "p", project, dependencies=orch_main._thread_mount_dependencies()
+        )
     assert row is None
 
 
 @pytest.mark.asyncio
 async def test_default_project_backend_uninitialized_returns_none():
-    from orchestrator.main import _build_default_project_mount_row
+    from orchestrator.services.thread_mount_rows import (
+        build_default_project_mount_row,
+    )
 
     project = _project(project_id="p", is_default=True)
     backend = _backend(initialized=False)
@@ -221,7 +242,9 @@ async def test_default_project_backend_uninitialized_returns_none():
         patch("orchestrator.main.postgres_db", fake_db),
         patch("orchestrator.main.main_cloud_router", router),
     ):
-        row = await _build_default_project_mount_row("p", project)
+        row = await build_default_project_mount_row(
+            "p", project, dependencies=orch_main._thread_mount_dependencies()
+        )
     assert row is None
 
 
@@ -231,7 +254,7 @@ async def test_build_thread_mount_rows_mixes_default_and_non_default():
     right shapes. The default-project row points at workspace root; the
     non-default row lives under ``projects/<slug>/``.
     """
-    from orchestrator.main import _build_thread_mount_rows
+    from orchestrator.services.thread_mount_rows import build_thread_mount_rows
 
     default_project = _project(project_id="p-default", is_default=True, name="My Home")
     other_project = _project(project_id="p-other", is_default=False, name="Alpha")
@@ -257,7 +280,10 @@ async def test_build_thread_mount_rows_mixes_default_and_non_default():
         patch("orchestrator.main.postgres_db", fake_db),
         patch("orchestrator.main.main_cloud_router", router),
     ):
-        rows = await _build_thread_mount_rows(["p-default", "p-other"])
+        rows = await build_thread_mount_rows(
+            ["p-default", "p-other"],
+            dependencies=orch_main._thread_mount_dependencies(),
+        )
 
     assert len(rows) == 2
     by_kind = {r["mount_kind"]: r for r in rows}
@@ -272,14 +298,14 @@ async def test_project_ids_from_mounts_includes_project_default():
     """Phase 2: a ``project_default`` row counts as a project attachment
     for downstream datasource/visibility resolution.
     """
-    from orchestrator.main import _project_ids_from_mounts
+    from orchestrator.services.thread_mount_rows import project_ids_from_mounts
 
     rows = [
         {"mount_kind": "project_default", "source_ref": "p-default"},
         {"mount_kind": "project", "source_ref": "p-alpha"},
         {"mount_kind": "repo", "source_ref": "r-1"},
     ]
-    assert _project_ids_from_mounts(rows) == ["p-default", "p-alpha"]
+    assert project_ids_from_mounts(rows) == ["p-default", "p-alpha"]
 
 
 @pytest.mark.asyncio
@@ -298,7 +324,11 @@ async def test_thread_project_ids_preserves_scope_when_default_mount_is_unavaila
 
     with (
         patch("orchestrator.main.postgres_db", fake_db),
-        patch("orchestrator.main._build_thread_mount_rows", AsyncMock(return_value=[])),
+        patch.object(
+            thread_mount_rows_service,
+            "build_thread_mount_rows",
+            AsyncMock(return_value=[]),
+        ),
     ):
         project_ids = await orchestrator.main._thread_project_ids("thread-1")
 
@@ -899,7 +929,7 @@ async def test_collision_two_same_named_projects_get_distinct_paths():
     second gets ``projects/alpha-2``. UNIQUE (thread_id, target_path) at
     persistence time always holds.
     """
-    from orchestrator.main import _build_thread_mount_rows
+    from orchestrator.services.thread_mount_rows import build_thread_mount_rows
 
     fake_db = _multi_project_db(
         [
@@ -913,7 +943,9 @@ async def test_collision_two_same_named_projects_get_distinct_paths():
         patch("orchestrator.main.postgres_db", fake_db),
         patch("orchestrator.main.main_cloud_router", _router_for_backend(backend)),
     ):
-        rows = await _build_thread_mount_rows(["p-1", "p-2"])
+        rows = await build_thread_mount_rows(
+            ["p-1", "p-2"], dependencies=orch_main._thread_mount_dependencies()
+        )
 
     assert len(rows) == 2
     assert [r["target_path"] for r in rows] == [
@@ -928,7 +960,7 @@ async def test_collision_case_insensitive():
     """``_slugify_mount_name`` lowercases, so "Alpha" and "alpha" produce
     the same slug. Collision logic must still dedup the second one.
     """
-    from orchestrator.main import _build_thread_mount_rows
+    from orchestrator.services.thread_mount_rows import build_thread_mount_rows
 
     fake_db = _multi_project_db(
         [
@@ -942,7 +974,9 @@ async def test_collision_case_insensitive():
         patch("orchestrator.main.postgres_db", fake_db),
         patch("orchestrator.main.main_cloud_router", _router_for_backend(backend)),
     ):
-        rows = await _build_thread_mount_rows(["p-1", "p-2"])
+        rows = await build_thread_mount_rows(
+            ["p-1", "p-2"], dependencies=orch_main._thread_mount_dependencies()
+        )
 
     assert [r["target_path"] for r in rows] == [
         "projects/alpha",
@@ -956,7 +990,7 @@ async def test_collision_three_same_named_projects():
     counter walks forward and doesn't reuse freed-up indices (none get
     freed in this scenario anyway).
     """
-    from orchestrator.main import _build_thread_mount_rows
+    from orchestrator.services.thread_mount_rows import build_thread_mount_rows
 
     fake_db = _multi_project_db(
         [
@@ -971,7 +1005,9 @@ async def test_collision_three_same_named_projects():
         patch("orchestrator.main.postgres_db", fake_db),
         patch("orchestrator.main.main_cloud_router", _router_for_backend(backend)),
     ):
-        rows = await _build_thread_mount_rows(["p-1", "p-2", "p-3"])
+        rows = await build_thread_mount_rows(
+            ["p-1", "p-2", "p-3"], dependencies=orch_main._thread_mount_dependencies()
+        )
 
     assert [r["target_path"] for r in rows] == [
         "projects/alpha",
@@ -985,7 +1021,7 @@ async def test_no_collision_unique_names_unaffected():
     """Sanity check: unique names don't acquire suffixes (regression guard
     in case the suffix loop is ever rewritten with an off-by-one).
     """
-    from orchestrator.main import _build_thread_mount_rows
+    from orchestrator.services.thread_mount_rows import build_thread_mount_rows
 
     fake_db = _multi_project_db(
         [
@@ -1000,7 +1036,9 @@ async def test_no_collision_unique_names_unaffected():
         patch("orchestrator.main.postgres_db", fake_db),
         patch("orchestrator.main.main_cloud_router", _router_for_backend(backend)),
     ):
-        rows = await _build_thread_mount_rows(["p-1", "p-2", "p-3"])
+        rows = await build_thread_mount_rows(
+            ["p-1", "p-2", "p-3"], dependencies=orch_main._thread_mount_dependencies()
+        )
 
     assert [r["target_path"] for r in rows] == [
         "projects/alpha",
@@ -1015,7 +1053,7 @@ async def test_dedupe_repeated_project_id():
     not a row at ``projects/alpha`` plus a phantom ``projects/alpha-2``
     pointing at the same source_ref.
     """
-    from orchestrator.main import _build_thread_mount_rows
+    from orchestrator.services.thread_mount_rows import build_thread_mount_rows
 
     fake_db = _multi_project_db(
         [
@@ -1028,7 +1066,9 @@ async def test_dedupe_repeated_project_id():
         patch("orchestrator.main.postgres_db", fake_db),
         patch("orchestrator.main.main_cloud_router", _router_for_backend(backend)),
     ):
-        rows = await _build_thread_mount_rows(["p-1", "p-1", "p-1"])
+        rows = await build_thread_mount_rows(
+            ["p-1", "p-1", "p-1"], dependencies=orch_main._thread_mount_dependencies()
+        )
 
     assert len(rows) == 1
     assert rows[0]["target_path"] == "projects/alpha"
@@ -1042,7 +1082,7 @@ async def test_collision_with_default_project_present():
     namespace with non-defaults (which live under ``projects/``), so the
     suffix logic only fires between the non-defaults.
     """
-    from orchestrator.main import _build_thread_mount_rows
+    from orchestrator.services.thread_mount_rows import build_thread_mount_rows
 
     fake_db = _multi_project_db(
         [
@@ -1057,7 +1097,10 @@ async def test_collision_with_default_project_present():
         patch("orchestrator.main.postgres_db", fake_db),
         patch("orchestrator.main.main_cloud_router", _router_for_backend(backend)),
     ):
-        rows = await _build_thread_mount_rows(["p-default", "p-1", "p-2"])
+        rows = await build_thread_mount_rows(
+            ["p-default", "p-1", "p-2"],
+            dependencies=orch_main._thread_mount_dependencies(),
+        )
 
     assert len(rows) == 3
     paths = [r["target_path"] for r in rows]
@@ -1243,7 +1286,8 @@ async def test_build_agent_cloud_mount_protected_marker_no_row_returns_none(
 ):
     """(d) marker + flag ON + container runtime + no active row -> None.
 
-    No task is registered in ``_protected_engage_tasks`` for this thread_id
+    No task is registered in ``cloud_task_registry.protected_engage_tasks``
+    for this thread_id
     and no ``protected_cloud_error`` is recorded, so this exercises F-I1's
     poll-exhaustion path (3x get_ro_mount_by_thread, sleep(3) between) —
     ``asyncio.sleep`` is patched so the 9s worst case doesn't slow the suite.
@@ -1256,7 +1300,7 @@ async def test_build_agent_cloud_mount_protected_marker_no_row_returns_none(
     # Defensive: no in-flight engage task registered for this thread_id (a
     # leaked registration from another test would take the await-task branch
     # instead of the poll branch this test targets).
-    orchestrator.main._protected_engage_tasks.pop(
+    orchestrator.main.cloud_task_registry.protected_engage_tasks.pop(
         (_THREAD_ID, _RUNTIME_GENERATION), None
     )
     with (

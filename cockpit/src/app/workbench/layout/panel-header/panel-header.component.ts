@@ -111,7 +111,7 @@ import { ComponentMetadata, ComponentType } from '../../layout.model';
 
       .panel-title {
         text-transform: uppercase;
-        letter-spacing: 0.5px;
+        letter-spacing: 0.06em;
       }
 
       .dropdown-arrow {

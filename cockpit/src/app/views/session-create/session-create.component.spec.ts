@@ -178,6 +178,7 @@ describe('SessionCreateComponent framework defaults', () => {
     fixture.detectChanges();
     const prefillTools = vi.fn();
     fixture.componentInstance.agentSettings = {
+      getOverrides: vi.fn().mockReturnValue({}),
       toolsGroup: {prefillFromConfig: prefillTools},
     } as any;
 
@@ -372,6 +373,7 @@ describe('SessionCreateComponent — reasoning pick lost to an involuntary prefi
     fixture.detectChanges(); // runs ngOnInit — issues every request below at once
 
     fixture.componentInstance.agentSettings = {
+      getOverrides: vi.fn().mockReturnValue({}),
       prefillFromConfig: (config: Record<string, unknown>) => modelGroup.prefillFromConfig(config),
     } as any;
 
@@ -401,7 +403,7 @@ describe('SessionCreateComponent — reasoning pick lost to an involuntary prefi
       },
     });
     http.expectOne(
-      (r) => r.urlWithParams.endsWith('/experts/expert-1?account_defaults=true'),
+      (r) => r.urlWithParams.endsWith('/experts/expert-1?account_defaults=true&role=session'),
     ).flush({config: {llm: {}}});
     expect(fixture.componentInstance.selectedExpert()?.id).toBe('expert-1');
     expect(modelGroup.reasoningResetNotice()).toBe(false); // quiescent — nothing to lose yet
@@ -433,7 +435,7 @@ describe('SessionCreateComponent — reasoning pick lost to an involuntary prefi
     // request the user never asked for and a control (the expert grid) they
     // never touched.
     http.expectOne(
-      (r) => r.urlWithParams.endsWith('/experts/expert-2?account_defaults=true'),
+      (r) => r.urlWithParams.endsWith('/experts/expert-2?account_defaults=true&role=session'),
     ).flush({config: {llm: {}}});
 
     // The reasoning pick is gone, with no trace it ever reset — the bug as
@@ -492,7 +494,7 @@ describe('SessionCreateComponent — reasoning pick lost to an involuntary prefi
       },
     });
     http.expectOne(
-      (r) => r.urlWithParams.endsWith('/experts/expert-1?account_defaults=true'),
+      (r) => r.urlWithParams.endsWith('/experts/expert-1?account_defaults=true&role=session'),
     ).flush({config: {llm: {}}});
 
     expect(modelGroup.sessionReasoning()).toBeNull();
@@ -567,6 +569,8 @@ describe('SessionCreateComponent tool preview', () => {
     } as never);
 
     expect(api.previewToolGroups).toHaveBeenCalledWith({
+      config_override: {},
+      workspace_preference: null,
       config_name: 'session_base',
       expert_id: 'db-expert-1',
       project_id: null,
@@ -586,6 +590,8 @@ describe('SessionCreateComponent tool preview', () => {
     } as never);
 
     expect(api.previewToolGroups).toHaveBeenCalledWith({
+      config_override: {},
+      workspace_preference: null,
       config_name: 'scholar',
       expert_id: null,
       project_id: null,
@@ -597,6 +603,7 @@ describe('SessionCreateComponent tool preview', () => {
     const component = fixture.componentInstance;
     const prefill = vi.fn();
     component.agentSettings = {
+      getOverrides: vi.fn().mockReturnValue({}),
       prefillFromConfig: vi.fn(),
       prefillFromResolvedToolset: prefill,
       hasToolEdits: () => false,
@@ -619,6 +626,7 @@ describe('SessionCreateComponent tool preview', () => {
     const component = fixture.componentInstance;
     const prefill = vi.fn();
     component.agentSettings = {
+      getOverrides: vi.fn().mockReturnValue({}),
       prefillFromConfig: vi.fn(),
       prefillFromResolvedToolset: prefill,
       hasToolEdits: () => true,
@@ -640,6 +648,8 @@ describe('SessionCreateComponent tool preview', () => {
     fixture.componentInstance.toggleProject('proj-1');
 
     expect(api.previewToolGroups).toHaveBeenLastCalledWith({
+      config_override: {},
+      workspace_preference: null,
       config_name: 'session_base',
       expert_id: null,
       project_id: 'proj-1',
@@ -651,6 +661,7 @@ describe('SessionCreateComponent tool preview', () => {
     const component = fixture.componentInstance;
     const prefill = vi.fn();
     component.agentSettings = {
+      getOverrides: vi.fn().mockReturnValue({}),
       prefillFromConfig: vi.fn(),
       prefillFromResolvedToolset: prefill,
       hasToolEdits: () => false,
@@ -750,6 +761,7 @@ describe('SessionCreateComponent "Start a new session" prefill (session_config_d
     setSessionModelOverride: ReturnType<typeof vi.fn>,
   ): void {
     component.agentSettings = {
+      getOverrides: vi.fn().mockReturnValue({}),
       prefillFromConfig: vi.fn(),
       toolsGroup: {prefillFromConfig: vi.fn()},
       setSessionModelOverride,

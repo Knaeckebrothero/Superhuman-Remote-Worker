@@ -70,9 +70,10 @@
   color: inherit;
 }
 
-// NOT type.display: the Roman display recipe uppercases and letter-spaces,
-// and this heading is a folder path, i.e. data. "cloud" must not render as
-// "C L O U D".
+// type.display is sentence-case Inter since the 2026-09-10 refresh; it is safe
+// on data like this folder path. Kept as a recipe include so a future theme
+// that rebinds --font-primary still cannot uppercase it: see the guard in
+// styles/visual-language.spec.ts.
 .review__title {
   margin: 0;
   font-weight: v.$font-weight-bold;

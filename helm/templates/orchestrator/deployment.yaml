@@ -2,7 +2,8 @@
 {{- $vmRemoteProtocol := .Values.orchestrator.vmRemoteOperationProtocol.enabled | default false -}}
 {{- $workspaceCleanupProtocol := .Values.orchestrator.workspaceCleanupReconciliationEnabled | default false -}}
 {{- $workspaceLifecycleCutover := .Values.orchestrator.workspaceLifecycleProtocolCutoverEnabled | default false -}}
-{{- $orchestratorRecreate := or $runtimeAuthorityCutover (or $vmRemoteProtocol (or $workspaceLifecycleCutover $workspaceCleanupProtocol)) -}}
+{{- $manifestCutover := .Values.orchestrator.manifestContractCutoverEnabled | default false -}}
+{{- $orchestratorRecreate := or $manifestCutover (or $runtimeAuthorityCutover (or $vmRemoteProtocol (or $workspaceLifecycleCutover $workspaceCleanupProtocol))) -}}
 {{- if and $runtimeAuthorityCutover (ne (lower (toString (.Values.agent.requirePinnedStatusIdentity | default "true"))) "true") -}}
 {{- fail "orchestrator.runtimeAuthorityMigrationMaintenanceAck requires agent.requirePinnedStatusIdentity=true" -}}
 {{- end }}
@@ -38,7 +39,19 @@ spec:
         # controlled enable/disable therefore deterministically converges every
         # replica before operators rely on the new policy.
         checksum/officer-auto-pull-release: {{ dict "officerAutoPullReleaseEnabled" (.Values.orchestrator.officerAutoPullReleaseEnabled | default false) | toJson | sha256sum | quote }}
+        # Completion/control policy is read once at process startup. Hash the
+        # exact ConfigMap inputs so mode and finalizer changes replace every
+        # orchestrator replica without relying on the optional Reloader.
+        checksum/completion-control-settings: {{ dict "commandsEnabled" (.Values.orchestrator.completionCommandsEnabled | default false) "statusReorderEnabled" (.Values.orchestrator.completionStatusReorderEnabled | default false) "finalizerInlineDelaySeconds" (.Values.orchestrator.completionFinalizerInlineDelaySeconds | default 0) | toJson | sha256sum | quote }}
+        # Stateless session/worker admission is also read once at startup.
+        # Keep the authority that admits work synchronized with executor
+        # topology after any source-controlled pool-mode change.
+        checksum/stateless-admission-settings: {{ dict "sessionEnabled" (.Values.agent.stateless.enabled | default false) "cloudPushRecoveryEnabled" (and .Values.agent.stateless.enabled .Values.agent.stateless.cloudPushRecoveryEnabled) "workerEnabled" (.Values.agent.stateless.worker.enabled | default false) "workerDefaultEnabled" (.Values.agent.stateless.worker.defaultEnabled | default false) | toJson | sha256sum | quote }}
+        # Native admission reads these values at startup. Operator changes must
+        # replace the process even when the optional Reloader is disabled.
+        checksum/manifest-hosting: {{ toJson .Values.manifestHosting | sha256sum | quote }}
         checksum/workspace-cleanup-reconciliation: {{ dict "enabled" $workspaceCleanupProtocol | toJson | sha256sum | quote }}
+        checksum/workspace-preparation: {{ include "srw.vmPreparationEnvironment" . | sha256sum | quote }}
         checksum/workspace-lifecycle-protocol-cutover: {{ dict "enabled" $workspaceLifecycleCutover | toJson | sha256sum | quote }}
         checksum/workspace-lifecycle-service-account: {{ .Values.orchestrator.workspaceLifecycleServiceAccountGeneration | default "0197" | toString | sha256sum | quote }}
         checksum/vm-remote-operation-protocol: {{ dict "enabled" $vmRemoteProtocol | toJson | sha256sum | quote }}
@@ -487,6 +500,11 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: STATELESS_SESSION_ENABLED
+            - name: STATELESS_CLOUD_PUSH_RECOVERY_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: STATELESS_CLOUD_PUSH_RECOVERY_ENABLED
             - name: STATELESS_WORKER_ENABLED
               valueFrom:
                 configMapKeyRef:
@@ -1314,6 +1332,14 @@ spec:
                   name: {{ include "srw.configMapName" . }}
                   key: VM_PERSISTENT_ROOTDISK
                   optional: true
+            # Admission must see the same capabilities as the VM controller.
+            {{- range $key, $_ := (include "srw.vmPreparationEnvironment" . | fromYaml) }}
+            - name: {{ $key }}
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" $ }}
+                  key: {{ $key }}
+            {{- end }}
             # Workspace containers
             - name: WORKSPACE_IMAGE
               valueFrom:
@@ -1429,11 +1455,17 @@ spec:
                   key: HEADSCALE_URL
                   optional: true
             {{- end }}
-            # Codex OAuth Proxy
+            # AI Subscriptions proxy (CLIProxyAPI).
+            #
+            # The Service, the Secret keys and the auth PVC keep their
+            # historical CODEX_* names deliberately: the display rename to
+            # "Subscription proxy" does not rename storage or Kubernetes
+            # objects, so an upgrade needs no credential migration. See
+            # knowledge-base/knowledge/features/subscription_proxy.md §8.5.
             - name: CODEX_PROXY_URL
               value: "http://{{ include "srw.fullname" . }}-codex-proxy:8317"
             # CODEX_BASE_URL removed in chunk 7 of models_yaml_removal —
-            # the codex transport is a system endpoint catalog row now,
+            # the subscription transport is a system endpoint catalog row now,
             # not an env-var-injected base URL.
             - name: CODEX_MANAGEMENT_KEY
               valueFrom:
@@ -1441,6 +1473,19 @@ spec:
                   name: {{ include "srw.secretName" . }}
                   key: CODEX_MANAGEMENT_KEY
                   optional: true
+            {{- if .Values.codexProxy.inferenceApiKeySecret.name }}
+            # Optional: a credential distinct from the management key, sent on
+            # /v1/* inference calls only. Management and inference auth are
+            # separate concerns on CLIProxyAPI; without this the seeder keeps
+            # storing the management key as the endpoint credential, which is
+            # what every existing deployment does.
+            - name: SUBSCRIPTION_PROXY_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.codexProxy.inferenceApiKeySecret.name }}
+                  key: {{ .Values.codexProxy.inferenceApiKeySecret.key }}
+                  optional: true
+            {{- end }}
             # Orchestrator settings
             - name: AUTO_ASSIGN_ENABLED
               valueFrom:

@@ -447,6 +447,7 @@ def _connect(host: str, origin: str) -> tuple[ssl.SSLSocket, bytes]:
     raw = socket.create_connection((host, 443), timeout=30)
     try:
         context = ssl.create_default_context()
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
         sock = context.wrap_socket(raw, server_hostname=host)
     except ssl.SSLError as exc:
         # A bad certificate previously reached the user as a raw traceback --

@@ -43,7 +43,9 @@ class FakeSync(WorkspaceSyncBase):
         local_path: str,
         *,
         before_write: Optional[Callable[[], Awaitable[None]]] = None,
-    ) -> None:
+        if_match: Optional[str] = None,
+        if_none_match: bool = False,
+    ) -> Optional[str]:
         if before_write is not None:
             await before_write()
         self.uploads.append((rel_path, local_path))
@@ -53,6 +55,7 @@ class FakeSync(WorkspaceSyncBase):
         rel_path: str,
         *,
         before_write: Optional[Callable[[], Awaitable[None]]] = None,
+        if_match: Optional[str] = None,
     ) -> None:
         if before_write is not None:
             await before_write()

@@ -1,5 +1,6 @@
 import {CUSTOM_ELEMENTS_SCHEMA, signal, ɵresolveComponentResources} from '@angular/core';
 import {TestBed} from '@angular/core/testing';
+import {TranslocoService} from '@jsverse/transloco';
 import {beforeAll, beforeEach, describe, expect, it, vi} from 'vitest';
 import {of, Subject} from 'rxjs';
 import {AdminModelsService} from '../../../core/services/admin-models.service';
@@ -26,17 +27,21 @@ const models = {
 const providers = {
   systemApiKeys: signal([]),
   systemEndpoints: signal([]),
-  codexAvailability: signal({
+  subscriptionAvailability: signal({
     available: false,
+    reachable: false,
+    error: null,
     account_count: 0,
+    accounts: [],
     models: [],
     proxy_url: null,
     endpoint_id: null,
   }),
   loadSystemApiKeys: vi.fn(),
   loadSystemEndpoints: vi.fn(),
-  loadCodexAvailability: vi.fn(),
-  discoverSystemEndpointModels: vi.fn(() => of({models: []})),
+  loadSubscriptionAvailability: vi.fn(),
+  discoverSystemEndpointModels: vi.fn(() => of({ok: true, models: []})),
+  importSubscriptionModels: vi.fn(() => of({created: [], skipped: [], rejected: []})),
 };
 
 describe('AdminCatalogComponent search/fetch form', () => {
@@ -49,6 +54,7 @@ describe('AdminCatalogComponent search/fetch form', () => {
     TestBed.configureTestingModule({
       imports: [AdminCatalogComponent],
       providers: [
+        {provide: TranslocoService, useValue: {translate: vi.fn((key: string) => key)}},
         {provide: AdminModelsService, useValue: models},
         {provide: AdminProvidersService, useValue: providers},
         {

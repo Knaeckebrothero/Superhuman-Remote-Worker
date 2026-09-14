@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 from agent.services.knowledge.bindings import native_kb_project_id
+from shared.credential_connectors import ENV_CONNECTOR_TYPES, collect_credential_env
 from shared.datasource_policy import (
     EMAIL_TIER_ORDER as EMAIL_TIER_ORDER,
     EMAIL_TIER_TOOLS as EMAIL_TIER_TOOLS,
@@ -89,7 +90,6 @@ def process_datasources(
     client_registry: Dict[str, Any] = {}
     cli_ds_types: List[str] = []
 
-    generic_list: List[Dict[str, Any]] = []
     mcp_list: List[Dict[str, Any]] = []
     connector_list: List[Dict[str, Any]] = []
 
@@ -98,8 +98,8 @@ def process_datasources(
         if not ds_type:
             continue
 
-        if ds_type == "generic":
-            generic_list.append(ds)
+        if ds_type in ENV_CONNECTOR_TYPES:
+            continue
         elif ds_type == "repository":
             logger.warning(
                 "Repository datasource %r ignored by process_datasources(); "
@@ -120,17 +120,8 @@ def process_datasources(
         else:
             connector_list.append(ds)
 
-    # Generic datasources: inject env vars into process environment
-    for ds in generic_list:
-        creds = ds.get("credentials") or {}
-        env_vars = creds.get("env_vars", {})
-        for key, value in env_vars.items():
-            os.environ[key] = str(value)
-        logger.info(
-            "Injected %d env vars for generic datasource: %s",
-            len(env_vars),
-            ds.get("name", "unnamed"),
-        )
+    # ENV connectors are delivered by install_workspace_credentials() after
+    # workspace initialization. Never put them in the reused agent process.
 
     # Managed connectors: create tool connections. The registry is
     # TYPE-keyed (last-one-wins), and datasource_tool_categories() binds
@@ -165,6 +156,18 @@ def process_datasources(
         datasources_dict["mcp"] = MCPManager(mcp_list)
 
     return datasources_dict, client_registry, cli_ds_types
+
+
+def install_workspace_credentials(
+    ds_configs: List[Dict[str, Any]], workspace: Any
+) -> None:
+    """Deliver attached ENV connectors to the workspace over its own transport."""
+    values = collect_credential_env(ds_configs)
+    if not values:
+        return
+    if workspace is None or not workspace.backend.supports_shell:
+        raise ValueError("Credential connectors require a sandbox or VM workspace")
+    workspace.backend.install_credential_environment(values)
 
 
 def close_datasource_connections(
@@ -1124,9 +1127,19 @@ def _render_connector_lines(
             name = ds.get("name", "Unnamed")
             is_ro = ds.get("project_read_only", False)
 
-            if ds_type == "generic":
-                cli = ds.get("cli_hint", "CLI via env vars")
-                lines.append(f"- **{name}** (generic) — {cli}{_declared_ro_note(ds)}")
+            if ds_type in ENV_CONNECTOR_TYPES:
+                cli = ds.get("cli_hint") or "CLI via env vars"
+                lines.append(f"- **{name}** ({ds_type}) — {cli}{_declared_ro_note(ds)}")
+                variables = (ds.get("credentials") or {}).get("env_vars", {})
+                if variables:
+                    lines.append(
+                        "  Environment: " + ", ".join(f"`{key}`" for key in variables)
+                    )
+                    lines.append(
+                        "  Read values with os.environ in workspace scripts. For login forms, "
+                        'use browser_type(ref=..., env_var="VARIABLE_NAME"). '
+                        "Avoid printing credentials or writing literal values into scripts."
+                    )
             elif ds_type == "webdav":
                 access = "read-only tools" if is_ro else "read-write tools"
                 lines.append(f"- **{name}** (webdav, {access}){_declared_ro_note(ds)}")

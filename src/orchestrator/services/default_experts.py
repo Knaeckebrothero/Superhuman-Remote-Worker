@@ -14,14 +14,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-import yaml
-
 from orchestrator.services.grants_service import resolve_grants_for
 from shared.runtime.core.expert_resolution import (
     validate_expert_persona_placeholders,
     with_role_tag,
 )
 from shared.runtime.core.loader import canonical_config_name, expert_phase_prompt_bodies
+from shared.runtime.core.srw_manifest_config import read_srw_config
 
 logger = logging.getLogger(__name__)
 
@@ -43,9 +42,35 @@ MANAGED_SEEDS: tuple[dict[str, Any], ...] = (
         "managed_key": "application-default-session-seed",
         "directory": "assistant",
         "expert_type": "session",
-        "seed_version": 1,
+        # 2: the assistant gained its roster. 3 repairs only that exact
+        # managed v2 roster's shell-enabled implementer; an operator's own
+        # roster remains authoritative. Other upgrades remain additive.
+        "seed_version": 3,
     },
 )
+
+
+# Exact historical seed content, independent of future bundle edits. Comparing
+# the whole subtree preserves even small operator changes to a roster entry.
+_ASSISTANT_V2_SUBAGENTS = {
+    "default": "explorer",
+    "roster": {
+        "explorer": {"$ref": "subagents/explorer"},
+        "reader": {"$ref": "subagents/reader"},
+        "implementer": {"$ref": "subagents/implementer"},
+    },
+}
+_ASSISTANT_V3_SUBAGENTS = {
+    "default": "explorer",
+    "roster": {
+        "explorer": {"$ref": "subagents/explorer"},
+        "reader": {"$ref": "subagents/reader"},
+        "implementer": {
+            "$ref": "subagents/implementer",
+            "tools": {"shell": []},
+        },
+    },
+}
 
 
 class DefaultExpertUnavailable(RuntimeError):
@@ -75,7 +100,7 @@ def load_seed_bundle(
     """Read one bundled expert as a raw DB overlay (never a merged snapshot)."""
     expert_dir = config_dir / "experts" / directory
     config_path = expert_dir / "config.yaml"
-    raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    raw = read_srw_config(config_path)
     if not isinstance(raw, dict):
         raise ValueError(f"Invalid managed expert config: {config_path}")
     # Both sides canonical: the public root names (`worker_base`/`session_base`)
@@ -120,11 +145,71 @@ def load_seed_bundle(
     }
 
 
+async def upgrade_managed_seed(
+    db, *, spec: dict[str, Any], bundle: dict[str, Any], row: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Upgrade a managed seed while preserving operator-owned content.
+
+    Copies only the bundle's top-level ``config`` keys the row does NOT carry
+    and stamps the new version; a key the row has — whatever its value — is
+    the operator's and stays. Returns the updated row, or ``None`` when the
+    row is current. This is how a seeded row gains a block the bundle grew
+    later (the assistant's ``subagents`` roster: every deployment seeded before
+    2026-09-07 bound ``delegate_agent`` with nothing to delegate to). The exact
+    managed v2 assistant roster is the one repair exception: the SQL compares
+    its version and whole subtree again before replacing it, so a concurrent
+    operator edit cannot be overwritten using this earlier read.
+    """
+    current = int(row.get("seed_version") or 0)
+    target = int(spec["seed_version"])
+    if current >= target:
+        return None
+    existing = _json_object(row.get("config"))
+    additions = {
+        key: value
+        for key, value in (bundle.get("config") or {}).items()
+        if key not in existing
+    }
+    repair = {}
+    if (
+        spec["managed_key"] == "application-default-session-seed"
+        and current == 2
+        and target >= 3
+        and existing.get("subagents") == _ASSISTANT_V2_SUBAGENTS
+    ):
+        repair = {
+            "expected_seed_version": 2,
+            "expected_subagents": _ASSISTANT_V2_SUBAGENTS,
+            # A future bundle may carry unrelated roster changes. A v2 row
+            # still gets this historical repair, never those newer values.
+            "replacement_subagents": _ASSISTANT_V3_SUBAGENTS,
+        }
+    updated = await db.upgrade_managed_expert_seed(
+        managed_key=spec["managed_key"],
+        seed_version=target,
+        config_additions=additions,
+        **repair,
+    )
+    if updated:
+        logger.info(
+            "Managed expert %s: seed %s -> %s, added config keys %s",
+            spec["managed_key"],
+            current,
+            target,
+            sorted(additions) or "none",
+        )
+    return updated
+
+
 async def seed_managed_default_experts(db, config_dir: Path) -> dict[str, str]:
     """Insert missing managed experts and missing application pointers.
 
     Both operations are insert-only.  Existing expert content and an operator's
     current application pointer are preserved across restarts and upgrades.
+    The one exception is :func:`upgrade_managed_seed`: a row behind the
+    bundle's ``seed_version`` gains the top-level config keys it lacks. Only
+    the exact managed v2 assistant roster receives a conditional repair;
+    operator variants and unrelated content remain unchanged.
     """
     seeded: dict[str, str] = {}
     for spec in MANAGED_SEEDS:
@@ -133,11 +218,15 @@ async def seed_managed_default_experts(db, config_dir: Path) -> dict[str, str]:
             directory=spec["directory"],
             expert_type=spec["expert_type"],
         )
-        row, _created = await db.upsert_managed_expert(
+        row, created = await db.upsert_managed_expert(
             managed_key=spec["managed_key"],
             seed_version=spec["seed_version"],
             **bundle,
         )
+        if not created:
+            row = (
+                await upgrade_managed_seed(db, spec=spec, bundle=bundle, row=row) or row
+            )
         if row["expert_type"] != spec["expert_type"]:
             raise RuntimeError(
                 f"Managed expert {spec['managed_key']} has incompatible type "
@@ -228,7 +317,18 @@ async def resolve_root_expert(
                 project_id=project_id, expert_id=explicit_expert_id
             )
             if link:
-                project_override = _json_object(link.get("config_override")) or None
+                if link.get("project_manifest_composed"):
+                    from orchestrator.services.manifest_projects import (
+                        project_expert_for_execution,
+                    )
+
+                    frozen = await project_expert_for_execution(
+                        db, project_id, explicit_expert_id, expert_type
+                    )
+                    if frozen:
+                        explicit = ExpertSelection(expert=frozen, source="explicit")
+                else:
+                    project_override = _json_object(link.get("config_override")) or None
         return ExpertSelection(
             expert=explicit.expert,
             source="explicit",
@@ -243,7 +343,11 @@ async def resolve_root_expert(
             return ExpertSelection(
                 expert=project,
                 source="project",
-                project_override=_json_object(project.get("config_override")) or None,
+                project_override=(
+                    None
+                    if project.get("project_composed")
+                    else _json_object(project.get("config_override")) or None
+                ),
             )
 
     if await personal_defaults_allowed(

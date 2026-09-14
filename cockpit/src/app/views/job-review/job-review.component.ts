@@ -6,7 +6,6 @@ import {DataService} from '../../core/services/data.service';
 import {Datasource, Job, PullRequestStatus, RepositoryForge} from '../../core/models/api.model';
 import {environment} from '../../core/environment';
 import {AppButtonComponent} from '../../ui/button';
-import {AppIconButtonComponent} from '../../ui/icon-button';
 import {AppBadgeComponent, type BadgeTone} from '../../ui/badge';
 import {AppTextareaComponent} from '../../ui/textarea';
 import {AppSpinnerComponent} from '../../ui/spinner';
@@ -170,7 +169,6 @@ export function selectDeliveryRepository(
   imports: [
     TranslocoPipe,
     AppButtonComponent,
-    AppIconButtonComponent,
     AppBadgeComponent,
     AppTextareaComponent,
     AppSpinnerComponent,
@@ -179,20 +177,6 @@ export function selectDeliveryRepository(
   ],
   template: `
     <div class="review-container">
-      <div class="header">
-        <span class="title">{{ 'jobReview.title' | transloco }}</span>
-        <app-icon-button
-          variant="ghost"
-          size="sm"
-          class="refresh-btn"
-          [ariaLabel]="'jobReview.refresh' | transloco"
-          [disabled]="isLoading()"
-          (clicked)="loadJob()"
-        >
-          ↻
-        </app-icon-button>
-      </div>
-
       @if (!currentJobId()) {
         <div class="empty-state">
           <span class="empty-hint">{{ 'jobReview.empty.selectJob' | transloco }}</span>
@@ -549,25 +533,6 @@ export function selectDeliveryRepository(
         background: var(--panel-bg, var(--panel-bg));
       }
 
-      .header {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        padding: 10px 12px;
-        background: var(--panel-header-bg);
-        border-bottom: 1px solid var(--border-color, var(--surface-0));
-        flex-shrink: 0;
-      }
-
-      .title {
-        font-weight: 600;
-        color: var(--text-primary, var(--text-primary));
-      }
-
-      .refresh-btn {
-        margin-left: auto;
-      }
-
       /* Empty / Loading States */
       .empty-state,
       .loading-state,
@@ -615,10 +580,10 @@ export function selectDeliveryRepository(
       }
 
       .section-header {
-        font-size: 10px;
+        font-size: 11px;
         font-weight: 600;
         text-transform: uppercase;
-        letter-spacing: 0.5px;
+        letter-spacing: 0.06em;
         color: var(--text-muted);
       }
 
@@ -761,10 +726,10 @@ export function selectDeliveryRepository(
         position: relative;
         padding: 0 12px;
         background: var(--panel-bg, var(--panel-bg));
-        font-size: 10px;
+        font-size: 11px;
         color: var(--text-muted);
         text-transform: uppercase;
-        letter-spacing: 0.5px;
+        letter-spacing: 0.06em;
       }
 
       /* Result Message */

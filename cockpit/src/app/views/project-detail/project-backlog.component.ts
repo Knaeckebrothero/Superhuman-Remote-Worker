@@ -148,7 +148,7 @@ export function groupByPriority(items: BacklogItem[]): BacklogGroup[] {
       .backlog-wip-badge {
         font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: var(--radius-tag);
         background: color-mix(in srgb, var(--info) 18%, transparent); color: var(--info);
-        text-transform: uppercase; letter-spacing: 0.3px; white-space: nowrap;
+        text-transform: uppercase; letter-spacing: 0.06em; white-space: nowrap;
       }
       .backlog-wip-title { font-size: 13px; color: var(--text-primary); }
 
@@ -174,7 +174,7 @@ export function groupByPriority(items: BacklogItem[]): BacklogGroup[] {
         border: 1px solid var(--border-color); font-size: 13px;
       }
       .backlog-type {
-        font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.3px;
+        font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em;
         padding: 1px 6px; border-radius: var(--radius-tag);
         background: var(--surface-1); color: var(--text-secondary); white-space: nowrap;
       }

@@ -22,6 +22,11 @@ agents never see connectors you didn't attach.
   search and read.
 - **Credential files** — kubeconfig, SSH key, or a generic file the agent
   needs to reach some other system.
+- **Credentials** — named environment variables for API keys or website
+  logins, delivered to a sandbox or VM workspace. Scripts read them from the
+  environment; browser forms use `browser_type(ref=..., env_var="NAME")`.
+  Once attached, credentials stay for the session and cannot be detached.
+  Output is not filtered, and expiry is controlled by the credential provider.
 - **Generic** — a free-form connection definition for anything else.
 
 Email and OKF Knowledge Base setup have focused guide topics because their
@@ -59,3 +64,45 @@ carry whatever access their underlying credential grants.
 
 Jobs an agent creates on your behalf (for example, a session delegating work)
 inherit the connector selection of their parent unless overridden.
+
+## Add access to the current session
+
+If a task needs an external account, first check the supported type above and
+explain what access is needed and why. A saved connector and a session
+attachment are separate steps:
+
+1. Open **Connectors** to create or configure the appropriate connection. Use
+   the focused `datasources-email` or `datasources-okf` guide for those types.
+   Keep passwords, tokens, and keys in the connector's credential controls.
+2. Return to the connected session and open header **Settings → Connectors**.
+   On a narrow screen, **Settings** is in the header's three-dot menu. Select
+   the eligible connector for this conversation. If the list fails to load,
+   use **Retry**; an empty or failed list is not proof that a type is unsupported.
+3. Changes apply automatically from the next response. Read any error, then
+   send the agent a follow-up so it can check its newly bound tools and try
+   the operation. An attachment alone is not proof that the service is ready.
+
+Repository and **Credentials** attachments need a Container or VM workspace;
+upgrade a Virtual session under **Settings → Workspace** first. Knowledge-base
+attachments are fixed during a live session; choose those when starting a
+session. **Credentials** cannot be detached once attached. Other removals
+close connections after the current response finishes; information the agent
+already read remains in the conversation. Removing a connector does not
+revoke its underlying provider credential or undo prior actions.
+
+## When a service has no named connector
+
+Check whether its supported interface matches an existing connector, such as
+WebDAV, a repository, or an MCP server. An MCP server must actually exist and
+be compatible; a **Generic** connection definition does not create tools or
+implement an integration by itself.
+
+An external provider may also offer an API or CLI usable from a shell-capable
+workspace, a website usable with Browser tools, or an export/import workflow
+the user can carry out with the agent's help. Verify the provider's current
+documentation and required access before choosing that route. Read
+`canvas-and-browser` for browser enablement and a user-controlled login;
+`files-and-integrations` covers external hosting prerequisites. Explain which
+parts the agent can do now, the smallest setup step the user needs to take,
+and useful work that can begin while access is pending. No named connector
+does not by itself make the user's goal impossible.

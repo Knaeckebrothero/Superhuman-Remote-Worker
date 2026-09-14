@@ -363,6 +363,8 @@ def test_every_rendered_cluster_gets_a_credential_object():
 # replication is not blocked there either; adding a policy would be a new
 # restriction and belongs in its own change.
 POLICIES = "templates/databases/network-policies.yaml"
+# helm/values.yaml: databases.operator.namespace
+OPERATOR_NAMESPACE = "cnpg-system"
 POLICY_COMPONENTS = {
     "postgres": "postgres",
     "vector": "pgvector",
@@ -450,7 +452,17 @@ def test_statefulset_policy_is_unchanged_when_inert(key, component):
         for s in _sources(policy, "podSelector")
     ]
     assert component not in components
-    assert _sources(policy, "namespaceSelector") == []
+    # Scoped to the operator namespace rather than asserting no namespaceSelector
+    # at all. These renders carry helm/ci/test-values.yaml, which enables the
+    # stateless pool's KEDA autoscaling, and that feature owns a namespaceSelector
+    # of its own on the postgres policy (the scaler queries 5432 from the KEDA
+    # namespace) at every engine. "Inert" is a claim about THIS migration -- no
+    # CNPG operator ingress until an engine is flipped -- not a claim that no
+    # other feature may ever allow a namespace in.
+    assert OPERATOR_NAMESPACE not in [
+        n["matchLabels"].get("kubernetes.io/metadata.name")
+        for n in _sources(policy, "namespaceSelector")
+    ]
 
 
 # --- disruption budgets ----------------------------------------------------

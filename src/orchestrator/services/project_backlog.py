@@ -29,6 +29,7 @@ from datetime import datetime
 from typing import Any
 
 from orchestrator.services.kb_git_source import GiteaKnowledgeGitSource
+from orchestrator.services.work_categories import BACKLOG_NOTE_TYPES
 from shared.backlog_tags import READY_TAG, category_tag
 
 logger = logging.getLogger(__name__)
@@ -36,8 +37,6 @@ logger = logging.getLogger(__name__)
 # Canonical copy: src/services/knowledge_graph.py (not importable here — the
 # orchestrator image has no agent deps; see kb_reindex.py for the same pattern).
 PRIORITY_WORDS: dict[int, str] = {0: "high", 1: "normal", 2: "low"}
-
-BACKLOG_NOTE_TYPES: tuple[str, ...] = ("feature", "issue", "idea")
 
 # The note-type filter, pre-rendered as a SQL literal `IN (...)` list rather
 # than bound as `= ANY($n::text[])`. Fix round 1, Finding 1: measured on
@@ -417,21 +416,14 @@ async def _resolve_note_repo(project_id: str, postgres_db: Any) -> Any | None:
     once a project has its own ``knowledge`` repo, and that divergence is
     silent (knowledge-base/knowledge/features/knowledge_base_repo_separation.md §5a, §10).
 
-    ``postgres_db`` is late-bound off ``main`` when the caller passes none: it
-    is a module global built during orchestrator startup, and importing
-    ``main`` at call time rather than import time avoids the circular import
-    (same pattern as services/sitrep.py). ``None`` when the project has no KB
-    repo at all — there is no file to mirror to, only the index.
+    ``postgres_db`` is required (R1.B07 closed the late ``orchestrator.main``
+    fallback that used to stand in for it): every caller already holds the
+    handle, and a silent ``None`` there meant the mirror simply did not run.
+    ``None`` is returned when the project has no KB repo at all — there is no
+    file to mirror to, only the index.
     """
     if postgres_db is None:
-        try:
-            import orchestrator.main as orchestrator_main  # late import: avoid circular
-
-            postgres_db = getattr(orchestrator_main, "postgres_db", None)
-        except Exception:
-            postgres_db = None
-        if postgres_db is None:
-            return None
+        return None
 
     from orchestrator.services.kb_reindex import (
         resolve_kb_repo,
@@ -534,8 +526,9 @@ async def close_backlog_ticket(
     reporting a close that reindex could later resurrect.
 
     ``postgres_db`` is only needed to resolve which repo holds the vault (see
-    ``_resolve_note_repo``); callers that have the handle should pass it, and
-    it is late-bound off ``main`` when they don't.
+    ``_resolve_note_repo``). R1.B07 made it the caller's job in every case;
+    without it the canonical (file) mirror cannot be crossed, and this reports
+    failure rather than a close that reindex could later resurrect.
     """
 
     async def _permit() -> None:
@@ -543,10 +536,6 @@ async def close_backlog_ticket(
             await authority_check()
 
     await _permit()
-    if postgres_db is None:
-        from orchestrator.main import postgres_db as app_postgres_db
-
-        postgres_db = app_postgres_db
 
     from orchestrator.services.kb_materialize import (
         materialize_knowledge_metadata_update,

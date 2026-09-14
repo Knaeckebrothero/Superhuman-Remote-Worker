@@ -5,22 +5,34 @@ exercised in ``test_apply.py``; here it's patched out so these tests focus
 on endpoint-level concerns: epoch parsed from the request body and threaded
 through to the engine call, ``StagedApplyError`` -> ``HTTPException``
 passthrough, the partial-write 502 mapping, and owner-auth propagation.
-Also covers ``main._reset_thread_overlay`` directly (the agent-URL
-resolution helper), since it has no other dedicated test.
+Also covers ``thread_cloud_diff._reset_thread_overlay`` directly (the
+agent-URL resolution helper), since it has no other dedicated test.
 
 Follows the ExitStack pattern in
 tests/cloud_staging/test_thread_cloud_diff_endpoints.py: ``import main``
-(conftest puts orchestrator/ on sys.path), patch its module globals, and
+(conftest puts orchestrator/ on sys.path), patch its module globals, build
+the route dependencies from main's own factory *inside* those patches, and
 call the endpoint coroutines directly.
+
+R1.B04 moved both routes to ``routers.thread_cloud_diff`` and their bodies
+(plus ``_reset_thread_overlay`` and the two overlay-authority helpers) to
+``services.thread_cloud_diff``. Collaborators now arrive through
+``ThreadCloudDiffRouteDependencies``, so the patches below target either a
+global main's factory reads live or the service module that owns the name —
+patching a moved name on ``main`` would not intercept.
 """
 
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
+from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
 
 import orchestrator.main
+from orchestrator.routers import thread_cloud_diff as diff_routes
+from orchestrator.services import thread_cloud_diff as diff_ops
 
 # NOTE: import via the bare ``services.`` root, NOT ``orchestrator.services.``.
 # orchestrator/ is on sys.path (conftest.py) so ``services.cloud_staging.apply``
@@ -85,26 +97,29 @@ def _staged_summary(*, runtime_generation: str = RUNTIME_GENERATION) -> dict:
     }
 
 
+@contextmanager
 def _patch_endpoint(
     *,
     user: dict,
     thread: dict,
     require_thread_owner_result=None,
     reset_overlay_result: bool = True,
-) -> tuple[ExitStack, MagicMock]:
-    """Patch every global the two endpoints touch. Returns (stack, db)."""
+):
+    """Patch every global the two endpoints touch; yield db + dependencies.
+
+    The owner gate is a *declared* dependency now (the dataclass defaults it to
+    the real ``security.access.require_thread_owner``, which main's factory
+    leaves alone), so it is injected with ``dataclasses.replace`` rather than
+    patched onto a module. Everything else is still a main global, resolved
+    live by ``main._thread_cloud_diff_dependencies()`` — which is why that
+    factory has to run inside this stack.
+    """
     stack = ExitStack()
-    if require_thread_owner_result is not None:
-        stack.enter_context(
-            patch("orchestrator.main.require_thread_owner", require_thread_owner_result)
-        )
-    else:
-        stack.enter_context(
-            patch(
-                "orchestrator.main.require_thread_owner",
-                AsyncMock(return_value=(user, thread)),
-            )
-        )
+    gate = (
+        require_thread_owner_result
+        if require_thread_owner_result is not None
+        else AsyncMock(return_value=(user, thread))
+    )
     db = MagicMock()
     db.get_ro_mount_by_thread = AsyncMock(
         return_value={"staged_epoch": 5, "staged_summary": _staged_summary()}
@@ -115,13 +130,28 @@ def _patch_endpoint(
     stack.enter_context(
         patch("orchestrator.main._is_protected_cloud_mode_enabled", lambda: True)
     )
-    stack.enter_context(
-        patch(
-            "orchestrator.main._reset_thread_overlay",
-            AsyncMock(return_value=reset_overlay_result),
+    reset_overlay = AsyncMock(return_value=reset_overlay_result)
+    # ``_reset_thread_overlay`` moved with the endpoint bodies; apply/reject
+    # resolve it in the service module's own namespace, so that is where it
+    # has to be patched.
+    stack.enter_context(patch.object(diff_ops, "_reset_thread_overlay", reset_overlay))
+    with stack:
+        dependencies = replace(
+            orchestrator.main._thread_cloud_diff_dependencies(),
+            require_thread_owner=gate,
         )
-    )
-    return stack, db
+        # Proof the patches intercept: the factory reads these globals live,
+        # and the protected-mode flag is off by default (env-driven), so a
+        # missed patch would 404 every protected case below.
+        assert dependencies.operations.store is db
+        assert dependencies.operations.is_protected_cloud_mode_enabled() is True
+        assert dependencies.require_thread_owner is gate
+        yield SimpleNamespace(
+            db=db,
+            dependencies=dependencies,
+            gate=gate,
+            reset_overlay=reset_overlay,
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -143,16 +173,18 @@ class TestApplyEndpoint:
                 "overlay_reset": True,
             }
         )
-        stack, db = _patch_endpoint(user=user, thread=thread)
         with (
-            stack,
+            _patch_endpoint(user=user, thread=thread) as wired,
             patch(
                 "orchestrator.services.cloud_staging.apply.apply_staged_diff",
                 engine_mock,
             ),
         ):
-            result = await orchestrator.main.apply_thread_cloud_diff(
-                fake_request, THREAD_ID, {"epoch": 5}
+            result = await diff_routes.apply_thread_cloud_diff(
+                fake_request,
+                THREAD_ID,
+                {"epoch": 5},
+                dependencies=wired.dependencies,
             )
 
             assert result == {
@@ -176,11 +208,12 @@ class TestApplyEndpoint:
             # not just "a callable".
             out = await kwargs["reset_agent_overlay"]()
             assert out is True
-            orchestrator.main._reset_thread_overlay.assert_awaited_once_with(
+            wired.reset_overlay.assert_awaited_once_with(
                 THREAD_ID,
-                orchestrator.main._capture_thread_overlay_reset_authority(
+                diff_ops._capture_thread_overlay_reset_authority(
                     thread, _staged_summary()
                 ),
+                dependencies=wired.dependencies.operations,
             )
 
     @pytest.mark.asyncio
@@ -194,17 +227,19 @@ class TestApplyEndpoint:
                 409, {"code": "epoch_stale", "staged_epoch": 3}
             )
         )
-        stack, db = _patch_endpoint(user=user, thread=thread)
         with (
-            stack,
+            _patch_endpoint(user=user, thread=thread) as wired,
             patch(
                 "orchestrator.services.cloud_staging.apply.apply_staged_diff",
                 engine_mock,
             ),
         ):
             with pytest.raises(HTTPException):
-                await orchestrator.main.apply_thread_cloud_diff(
-                    fake_request, THREAD_ID, {}
+                await diff_routes.apply_thread_cloud_diff(
+                    fake_request,
+                    THREAD_ID,
+                    {},
+                    dependencies=wired.dependencies,
                 )
             _, kwargs = engine_mock.call_args
             assert kwargs["epoch"] == -1
@@ -216,17 +251,19 @@ class TestApplyEndpoint:
         user = _make_user()
         thread = _make_thread()
         engine_mock = AsyncMock()
-        stack, db = _patch_endpoint(user=user, thread=thread)
         with (
-            stack,
+            _patch_endpoint(user=user, thread=thread) as wired,
             patch(
                 "orchestrator.services.cloud_staging.apply.apply_staged_diff",
                 engine_mock,
             ),
         ):
             with pytest.raises(HTTPException) as ei:
-                await orchestrator.main.apply_thread_cloud_diff(
-                    fake_request, THREAD_ID, {"epoch": "not-a-number"}
+                await diff_routes.apply_thread_cloud_diff(
+                    fake_request,
+                    THREAD_ID,
+                    {"epoch": "not-a-number"},
+                    dependencies=wired.dependencies,
                 )
             engine_mock.assert_not_awaited()
         assert ei.value.status_code == 422
@@ -234,17 +271,19 @@ class TestApplyEndpoint:
 
         # reject mirrors the same guard (None -> TypeError branch).
         reject_mock = AsyncMock()
-        stack2, _db2 = _patch_endpoint(user=user, thread=thread)
         with (
-            stack2,
+            _patch_endpoint(user=user, thread=thread) as wired2,
             patch(
                 "orchestrator.services.cloud_staging.apply.reject_staged_diff",
                 reject_mock,
             ),
         ):
             with pytest.raises(HTTPException) as ei2:
-                await orchestrator.main.reject_thread_cloud_diff(
-                    fake_request, THREAD_ID, {"epoch": None}
+                await diff_routes.reject_thread_cloud_diff(
+                    fake_request,
+                    THREAD_ID,
+                    {"epoch": None},
+                    dependencies=wired2.dependencies,
                 )
             reject_mock.assert_not_awaited()
         assert ei2.value.status_code == 422
@@ -259,17 +298,19 @@ class TestApplyEndpoint:
                 409, {"code": "external_modifications_detected", "diverged": []}
             )
         )
-        stack, db = _patch_endpoint(user=user, thread=thread)
         with (
-            stack,
+            _patch_endpoint(user=user, thread=thread) as wired,
             patch(
                 "orchestrator.services.cloud_staging.apply.apply_staged_diff",
                 engine_mock,
             ),
         ):
             with pytest.raises(HTTPException) as ei:
-                await orchestrator.main.apply_thread_cloud_diff(
-                    fake_request, THREAD_ID, {"epoch": 5}
+                await diff_routes.apply_thread_cloud_diff(
+                    fake_request,
+                    THREAD_ID,
+                    {"epoch": 5},
+                    dependencies=wired.dependencies,
                 )
         assert ei.value.status_code == 409
         assert ei.value.detail == {
@@ -284,17 +325,19 @@ class TestApplyEndpoint:
         engine_mock = AsyncMock(
             side_effect=StagedApplyError(410, {"code": "staging_missing"})
         )
-        stack, db = _patch_endpoint(user=user, thread=thread)
         with (
-            stack,
+            _patch_endpoint(user=user, thread=thread) as wired,
             patch(
                 "orchestrator.services.cloud_staging.apply.apply_staged_diff",
                 engine_mock,
             ),
         ):
             with pytest.raises(HTTPException) as ei:
-                await orchestrator.main.apply_thread_cloud_diff(
-                    fake_request, THREAD_ID, {"epoch": 5}
+                await diff_routes.apply_thread_cloud_diff(
+                    fake_request,
+                    THREAD_ID,
+                    {"epoch": 5},
+                    dependencies=wired.dependencies,
                 )
         assert ei.value.status_code == 410
         assert ei.value.detail == {"code": "staging_missing"}
@@ -310,17 +353,19 @@ class TestApplyEndpoint:
                 "errors": ["bad.txt: boom"],
             }
         )
-        stack, db = _patch_endpoint(user=user, thread=thread)
         with (
-            stack,
+            _patch_endpoint(user=user, thread=thread) as wired,
             patch(
                 "orchestrator.services.cloud_staging.apply.apply_staged_diff",
                 engine_mock,
             ),
         ):
             with pytest.raises(HTTPException) as ei:
-                await orchestrator.main.apply_thread_cloud_diff(
-                    fake_request, THREAD_ID, {"epoch": 5}
+                await diff_routes.apply_thread_cloud_diff(
+                    fake_request,
+                    THREAD_ID,
+                    {"epoch": 5},
+                    dependencies=wired.dependencies,
                 )
         assert ei.value.status_code == 502
         assert ei.value.detail == {
@@ -334,10 +379,15 @@ class TestApplyEndpoint:
     async def test_apply_404_when_not_protected(self, fake_request):
         user = _make_user()
         thread = _make_thread(protected=False)
-        stack, db = _patch_endpoint(user=user, thread=thread)
-        with stack, pytest.raises(HTTPException) as ei:
-            await orchestrator.main.apply_thread_cloud_diff(
-                fake_request, THREAD_ID, {"epoch": 5}
+        with (
+            _patch_endpoint(user=user, thread=thread) as wired,
+            pytest.raises(HTTPException) as ei,
+        ):
+            await diff_routes.apply_thread_cloud_diff(
+                fake_request,
+                THREAD_ID,
+                {"epoch": 5},
+                dependencies=wired.dependencies,
             )
         assert ei.value.status_code == 404
 
@@ -346,12 +396,19 @@ class TestApplyEndpoint:
         denied = AsyncMock(
             side_effect=HTTPException(status_code=403, detail="Not your thread")
         )
-        stack, db = _patch_endpoint(
-            user=_make_user(), thread=_make_thread(), require_thread_owner_result=denied
-        )
-        with stack, pytest.raises(HTTPException) as ei:
-            await orchestrator.main.apply_thread_cloud_diff(
-                fake_request, THREAD_ID, {"epoch": 5}
+        with (
+            _patch_endpoint(
+                user=_make_user(),
+                thread=_make_thread(),
+                require_thread_owner_result=denied,
+            ) as wired,
+            pytest.raises(HTTPException) as ei,
+        ):
+            await diff_routes.apply_thread_cloud_diff(
+                fake_request,
+                THREAD_ID,
+                {"epoch": 5},
+                dependencies=wired.dependencies,
             )
         assert ei.value.status_code == 403
 
@@ -369,16 +426,18 @@ class TestRejectEndpoint:
         engine_mock = AsyncMock(
             return_value={"rejected": True, "epoch": 6, "overlay_reset": True}
         )
-        stack, db = _patch_endpoint(user=user, thread=thread)
         with (
-            stack,
+            _patch_endpoint(user=user, thread=thread) as wired,
             patch(
                 "orchestrator.services.cloud_staging.apply.reject_staged_diff",
                 engine_mock,
             ),
         ):
-            result = await orchestrator.main.reject_thread_cloud_diff(
-                fake_request, THREAD_ID, {"epoch": 5}
+            result = await diff_routes.reject_thread_cloud_diff(
+                fake_request,
+                THREAD_ID,
+                {"epoch": 5},
+                dependencies=wired.dependencies,
             )
 
             assert result == {
@@ -405,17 +464,19 @@ class TestRejectEndpoint:
                 409, {"code": "epoch_stale", "staged_epoch": 9}
             )
         )
-        stack, db = _patch_endpoint(user=user, thread=thread)
         with (
-            stack,
+            _patch_endpoint(user=user, thread=thread) as wired,
             patch(
                 "orchestrator.services.cloud_staging.apply.reject_staged_diff",
                 engine_mock,
             ),
         ):
             with pytest.raises(HTTPException) as ei:
-                await orchestrator.main.reject_thread_cloud_diff(
-                    fake_request, THREAD_ID, {"epoch": 5}
+                await diff_routes.reject_thread_cloud_diff(
+                    fake_request,
+                    THREAD_ID,
+                    {"epoch": 5},
+                    dependencies=wired.dependencies,
                 )
         assert ei.value.status_code == 409
         assert ei.value.detail == {"code": "epoch_stale", "staged_epoch": 9}
@@ -424,10 +485,15 @@ class TestRejectEndpoint:
     async def test_reject_404_when_not_protected(self, fake_request):
         user = _make_user()
         thread = _make_thread(protected=False)
-        stack, db = _patch_endpoint(user=user, thread=thread)
-        with stack, pytest.raises(HTTPException) as ei:
-            await orchestrator.main.reject_thread_cloud_diff(
-                fake_request, THREAD_ID, {"epoch": 5}
+        with (
+            _patch_endpoint(user=user, thread=thread) as wired,
+            pytest.raises(HTTPException) as ei,
+        ):
+            await diff_routes.reject_thread_cloud_diff(
+                fake_request,
+                THREAD_ID,
+                {"epoch": 5},
+                dependencies=wired.dependencies,
             )
         assert ei.value.status_code == 404
 
@@ -436,12 +502,19 @@ class TestRejectEndpoint:
         denied = AsyncMock(
             side_effect=HTTPException(status_code=403, detail="Not your thread")
         )
-        stack, db = _patch_endpoint(
-            user=_make_user(), thread=_make_thread(), require_thread_owner_result=denied
-        )
-        with stack, pytest.raises(HTTPException) as ei:
-            await orchestrator.main.reject_thread_cloud_diff(
-                fake_request, THREAD_ID, {"epoch": 5}
+        with (
+            _patch_endpoint(
+                user=_make_user(),
+                thread=_make_thread(),
+                require_thread_owner_result=denied,
+            ) as wired,
+            pytest.raises(HTTPException) as ei,
+        ):
+            await diff_routes.reject_thread_cloud_diff(
+                fake_request,
+                THREAD_ID,
+                {"epoch": 5},
+                dependencies=wired.dependencies,
             )
         assert ei.value.status_code == 403
 
@@ -478,8 +551,18 @@ class _FakeAsyncClient:
 
 class TestResetThreadOverlay:
     @staticmethod
+    def _deps() -> diff_ops.ThreadCloudDiffDependencies:
+        """Operations dependencies from main's factory.
+
+        Call this *inside* the ``postgres_db`` patch: the factory reads that
+        global live, and ``_reset_thread_overlay`` reaches the store only
+        through ``dependencies.store``.
+        """
+        return orchestrator.main._thread_cloud_diff_dependencies().operations
+
+    @staticmethod
     def _authority() -> dict[str, str]:
-        authority = orchestrator.main._capture_thread_overlay_reset_authority(
+        authority = diff_ops._capture_thread_overlay_reset_authority(
             _make_thread(), _staged_summary()
         )
         assert authority is not None
@@ -509,10 +592,15 @@ class TestResetThreadOverlay:
         client = _FakeAsyncClient(response=_FakeResponse(200))
         with (
             patch("orchestrator.main.postgres_db", db),
-            patch("orchestrator.main.httpx.AsyncClient", return_value=client),
+            patch(
+                "orchestrator.services.thread_cloud_diff.httpx.AsyncClient",
+                return_value=client,
+            ),
         ):
-            out = await orchestrator.main._reset_thread_overlay(
-                THREAD_ID, self._authority()
+            deps = self._deps()
+            assert deps.store is db  # the patch intercepts
+            out = await diff_ops._reset_thread_overlay(
+                THREAD_ID, self._authority(), dependencies=deps
             )
         assert out is True
         assert client.headers == {
@@ -534,12 +622,14 @@ class TestResetThreadOverlay:
         with (
             patch("orchestrator.main.postgres_db", db),
             patch(
-                "orchestrator.main.httpx.AsyncClient",
+                "orchestrator.services.thread_cloud_diff.httpx.AsyncClient",
                 return_value=_FakeAsyncClient(response=_FakeResponse(404)),
             ),
         ):
-            out = await orchestrator.main._reset_thread_overlay(
-                THREAD_ID, self._authority()
+            deps = self._deps()
+            assert deps.store is db  # the patch intercepts
+            out = await diff_ops._reset_thread_overlay(
+                THREAD_ID, self._authority(), dependencies=deps
             )
         assert out is False
 
@@ -550,26 +640,32 @@ class TestResetThreadOverlay:
         with (
             patch("orchestrator.main.postgres_db", db),
             patch(
-                "orchestrator.main.httpx.AsyncClient",
+                "orchestrator.services.thread_cloud_diff.httpx.AsyncClient",
                 return_value=_FakeAsyncClient(exc=ConnectionError("dead pod")),
             ),
         ):
-            out = await orchestrator.main._reset_thread_overlay(
-                THREAD_ID, self._authority()
+            deps = self._deps()
+            assert deps.store is db  # the patch intercepts
+            out = await diff_ops._reset_thread_overlay(
+                THREAD_ID, self._authority(), dependencies=deps
             )
         assert out is False
 
     @pytest.mark.asyncio
     async def test_reset_overlay_false_when_no_agent_bound(self):
-        out = await orchestrator.main._reset_thread_overlay(THREAD_ID, None)
+        out = await diff_ops._reset_thread_overlay(
+            THREAD_ID, None, dependencies=self._deps()
+        )
         assert out is False
 
     @pytest.mark.asyncio
     async def test_reset_overlay_false_when_agent_has_no_pod_ip(self):
         db = self._db(agent={"id": AGENT_ID, "thread_id": THREAD_ID, "pod_ip": None})
         with patch("orchestrator.main.postgres_db", db):
-            out = await orchestrator.main._reset_thread_overlay(
-                THREAD_ID, self._authority()
+            deps = self._deps()
+            assert deps.store is db  # the patch intercepts
+            out = await diff_ops._reset_thread_overlay(
+                THREAD_ID, self._authority(), dependencies=deps
             )
         assert out is False
 
@@ -582,18 +678,21 @@ class TestResetThreadOverlay:
         with (
             patch("orchestrator.main.postgres_db", db),
             patch(
-                "orchestrator.main.httpx.AsyncClient", return_value=client
+                "orchestrator.services.thread_cloud_diff.httpx.AsyncClient",
+                return_value=client,
             ) as http_client,
         ):
-            out = await orchestrator.main._reset_thread_overlay(
-                THREAD_ID, self._authority()
+            deps = self._deps()
+            assert deps.store is db  # the patch intercepts
+            out = await diff_ops._reset_thread_overlay(
+                THREAD_ID, self._authority(), dependencies=deps
             )
         assert out is False
         http_client.assert_not_called()
 
     def test_capture_refuses_review_from_predecessor_generation(self):
         assert (
-            orchestrator.main._capture_thread_overlay_reset_authority(
+            diff_ops._capture_thread_overlay_reset_authority(
                 _make_thread(),
                 _staged_summary(
                     runtime_generation="77777777-7777-4777-8777-777777777777"
@@ -618,11 +717,14 @@ class TestResetThreadOverlay:
         with (
             patch("orchestrator.main.postgres_db", db),
             patch(
-                "orchestrator.main.httpx.AsyncClient", return_value=client
+                "orchestrator.services.thread_cloud_diff.httpx.AsyncClient",
+                return_value=client,
             ) as http_client,
         ):
-            out = await orchestrator.main._reset_thread_overlay(
-                THREAD_ID, self._authority()
+            deps = self._deps()
+            assert deps.store is db  # the patch intercepts
+            out = await diff_ops._reset_thread_overlay(
+                THREAD_ID, self._authority(), dependencies=deps
             )
         assert out is False
         http_client.assert_not_called()

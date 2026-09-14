@@ -207,3 +207,209 @@ tasks:
       schicken? Danke!
       ---
     required_deliverables: [output/digest.md]
+
+  # --- Engineer-vs-developer campaign tasks (engineer_expert.md §6). The arm's
+  # config_name overrides `config_name: engineer` below, so the same text runs
+  # on both experts. New ids only; never edit a task in place.
+
+  - id: D3-ledger-refactor
+    family: dev
+    config_name: engineer
+    description: |
+      The module below has three real bugs and one duplicated helper. Save it
+      as `code/ledger.py`, then:
+
+      1. Write `code/test_ledger.py` (pytest) with tests that expose each of
+         the three bugs — each test must fail against the original module —
+         plus the happy paths.
+      2. Fix the bugs in `code/ledger.py` so every test passes. Do not change
+         the function names or signatures.
+      3. Only once everything is green, remove the duplicated helper so a single
+         helper remains, and re-run the tests.
+      4. Save the final passing `pytest code/ -v` output to `output/test-run.txt`.
+
+      Document each bug you found in a comment above the test that exposes it.
+
+      ```python
+      from collections import defaultdict
+
+
+      def _normalize_category(name):
+          return name.strip().lower().replace("  ", " ")
+
+
+      def _clean_category(name):
+          return name.strip().lower().replace("  ", " ")
+
+
+      def parse_amount(text, locale="en"):
+          """Parse '1,234.56' (locale 'en') or '1.234,56' (locale 'de') into a float."""
+          text = text.strip()
+          if locale == "de":
+              text = text.replace(",", ".").replace(".", "")
+          else:
+              text = text.replace(",", "")
+          return float(text)
+
+
+      def monthly_totals(entries):
+          """entries: dicts with 'date' (YYYY-MM-DD) and 'amount' (float).
+
+          Returns {'YYYY-MM': total} with keys sorted ascending.
+          """
+          totals = defaultdict(float)
+          for entry in entries:
+              month = entry["date"][:4]
+              totals[month] += entry["amount"]
+          return dict(sorted(totals.items()))
+
+
+      def top_categories(entries, n=3, exclude=()):
+          """The n categories with the highest total amount, highest first,
+          ties broken alphabetically, skipping `exclude` (case-insensitive)."""
+          excluded = {_normalize_category(e) for e in exclude}
+          totals = defaultdict(float)
+          for entry in entries:
+              cat = _clean_category(entry["category"])
+              if cat in excluded:
+                  continue
+              totals[cat] += entry["amount"]
+          ranked = sorted(totals.items(), key=lambda kv: (kv[1], kv[0]))
+          return [cat for cat, _ in ranked[:n]]
+      ```
+    required_deliverables:
+      [code/ledger.py, code/test_ledger.py, output/test-run.txt]
+
+  - id: D4-static-page
+    family: frontend
+    config_name: engineer
+    description: |
+      Build a single self-contained page `code/index.html` (no external
+      scripts or stylesheets; inline CSS and JS only) called "Reading List":
+
+      1. `<title>` is exactly `Reading List`.
+      2. A text input with id `title`, a button with id `add`, a button with
+         id `clear`, and a `<ul>` with id `items`.
+      3. Clicking `add` appends the input's text as a new `<li>` to `items`
+         (ignore empty input) and clears the input.
+      4. The list persists across reloads in `localStorage` under the key
+         `reading-list`; on load the saved items are rendered.
+      5. Clicking `clear` empties the list and the stored value.
+
+      Save the checker below verbatim as `code/check_page.py`, run
+      `python code/check_page.py` from the workspace root, and store its
+      complete output in `output/check-run.txt`. The last line must be
+      `OK: 6 checks passed`. Do not modify the checker.
+
+      ```python
+      import re
+      import sys
+      from html.parser import HTMLParser
+      from pathlib import Path
+
+
+      class Scan(HTMLParser):
+          def __init__(self):
+              super().__init__()
+              self.ids = set()
+              self.title = ""
+              self.in_title = False
+              self.scripts = []
+              self.in_script = False
+              self.external = []
+
+          def handle_starttag(self, tag, attrs):
+              a = dict(attrs)
+              if a.get("id"):
+                  self.ids.add(a["id"])
+              if tag == "title":
+                  self.in_title = True
+              if tag == "script":
+                  if a.get("src"):
+                      self.external.append(a["src"])
+                  self.in_script = True
+                  self.scripts.append("")
+              if tag == "link" and a.get("href"):
+                  self.external.append(a["href"])
+
+          def handle_endtag(self, tag):
+              if tag == "title":
+                  self.in_title = False
+              if tag == "script":
+                  self.in_script = False
+
+          def handle_data(self, data):
+              if self.in_title:
+                  self.title += data
+              if self.in_script:
+                  self.scripts[-1] += data
+
+
+      src = Path("code/index.html").read_text(encoding="utf-8")
+      s = Scan()
+      s.feed(src)
+      js = "\n".join(s.scripts)
+      checks = [
+          ("title is 'Reading List'", s.title.strip() == "Reading List"),
+          ("has #title, #add, #clear and #items", {"title", "add", "clear", "items"} <= s.ids),
+          ("inline script present", bool(js.strip())),
+          ("persists under localStorage key 'reading-list'", "localStorage" in js and "reading-list" in js),
+          ("self-contained: no external scripts or stylesheets", not s.external),
+          ("wires the buttons with addEventListener", "addEventListener" in js and re.search(r"\badd\b", js) is not None),
+      ]
+      failed = [name for name, ok in checks if not ok]
+      for name, ok in checks:
+          print(("PASS" if ok else "FAIL"), name)
+      if failed:
+          sys.exit(1)
+      print(f"OK: {len(checks)} checks passed")
+      ```
+    required_deliverables:
+      [code/index.html, code/check_page.py, output/check-run.txt]
+
+  - id: D5-clone-and-extend
+    family: dev-repo
+    config_name: engineer
+    description: |
+      Work inside a real, pinned open-source repository.
+
+      1. Clone it at the pinned tag into the workspace:
+         `git clone --depth 1 --branch v10.5.0 https://github.com/more-itertools/more-itertools code/more-itertools`
+         If the clone fails for network reasons, write the exact error to
+         `output/test-run.txt` and stop — do not substitute another repository.
+      2. Add a new public function `chunk_sums(iterable, n)` to the package:
+         it yields the sum of each consecutive chunk of `n` items, the last
+         partial chunk included; `n < 1` raises `ValueError`. Follow the
+         package's own conventions: implement it next to the other grouping
+         helpers in `more_itertools/more.py`, export it (`__all__` and the
+         package `__init__`), add it to the type stub if the package ships one,
+         and add it to the API docs under the same section as `chunked`.
+      3. Add tests to the existing test module in that module's own style, run
+         them, then run the whole suite: `python -m pytest tests -q` from the
+         repository root. Everything must pass.
+      4. Save `output/change.patch` (`git diff` against the pinned tag, from the
+         repository root) and the full-suite pytest output to
+         `output/test-run.txt`.
+    required_deliverables: [output/change.patch, output/test-run.txt]
+
+  - id: O1-install-and-report
+    family: ops
+    config_name: engineer
+    description: |
+      Operations task, no code to write. Install the `httpie` command-line
+      client into this workspace without root (for example
+      `pip install --user httpie`, or `pipx`), then run exactly these three
+      commands and capture their complete output:
+
+      1. `http --version`
+      2. `http --offline GET https://example.com/api/items q==bench` (offline
+         mode prints the request it would send without touching the network)
+      3. `python -c "import httpie; print(httpie.__version__)"`
+
+      Write `output/install-report.md` with: the install method and the exact
+      command you used; one `##` section per command above, each containing
+      the command and its verbatim output in a fenced block; and a final
+      `## Result` line stating whether all three commands succeeded. If the
+      install fails for network reasons, record the exact error under
+      `## Result` and stop.
+    required_deliverables: [output/install-report.md]

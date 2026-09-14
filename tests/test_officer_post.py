@@ -213,6 +213,14 @@ async def _schema_applied(pg_dsn):
     conn = await asyncpg.connect(pg_dsn)
     try:
         await conn.execute(SCHEMA_FILE.read_text())
+        await conn.execute("SET search_path TO public")
+        if not await conn.fetchval("SELECT to_regclass('srw_resources')"):
+            await conn.execute(
+                (
+                    REPO_ROOT
+                    / "src/orchestrator/database/migrations/app/0234_manifest_resources.sql"
+                ).read_text()
+            )
     finally:
         await conn.close()
 
@@ -236,10 +244,20 @@ async def db(pg_dsn, _schema_applied, monkeypatch):
 
 async def _seed_project(db: PostgresDB, name: str = "post-test") -> str:
     project_id = uuid4()
+    owner_id = uuid4()
     async with db.acquire() as conn:
         await conn.execute(
             "INSERT INTO projects (id, name) VALUES ($1, $2)", project_id, name
         )
+        await conn.execute(
+            "INSERT INTO users(id,display_name,default_project_id) VALUES($1,$2,$3)",
+            owner_id,
+            "Post owner",
+            project_id,
+        )
+    # Preserve the bypassed Officer-post mint exercised by this fixture while
+    # giving the canonical Project configuration a real membership authority.
+    await db.add_project_member(str(project_id), str(owner_id), "owner")
     return str(project_id)
 
 

@@ -1,15 +1,20 @@
 """GET /api/ssh/host-keys — publish the gateway's host keys for pinning.
 
 Unauthenticated by design (see the `# nosec: public` marker above the route
-in main.py): host keys are public material, and the client needs them
-*before* it can authenticate anything else. Most of these tests call the
-handler directly for speed; ``test_anonymous_http_get_reaches_the_handler``
-goes through the real ASGI stack because unauthenticated *reachability* — not
-just the inventory's classification of the route — is the property the whole
-design rests on. The endpoint-inventory snapshot test
-(tests/test_endpoint_inventory.py) proves the route is deliberately public
-rather than merely unscoped; it must be run alongside this file, not instead
-of it.
+in ``orchestrator/routers/ssh_access.py``): host keys are public material,
+and the client needs them *before* it can authenticate anything else. Most of
+these tests call the handler directly for speed;
+``test_anonymous_http_get_reaches_the_handler`` goes through the real ASGI
+stack because unauthenticated *reachability* — not just the inventory's
+classification of the route — is the property the whole design rests on. The
+endpoint-inventory snapshot test (tests/test_endpoint_inventory.py) proves the
+route is deliberately public rather than merely unscoped; it must be run
+alongside this file, not instead of it.
+
+The parse memo is an application-owned object
+(``ssh_access.SshGatewayHostKeyCache``), not a module-level ``lru_cache``, so
+each case here gets its own — which is exactly what the caching cases below
+need in order to count parses without inheriting another test's memo.
 """
 
 import subprocess
@@ -18,6 +23,15 @@ import pytest
 from fastapi.testclient import TestClient
 
 import orchestrator.main
+from orchestrator.routers import ssh_access as ssh_access_routes
+from orchestrator.services import ssh_access as ssh_access_operations
+from tests._mounted_router import mount_router
+from tests._ssh_access_harness import SshAccessHarness
+
+
+@pytest.fixture
+def harness():
+    return SshAccessHarness()
 
 
 def _keygen(path):
@@ -35,8 +49,14 @@ def _blob(pub_path):
     return pub_path.read_text().split()[1]
 
 
+async def _host_keys(harness):
+    return await ssh_access_routes.get_ssh_host_keys(
+        request=object(), dependencies=harness.dependencies
+    )
+
+
 @pytest.mark.asyncio
-async def test_publishes_type_key_and_fingerprint(monkeypatch, tmp_path):
+async def test_publishes_type_key_and_fingerprint(harness, monkeypatch, tmp_path):
     key, pub = _keygen(tmp_path / "gw")
     fingerprint = subprocess.run(
         ["ssh-keygen", "-lf", str(pub)],
@@ -48,7 +68,7 @@ async def test_publishes_type_key_and_fingerprint(monkeypatch, tmp_path):
     monkeypatch.setenv("SSH_GATEWAY_PUBLIC_HOST_KEYS", str(pub))
     monkeypatch.setenv("SSH_GATEWAY_HOSTNAME", "ssh.srw.works")
 
-    result = await orchestrator.main.get_ssh_host_keys(request=object())
+    result = await _host_keys(harness)
     assert result["hostname"] == "ssh.srw.works"
     entry = result["host_keys"][0]
     assert entry["type"] == "ssh-ed25519"
@@ -62,7 +82,7 @@ async def test_publishes_type_key_and_fingerprint(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_never_emits_a_private_key(monkeypatch, tmp_path):
+async def test_never_emits_a_private_key(harness, monkeypatch, tmp_path):
     """Pointing this at a private key file by mistake must never leak it.
 
     The task brief for this endpoint assumed ``asyncssh.import_public_key``
@@ -93,7 +113,7 @@ async def test_never_emits_a_private_key(monkeypatch, tmp_path):
     monkeypatch.setenv("SSH_GATEWAY_PUBLIC_HOST_KEYS", str(key))
     monkeypatch.setenv("SSH_GATEWAY_HOSTNAME", "ssh.srw.works")
 
-    result = await orchestrator.main.get_ssh_host_keys(request=object())
+    result = await _host_keys(harness)
 
     assert result["host_keys"], (
         "expected asyncssh to leniently extract the public component from "
@@ -110,7 +130,7 @@ async def test_never_emits_a_private_key(monkeypatch, tmp_path):
 
 @pytest.mark.asyncio
 async def test_one_unreadable_path_does_not_suppress_the_good_ones(
-    monkeypatch, tmp_path
+    harness, monkeypatch, tmp_path
 ):
     """The documented per-path tolerance, with a second path to exercise it.
 
@@ -128,14 +148,16 @@ async def test_one_unreadable_path_does_not_suppress_the_good_ones(
     monkeypatch.setenv("SSH_GATEWAY_PUBLIC_HOST_KEYS", f"{missing}, {good_pub}")
     monkeypatch.setenv("SSH_GATEWAY_HOSTNAME", "ssh.srw.works")
 
-    result = await orchestrator.main.get_ssh_host_keys(request=object())
+    result = await _host_keys(harness)
 
     assert len(result["host_keys"]) == 1
     assert result["host_keys"][0]["public_key"].split()[1] == _blob(good_pub)
 
 
 @pytest.mark.asyncio
-async def test_publishes_every_key_in_a_comma_separated_list(monkeypatch, tmp_path):
+async def test_publishes_every_key_in_a_comma_separated_list(
+    harness, monkeypatch, tmp_path
+):
     """The variable is a *list* for a reason; publish all of it.
 
     Catches a ``break`` (or a ``return`` of only the first entry) after the
@@ -149,14 +171,14 @@ async def test_publishes_every_key_in_a_comma_separated_list(monkeypatch, tmp_pa
     monkeypatch.setenv("SSH_GATEWAY_PUBLIC_HOST_KEYS", f" {first_pub} , {second_pub} ")
     monkeypatch.setenv("SSH_GATEWAY_HOSTNAME", "ssh.srw.works")
 
-    result = await orchestrator.main.get_ssh_host_keys(request=object())
+    result = await _host_keys(harness)
 
     blobs = [entry["public_key"].split()[1] for entry in result["host_keys"]]
     assert blobs == [_blob(first_pub), _blob(second_pub)]
 
 
 @pytest.mark.asyncio
-async def test_a_partial_read_is_retried_not_cached(monkeypatch, tmp_path):
+async def test_a_partial_read_is_retried_not_cached(harness, monkeypatch, tmp_path):
     """A transient read failure must not be pinned for the pod's lifetime.
 
     These files arrive on a projected Secret volume: the volume may not be
@@ -174,13 +196,13 @@ async def test_a_partial_read_is_retried_not_cached(monkeypatch, tmp_path):
     monkeypatch.setenv("SSH_GATEWAY_PUBLIC_HOST_KEYS", paths)
     monkeypatch.setenv("SSH_GATEWAY_HOSTNAME", "ssh.srw.works")
 
-    degraded = await orchestrator.main.get_ssh_host_keys(request=object())
+    degraded = await _host_keys(harness)
     assert len(degraded["host_keys"]) == 1
 
     _, late_source_pub = _keygen(tmp_path / "late_source")
     late.write_text(late_source_pub.read_text())
 
-    recovered = await orchestrator.main.get_ssh_host_keys(request=object())
+    recovered = await _host_keys(harness)
     assert len(recovered["host_keys"]) == 2, (
         "the failed read was cached under an env value that never changes"
     )
@@ -191,7 +213,7 @@ async def test_a_partial_read_is_retried_not_cached(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_a_complete_read_is_cached(monkeypatch, tmp_path):
+async def test_a_complete_read_is_cached(harness, monkeypatch, tmp_path):
     """The cache is all that stands between an anonymous request and blocking
     file I/O plus an asyncssh parse, per configured key, on the event loop.
 
@@ -205,26 +227,20 @@ async def test_a_complete_read_is_cached(monkeypatch, tmp_path):
     monkeypatch.setenv("SSH_GATEWAY_PUBLIC_HOST_KEYS", str(pub))
     monkeypatch.setenv("SSH_GATEWAY_HOSTNAME", "ssh.srw.works")
 
-    # Defensive: if the memoization is removed outright, this test must still
-    # reach its parse-count assertion and fail *there*, saying what broke —
-    # not error out on a missing cache_clear before asserting anything.
-    getattr(
-        orchestrator.main._memoized_ssh_gateway_host_keys, "cache_clear", lambda: None
-    )()
-
     parses: list[str] = []
-    real_parse = orchestrator.main._parse_ssh_gateway_host_keys
 
     def counting_parse(paths_value):
         parses.append(paths_value)
-        return real_parse(paths_value)
+        return ssh_access_operations.parse_ssh_gateway_host_keys(
+            paths_value, logger=harness.logger
+        )
 
-    monkeypatch.setattr(
-        orchestrator.main, "_parse_ssh_gateway_host_keys", counting_parse
+    harness.host_keys = ssh_access_operations.SshGatewayHostKeyCache(
+        logger=harness.logger, parse=counting_parse
     )
 
-    first = await orchestrator.main.get_ssh_host_keys(request=object())
-    second = await orchestrator.main.get_ssh_host_keys(request=object())
+    first = await _host_keys(harness)
+    second = await _host_keys(harness)
 
     assert first["host_keys"], "guard: the read must have succeeded to be cacheable"
     assert first["host_keys"] == second["host_keys"]
@@ -236,15 +252,54 @@ async def test_a_complete_read_is_cached(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_unconfigured_returns_an_empty_list(monkeypatch):
+async def test_two_applications_do_not_share_one_host_key_memo(monkeypatch, tmp_path):
+    """The memo is application-owned, and that is the point of the object.
+
+    A module-level ``lru_cache`` would be shared by every application built
+    in this process, so one application's operator configuration would decide
+    another's published host keys, and neither could clear it independently.
+    Two harnesses, one env value, two parses.
+    """
+    _, pub = _keygen(tmp_path / "gw")
+    monkeypatch.setenv("SSH_GATEWAY_PUBLIC_HOST_KEYS", str(pub))
+    monkeypatch.setenv("SSH_GATEWAY_HOSTNAME", "ssh.srw.works")
+
+    parses: list[str] = []
+
+    def _make():
+        built = SshAccessHarness()
+
+        def counting_parse(paths_value):
+            parses.append(paths_value)
+            return ssh_access_operations.parse_ssh_gateway_host_keys(
+                paths_value, logger=built.logger
+            )
+
+        built.host_keys = ssh_access_operations.SshGatewayHostKeyCache(
+            logger=built.logger, parse=counting_parse
+        )
+        return built
+
+    first, second = _make(), _make()
+    assert first.host_keys is not second.host_keys
+
+    await _host_keys(first)
+    await _host_keys(first)
+    await _host_keys(second)
+
+    assert len(parses) == 2
+
+
+@pytest.mark.asyncio
+async def test_unconfigured_returns_an_empty_list(harness, monkeypatch):
     monkeypatch.delenv("SSH_GATEWAY_PUBLIC_HOST_KEYS", raising=False)
     monkeypatch.delenv("SSH_GATEWAY_HOSTNAME", raising=False)
-    result = await orchestrator.main.get_ssh_host_keys(request=object())
+    result = await _host_keys(harness)
     assert result["host_keys"] == []
     assert result["hostname"] == ""
 
 
-def test_anonymous_http_get_reaches_the_handler(monkeypatch, tmp_path):
+def test_anonymous_http_get_reaches_the_router(monkeypatch, tmp_path):
     """No credentials, real ASGI stack, 200 with the key in the body.
 
     Every other test in this file bypasses routing and middleware by calling
@@ -252,7 +307,36 @@ def test_anonymous_http_get_reaches_the_handler(monkeypatch, tmp_path):
     only that the route is *classified* public. Neither shows that an
     anonymous ``GET`` actually arrives — which is the property the entire
     design rests on, since a client has nothing to authenticate with until
-    it has these keys.
+    it has these keys. Mounted in isolation, with only this application's
+    factory: no lifespan, no database, no gateway.
+    """
+    key, pub = _keygen(tmp_path / "gw")
+    monkeypatch.setenv("SSH_GATEWAY_PUBLIC_HOST_KEYS", str(pub))
+    monkeypatch.setenv("SSH_GATEWAY_HOSTNAME", "ssh.srw.works")
+
+    built = SshAccessHarness()
+    app = mount_router(
+        ssh_access_routes.router,
+        factories={"ssh_access_dependencies_factory": lambda: built.dependencies},
+    )
+
+    response = TestClient(app, raise_server_exceptions=False).get("/api/ssh/host-keys")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["hostname"] == "ssh.srw.works"
+    assert [entry["public_key"].split()[1] for entry in body["host_keys"]] == [
+        _blob(pub)
+    ]
+
+
+def test_anonymous_http_get_reaches_the_handler(monkeypatch, tmp_path):
+    """The same property through the application the product actually serves.
+
+    The isolated mount above proves the router is anonymous; this proves the
+    route is reachable anonymously on ``main.app``, past its middleware
+    stack — a router that is correct but unmounted, or mounted behind an
+    application-level dependency, fails here and nowhere else.
     """
     key, pub = _keygen(tmp_path / "gw")
     monkeypatch.setenv("SSH_GATEWAY_PUBLIC_HOST_KEYS", str(pub))

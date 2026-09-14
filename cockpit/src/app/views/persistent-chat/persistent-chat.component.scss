@@ -86,17 +86,7 @@
         overflow: hidden;
       }
 
-      .back-link {
-        display: flex;
-        align-items: center;
-        color: var(--text-muted);
-        text-decoration: none;
-        margin-right: 4px;
-      }
-
-      .back-link:hover { color: var(--text-primary); }
-
-      .header-icon, .error-icon {
+      .error-icon {
         color: var(--accent-color);
       }
 
@@ -108,12 +98,6 @@
         overflow: hidden;
         text-overflow: ellipsis;
         min-width: 0;
-      }
-
-      .header-session-id {
-        font-family: var(--font-mono, monospace);
-        font-size: 11px;
-        color: var(--text-muted);
       }
 
       .status-dot {
@@ -128,30 +112,18 @@
       .status-dot.disconnected { background: var(--surface-2); }
       .status-dot.error { background: var(--danger); }
 
+      // The dot's [title] is hover-only — no touch, no keyboard, and not
+      // reliably surfaced to assistive tech — so connected/disconnected/error
+      // would otherwise differ by colour alone (WCAG 1.4.1). This carries the
+      // same text a sighted pointer user gets from the title, permanently in
+      // the a11y tree, at zero header pixels.
+      .status-announce {
+        @include m.visually-hidden;
+      }
+
       @keyframes pulse {
         0%, 100% { opacity: 1; }
         50% { opacity: 0.4; }
-      }
-
-      .status-label {
-        font-size: 11px;
-        color: var(--text-muted);
-      }
-
-      /* Status bar */
-
-      .status-bar {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        padding: 4px 16px;
-        border-bottom: 1px solid var(--border-color, var(--surface-0));
-        background: var(--panel-bg);
-        flex-shrink: 0;
-      }
-
-      .status-bar > app-badge {
-        flex-shrink: 0;
       }
 
       /* Task bar */
@@ -218,22 +190,6 @@
         flex: 0 0 auto;
       }
 
-      .settings-btn {
-        display: flex;
-        align-items: center;
-        padding: 4px 8px;
-        border-radius: var(--radius-control);
-        border: 1px solid var(--border-color, var(--surface-0));
-        background: transparent;
-        color: var(--text-muted);
-        cursor: pointer;
-        transition: all 0.15s ease;
-      }
-      .settings-btn:hover, .settings-btn.active {
-        color: var(--accent-color);
-        border-color: var(--accent-color);
-      }
-
       .settings-panel {
         padding: 10px 16px;
         border-bottom: 1px solid var(--border-color, var(--surface-0));
@@ -289,16 +245,6 @@
         opacity: 0.6;
         cursor: default;
       }
-
-      .gitea-btn {
-        border-color: var(--success);
-        color: var(--success);
-      }
-
-      .gitea-btn:hover {
-        background: var(--success-tint);
-      }
-
 
       .ide-spinner {
         width: 12px;
@@ -382,133 +328,6 @@
         justify-content: center;
       }
 
-      .empty-inner {
-        text-align: center;
-        max-width: 850px;
-        padding: 72px 48px;
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-      }
-
-      .empty-mark {
-        width: 144px;
-        height: 144px;
-        margin-bottom: 30px;
-        opacity: 0.95;
-      }
-
-      .empty-title {
-        font-family: var(--font-display, inherit);
-        font-size: 32px;
-        font-weight: 600;
-        text-transform: uppercase;
-        letter-spacing: 0.06em;
-        color: var(--text-primary);
-        margin: 0 0 16px;
-        line-height: 1.15;
-      }
-
-      .empty-subtitle {
-        font-size: 17px;
-        line-height: 1.55;
-        color: var(--text-muted);
-        margin: 0 0 38px;
-        max-width: 620px;
-      }
-
-      .suggestion-grid {
-        display: grid;
-        grid-template-columns: 1fr 1fr;
-        gap: 10px;
-        width: 100%;
-        max-width: 760px;
-      }
-
-      .suggestion-chip {
-        display: inline-flex;
-        align-items: center;
-        gap: 10px;
-        padding: 16px 22px;
-        background: var(--surface-0);
-        border: 1px solid var(--border-color, var(--surface-0));
-        color: var(--text-secondary);
-        font-family: inherit;
-        font-size: 16px;
-        font-weight: 500;
-        text-align: left;
-        cursor: pointer;
-        border-radius: 0;
-        transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
-      }
-
-      .suggestion-chip:hover {
-        border-color: var(--accent-color);
-        color: var(--text-primary);
-        background: var(--hover, rgba(255, 255, 255, 0.04));
-      }
-
-      .suggestion-icon {
-        color: var(--accent-color);
-        flex-shrink: 0;
-      }
-
-      .suggestion-text {
-        flex: 1;
-      }
-
-      .draft-advanced {
-        margin-top: 26px;
-        font-size: 14px;
-        color: var(--text-muted);
-        text-decoration: underline;
-        text-underline-offset: 3px;
-      }
-
-      .draft-advanced:hover {
-        color: var(--text-primary);
-      }
-
-      .draft-connectors {
-        display: flex;
-        justify-content: center;
-        margin-top: 12px;
-        min-height: 28px;
-      }
-
-      .draft-connectors-toggle,
-      .draft-connectors-state {
-        display: inline-flex;
-        align-items: center;
-        gap: 8px;
-        padding: 5px 10px;
-        border: 1px solid var(--border-color, var(--surface-1));
-        border-radius: var(--radius-pill, 999px);
-        background: var(--surface-0);
-        color: var(--text-secondary);
-        font-size: 12px;
-      }
-
-      .draft-connectors-toggle { cursor: pointer; }
-      .draft-connectors-toggle input { accent-color: var(--accent-color); }
-      .draft-connectors-error { color: var(--danger); }
-      .draft-connectors-error button {
-        border: 0;
-        padding: 0;
-        background: transparent;
-        color: inherit;
-        font: inherit;
-        font-weight: 600;
-        cursor: pointer;
-        text-decoration: underline;
-      }
-
-      @media (max-width: 600px) {
-        .suggestion-grid {
-          grid-template-columns: 1fr;
-        }
-      }
-
       .startup-wrapper {
         display: flex;
         justify-content: center;
@@ -557,9 +376,6 @@
       }
 
       .startup-card-title {
-        font-family: var(--font-display, inherit);
-        text-transform: uppercase;
-        letter-spacing: 0.18em;
         font-weight: 600;
         font-size: 15px;
         color: var(--text-primary);
@@ -1028,7 +844,7 @@
       .wake-cycle-said {
         padding: 0 12px;
         font-size: 12px;
-        color: var(--text);
+        color: var(--text-primary);
         white-space: pre-wrap;
       }
       .wake-cycle-sleep {
@@ -1194,10 +1010,10 @@
       }
 
       .divider-text {
-        font-size: 10px;
+        font-size: 11px;
         color: var(--text-muted);
         text-transform: uppercase;
-        letter-spacing: 0.5px;
+        letter-spacing: 0.06em;
         white-space: nowrap;
       }
 
@@ -1210,10 +1026,10 @@
       .compaction-summary > summary {
         cursor: pointer;
         text-align: center;
-        font-size: 10px;
+        font-size: 11px;
         color: var(--text-muted);
         text-transform: uppercase;
-        letter-spacing: 0.5px;
+        letter-spacing: 0.06em;
       }
       .compaction-summary-body {
         margin-top: 6px;
@@ -1306,6 +1122,65 @@
         40% { transform: translateY(-6px); }
       }
 
+      /* Queued turn: accepted, no agent has claimed it yet. Deliberately not
+         the thinking dots — a slow pulse on an hourglass, muted text, and the
+         escalation lines stacked beneath. Tokens only, no fallbacks. */
+      .queued-body {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        padding: 4px 0;
+      }
+
+      .queued-icon {
+        animation: pulseSoft 2s infinite ease-in-out;
+      }
+
+      .queued-line {
+        color: var(--text-secondary);
+      }
+
+      .queued-busy,
+      .queued-elapsed {
+        color: var(--text-muted);
+        font-size: 0.92em;
+        line-height: 1.5;
+      }
+
+      .queued-elapsed {
+        font-variant-numeric: tabular-nums;
+      }
+
+      /* Parked unit: a failure with a way out. Same bubble frame as queued,
+         but an error glyph, primary-weight title, and a retry action. */
+      .parked-body {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        padding: 4px 0;
+      }
+
+      .parked-icon {
+        color: var(--danger);
+      }
+
+      .parked-line {
+        color: var(--text-primary);
+        font-weight: 600;
+      }
+
+      .parked-reason {
+        color: var(--text-secondary);
+        font-size: 0.92em;
+        line-height: 1.5;
+      }
+
+      .parked-actions {
+        display: flex;
+        gap: 8px;
+        margin-top: 4px;
+      }
+
       /* Approval — pending mile marker and resolved trail strips.
          Pending: sharp-cornered card with accent-color left border.
          Resolved: single-line trail strip in the message stream
@@ -1319,18 +1194,17 @@
         background: var(--surface-0);
         border: 1px solid var(--border-color, var(--surface-0));
         border-left: 3px solid var(--accent-color);
-        border-radius: 0;
+        border-radius: var(--radius-surface);
         display: flex;
         flex-direction: column;
         gap: 6px;
       }
 
       .mile-label {
-        font-family: var(--font-display, inherit);
         text-transform: uppercase;
-        letter-spacing: 0.20em;
+        letter-spacing: 0.06em;
         font-weight: 600;
-        font-size: 10px;
+        font-size: 11px;
         color: var(--accent-color);
       }
 
@@ -1427,10 +1301,10 @@
         gap: 3px;
         padding: 1px 6px;
         border-radius: var(--radius-tag);
-        font-size: 10px;
+        font-size: 11px;
         font-weight: 600;
         text-transform: uppercase;
-        letter-spacing: 0.04em;
+        letter-spacing: 0.06em;
         flex-shrink: 0;
       }
 
@@ -1493,9 +1367,6 @@
       }
 
       .reconnect-banner .rb-body strong {
-        font-family: var(--font-display, inherit);
-        text-transform: uppercase;
-        letter-spacing: 0.18em;
         font-weight: 600;
         font-size: 11px;
         color: var(--danger);
@@ -1529,9 +1400,6 @@
         color: #fff;
         border: 0;
         cursor: pointer;
-        font-family: var(--font-display, inherit);
-        text-transform: uppercase;
-        letter-spacing: 0.18em;
         font-weight: 600;
         font-size: 10.5px;
         box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
@@ -1573,11 +1441,10 @@
         padding: 6px 12px;
         background: var(--surface-0);
         border: 1px solid var(--border-color, var(--surface-0));
-        font-family: var(--font-display, inherit);
         text-transform: uppercase;
-        letter-spacing: 0.20em;
+        letter-spacing: 0.06em;
         font-weight: 600;
-        font-size: 10px;
+        font-size: 11px;
         color: var(--text-muted);
       }
 
@@ -1598,11 +1465,10 @@
       }
 
       .resume-eyebrow {
-        font-family: var(--font-display, inherit);
         text-transform: uppercase;
-        letter-spacing: 0.28em;
+        letter-spacing: 0.06em;
         font-weight: 600;
-        font-size: 9.5px;
+        font-size: 11px;
         color: var(--accent-color);
         margin-bottom: 4px;
       }
@@ -1647,7 +1513,7 @@
         margin: 0 auto;
         background: var(--panel-bg);
         border: 1px solid var(--border-color, var(--surface-0));
-        border-radius: 0;
+        border-radius: var(--radius-surface);
         transition: outline-color 0.15s ease, border-color 0.15s ease;
       }
 
@@ -1714,7 +1580,7 @@
         padding: 0 10px;
         background: transparent;
         border: 1px solid transparent;
-        border-radius: 0;
+        border-radius: var(--radius-control);
         color: var(--text-muted);
         font-family: inherit;
         font-size: 11px;
@@ -2328,7 +2194,7 @@
         color: var(--accent-color);
         font-size: 11px;
         text-transform: uppercase;
-        letter-spacing: 0.5px;
+        letter-spacing: 0.06em;
       }
 
       .message-body ::ng-deep tr:hover {
@@ -2423,8 +2289,8 @@
           padding: 6px 8px;
         }
 
-        /* Let the title take the available width on one line (it was wrapping
-           to ~3 lines). The 8-char session id is redundant on a phone. */
+        /* Let the title take the available width on one line (it was
+           wrapping to ~3 lines). */
         .header-left {
           flex: 1;
           min-width: 0;
@@ -2435,31 +2301,8 @@
           min-width: 0;
         }
 
-        .header-session-id {
-          display: none;
-        }
-
-        /* The dot alone carries connection state; the text label is what
-           pushed the header buttons into each other on a phone. */
-        .status-label {
-          display: none;
-        }
-
-        /* Decorative — the title needs those pixels more. */
-        .header-icon {
-          display: none;
-        }
-
         .header-right {
           flex-shrink: 0;
-        }
-
-        /* Badges (model · turn · mode …) keep their width; scroll instead of
-           spilling out of the viewport. */
-        .status-bar {
-          overflow-x: auto;
-          scrollbar-width: none;
-          &::-webkit-scrollbar { display: none; }
         }
 
         .messages {
@@ -2657,7 +2500,7 @@
 
   .compaction-title {
     font-weight: 600;
-    letter-spacing: 0.08em;
+    letter-spacing: 0.06em;
     text-transform: uppercase;
     color: var(--warning, #e0707a);
   }
@@ -2679,7 +2522,7 @@
   .compaction-segment {
     flex: 1;
     height: 4px;
-    border-radius: 2px;
+    border-radius: var(--radius-tag);
     background: color-mix(in srgb, var(--warning, #e0707a) 22%, transparent);
     overflow: hidden;
     position: relative;
@@ -2756,8 +2599,8 @@
   .usage-k {
     color: var(--text-muted);
     text-transform: uppercase;
-    letter-spacing: 0.07em;
-    font-size: 9.5px;
+    letter-spacing: 0.06em;
+    font-size: 11px;
   }
 
   // primary: context-window fill (hero)
@@ -2770,9 +2613,9 @@
   }
 
   .usage-ctx-label {
-    font-size: 9.5px;
+    font-size: 11px;
     font-weight: 700;
-    letter-spacing: 0.1em;
+    letter-spacing: 0.06em;
     text-transform: uppercase;
     color: var(--text-muted);
   }
@@ -2781,7 +2624,7 @@
     display: inline-block;
     width: 64px;
     height: 5px;
-    border-radius: 3px;
+    border-radius: var(--radius-tag);
     background: color-mix(in srgb, var(--text-muted) 22%, transparent);
     overflow: hidden;
   }
@@ -2789,7 +2632,7 @@
   .usage-gauge-fill {
     display: block;
     height: 100%;
-    border-radius: 3px;
+    border-radius: var(--radius-tag);
     background: var(--info, #7a9bc6);
     transition: width 300ms ease, background-color 300ms ease;
   }

@@ -34,10 +34,9 @@ def test_container_and_vm_install_the_same_stream_conformance_program():
 
     dockerfile = (REPO / "docker/Dockerfile.workspace").read_text()
     assert (
-        "COPY docker/check-browser-stream.py /usr/local/bin/check-browser-stream"
+        "COPY --chmod=0755 docker/check-browser-stream.py /usr/local/bin/check-browser-stream"
         in dockerfile
     )
-    assert "chmod +x /usr/local/bin/check-browser-stream" in dockerfile
 
     packer = (REPO / "docker/agent-vm-base/stage2.pkr.hcl").read_text()
     provision = (REPO / "docker/agent-vm-base/scripts/provision-stage2.sh").read_text()

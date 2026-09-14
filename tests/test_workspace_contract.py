@@ -7,6 +7,8 @@ from uuid import uuid4
 
 import pytest
 
+from tests import _b09_control_seams as control_seams
+
 from shared.workspace_contract import (
     LEGACY_K8S_RUNTIME_ADOPTION_KEY,
     WORKSPACE_CONTRACT_CONTEXT_KEY,
@@ -783,7 +785,7 @@ async def test_completion_recovery_reprovisions_and_retires_the_stale_marker(
     current["context"]["workspace_container"]["status"] = "deleted"
     deleted_job = await db.get_job(job["id"])
     assert orch_main._job_needs_sandbox(deleted_job)
-    assert orch_main._resume_missing_workspace(deleted_job) == "sandbox"
+    assert control_seams.resume_missing_workspace(deleted_job) == "sandbox"
 
     # Model the provisioner's replacement callback. JSONB merge legitimately
     # leaves the predecessor marker beside the new server-written Pod UID; live
@@ -850,7 +852,7 @@ async def test_completion_recovery_reprovisions_and_retires_the_stale_marker(
     assert runtime["_runtime_incarnation"] == replacement.runtime_incarnation
     assert LEGACY_K8S_RUNTIME_ADOPTION_KEY not in runtime
     assert resolve_workspace_runtime(resumed).ready
-    assert orch_main._resume_missing_workspace(resumed) is None
+    assert control_seams.resume_missing_workspace(resumed) is None
     db.admit_stateless_worker_job.assert_awaited_once()
     db.update_job_status.assert_not_awaited()
 
@@ -1027,10 +1029,8 @@ def test_safe_projection_never_contains_transport_coordinates() -> None:
 def test_fresh_and_resume_select_only_the_assigned_runtime(
     replace_endpoint: bool,
 ) -> None:
-    from orchestrator import main
-
     vm_job = _stamped_job("vm", requested="vm", vm=READY_VM, container=READY_SANDBOX)
-    config, decision = main._inject_matching_workspace_config(
+    config, decision = control_seams.inject_matching_workspace_config(
         vm_job,
         {"workspace": {"backend": "vm"}},
         replace_endpoint=replace_endpoint,
@@ -1041,7 +1041,7 @@ def test_fresh_and_resume_select_only_the_assigned_runtime(
     assert READY_SANDBOX["host"] not in repr(config)
 
     sandbox_job = _stamped_job("sandbox", vm=READY_VM, container=READY_SANDBOX)
-    config, decision = main._inject_matching_workspace_config(
+    config, decision = control_seams.inject_matching_workspace_config(
         sandbox_job,
         {"workspace": {"backend": "sandbox"}},
         replace_endpoint=replace_endpoint,
@@ -1056,10 +1056,8 @@ def test_fresh_and_resume_select_only_the_assigned_runtime(
 def test_fresh_and_resume_refuse_opposite_only_readiness(
     replace_endpoint: bool,
 ) -> None:
-    from orchestrator import main
-
     job = _stamped_job("vm", requested="vm", container=READY_SANDBOX)
-    config, decision = main._inject_matching_workspace_config(
+    config, decision = control_seams.inject_matching_workspace_config(
         job,
         {"workspace": {"backend": "vm"}},
         replace_endpoint=replace_endpoint,

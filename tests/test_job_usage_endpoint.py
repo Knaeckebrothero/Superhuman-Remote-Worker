@@ -32,17 +32,19 @@ from __future__ import annotations
 import inspect
 import uuid
 from datetime import datetime, timedelta, timezone
+import logging
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
 
-import orchestrator.main as m  # noqa: E402
+from orchestrator.routers import usage_reporting as usage_reporting_routes
+from orchestrator.services import usage_reporting as m
 
 UTC = timezone.utc
 NOW = datetime(2026, 8, 21, 12, 0, 0, tzinfo=UTC)
-SLACK = m._JOB_USAGE_WINDOW_SLACK
+SLACK = m.JOB_USAGE_WINDOW_SLACK
 
 
 def _row(
@@ -73,7 +75,7 @@ def _row(
 class TestJobUsageWindow:
     def test_brackets_creation_with_slack_at_both_ends(self):
         created = NOW - timedelta(hours=3)
-        from_ts, to_ts = m._job_usage_window(created, NOW, None)
+        from_ts, to_ts = m.job_usage_window(created, NOW, None)
         assert from_ts == created - SLACK
         assert to_ts == NOW + SLACK
 
@@ -85,18 +87,18 @@ class TestJobUsageWindow:
         land after ``completed_at`` and both are the job's cost.
         """
         created = NOW - timedelta(days=30)
-        _, to_ts = m._job_usage_window(created, NOW, None)
+        _, to_ts = m.job_usage_window(created, NOW, None)
         assert to_ts > NOW
         # The job sealed 29 days ago; a completed_at-bounded window would end there.
         assert to_ts - (created + timedelta(days=1)) > timedelta(days=28)
 
     def test_missing_creation_stamp_widens_to_the_ledger_floor(self):
         floor = NOW - timedelta(days=200)
-        from_ts, _ = m._job_usage_window(None, NOW, floor)
+        from_ts, _ = m.job_usage_window(None, NOW, floor)
         assert from_ts == floor
 
     def test_missing_creation_stamp_and_no_floor_falls_back_to_a_year(self):
-        from_ts, _ = m._job_usage_window(None, NOW, None)
+        from_ts, _ = m.job_usage_window(None, NOW, None)
         assert from_ts == NOW - timedelta(days=365)
 
 
@@ -107,30 +109,30 @@ class TestJobUsageWindow:
 
 class TestJobUsageState:
     def test_rows_present_is_measured(self):
-        assert m._job_usage_state([_row()], NOW, None) == "measured"
+        assert m.job_usage_state([_row()], NOW, None) == "measured"
 
     def test_job_older_than_the_ledger_predates_it(self):
         floor = NOW - timedelta(days=10)
         created = NOW - timedelta(days=40)
-        assert m._job_usage_state([], created, floor) == "predates_ledger"
+        assert m.job_usage_state([], created, floor) == "predates_ledger"
 
     def test_job_inside_the_ledger_with_no_rows_really_spent_nothing(self):
         floor = NOW - timedelta(days=40)
         created = NOW - timedelta(days=10)
-        assert m._job_usage_state([], created, floor) == "no_usage"
+        assert m.job_usage_state([], created, floor) == "no_usage"
 
     def test_job_exactly_at_the_floor_is_not_predating(self):
         floor = NOW - timedelta(days=10)
-        assert m._job_usage_state([], floor, floor) == "no_usage"
+        assert m.job_usage_state([], floor, floor) == "no_usage"
 
     def test_no_floor_never_claims_predates(self):
         """An empty ledger has no floor to compare against — don't invent one."""
-        assert m._job_usage_state([], NOW - timedelta(days=999), None) == "no_usage"
+        assert m.job_usage_state([], NOW - timedelta(days=999), None) == "no_usage"
 
     def test_rows_win_even_when_the_job_predates_the_floor(self):
         floor = NOW - timedelta(days=10)
         created = NOW - timedelta(days=40)
-        assert m._job_usage_state([_row()], created, floor) == "measured"
+        assert m.job_usage_state([_row()], created, floor) == "measured"
 
 
 # ---------------------------------------------------------------------------
@@ -140,7 +142,7 @@ class TestJobUsageState:
 
 class TestFoldJobUsage:
     def test_no_rows_reports_unknown_cost_not_zero(self):
-        folded = m._fold_job_usage([])
+        folded = m.fold_job_usage([])
         assert folded["cost"]["usd"] is None
         assert folded["cost"]["events"] == 0
         assert folded["llm"]["total_tokens"] == 0
@@ -171,7 +173,7 @@ class TestFoldJobUsage:
                 priced_events=0,
             ),
         ]
-        folded = m._fold_job_usage(rows)
+        folded = m.fold_job_usage(rows)
         assert folded["cost"]["usd"] is None
         assert folded["cost"]["complete"] is False
         assert folded["cost"]["priced_events"] == 0
@@ -191,7 +193,7 @@ class TestFoldJobUsage:
                 priced_events=0,
             ),
         ]
-        folded = m._fold_job_usage(rows)
+        folded = m.fold_job_usage(rows)
         assert folded["cost"]["usd"] == 0.25
         assert folded["cost"]["complete"] is False
         assert folded["cost"]["priced_events"] == 4
@@ -199,7 +201,7 @@ class TestFoldJobUsage:
 
     def test_fully_priced_usage_is_complete(self):
         rows = [_row(cost_usd=0.25, events=4, priced_events=4)]
-        assert m._fold_job_usage(rows)["cost"]["complete"] is True
+        assert m.fold_job_usage(rows)["cost"]["complete"] is True
 
     def test_token_buckets_and_cache_ratio(self):
         rows = [
@@ -207,7 +209,7 @@ class TestFoldJobUsage:
             _row(unit="cached-prompt-token", quantity=9000.0),
             _row(unit="completion-token", quantity=500.0),
         ]
-        llm = m._fold_job_usage(rows)["llm"]
+        llm = m.fold_job_usage(rows)["llm"]
         assert llm["prompt_tokens"] == 1000
         assert llm["cached_prompt_tokens"] == 9000
         assert llm["completion_tokens"] == 500
@@ -227,7 +229,7 @@ class TestFoldJobUsage:
                 priced_events=0,
             ),
         ]
-        assert m._fold_job_usage(rows)["llm"]["total_tokens"] == 100
+        assert m.fold_job_usage(rows)["llm"]["total_tokens"] == 100
 
     def test_unknown_llm_unit_is_not_counted_as_tokens(self):
         """`request` rows are real; reasoning tokens ride in details, not as a unit.
@@ -239,7 +241,7 @@ class TestFoldJobUsage:
             _row(unit="prompt-token", quantity=100.0),
             _row(unit="request", quantity=59.0),
         ]
-        assert m._fold_job_usage(rows)["llm"]["total_tokens"] == 100
+        assert m.fold_job_usage(rows)["llm"]["total_tokens"] == 100
 
     def test_by_category_keeps_unknown_separate_from_zero(self):
         rows = [
@@ -253,7 +255,7 @@ class TestFoldJobUsage:
                 priced_events=0,
             ),
         ]
-        cats = {c["category"]: c for c in m._fold_job_usage(rows)["by_category"]}
+        cats = {c["category"]: c for c in m.fold_job_usage(rows)["by_category"]}
         assert cats["llm"]["cost_usd"] == 0.5
         assert cats["compute"]["cost_usd"] is None
         assert cats["compute"]["events"] == 1
@@ -265,8 +267,13 @@ class TestFoldJobUsage:
 
 
 @pytest.fixture
-def route_env(monkeypatch):
-    """Wire the route's module globals to fakes and hand back the knobs."""
+def route_env():
+    """Build the route's dependency bundle over fakes and hand back the knobs.
+
+    The bundle is rebuilt per call so a test that swaps a collaborator on the
+    returned handle is read at request time — exactly how the application's own
+    factory resolves its late-bound metering singletons.
+    """
     job_id = str(uuid.uuid4())
     job = {
         "id": job_id,
@@ -279,18 +286,29 @@ def route_env(monkeypatch):
         query_ref_usage=AsyncMock(return_value=[]),
     )
     db = SimpleNamespace(get_job_descendant_ids=AsyncMock(return_value=[]))
-    monkeypatch.setattr(m, "usage_ledger", ledger)
-    monkeypatch.setattr(m, "postgres_db", db)
-    monkeypatch.setattr(
-        m, "require_job_access", AsyncMock(return_value=({"id": "u"}, job))
-    )
+
+    def dependencies():
+        return usage_reporting_routes.UsageReportingDependencies(
+            store=db,
+            reports=m.UsageReportingDependencies(
+                store=db,
+                audit_reader=SimpleNamespace(is_available=False),
+                logger=logging.getLogger("test-job-usage"),
+                usage_ledger=ledger,
+            ),
+            require_admin=AsyncMock(),
+            metering_settings=SimpleNamespace(v2_reads_enabled=False),
+            require_job_access=AsyncMock(return_value=({"id": "u"}, job)),
+        )
 
     async def call(**kwargs):
         # Called directly, so FastAPI never resolves the declared defaults and an
         # unpassed `include_subjobs` would arrive as a (truthy!) Query object.
         # The declared default is pinned separately, in test_default_scope_is_own.
         kwargs.setdefault("include_subjobs", False)
-        return await m.get_job_usage(SimpleNamespace(), job_id, **kwargs)
+        return await usage_reporting_routes.get_job_usage(
+            SimpleNamespace(), job_id, dependencies=dependencies(), **kwargs
+        )
 
     return SimpleNamespace(job_id=job_id, job=job, ledger=ledger, db=db, call=call)
 
@@ -303,7 +321,9 @@ class TestRoute:
         FastAPI's default resolution, and `Query(default=False)` is truthy.
         """
         default = (
-            inspect.signature(m.get_job_usage).parameters["include_subjobs"].default
+            inspect.signature(usage_reporting_routes.get_job_usage)
+            .parameters["include_subjobs"]
+            .default
         )
         assert default.default is False
 

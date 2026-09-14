@@ -1,5 +1,7 @@
 """Authority containment for VM-upgrade freeze captures."""
 
+from tests import _b09_control_seams as control_seams
+
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -64,7 +66,7 @@ async def test_k8s_same_ip_successor_is_not_captured():
     }
 
     with patch.object(orchestrator.main, "snapshot_service", service):
-        assert not await orchestrator.main._capture_workspace_snapshot_for_freeze(
+        assert not await control_seams.capture_workspace_snapshot_for_freeze(
             job, job["id"]
         )
 
@@ -102,9 +104,7 @@ async def test_explicit_vm_uses_one_exact_remote_operation_lease():
             "orchestrator.services.vm_remote_operation.claim_vm_remote_operation", claim
         ),
     ):
-        assert await orchestrator.main._capture_workspace_snapshot_for_freeze(
-            job, job["id"]
-        )
+        assert await control_seams.capture_workspace_snapshot_for_freeze(job, job["id"])
 
     claim.assert_awaited_once_with(
         db=orchestrator.main.postgres_db,
@@ -146,7 +146,7 @@ async def test_vm_claim_refusal_sends_no_snapshot_bytes():
             AsyncMock(side_effect=VMRemoteOperationUnavailable("dark")),
         ),
     ):
-        assert not await orchestrator.main._capture_workspace_snapshot_for_freeze(
+        assert not await control_seams.capture_workspace_snapshot_for_freeze(
             job, job["id"]
         )
 
@@ -172,9 +172,7 @@ async def test_explicit_local_container_capture_remains_available():
     }
 
     with patch.object(orchestrator.main, "snapshot_service", service):
-        assert await orchestrator.main._capture_workspace_snapshot_for_freeze(
-            job, job["id"]
-        )
+        assert await control_seams.capture_workspace_snapshot_for_freeze(job, job["id"])
 
     service.capture_vm_snapshot.assert_awaited_once_with(
         job_id="job-local",

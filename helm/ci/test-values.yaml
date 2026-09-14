@@ -39,6 +39,13 @@ test:
 agent:
   tailscale:
     enabled: true
+  # Render the stateless executor pool WITH queue-driven autoscaling so CI
+  # validates the ScaledObject/TriggerAuthentication against the KEDA CRD
+  # schemas (kubeconform pulls keda.sh from the datree CRD catalog).
+  stateless:
+    enabled: true
+    autoscaling:
+      enabled: true
 
 databases:
   neo4j:

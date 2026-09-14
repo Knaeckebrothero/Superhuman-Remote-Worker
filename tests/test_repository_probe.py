@@ -1,13 +1,53 @@
 """Repository connector probe: who the token is, what it may do, no token exposure."""
 
 import json
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
 
+from orchestrator.routers.datasources import (
+    test_datasource as probe_datasource_endpoint,
+)
 from shared.runtime.services import forge
 from shared.runtime.services.forge import ForgeError, ForgeRepo, probe_repository_access
+
+
+def _route_deps(row: dict):
+    """The connector router's collaborators with the owner gate resolved to ``row``.
+
+    Replaces the old ``patch("orchestrator.main.require_datasource_owner")``:
+    the route now reads that gate off the dependency dataclass, so patching a
+    ``main`` global would no longer intercept it. The gate is still *bound*
+    rather than awaited up front, which is what keeps an unexpected resolution
+    failure inside the probe's own try/except.
+    """
+    from orchestrator.main import _mcp_datasources_enabled, _validate_mcp_datasource
+    from orchestrator.routers.datasources import DatasourcesDependencies
+    from orchestrator.services.datasources import DatasourceDependencies
+    from orchestrator.services.kb_task_registry import KbDatasourceTaskRegistry
+    from orchestrator.services.knowledge_index import KnowledgeIndexDependencies
+
+    store = MagicMock()
+    return DatasourcesDependencies(
+        store=store,
+        operations=DatasourceDependencies(
+            store=store,
+            vector_db=MagicMock(),
+            knowledge_index=KnowledgeIndexDependencies(
+                store=store,
+                vector_db=MagicMock(),
+                gitea_client=MagicMock(),
+                logger=MagicMock(),
+                tasks=KbDatasourceTaskRegistry(),
+                inject_system_kb_embedding_profile=AsyncMock(return_value=None),
+            ),
+            mcp_datasources_enabled=_mcp_datasources_enabled,
+            validate_mcp_datasource=_validate_mcp_datasource,
+        ),
+        require_datasource_owner=AsyncMock(return_value=({}, row)),
+    )
+
 
 TOKEN = "ghp_secretsecretsecret"
 
@@ -234,8 +274,6 @@ class TestRepositoryConnectorEndpoint:
 
     @pytest.mark.asyncio
     async def test_token_connector_reports_principal_and_branch(self, monkeypatch):
-        from orchestrator.main import test_datasource as probe_datasource_endpoint
-
         monkeypatch.setattr(
             forge,
             "_transport",
@@ -244,11 +282,9 @@ class TestRepositoryConnectorEndpoint:
                 repo={"default_branch": "main", "permissions": {"push": True}},
             ),
         )
-        with patch(
-            "orchestrator.main.require_datasource_owner",
-            AsyncMock(return_value=({}, self._row())),
-        ):
-            result = await probe_datasource_endpoint(object(), self.DS_ID)
+        result = await probe_datasource_endpoint(
+            object(), self.DS_ID, dependencies=_route_deps(self._row())
+        )
 
         assert result["status"] == "ok"
         assert "Authenticated as srw-bot (fine-grained token)" in result["message"]
@@ -260,8 +296,6 @@ class TestRepositoryConnectorEndpoint:
 
     @pytest.mark.asyncio
     async def test_read_only_mismatch_and_admin_are_warned(self, monkeypatch):
-        from orchestrator.main import test_datasource as probe_datasource_endpoint
-
         monkeypatch.setattr(
             forge,
             "_transport",
@@ -274,11 +308,9 @@ class TestRepositoryConnectorEndpoint:
                 },
             ),
         )
-        with patch(
-            "orchestrator.main.require_datasource_owner",
-            AsyncMock(return_value=({}, self._row())),
-        ):
-            result = await probe_datasource_endpoint(object(), self.DS_ID)
+        result = await probe_datasource_endpoint(
+            object(), self.DS_ID, dependencies=_route_deps(self._row())
+        )
 
         assert result["status"] == "ok"
         message = result["message"]
@@ -293,14 +325,10 @@ class TestRepositoryConnectorEndpoint:
 
     @pytest.mark.asyncio
     async def test_rejected_token_is_an_error_result(self, monkeypatch):
-        from orchestrator.main import test_datasource as probe_datasource_endpoint
-
         monkeypatch.setattr(forge, "_transport", _transport(user=401, repo={}))
-        with patch(
-            "orchestrator.main.require_datasource_owner",
-            AsyncMock(return_value=({}, self._row())),
-        ):
-            result = await probe_datasource_endpoint(object(), self.DS_ID)
+        result = await probe_datasource_endpoint(
+            object(), self.DS_ID, dependencies=_route_deps(self._row())
+        )
 
         assert result["status"] == "error"
         assert "rejected the token" in result["message"]
@@ -308,44 +336,32 @@ class TestRepositoryConnectorEndpoint:
 
     @pytest.mark.asyncio
     async def test_ssh_connector_is_not_probed(self):
-        from orchestrator.main import test_datasource as probe_datasource_endpoint
-
         row = self._row(credentials={"ssh_key": "-----BEGIN OPENSSH PRIVATE KEY-----"})
-        with patch(
-            "orchestrator.main.require_datasource_owner",
-            AsyncMock(return_value=({}, row)),
-        ):
-            result = await probe_datasource_endpoint(object(), self.DS_ID)
+        result = await probe_datasource_endpoint(
+            object(), self.DS_ID, dependencies=_route_deps(row)
+        )
 
         assert result["status"] == "ok"
         assert "No API probe for SSH-key" in result["message"]
 
     @pytest.mark.asyncio
     async def test_self_hosted_without_forge_is_an_error_not_a_guess(self):
-        from orchestrator.main import test_datasource as probe_datasource_endpoint
-
         row = self._row(
             connection_url="https://git.example.test/acme/widgets.git", config="{}"
         )
-        with patch(
-            "orchestrator.main.require_datasource_owner",
-            AsyncMock(return_value=({}, row)),
-        ):
-            result = await probe_datasource_endpoint(object(), self.DS_ID)
+        result = await probe_datasource_endpoint(
+            object(), self.DS_ID, dependencies=_route_deps(row)
+        )
 
         assert result["status"] == "error"
         assert "forge" in result["message"]
 
     @pytest.mark.asyncio
     async def test_generic_connector_keeps_its_no_test_message(self):
-        from orchestrator.main import test_datasource as probe_datasource_endpoint
-
         row = self._row(type="generic", credentials={})
-        with patch(
-            "orchestrator.main.require_datasource_owner",
-            AsyncMock(return_value=({}, row)),
-        ):
-            result = await probe_datasource_endpoint(object(), self.DS_ID)
+        result = await probe_datasource_endpoint(
+            object(), self.DS_ID, dependencies=_route_deps(row)
+        )
 
         assert result == {
             "status": "ok",

@@ -1261,12 +1261,12 @@ export function nextWakeLabel(
       }
       .officer-card {
         border: 1px solid var(--border-color);
-        border-radius: 10px;
+        border-radius: var(--radius-surface);
         padding: 16px;
         display: flex;
         flex-direction: column;
         gap: 12px;
-        background: var(--bg-secondary);
+        background: var(--surface-0);
       }
       .officer-status-row {
         display: flex;
@@ -1277,10 +1277,10 @@ export function nextWakeLabel(
       .officer-badge {
         font-size: 11px;
         text-transform: uppercase;
-        letter-spacing: 0.4px;
+        letter-spacing: 0.06em;
         padding: 2px 8px;
-        border-radius: 999px;
-        background: var(--bg-tertiary);
+        border-radius: var(--radius-pill);
+        background: var(--surface-1);
         color: var(--text-secondary);
       }
       .officer-badge[data-status='active'] {
@@ -1313,9 +1313,9 @@ export function nextWakeLabel(
       .officer-slots .k {
         display: block;
         font-size: 11px;
-        color: var(--text-tertiary);
+        color: var(--text-muted);
         text-transform: uppercase;
-        letter-spacing: 0.4px;
+        letter-spacing: 0.06em;
       }
       .officer-meta .v {
         font-size: 13px;
@@ -1333,9 +1333,9 @@ export function nextWakeLabel(
       .officer-slot-chip {
         font-size: 12px;
         padding: 2px 10px;
-        border-radius: 999px;
+        border-radius: var(--radius-pill);
         border: 1px solid var(--border-color);
-        background: var(--bg-tertiary);
+        background: var(--surface-1);
       }
       /* A starved or broken pool. Border + text rather than a fill: it must
          read as attention-needed at a glance without competing with a real
@@ -1357,16 +1357,16 @@ export function nextWakeLabel(
       }
       .officer-section-title {
         font-size: 12px;
-        color: var(--text-tertiary);
+        color: var(--text-muted);
         text-transform: uppercase;
-        letter-spacing: 0.4px;
+        letter-spacing: 0.06em;
       }
       .officer-immediacy {
         font-size: 11px;
-        color: var(--text-tertiary);
+        color: var(--text-muted);
         font-style: italic;
         padding: 1px 8px;
-        border-radius: 999px;
+        border-radius: var(--radius-pill);
         border: 1px dashed var(--border-color);
       }
       .officer-drain {
@@ -1389,12 +1389,12 @@ export function nextWakeLabel(
       }
       .officer-confirm {
         border: 1px solid var(--border-color);
-        border-radius: 8px;
+        border-radius: var(--radius-control);
         padding: 10px 12px;
         display: flex;
         flex-direction: column;
         gap: 8px;
-        background: var(--bg-tertiary);
+        background: var(--surface-1);
       }
       .officer-policy {
         display: flex;
@@ -1429,9 +1429,9 @@ export function nextWakeLabel(
       }
       .officer-recent-title {
         font-size: 12px;
-        color: var(--text-tertiary);
+        color: var(--text-muted);
         text-transform: uppercase;
-        letter-spacing: 0.4px;
+        letter-spacing: 0.06em;
       }
       .officer-recent-item {
         display: flex;
@@ -1448,7 +1448,7 @@ export function nextWakeLabel(
       .officer-recent-severity {
         font-size: 11px;
         text-transform: uppercase;
-        letter-spacing: 0.3px;
+        letter-spacing: 0.06em;
         color: var(--text-secondary);
       }
       .officer-recent-severity[data-severity='high'] {
@@ -1469,7 +1469,7 @@ export function nextWakeLabel(
         color: var(--text-secondary);
       }
       .officer-hint.dim {
-        color: var(--text-tertiary);
+        color: var(--text-muted);
         font-size: 12px;
       }
       .officer-message {
@@ -1477,7 +1477,7 @@ export function nextWakeLabel(
         color: var(--text-secondary);
       }
       .dim {
-        color: var(--text-tertiary);
+        color: var(--text-muted);
       }
     `,
   ],

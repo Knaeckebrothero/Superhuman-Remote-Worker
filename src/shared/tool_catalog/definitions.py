@@ -1186,7 +1186,7 @@ BROWSER_DIRECT_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
     "browser_type": {
         "module": "research.browser_direct",
         "function": "browser_type",
-        "description": "Type text into an input field identified by its reference number.",
+        "description": "Type literal text or a workspace credential environment variable (env_var) into an input field identified by its reference number. Supply exactly one of text or env_var.",
         "category": "browser_direct",
         "short_description": "Type text into input field by reference number.",
         "phases": ["tactical"],

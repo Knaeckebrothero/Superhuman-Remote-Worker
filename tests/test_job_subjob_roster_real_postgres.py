@@ -287,6 +287,7 @@ async def list_client(db, monkeypatch):
     import httpx
     from fastapi import FastAPI
     from orchestrator import main
+    from orchestrator.routers.job_reads import router as job_reads_router
 
     monkeypatch.setattr(main, "postgres_db", db)
     monkeypatch.setattr(
@@ -295,14 +296,9 @@ async def list_client(db, monkeypatch):
         AsyncMock(return_value={"id": str(uuid.uuid4()), "is_admin": True}),
     )
     monkeypatch.setattr(main, "audit_reader", SimpleNamespace(is_available=False))
-    route = next(
-        r
-        for r in main.app.routes
-        if getattr(r, "path", None) == "/api/jobs"
-        and "GET" in getattr(r, "methods", ())
-    )
-    app = FastAPI()
-    app.router.routes.append(route)
+    app = FastAPI(default_response_class=main.CustomJSONResponse)
+    app.state.job_reads_dependencies_factory = main._job_reads_dependencies
+    app.include_router(job_reads_router)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://list.test"
     ) as client:

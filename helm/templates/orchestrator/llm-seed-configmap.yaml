@@ -26,13 +26,24 @@ data:
       {{- range $provider, $ref := .Values.llm.seed.systemApiKeys }}
       - provider: {{ $provider | quote }}
         apiKeyEnv: {{ printf "SEED_%s_API_KEY" ($provider | upper | replace "-" "_") | quote }}
+        {{- with $ref.label }}
+        label: {{ . | quote }}
+        {{- end }}
+        {{- if hasKey $ref "reconcile" }}
+        reconcile: {{ $ref.reconcile }}
+        {{- end }}
       {{- end }}
     systemEndpoints:
       {{- range $i, $ep := .Values.llm.seed.systemEndpoints }}
       - label: {{ required "llm.seed.systemEndpoints[].label is required" $ep.label | quote }}
         baseUrl: {{ required "llm.seed.systemEndpoints[].baseUrl is required" $ep.baseUrl | quote }}
-        {{- if $ep.apiKeyRef }}
+        {{- /* apiKeyRef (any mode) or an inline apiKey (dev mode, see
+             llm-seed-inline-secret.yaml) both surface as the same env var. */}}
+        {{- if or $ep.apiKeyRef (hasKey $ep "apiKey") }}
         apiKeyEnv: {{ printf "SEED_ENDPOINT_%d_API_KEY" $i | quote }}
+        {{- end }}
+        {{- if hasKey $ep "reconcile" }}
+        reconcile: {{ $ep.reconcile }}
         {{- end }}
         models:
           {{- range $ep.models }}
@@ -57,6 +68,16 @@ data:
             {{- end }}
             {{- if hasKey . "multimodal" }}
             multimodal: {{ .multimodal }}
+            {{- end }}
+            {{- if hasKey . "params" }}
+            {{- if not (kindIs "map" .params) }}
+            {{- fail (printf "llm.seed.systemEndpoints[%d].models[%s].params must be a mapping" $i .id) }}
+            {{- end }}
+            params:
+              {{- toYaml .params | nindent 14 }}
+            {{- end }}
+            {{- if hasKey . "reconcile" }}
+            reconcile: {{ .reconcile }}
             {{- end }}
             enabled: {{ default true .enabled }}
           {{- end }}
@@ -86,6 +107,42 @@ data:
         {{- if hasKey . "multimodal" }}
         multimodal: {{ .multimodal }}
         {{- end }}
+        {{- if hasKey . "params" }}
+        {{- if not (kindIs "map" .params) }}
+        {{- fail (printf "llm.seed.systemModels[%s/%s].params must be a mapping" .provider .id) }}
+        {{- end }}
+        params:
+          {{- toYaml .params | nindent 10 }}
+        {{- end }}
+        {{- if hasKey . "reconcile" }}
+        reconcile: {{ .reconcile }}
+        {{- end }}
         enabled: {{ default true .enabled }}
+      {{- end }}
+    {{- /*
+    Default-model pins: `llm.seed.defaults` is a kind -> catalog model_id map.
+    The kind list mirrors VALID_DEFAULT_MODEL_KINDS (orchestrator/schemas/
+    provider_catalog.py) and DEFAULT_PIN_CAPABILITY_BY_KIND (seed/llm_config.py);
+    a typo fails the render here instead of a warning buried in the Job log.
+    */}}
+    {{- $validKinds := list "auxiliary" "browser" "chat" "citation" "embedding" "fetch" "rerank" "search" "search_fallback" "tts" "vision" "whisper" }}
+    defaults:
+      {{- range $kind, $decl := .Values.llm.seed.defaults }}
+      {{- if not (has $kind $validKinds) }}
+      {{- fail (printf "llm.seed.defaults: unknown kind %q (valid: %s)" $kind (join ", " $validKinds)) }}
+      {{- end }}
+      {{- /* Scalar `kind: "<model_id>"`, or the mapping form
+           `kind: {model: "<model_id>", reconcile: true}`. */}}
+      {{- if kindIs "map" $decl }}
+      {{- if $decl.model }}
+      {{ $kind }}:
+        model: {{ $decl.model | quote }}
+        {{- if hasKey $decl "reconcile" }}
+        reconcile: {{ $decl.reconcile }}
+        {{- end }}
+      {{- end }}
+      {{- else if $decl }}
+      {{ $kind }}: {{ $decl | quote }}
+      {{- end }}
       {{- end }}
 {{- end }}

@@ -295,6 +295,22 @@ class TestFamilyOf:
     def test_claude_opus(self):
         assert family_of("claude-opus-4-7") == "claude-opus"
 
+    def test_claude_opus_5_has_its_own_family(self):
+        # Opus 5 is the only Opus that takes the full effort ladder, so it gets
+        # a dedicated matrix family; the rule must beat the generic prefix.
+        assert family_of("claude-opus-5") == "claude-opus-5"
+        assert family_of("claude-opus-5-20260401") == "claude-opus-5"
+        assert family_of("openrouter/anthropic/claude-opus-5") == "claude-opus-5"
+
+    def test_claude_fable_is_one_family_for_5_and_5_1(self):
+        assert family_of("claude-fable-5") == "claude-fable"
+        assert family_of("claude-fable-5-1") == "claude-fable"
+        assert family_of("openrouter/anthropic/claude-fable-5-1") == "claude-fable"
+
+    def test_older_opus_ids_stay_on_the_generic_family(self):
+        assert family_of("claude-opus-4-5") == "claude-opus"
+        assert family_of("claude-opus-4-8") == "claude-opus"
+
     def test_gpt_4o_uses_legacy_family(self):
         # `family_of`'s heuristic predates the family-matcher service and
         # still returns "gpt-4o" for native gpt-4o; the matcher service
@@ -321,6 +337,22 @@ class TestFamilyOf:
     def test_gpt_5_6_codex_stays_codex(self):
         # Codex checks keep precedence: a future 5.6 codex variant is `codex`.
         assert family_of("gpt-5.6-codex") == "codex"
+
+    def test_gpt_6_astra(self):
+        assert family_of("gpt-6-astra") == "gpt-6"
+        assert family_of("openai/gpt-6-astra") == "gpt-6"
+        assert family_of("codex/gpt-6-astra") == "gpt-6"
+
+    def test_gpt_6_codex_stays_codex(self):
+        # Codex checks keep precedence for gpt-6 too, so family_of() and
+        # family_matcher.detect_family() agree on a future codex variant.
+        assert family_of("gpt-6-astra-codex") == "codex"
+        assert family_of("gpt-6-codex-spark") == "codex-spark"
+
+    def test_gpt_6_does_not_leak_into_gpt_5(self):
+        # The gpt-5 prefix rules must not swallow gpt-6, and vice versa.
+        assert family_of("gpt-5.6-sol") == "gpt-5.6"
+        assert family_of("gpt-5") == "gpt-5"
 
     def test_gpt_5_5_stays_gpt_5(self):
         assert family_of("gpt-5.5") == "gpt-5"

@@ -1722,7 +1722,11 @@ class GitManager:
         """Mask credentials in a URL for safe logging."""
         import re
 
-        return re.sub(r"://([^:]+):[^@]+@", r"://\1:***@", url)
+        # "/" and "@" are excluded from both halves of the userinfo: they can
+        # only appear percent-encoded there, and letting them through meant a
+        # run of "://" markers made every one of them rescan the rest of the
+        # URL for an "@" that never came (quadratic on hostile input).
+        return re.sub(r"://([^:@/]+):[^@/]+@", r"://\1:***@", url)
 
     def _mask_url(self, url: str) -> str:
         """Instance method wrapper for URL masking."""

@@ -1,3 +1,5 @@
+import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
+import {workspaceCreationFields, workspacePreviewConfig} from "../agent-settings/workspace-selection";
 import {Component, computed, effect, ElementRef, inject, OnInit, signal, ViewChild} from '@angular/core';
 import {ActivatedRoute, Router} from '@angular/router';
 import {ApiService} from '../../core/services/api.service';
@@ -30,7 +32,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
   selector: 'app-job-create',
   standalone: true,
   imports: [
-    AgentSettingsComponent,
+    SidebarToggleComponent, AgentSettingsComponent,
     TranslocoPipe,
     AppButtonComponent,
     AppIconButtonComponent,
@@ -45,6 +47,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
   template: `
     <div class="job-create-container">
       <div class="header-bar">
+        <app-sidebar-toggle />
         <span class="title">{{ 'jobs.create.title' | transloco }}</span>
         <app-button variant="secondary" size="sm" class="back-btn" (clicked)="cancel()">
           {{ 'jobs.create.backToJobs' | transloco }}
@@ -288,9 +291,12 @@ import {AppTooltipDirective} from '../../ui/tooltip';
           }
 
           <!-- Agent Settings (tabbed: Settings / Instructions / Advanced) -->
+        @if (expertDetail()?.workspace_preference?.backend; as preference) {
+          <p class="field-hint">{{ 'agentSettings.execution.workspaceRecommendation' | transloco:{tier: preference} }}</p>
+        }
           <app-agent-settings
             mode="job"
-            [config]="expertDetail()?.config ?? frameworkDefaults() ?? {}"
+            [config]="workspaceConfig()"
             [resolvedToolset]="toolPreview()"
             [readsResolvedToolset]="true"
             [gatedCapabilities]="capabilities.grants() ?? null"
@@ -305,6 +311,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
             [datasourceContextKey]="datasourceContextKey()"
             [datasourceDefaultsEnabled]="capabilities.datasourceScopeAutoAttachAvailable()"
             [loadingExpert]="isLoadingExpertDetail()"
+          (change)="loadToolPreview()"
             (retryDatasources)="loadDatasources()"
             (instructionsChange)="onInstructionsChange($event)"
           />
@@ -323,7 +330,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
               type="submit"
               variant="primary"
               [loading]="isSubmitting() || isUploading()"
-              [disabled]="!formData.description || isLoadingDatasources() || datasourceLoadError()"
+              [disabled]="!formData.description || isLoadingDatasources() || datasourceLoadError() || isLoadingExpertDetail() || loadingWorkspacePreview()"
             >
               @if (isSubmitting()) {
                 {{ 'jobs.create.creating' | transloco }}
@@ -357,6 +364,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
       .header-bar {
         display: flex;
         align-items: center;
+        gap: 12px;
         padding: 10px 12px;
         background: var(--panel-header-bg);
         border-bottom: 1px solid var(--border-color, var(--surface-0));
@@ -406,6 +414,13 @@ import {AppTooltipDirective} from '../../ui/tooltip';
 
       /* Form Groups */
       .form-group {
+        margin-bottom: 16px;
+      }
+
+      /* The shared field primitive carries no outer margin; without this the
+         project hint ran straight into the Description label. */
+      app-form-field {
+        display: block;
         margin-bottom: 16px;
       }
 
@@ -1369,7 +1384,12 @@ export class JobCreateComponent implements OnInit {
    *  pane. `readsResolvedToolset` is what tells it a read was attempted.
    */
   readonly toolPreview = signal<SessionToolGroupsResponse | null>(null);
+  readonly workspaceConfig = computed(() => workspacePreviewConfig(
+    this.expertDetail()?.config ?? this.frameworkDefaults() ?? {}, this.toolPreview()?.workspace,
+  ));
   private toolPreviewSerial = 0;
+  private expertDetailSerial = 0;
+  readonly loadingWorkspacePreview = signal(false);
 
   /** Ask the server what this job's toolset would be.
    *
@@ -1385,8 +1405,9 @@ export class JobCreateComponent implements OnInit {
    *  Serial-guarded so a slow answer for an expert the user has already switched
    *  away from cannot paint over the current one.
    */
-  private loadToolPreview(): void {
+  loadToolPreview(): void {
     const serial = ++this.toolPreviewSerial;
+    this.loadingWorkspacePreview.set(true);
     const expert = this.selectedExpert();
     const isDbExpert =
       !!expert &&
@@ -1398,6 +1419,8 @@ export class JobCreateComponent implements OnInit {
 
     this.api
       .previewToolGroups({
+      config_override: this.agentSettings?.getOverrides() ?? {},
+      workspace_preference: this.expertDetail()?.workspace_preference?.backend ?? null,
         expert_type: 'worker',
         config_name: isBundled ? expert!.id : null,
         expert_id: isDbExpert ? expert!.id : null,
@@ -1405,7 +1428,8 @@ export class JobCreateComponent implements OnInit {
       })
       .subscribe((preview) => {
         if (serial !== this.toolPreviewSerial) return;
-        this.toolPreview.set(preview);
+        this.loadingWorkspacePreview.set(false);
+      this.toolPreview.set(preview);
         const categories = preview?.categories;
         if (categories && !this.agentSettings?.hasToolEdits()) {
           this.agentSettings?.prefillFromResolvedToolset(categories);
@@ -1414,9 +1438,12 @@ export class JobCreateComponent implements OnInit {
   }
 
   private fetchExpertDetail(expertId: string): void {
+    const serial = ++this.expertDetailSerial;
+    this.expertDetail.set(null);
     this.isLoadingExpertDetail.set(true);
-    this.api.getExpertDetail(expertId, {accountDefaults: true}).subscribe({
+    this.api.getExpertDetail(expertId, {accountDefaults: true, role: "worker"}).subscribe({
       next: (detail) => {
+        if (serial !== this.expertDetailSerial) return;
         this.expertDetail.set(detail);
         if (detail?.instructions) {
           this.agentSettings?.instructionsTab?.setFromExpert(detail.instructions);
@@ -1426,8 +1453,9 @@ export class JobCreateComponent implements OnInit {
           this.agentSettings?.prefillFromConfig(detail.config);
         }
         this.isLoadingExpertDetail.set(false);
+        this.loadToolPreview();
       },
-      error: () => { this.isLoadingExpertDetail.set(false); },
+      error: () => { if (serial === this.expertDetailSerial) this.isLoadingExpertDetail.set(false); },
     });
   }
 
@@ -1604,7 +1632,7 @@ export class JobCreateComponent implements OnInit {
   async onSubmit(): Promise<void> {
     if (
       !this.formData.description || this.isSubmitting() || this.isUploading() ||
-      this.isLoadingDatasources() || this.datasourceLoadError()
+      this.isLoadingDatasources() || this.datasourceLoadError() || this.isLoadingExpertDetail() || this.loadingWorkspacePreview()
     ) return;
     this.clearMessages();
 
@@ -1630,7 +1658,9 @@ export class JobCreateComponent implements OnInit {
     if (this.uploadId) request.upload_id = this.uploadId;
 
     // Collect overrides from the settings component
-    const configOverride = this.agentSettings?.getOverrides();
+    const workspaceFields = workspaceCreationFields(this.agentSettings?.getOverrides() ?? {}, this.toolPreview()?.workspace);
+    if ("workspace" in workspaceFields) request.workspace = workspaceFields.workspace;
+    const configOverride = workspaceFields.config_override;
     if (configOverride && Object.keys(configOverride).length > 0) {
       request.config_override = configOverride;
     }

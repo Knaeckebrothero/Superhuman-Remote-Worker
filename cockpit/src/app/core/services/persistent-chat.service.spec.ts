@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { NgZone, signal } from '@angular/core';
 import { TestBed } from '@angular/core/testing';
 import { HttpClient } from '@angular/common/http';
-import { NEVER, of, Subject, throwError } from 'rxjs';
+import { NEVER, from, of, Subject, throwError } from 'rxjs';
 import { TranslocoService } from '@jsverse/transloco';
 import {
   PersistentChatService,
@@ -142,6 +142,11 @@ function createService(
     uploadOneToThread: vi.fn().mockReturnValue(of({ kind: 'done', files: [] })),
     deleteThreadUpload: vi.fn().mockReturnValue(of(undefined)),
     humanizeUploadError: vi.fn().mockReturnValue('upload failed'),
+    // Durable queue block (stateless_turn_resilience.md step 2): the awaiting
+    // poll and the owner retry must never throw inside a timer in tests that
+    // don't care about them.
+    getThreadQueue: vi.fn().mockReturnValue(of(null)),
+    retryThreadQueue: vi.fn().mockReturnValue(of({ kind: 'ok', state: 'queued' })),
   };
 
   const mockCache: any = {
@@ -4723,19 +4728,57 @@ describe('PersistentChatService — control commands', () => {
     expect(ctx.service.error()).toBe('chat.control.admissionFailed');
   });
 
-  it('updateConfig forwards the config object over the WS with a request_id', async () => {
+  it('updateConfig forwards the config object over the WS with a request_id and settles on the ack', async () => {
     const ctx = await readySession();
-    const requestId = ctx.service.updateConfig({ model: 'claude-sonnet-4-6', temperature: 0.3 });
+    const outcome = ctx.service.updateConfig({ model: 'claude-sonnet-4-6', temperature: 0.3 });
     const sent = ctx.wsInstances[0].send.mock.calls.map((c: any) => JSON.parse(c[0]));
-    expect(sent).toContainEqual({
-      method: 'config.update',
-      config: { model: 'claude-sonnet-4-6', temperature: 0.3 },
-      request_id: requestId,
+    const frame = sent.find((f: any) => f.method === 'config.update');
+    expect(frame.config).toEqual({ model: 'claude-sonnet-4-6', temperature: 0.3 });
+    // The id is what config.changed / error frames echo back — the promise
+    // settles on that echo, not at send time (P0.3, and the Replicache
+    // speculative-then-authoritative shape the pane relies on).
+    expect(typeof frame.request_id).toBe('string');
+    expect(frame.request_id.length).toBeGreaterThan(0);
+    fireSseMessage(
+      ctx.sseInstances[0],
+      {
+        method: 'config.changed',
+        params: {
+          model: 'claude-sonnet-4-6',
+          temperature: 0.3,
+          applied: { llm: { model: 'claude-sonnet-4-6' } },
+          request_id: frame.request_id,
+        },
+      },
+      '1:7',
+    );
+    await expect(outcome).resolves.toMatchObject({
+      ok: true,
+      requestId: frame.request_id,
+      transport: 'websocket',
+      effective: 'now',
+      applied: { llm: { model: 'claude-sonnet-4-6' } },
     });
-    // The returned id is what config.changed / error frames echo back —
-    // callers correlate in-flight updates with it (P0.3).
-    expect(typeof requestId).toBe('string');
-    expect(requestId.length).toBeGreaterThan(0);
+  });
+
+  it('a config.update the agent refuses settles its caller as not applied', async () => {
+    const ctx = await readySession();
+    const outcome = ctx.service.updateConfig({ llm: { model: 'forbidden' } });
+    const frame = ctx.wsInstances[0].send.mock.calls
+      .map((c: any) => JSON.parse(c[0]))
+      .find((f: any) => f.method === 'config.update');
+    ctx.wsInstances[0].onmessage({
+      data: JSON.stringify({
+        method: 'error',
+        params: {
+          message: 'Session config update rejected',
+          detail: 'grant denied',
+          request_id: frame.request_id,
+        },
+      }),
+    } as MessageEvent);
+    await expect(outcome).resolves.toMatchObject({ ok: false, transport: 'websocket' });
+    expect(ctx.service.error()).toContain('grant denied');
   });
 });
 
@@ -10001,6 +10044,64 @@ describe('PersistentChatService — awaiting-turn state (queued input visibility
     expect(ctx.service.isAwaitingTurn()).toBe(false);
   });
 
+  // The queued bubble escalates on time alone ("busier than usual" at 10 s,
+  // elapsed counter at 60 s) — never on a queue position. The clock lives in
+  // the service, keyed off isAwaitingTurn, so every pendingTurnCount reset
+  // ends it without each site knowing.
+  it('stamps awaitingSince and advances awaitingElapsedMs once a second while queued', async () => {
+    const ctx = await readySession();
+    vi.useFakeTimers();
+    try {
+      await ctx.service.sendMessage('queued behind a busy pool');
+      await Promise.resolve();
+      TestBed.tick();
+      expect(ctx.service.awaitingSince()).not.toBeNull();
+      expect(ctx.service.awaitingElapsedMs()).toBe(0);
+
+      vi.advanceTimersByTime(10_000);
+      expect(ctx.service.awaitingElapsedMs()).toBe(10_000);
+      vi.advanceTimersByTime(55_000);
+      expect(ctx.service.awaitingElapsedMs()).toBe(65_000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('turn.started ends the awaiting stretch and stops the clock', async () => {
+    const ctx = await readySession();
+    vi.useFakeTimers();
+    try {
+      await ctx.service.sendMessage('hello');
+      await Promise.resolve();
+      TestBed.tick();
+      vi.advanceTimersByTime(3_000);
+      expect(ctx.service.awaitingElapsedMs()).toBe(3_000);
+
+      fireSseMessage(ctx.sseInstances[0], { method: 'turn.started', params: { turn_id: 1 } }, '1:2');
+      TestBed.tick();
+      expect(ctx.service.awaitingSince()).toBeNull();
+      expect(ctx.service.awaitingElapsedMs()).toBe(0);
+      vi.advanceTimersByTime(5_000);
+      expect(ctx.service.awaitingElapsedMs()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a thread switch ends the awaiting stretch (accounting is per thread)', async () => {
+    const ctx = await readySession();
+    await ctx.service.sendMessage('first thread');
+    await Promise.resolve();
+    TestBed.tick();
+    expect(ctx.service.awaitingSince()).not.toBeNull();
+
+    await ctx.service.connect('thread-x');
+    TestBed.tick();
+    expect(ctx.service.pendingTurnCount()).toBe(0);
+    expect(ctx.service.awaitingSince()).toBeNull();
+    expect(ctx.service.awaitingElapsedMs()).toBe(0);
+  });
+
   it('an unstarted turn can never decrement below zero', async () => {
     const ctx = await readySession();
     // turn.started with no tracked accept (other tab / injected input).
@@ -10030,5 +10131,353 @@ describe('PersistentChatService — awaiting-turn state (queued input visibility
 
     expect(ctx.service.pendingTurnCount()).toBe(0);
     expect(ctx.service.isAwaitingTurn()).toBe(false);
+  });
+});
+
+describe('PersistentChatService — control transport is declared, never inferred', () => {
+  // live_settings_silently_dropped_on_stateless_sessions: on a queue-served
+  // session `config.update` used to be pushed into the control outbox and
+  // wait for a socket `_ensureControlWs` refuses to open — forever, silently.
+  // `/connection` now declares the transport per verb (`controls`); the
+  // Cockpit dispatches from that declaration, routes `config.update` over the
+  // owner PATCH when it says `rest`, and refuses LOUDLY when a verb has no
+  // transport at all. An older orchestrator without `controls` gets the
+  // legacy derivation, which is exactly what such a server implements.
+  let originalEs: any;
+  let originalWs: any;
+
+  beforeEach(() => {
+    originalEs = (globalThis as any).EventSource;
+    originalWs = (globalThis as any).WebSocket;
+  });
+
+  afterEach(() => {
+    (globalThis as any).EventSource = originalEs;
+    (globalThis as any).WebSocket = originalWs;
+    vi.clearAllMocks();
+  });
+
+  function socketlessGet(connection: Record<string, unknown>) {
+    return (url: string) => {
+      if (url.includes('/api/sessions/') && url.endsWith('/connection')) return of(connection);
+      if (url.endsWith('/messages')) return of({ messages: [], total: 0 });
+      if (url.endsWith('/state')) {
+        return of({
+          thread_id: 'socketless',
+          permission_mode: 'autonomous',
+          narration_mode: 'auto',
+          turn_count: 2,
+          turn_in_flight: false,
+          message_count: 4,
+          model: 'gpt-5.6-sol',
+          temperature: 0,
+          running_tool: null,
+          pending_permissions: [],
+          event_cursor: { epoch: 1, seq: 9 },
+          replay_cursor: { epoch: 1, seq: 8 },
+          snapshot_source: 'durable_journal',
+        });
+      }
+      return of({ status: 'active', total_turns: 2, config_name: 'session_base' });
+    };
+  }
+
+  const declaredSocketless = {
+    state: 'ready',
+    control_socket: 'none',
+    ws_url: null,
+    token: null,
+    expires_at: null,
+    pinned_runtime_generation_contract: 1,
+    session_runtime_generation: '99999999-9999-4999-8999-999999999999',
+    controls: {
+      'config.update': 'rest',
+      'workspace.undo': 'rest',
+      'mode.set': 'rest',
+      'narration.set': 'rest',
+    },
+  };
+
+  async function socketlessSession(connection: Record<string, unknown> = declaredSocketless) {
+    const ctx = createService();
+    ctx.mockHttp.get.mockImplementation(socketlessGet(connection));
+    await ctx.service.connect('socketless');
+    fireSseOpen(ctx.sseInstances[0]);
+    (ctx.service as any)._ensureControlWs();
+    return ctx;
+  }
+
+  it('routes config.update over the owner PATCH when /connection declares rest', async () => {
+    const ctx = await socketlessSession();
+    ctx.mockHttp.patch.mockReturnValue(
+      of({
+        status: 'updated',
+        config_override: { llm: { reasoning_level: 'max' } },
+        datasource_ids: null,
+        effective: 'next_turn',
+      }),
+    );
+    const stamps = vi.spyOn(ctx.service as any, '_systemMessage');
+
+    const outcome = await ctx.service.updateConfig({ llm: { reasoning_level: 'max' } });
+
+    expect(ctx.wsInstances).toHaveLength(0);
+    expect((ctx.service as any).controlOutbox).toEqual([]);
+    expect(ctx.mockHttp.patch).toHaveBeenCalledWith(
+      expect.stringMatching(/\/persistent\/threads\/socketless\/config$/),
+      { config_override: { llm: { reasoning_level: 'max' } } },
+    );
+    expect(outcome).toMatchObject({
+      ok: true,
+      transport: 'rest',
+      effective: 'next_turn',
+      applied: { llm: { reasoning_level: 'max' } },
+    });
+    // The stamp the socket ack would have journaled is written locally.
+    expect(stamps).toHaveBeenCalledWith('chat.control.appliedNextTurn');
+    expect(ctx.service.error()).toBeNull();
+  });
+
+  it('carries the desired datasource set as the PATCH sibling key', async () => {
+    const ctx = await socketlessSession();
+    ctx.mockHttp.patch.mockReturnValue(
+      of({ status: 'updated', config_override: {}, datasource_ids: ['ds-1'], effective: 'next_turn' }),
+    );
+    await ctx.service.updateConfig({}, ['ds-1']);
+    expect(ctx.mockHttp.patch).toHaveBeenCalledWith(expect.any(String), {
+      config_override: {},
+      datasource_ids: ['ds-1'],
+    });
+  });
+
+  it('a rejected PATCH settles as not applied and surfaces the detail', async () => {
+    const ctx = await socketlessSession();
+    ctx.mockHttp.patch.mockReturnValue(
+      throwError(() => ({ status: 409, error: { detail: 'protected sessions cannot change tier' } })),
+    );
+    const outcome = await ctx.service.updateConfig({ workspace: { backend: 'vm' } });
+    expect(outcome).toMatchObject({ ok: false, transport: 'rest' });
+    expect(ctx.service.error()).toContain('protected sessions cannot change tier');
+  });
+
+  it('an older orchestrator without `controls` still routes a socketless config.update over REST', async () => {
+    const { controls: _omitted, ...legacy } = declaredSocketless;
+    void _omitted;
+    const ctx = await socketlessSession(legacy);
+    ctx.mockHttp.patch.mockReturnValue(of({ status: 'updated', config_override: { llm: { temperature: 0.4 } } }));
+    const outcome = await ctx.service.updateConfig({ llm: { temperature: 0.4 } });
+    expect(outcome.ok).toBe(true);
+    expect(ctx.mockHttp.patch).toHaveBeenCalledTimes(1);
+    expect(ctx.service.temperature()).toBe(0.4);
+  });
+
+  it('the declaration wins over the lane: a socket session whose controls say rest PATCHes', async () => {
+    const ctx = createService();
+    ctx.mockHttp.get.mockImplementation(
+      socketlessGet({
+        ...declaredSocketless,
+        control_socket: 'websocket',
+        ws_url: 'wss://api.example.com/p/socketless/ws?t=jwt',
+        token: 'jwt',
+        expires_at: 0,
+      }),
+    );
+    await ctx.service.connect('socketless');
+    fireSseOpen(ctx.sseInstances[0]);
+    ctx.mockHttp.patch.mockReturnValue(of({ status: 'updated', config_override: {} }));
+
+    await ctx.service.updateConfig({ llm: { reasoning_level: 'low' } });
+
+    expect(ctx.mockHttp.patch).toHaveBeenCalledTimes(1);
+    const socketFrames = ctx.wsInstances[0].send.mock.calls
+      .map((c: any) => JSON.parse(c[0]))
+      .filter((f: any) => f.method === 'config.update');
+    expect(socketFrames).toEqual([]);
+  });
+
+  it('a verb with no transport on this session is refused loudly, not queued', async () => {
+    const ctx = await socketlessSession();
+
+    ctx.service.upgradeWorkspace('sandbox');
+    expect(ctx.service.error()).toBe('chat.control.unavailable');
+    expect(ctx.service.workspaceUpgradeInProgress()).toBeNull();
+    expect((ctx.service as any).controlOutbox).toEqual([]);
+
+    ctx.service.error.set(null);
+    const stamps = vi.spyOn(ctx.service as any, '_systemMessage');
+    expect((ctx.service as any).handleSlashCommand('/done')).toBe(true);
+    expect(stamps).not.toHaveBeenCalledWith('Ending session...');
+    expect(ctx.service.error()).toBe('chat.control.unavailable');
+    expect((ctx.service as any).controlOutbox).toEqual([]);
+    expect(ctx.wsInstances).toHaveLength(0);
+  });
+
+  it('frames queued before /connection resolved are failed once it declares no socket', async () => {
+    const ctx = createService();
+    let releaseConnection!: (value: unknown) => void;
+    const gate = new Promise((resolve) => (releaseConnection = resolve));
+    const get = socketlessGet(declaredSocketless);
+    ctx.mockHttp.get.mockImplementation((url: string) => {
+      if (url.includes('/api/sessions/') && url.endsWith('/connection')) {
+        return from(gate.then(() => declaredSocketless));
+      }
+      return get(url);
+    });
+    const connecting = ctx.service.connect('socketless');
+    // Let the connect reach its /connection await (thread meta + snapshot
+    // resolve first); the gate keeps the transport unknown.
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+    expect((ctx.service as any).controlSocket).toBe('unknown');
+    // Transport still unknown: a socket verb queues, as it always did.
+    (ctx.service as any)._sendControl({ method: 'compact', focus: '' });
+    expect((ctx.service as any).controlOutbox).toHaveLength(1);
+
+    releaseConnection(undefined);
+    await connecting;
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+
+    // ...and is failed the moment the session turns out to have no socket,
+    // instead of sitting in the outbox for the life of the tab.
+    expect((ctx.service as any).controlOutbox).toEqual([]);
+    expect(ctx.service.error()).toBe('chat.control.unavailable');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Durable queue state: parked units, the awaiting poll, owner retry
+// (stateless_turn_resilience.md, step 2)
+// ---------------------------------------------------------------------------
+describe('PersistentChatService — queue state (parked / poll / retry)', () => {
+  const parkedBlock = {
+    state: 'parked',
+    park_reason: 'attach_failed',
+    parked_at: '2026-09-08T14:00:00Z',
+    retryable: true,
+    attempts: 5,
+    pending_input: true,
+  };
+
+  async function readyOn(threadId: string, connection: Record<string, unknown> = {}) {
+    const ctx = createService();
+    ctx.mockHttp.get.mockImplementation((url: string) => {
+      if (url.endsWith(`/sessions/${threadId}/connection`)) {
+        return of({ state: 'ready', ws_url: null, control_socket: 'none', ...connection });
+      }
+      return of({ status: 'active', total_turns: 0, messages: [], total: 0 });
+    });
+    await ctx.service.connect(threadId);
+    fireSseOpen(ctx.sseInstances[0]);
+    fireSseMessage(ctx.sseInstances[0], { method: 'ready', params: {} }, '1:1');
+    ctx.mockHttp.post.mockClear();
+    return ctx;
+  }
+
+  it('renders a parked accept as parked, never as awaiting', async () => {
+    const ctx = await readyOn('thread-p');
+    ctx.mockHttp.post.mockReturnValue(
+      of({ accepted: true, turn_id: 3, queue: parkedBlock }),
+    );
+    await ctx.service.sendMessage('hello?');
+    await Promise.resolve();
+    expect(ctx.service.queueState()).toEqual(parkedBlock);
+    expect(ctx.service.isParked()).toBe(true);
+    // The accept still bumped pendingTurnCount, but a parked unit is not "waiting".
+    expect(ctx.service.pendingTurnCount()).toBe(1);
+    expect(ctx.service.isAwaitingTurn()).toBe(false);
+  });
+
+  it('takes the queue block from /connection so a reload shows the parked unit', async () => {
+    const ctx = await readyOn('thread-c', { queue: parkedBlock });
+    // The control-plane resolve reads /connection; give it a tick.
+    await new Promise((r) => setTimeout(r, 0));
+    expect(ctx.service.queueState()?.state).toBe('parked');
+    expect(ctx.service.isParked()).toBe(true);
+  });
+
+  it('polls GET /queue every 5 s only while awaiting, and stops on turn.started', async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = await readyOn('thread-q');
+      const getQueue = vi.fn().mockReturnValue(of({ ...parkedBlock, state: 'queued', park_reason: null }));
+      (ctx.mockApi as any).getThreadQueue = getQueue;
+      ctx.mockHttp.post.mockReturnValue(
+        of({ accepted: true, turn_id: 1, queue: { ...parkedBlock, state: 'queued', park_reason: null } }),
+      );
+      await ctx.service.sendMessage('ping');
+      await Promise.resolve();
+      expect(ctx.service.isAwaitingTurn()).toBe(true);
+      expect(getQueue).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(getQueue).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(getQueue).toHaveBeenCalledTimes(2);
+
+      fireSseMessage(ctx.sseInstances[0], { method: 'turn.started', params: { turn_id: 1 } }, '1:2');
+      expect(ctx.service.isAwaitingTurn()).toBe(false);
+      expect(ctx.service.queueState()).toBeNull();
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(getQueue).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a poll that reports parked ends the awaiting stretch', async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = await readyOn('thread-pp');
+      (ctx.mockApi as any).getThreadQueue = vi.fn().mockReturnValue(of(parkedBlock));
+      ctx.mockHttp.post.mockReturnValue(
+        of({ accepted: true, turn_id: 1, queue: { ...parkedBlock, state: 'queued', park_reason: null } }),
+      );
+      await ctx.service.sendMessage('ping');
+      await Promise.resolve();
+      expect(ctx.service.isAwaitingTurn()).toBe(true);
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(ctx.service.isParked()).toBe(true);
+      expect(ctx.service.isAwaitingTurn()).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a thread switch clears the parked state (accounting is per thread)', async () => {
+    const ctx = await readyOn('thread-a');
+    ctx.mockHttp.post.mockReturnValue(of({ accepted: true, turn_id: 1, queue: parkedBlock }));
+    await ctx.service.sendMessage('x');
+    await Promise.resolve();
+    expect(ctx.service.isParked()).toBe(true);
+    ctx.mockHttp.get.mockImplementation(() =>
+      of({ status: 'active', total_turns: 0, messages: [], total: 0 }),
+    );
+    await ctx.service.connect('thread-b');
+    expect(ctx.service.queueState()).toBeNull();
+    expect(ctx.service.isParked()).toBe(false);
+  });
+
+  it('retryParked re-queues on 200 and shows the waiting state again', async () => {
+    const ctx = await readyOn('thread-r');
+    ctx.mockHttp.post.mockReturnValue(of({ accepted: true, turn_id: 1, queue: parkedBlock }));
+    await ctx.service.sendMessage('x');
+    await Promise.resolve();
+    (ctx.mockApi as any).retryThreadQueue = vi.fn().mockReturnValue(of({ kind: 'ok', state: 'queued' }));
+    expect(await ctx.service.retryParked()).toBe('ok');
+    expect((ctx.mockApi as any).retryThreadQueue).toHaveBeenCalledWith('thread-r');
+    expect(ctx.service.isParked()).toBe(false);
+    expect(ctx.service.queueState()?.state).toBe('queued');
+    expect(ctx.service.isAwaitingTurn()).toBe(true);
+  });
+
+  it('retryParked leaves the parked bubble and toasts the server code on refusal', async () => {
+    const ctx = await readyOn('thread-x');
+    ctx.mockHttp.post.mockReturnValue(of({ accepted: true, turn_id: 1, queue: parkedBlock }));
+    await ctx.service.sendMessage('x');
+    await Promise.resolve();
+    (ctx.mockApi as any).retryThreadQueue = vi
+      .fn()
+      .mockReturnValue(of({ kind: 'refused', status: 409, code: 'claim_loss_hold' }));
+    expect(await ctx.service.retryParked()).toBe('refused');
+    expect(ctx.service.isParked()).toBe(true);
+    expect((TestBed.inject(AppToastService) as any).danger).toHaveBeenCalled();
   });
 });

@@ -86,8 +86,8 @@
 }
 
 :host.cdk-keyboard-focused .app-checkbox__box {
-  outline: 2px solid var(--accent-color);
-  outline-offset: 2px;
+  outline: none;
+  box-shadow: 0 0 0 3px var(--ring);
 }
 
 @media (max-width: v.$breakpoint-md) {

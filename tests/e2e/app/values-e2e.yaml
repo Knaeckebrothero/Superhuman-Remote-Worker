@@ -180,3 +180,17 @@ llm:
             displayName: E2E Embedding
             family: e2e
             capabilities: [embedding]
+          # The memory reranker's own catalog slot (required by readiness).
+          # The fixture accepts this id on /rerank alongside e2e-embedding.
+          - id: qwen3-reranker-8b
+            displayName: E2E Reranker
+            family: e2e
+            capabilities: [rerank]
+    # Readiness requires a pinned default per required capability. Migration
+    # 0242 pins `rerank` only when it created the row itself — an upgrade from
+    # a deployment that already had enabled embedding rows. On a FRESH install
+    # migrations run before anything is seeded, so 0242 creates nothing, pins
+    # nothing, and readiness reports `missing_defaults: ["rerank"]`. Pin it
+    # here so this stack reaches `ready: true` the way a real install should.
+    defaults:
+      rerank: qwen3-reranker-8b

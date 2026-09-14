@@ -74,13 +74,30 @@ _HEADINGS = {
 }
 _HEADING_FALLBACK = ("15px", "21px", "14px 0 6px 0")
 
-_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})\s*[^\s`]*\s*$")
-_HEADING_RE = re.compile(r"^ {0,3}(#{1,6})\s+(.*?)\s*#*\s*$")
+# Every pattern below scans a line of an untrusted, model-authored body, so each
+# is written to stay linear. The tilde lookahead requires the entire delimiter
+# run, so a failing info string cannot repartition tildes between both groups.
+_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,}(?!~))\s*(?:[^\s`]+\s*)?$")
+# An ATX closing run ("## Done ##") is trimmed by _atx_text rather than by a
+# "(.*?)\s*#*\s*$" tail, which offered three ways to split the same whitespace.
+_HEADING_RE = re.compile(r"^ {0,3}(#{1,6})\s+(.*)")
 _HR_RE = re.compile(r"^ {0,3}(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})$")
 _QUOTE_RE = re.compile(r"^ {0,3}>[ \t]?(.*)$")
-_UL_RE = re.compile(r"^( *)([-*+])[ \t]+(.*)$")
-_OL_RE = re.compile(r"^( *)(\d{1,9})[.)][ \t]+(.*)$")
+# No trailing "$": "." already stops at a newline and every caller passes a
+# single line, so the anchor only gave the marker's whitespace run something to
+# backtrack against.
+_UL_RE = re.compile(r"^( *)([-*+])[ \t]+(.*)")
+_OL_RE = re.compile(r"^( *)(\d{1,9})[.)][ \t]+(.*)")
 _SAFE_SCHEME_RE = re.compile(r"^(?:https?://|mailto:)", re.IGNORECASE)
+# Candidate labels stop at another opener. Destination scanning also stops at
+# an opener, except for a single bracketed IPv6 authority after an HTTP scheme.
+# Titles are handled by _sub_links, which caches their closing delimiters.
+_LINK_OPEN_RE = re.compile(r"\[([^\[\]\n]*)\]\(")
+_LINK_DEST_RE = re.compile(
+    r"(?:https?://(?:[^/@\s<>\[\]()]+@)?\[[^\[\]\s()<>]+\][^)\s<>\[]*"
+    r"|[^)\s<>\[]+)",
+    re.IGNORECASE,
+)
 
 # Nesting past this renders as flat paragraphs -- see _parse_blocks.
 _MAX_DEPTH = 12
@@ -135,7 +152,8 @@ def _parse_blocks(lines: list[str], depth: int = 0) -> list[tuple[str, str]]:
             blocks.append(("html", _thematic_break()))
             i += 1
         elif heading := _HEADING_RE.match(line):
-            blocks.append(("html", _heading(len(heading.group(1)), heading.group(2))))
+            text = _atx_text(heading.group(2))
+            blocks.append(("html", _heading(len(heading.group(1)), text)))
             i += 1
         elif _QUOTE_RE.match(line):
             inner, i = _consume_quote(lines, i)
@@ -338,6 +356,17 @@ def _consume_table(lines: list[str], start: int) -> tuple[str, int]:
     )
 
 
+def _atx_text(text: str) -> str:
+    """Heading text minus its optional closing run of hashes ("## Done ##").
+
+    `_HEADING_RE` used to trim that run with a `(.*?)\\s*#*\\s*$` tail, which
+    gave the engine three overlapping ways to split the same trailing
+    whitespace -- quadratic on a hostile line. Two rstrips cost one pass.
+    """
+    text = text.rstrip()
+    return text.rstrip("#").rstrip() if text.endswith("#") else text
+
+
 def _heading(level: int, text: str) -> str:
     size, line_height, margin = _HEADINGS.get(level, _HEADING_FALLBACK)
     tag = f"h{min(level + 1, 6)}"
@@ -409,21 +438,110 @@ def _inline(text: str) -> str:
         lambda m: keep(html.escape(m.group(1), quote=True)),
         text,
     )
-    text = re.sub(r"(`+)([\s\S]+?)\1", lambda m: keep(_code_span(m.group(2))), text)
+    text = _sub_code_spans(text, lambda inner: keep(_code_span(inner)))
     text = re.sub(
         r"<((?:https?://|mailto:)[^\s<>]+)>",
         lambda m: keep(_anchor(m.group(1), html.escape(m.group(1), quote=True))),
         text,
     )
     text = html.escape(text, quote=True)
-    text = re.sub(
-        r"\[([^\]\n]*)\]\(\s*<?([^)\s<>]+)>?(?:\s+&quot;[^)\n]*&quot;)?\s*\)",
-        lambda m: keep(_anchor(html.unescape(m.group(2)), _emphasis(m.group(1)))),
+    text = _sub_links(
         text,
+        lambda label, url: keep(_anchor(html.unescape(url), _emphasis(label))),
     )
     text = _BARE_URL_RE.sub(_bare_url(keep), text)
     text = _emphasis(text)
     return _restore(text.replace("\n", "<br>"), tokens)
+
+
+def _sub_links(text: str, render) -> str:
+    """Replace links without rescanning an unterminated title per opener.
+
+    Labels and destinations scan only as far as the next candidate. Titles can
+    contain brackets, so their next closing parenthesis/newline is cached as
+    candidates advance. A long shared trailing whitespace run is trimmed once
+    per closing parenthesis. Failed outer links still allow valid inner links.
+    """
+    out: list[str] = []
+    copied = 0
+    next_close = next_newline = -2  # -2: not searched; -1: no remaining delimiter
+    title_end = -1
+    length = len(text)
+    for opening in _LINK_OPEN_RE.finditer(text):
+        if opening.start() < copied:
+            continue
+        pos = opening.end()
+        while pos < length and text[pos] in " \t":
+            pos += 1
+        if pos < length and text[pos] == "<":
+            pos += 1
+        destination = _LINK_DEST_RE.match(text, pos)
+        if destination is None:
+            continue
+        pos = destination.end()
+        if pos < length and text[pos] == ">":
+            pos += 1
+        separator = pos
+        while pos < length and text[pos] in " \t":
+            pos += 1
+        if pos < length and text[pos] == ")":
+            end = pos + 1
+        elif pos > separator and text.startswith("&quot;", pos):
+            content = pos + len("&quot;")
+            if next_close == -2 or (next_close >= 0 and next_close < content):
+                next_close = text.find(")", content)
+                title_end = next_close
+                while title_end > content and text[title_end - 1] in " \t":
+                    title_end -= 1
+            if next_newline == -2 or (next_newline >= 0 and next_newline < content):
+                next_newline = text.find("\n", content)
+            if (
+                next_close < 0
+                or (next_newline >= 0 and next_newline < next_close)
+                or title_end - len("&quot;") < content
+                or not text.startswith("&quot;", title_end - len("&quot;"))
+            ):
+                continue
+            end = next_close + 1
+        else:
+            continue
+        out.append(text[copied : opening.start()])
+        out.append(render(opening.group(1), destination.group()))
+        copied = end
+    out.append(text[copied:])
+    return "".join(out)
+
+
+def _sub_code_spans(text: str, render) -> str:
+    """Match backtick runs to the next run of exactly the same width.
+
+    Index runs once, then map each one to its next same-width partner in a
+    reverse pass. Unmatched widths never rescan the remaining runs or text.
+    Both passes and the emitted slices cost O(len(text)) total.
+    """
+    runs = [(match.start(), match.end()) for match in re.finditer(r"`+", text)]
+    following: list[int | None] = [None] * len(runs)
+    by_width: dict[int, int] = {}
+    for index in range(len(runs) - 1, -1, -1):
+        start, end = runs[index]
+        width = end - start
+        following[index] = by_width.get(width)
+        by_width[width] = index
+    out: list[str] = []
+    copied = index = 0
+    while index < len(runs):
+        partner = following[index]
+        if partner is None:
+            index += 1
+            continue
+        start, end = runs[index]
+        close_start, close_end = runs[partner]
+        out.append(text[copied:start])
+        out.append(render(text[end:close_start]))
+        copied = close_end
+        index = partner + 1
+    out.append(text[copied:])
+    return "".join(out)
 
 
 def _bare_url(keep):
@@ -473,15 +591,25 @@ def _emphasis(text: str) -> str:
 
     The `_` variants require a non-word character on both sides, or every
     `snake_case_identifier` in an agent message turns into italics."""
+    # "(.+?)" spanning a "**" of its own is what made these quadratic: every
+    # opener lazily rescanned the rest of the line, and a closer rejected by the
+    # lookarounds sent it back to the next opener. A span that cannot contain
+    # its own delimiter gives each character one chance to be consumed.
     text = re.sub(
-        r"(?<!\*)\*\*(?!\s)(.+?)(?<!\s)\*\*(?!\*)", r"<strong>\1</strong>", text
+        r"(?<!\*)\*\*(?!\s)((?:[^*\n]|\*(?!\*))+)(?<!\s)\*\*(?!\*)",
+        r"<strong>\1</strong>",
+        text,
     )
     text = re.sub(
-        r"(?<![\w_])__(?!\s)(.+?)(?<!\s)__(?!\w)", r"<strong>\1</strong>", text
+        r"(?<![\w_])__(?!\s)((?:[^_\n]|_(?!_))+)(?<!\s)__(?!\w)",
+        r"<strong>\1</strong>",
+        text,
     )
     text = re.sub(r"(?<![\*\w])\*(?!\s)([^*\n]+?)(?<!\s)\*(?!\*)", r"<em>\1</em>", text)
     text = re.sub(r"(?<![\w_])_(?!\s)([^_\n]+?)(?<!\s)_(?!\w)", r"<em>\1</em>", text)
-    return re.sub(r"~~(?!\s)(.+?)(?<!\s)~~", r"<s>\1</s>", text)
+    # Not flagged by CodeQL, but the same "(.+?)" shape as the two above and
+    # measurably quadratic on a run of unclosed "~~" openers.
+    return re.sub(r"~~(?!\s)((?:[^~\n]|~(?!~))+)(?<!\s)~~", r"<s>\1</s>", text)
 
 
 def _restore(text: str, tokens: list[str]) -> str:

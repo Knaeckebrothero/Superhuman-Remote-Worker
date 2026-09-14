@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from contextlib import asynccontextmanager
-from typing import Any, Literal
+from dataclasses import dataclass
+from functools import partial
+from typing import Any, Awaitable, Callable, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from orchestrator.schemas.job_create import JobCreate
 from orchestrator.security.access import mcp_scope_project_id, require_project_member
 from orchestrator.security.auth import require_approved_user
 from orchestrator.services.agent_pod_entrypoint import validate_config_name
@@ -115,70 +117,64 @@ class BenchRunCreate(BaseModel):
         return self
 
 
-def _bench_internal_request(created_by: str) -> Request:
-    """Build the authenticated in-process request used by ``create_job``.
-
-    The shared key authenticates the transport; ``X-MCP-User-Id`` makes the
-    existing handler resolve and re-check the creator from Postgres.  No body
-    identity is trusted, matching normal MCP-forwarded job creation.
-    """
-
-    internal_key = os.getenv("MCP_INTERNAL_KEY", "")
-    if not internal_key:
-        raise RuntimeError(
-            "MCP_INTERNAL_KEY is required for server-side bench job creation"
-        )
-    headers = [
-        (b"x-internal-key", internal_key.encode("latin-1")),
-        (b"x-mcp-user-id", created_by.encode("ascii")),
-    ]
-    return Request(
-        {
-            "type": "http",
-            "asgi": {"version": "3.0", "spec_version": "2.3"},
-            "http_version": "1.1",
-            "method": "POST",
-            "scheme": "http",
-            "path": "/api/jobs",
-            "raw_path": b"/api/jobs",
-            "query_string": b"",
-            "headers": headers,
-            "client": ("127.0.0.1", 0),
-            "server": ("orchestrator", 8085),
-        }
-    )
+CreateBenchJob = Callable[[str, JobCreate], Awaitable[dict[str, Any]]]
+ValidateToolOverrides = Callable[[dict[str, Any] | None], dict[str, Any] | None]
+ResolveJobRepo = Callable[[str], Awaitable[tuple[str, str | None]]]
+CancelBenchJob = Callable[[str, dict[str, Any]], Awaitable[Any]]
 
 
-async def _create_job_through_main(
+@dataclass(frozen=True)
+class BenchDependencies:
+    store: BenchStore
+    create_job: CreateBenchJob
+    validate_tool_overrides: ValidateToolOverrides | None = None
+    audit_reader: Any | None = None
+    forge: Any | None = None
+    resolve_job_repo: ResolveJobRepo | None = None
+    cancel_job: CancelBenchJob | None = None
+
+
+def _request_dependencies(request: Request) -> BenchDependencies:
+    """Resolve the collaborators owned by the mounted application."""
+
+    factory = getattr(request.app.state, "bench_dependencies_factory", None)
+    if not callable(factory):
+        raise RuntimeError("Bench application dependencies are not configured")
+    return factory()
+
+
+async def _create_job_through_admission(
     run: dict[str, Any],
     task: dict[str, Any],
     arm: dict[str, Any],
     replicate: int,
+    *,
+    create_job: CreateBenchJob,
 ) -> dict[str, Any]:
-    """Call the regular job-creation handler directly (never over HTTP)."""
-
-    from orchestrator.main import JobCreate, create_job
+    """Submit the frozen payload through application-owned job admission."""
 
     created_by = str(run["created_by"])
     payload = build_bench_job_payload(run, task, arm, replicate)
     return await create_job(
-        _bench_internal_request(created_by),
+        created_by,
         JobCreate(**payload),
     )
 
 
 @asynccontextmanager
-async def _bench_lifespan(_app: Any):
+async def _bench_lifespan(app: Any):
     """Start after the app DB lifespan and drain before DB shutdown."""
 
-    from orchestrator.main import postgres_db
+    dependencies = app.state.bench_dependencies_factory()
 
     shutdown_event = asyncio.Event()
     task = asyncio.create_task(
         bench_sweeper_loop(
-            BenchStore(postgres_db),
+            dependencies.store,
             shutdown_event,
-            create_job_fn=_create_job_through_main,
+            create_job_fn=partial(
+                _create_job_through_admission, create_job=dependencies.create_job
+            ),
         )
     )
     try:
@@ -213,9 +209,12 @@ async def _visible_run_or_404(
 async def create_run(request: Request, body: BenchRunCreate) -> dict[str, Any]:
     """Freeze and start a creator-owned benchmark run."""
 
-    from orchestrator.main import _with_validated_tool_overrides, postgres_db
-
-    caller = await require_approved_user(request, postgres_db)
+    dependencies = _request_dependencies(request)
+    database = dependencies.store.db
+    validate_tool_overrides = dependencies.validate_tool_overrides
+    if validate_tool_overrides is None:
+        raise RuntimeError("Bench tool validation is not configured")
+    caller = await require_approved_user(request, database)
     payload = body.model_dump(mode="python")
 
     # Match POST /api/jobs' scope rules, but resolve the project now so it is
@@ -235,7 +234,7 @@ async def create_run(request: Request, body: BenchRunCreate) -> dict[str, Any]:
     if requested_project:
         await require_project_member(
             request,
-            postgres_db,
+            database,
             requested_project,
             min_role="editor",
             allow_archived=False,
@@ -260,7 +259,7 @@ async def create_run(request: Request, body: BenchRunCreate) -> dict[str, Any]:
         if arm_project_id not in checked_arm_projects:
             await require_project_member(
                 request,
-                postgres_db,
+                database,
                 arm_project_id,
                 min_role="editor",
                 allow_archived=False,
@@ -273,16 +272,16 @@ async def create_run(request: Request, body: BenchRunCreate) -> dict[str, Any]:
     # validates again at each actual submission.
     for task in payload["tasks"]:
         task["config_override"] = (
-            _with_validated_tool_overrides(task.get("config_override")) or {}
+            validate_tool_overrides(task.get("config_override")) or {}
         )
     for arm in payload["arms"]:
         arm["config_override"] = (
-            _with_validated_tool_overrides(arm.get("config_override")) or {}
+            validate_tool_overrides(arm.get("config_override")) or {}
         )
         if arm.get("expert_id"):
             try:
                 await validate_automation_expert_selection(
-                    postgres_db,
+                    database,
                     owner_id=str(caller["id"]),
                     project_id=requested_project,
                     expert="worker_base",
@@ -292,7 +291,7 @@ async def create_run(request: Request, body: BenchRunCreate) -> dict[str, Any]:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     return await create_bench_run(
-        BenchStore(postgres_db),
+        dependencies.store,
         name=body.name,
         created_by=str(caller["id"]),
         spec=payload,
@@ -306,10 +305,9 @@ async def list_runs(
 ) -> list[dict[str, Any]]:
     """List caller-owned runs; admins can inspect the full fleet."""
 
-    from orchestrator.main import postgres_db
-
-    caller = await require_approved_user(request, postgres_db)
-    return await BenchStore(postgres_db).list_runs(
+    dependencies = _request_dependencies(request)
+    caller = await require_approved_user(request, dependencies.store.db)
+    return await dependencies.store.list_runs(
         created_by=None if caller.get("is_admin") else str(caller["id"]),
         limit=limit,
     )
@@ -319,33 +317,28 @@ async def list_runs(
 async def get_run(request: Request, run_id: str) -> dict[str, Any]:
     """Return one visible run, including its frozen spec and live ledger."""
 
-    from orchestrator.main import postgres_db
-
-    caller = await require_approved_user(request, postgres_db)
-    return await _visible_run_or_404(BenchStore(postgres_db), run_id, caller)
+    dependencies = _request_dependencies(request)
+    caller = await require_approved_user(request, dependencies.store.db)
+    return await _visible_run_or_404(dependencies.store, run_id, caller)
 
 
 @router.get("/runs/{run_id}/report")
 async def get_report(request: Request, run_id: str) -> dict[str, Any]:
     """Compute the v0 phase/cost report server-side from authoritative data."""
 
-    from orchestrator.main import (
-        audit_reader,
-        gitea_client,
-        postgres_db,
-        resolve_job_repo,
-    )
-
-    caller = await require_approved_user(request, postgres_db)
-    run = await _visible_run_or_404(BenchStore(postgres_db), run_id, caller)
-    if not audit_reader.is_available:
+    dependencies = _request_dependencies(request)
+    caller = await require_approved_user(request, dependencies.store.db)
+    run = await _visible_run_or_404(dependencies.store, run_id, caller)
+    if dependencies.audit_reader is None or not dependencies.audit_reader.is_available:
         raise HTTPException(status_code=503, detail="Audit store not available")
+    if dependencies.forge is None or dependencies.resolve_job_repo is None:
+        raise RuntimeError("Bench reporting dependencies are not configured")
     return await compute_bench_report(
-        postgres_db,
+        dependencies.store.db,
         run,
-        audit_reader=audit_reader,
-        gitea_client=gitea_client,
-        resolve_job_repo=resolve_job_repo,
+        audit_reader=dependencies.audit_reader,
+        gitea_client=dependencies.forge,
+        resolve_job_repo=dependencies.resolve_job_repo,
     )
 
 
@@ -353,14 +346,15 @@ async def get_report(request: Request, run_id: str) -> dict[str, Any]:
 async def cancel_run(request: Request, run_id: str) -> dict[str, Any]:
     """Stop future submissions and cancel all currently live member jobs."""
 
-    from orchestrator.main import cancel_job, postgres_db
-
-    caller = await require_approved_user(request, postgres_db)
-    store = BenchStore(postgres_db)
+    dependencies = _request_dependencies(request)
+    caller = await require_approved_user(request, dependencies.store.db)
+    store = dependencies.store
     run = await _visible_run_or_404(store, run_id, caller)
+    if dependencies.cancel_job is None:
+        raise RuntimeError("Bench cancellation is not configured")
 
     async def cancel_member(job_id: str) -> Any:
-        return await cancel_job(request, job_id)
+        return await dependencies.cancel_job(job_id, caller)
 
     try:
         return await cancel_bench_run(

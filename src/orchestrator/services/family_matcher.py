@@ -40,15 +40,27 @@ _FAMILY_RULES: list[tuple[re.Pattern, str | Callable[[re.Match], FamilyDetection
         re.compile(r"^openrouter/(.+)$"),
         lambda m: detect_family(m.group(1)),
     ),
-    # Anthropic
+    # Anthropic. claude-opus-5 must beat the generic claude-opus rule: only
+    # Opus 5 accepts the full effort ladder, so it has its own matrix family
+    # (family_of() in shared/runtime/core/model_registry.py encodes the same
+    # precedence). Older ids stay on `claude-opus` — "claude-opus-4-5" does not
+    # contain "claude-opus-5".
+    (re.compile(r"claude-opus-5", re.IGNORECASE), "claude-opus-5"),
     (re.compile(r"claude-opus", re.IGNORECASE), "claude-opus"),
     (re.compile(r"claude-sonnet", re.IGNORECASE), "claude-sonnet"),
     (re.compile(r"claude-haiku", re.IGNORECASE), "claude-haiku"),
+    # Fable 5 and 5.1 share one family (identical matrix knobs).
+    (re.compile(r"claude-fable", re.IGNORECASE), "claude-fable"),
     # codex variants — must beat both gpt-5 and codex itself, since real
     # codex IDs (e.g. `gpt-5.3-codex`, `gpt-5.3-codex-spark`) contain both
     # the `gpt-5` prefix and the `codex` substring.
     (re.compile(r"codex-spark", re.IGNORECASE), "codex-spark"),
     (re.compile(r"codex", re.IGNORECASE), "codex"),
+    # GPT-6 (Astra). Sits below the codex rules on purpose: those match any id
+    # containing "codex", so a future gpt-6 codex variant keeps landing in the
+    # codex family rather than here — family_of() in model_registry.py encodes
+    # the same precedence.
+    (re.compile(r"gpt-6", re.IGNORECASE), "gpt-6"),
     # GPT-5.6 tiers (Luna/Terra/Sol) — must beat the generic gpt-5 rule below.
     (re.compile(r"gpt-5\.6", re.IGNORECASE), "gpt-5.6"),
     # OpenAI gpt-5 family + o-series reasoning models

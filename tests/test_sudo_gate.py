@@ -25,9 +25,11 @@ import pytest
 
 from orchestrator.services.sudo_gate import SudoGateService, _SHELL_META_RE  # noqa: E402
 from orchestrator.services.sudo_gate import (  # noqa: E402
+    SUDO_COMMAND_TTL_SECONDS,
     SudoEntityUnavailable,
     SudoRequestConflict,
 )
+from shared.sudo_command_line import render_sudo_command_line  # noqa: E402
 
 
 # =============================================================================
@@ -1289,6 +1291,83 @@ class TestEvaluateAutoRules:
         assert result is None
 
     @pytest.mark.asyncio
+    async def test_self_targeted_metachar_command_still_consults_the_rules(self):
+        """Fix 3: `sudo -u <self>` grants nothing the caller does not have.
+
+        The agent re-enters a login shell to pick up a group it was just added
+        to; the `&&` in the `-c` string must not force a human out of bed.
+        """
+        svc = SudoGateService()
+        pool, conn = make_db_pool(fetch_return=[{"pattern": "*", "action": "approve"}])
+        svc.connect(pool)
+
+        result = await svc._evaluate_auto_rules(
+            "bash --login -c 'id && docker version'",
+            requesting_user="agent-host",
+            target_user="agent-host",
+        )
+        assert result == "approve"
+
+    @pytest.mark.asyncio
+    async def test_privilege_gaining_metachar_command_still_needs_review(self):
+        """The same line targeting another user keeps the human in the loop."""
+        svc = SudoGateService()
+        pool, conn = make_db_pool(fetch_return=[{"pattern": "*", "action": "approve"}])
+        svc.connect(pool)
+
+        result = await svc._evaluate_auto_rules(
+            "bash --login -c 'id && docker version'",
+            requesting_user="agent-host",
+            target_user="root",
+        )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_self_target_exception_does_not_invent_an_approval(self):
+        """Skipping the metachar check only re-enables the rules table."""
+        svc = SudoGateService()
+        pool, conn = make_db_pool(
+            fetch_return=[{"pattern": "apt-get *", "action": "approve"}]
+        )
+        svc.connect(pool)
+
+        result = await svc._evaluate_auto_rules(
+            "bash -c 'rm -rf / && reboot'",
+            requesting_user="agent-host",
+            target_user="agent-host",
+        )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_self_target_rule_can_still_deny(self):
+        """A deny rule outranks the exception — it is not an auto-approve."""
+        svc = SudoGateService()
+        pool, conn = make_db_pool(fetch_return=[{"pattern": "*", "action": "deny"}])
+        svc.connect(pool)
+
+        result = await svc._evaluate_auto_rules(
+            "bash -c 'id && whoami'",
+            requesting_user="agent-host",
+            target_user="agent-host",
+        )
+        assert result == "deny"
+
+    @pytest.mark.asyncio
+    async def test_unknown_users_keep_the_metachar_review(self):
+        """Absent user information is not evidence of no privilege gain."""
+        svc = SudoGateService()
+        pool, conn = make_db_pool(fetch_return=[{"pattern": "*", "action": "approve"}])
+        svc.connect(pool)
+
+        assert await svc._evaluate_auto_rules("true && id") is None
+        assert (
+            await svc._evaluate_auto_rules(
+                "true && id", requesting_user="", target_user=""
+            )
+            is None
+        )
+
+    @pytest.mark.asyncio
     async def test_safe_command_passes_metachar_check(self):
         """Commands without metacharacters proceed to rule matching."""
         svc = SudoGateService()
@@ -2153,6 +2232,96 @@ class TestFinalizeRequest:
 # =============================================================================
 # Test: Shell metacharacter regex
 # =============================================================================
+
+
+class TestRenderSudoCommandLine:
+    """The approval surfaces must show what the gate evaluated, not /bin/bash."""
+
+    def test_login_shell_wrapper_shows_the_inner_script(self):
+        """`sudo -u agent-host bash --login -c '…'` is not 'a bare shell'."""
+        rendered = render_sudo_command_line(
+            "/bin/bash", ["bash", "--login", "-c", "id && docker version"]
+        )
+        assert rendered == "/bin/bash --login -c 'id && docker version'"
+
+    def test_arguments_are_shell_quoted(self):
+        """Quoting keeps one request on one unambiguous line."""
+        rendered = render_sudo_command_line(
+            "/usr/bin/tee", ["tee", "/etc/my file.conf"]
+        )
+        assert rendered == "/usr/bin/tee '/etc/my file.conf'"
+
+    def test_argv0_is_kept_when_it_differs_from_the_binary(self):
+        """`busybox sh` must not be rendered as a plain busybox call."""
+        rendered = render_sudo_command_line("/bin/busybox", ["sh", "-c", "id"])
+        assert rendered == "/bin/busybox sh -c id"
+
+    def test_command_alone_when_there_are_no_arguments(self):
+        assert render_sudo_command_line("/usr/bin/id", []) == "/usr/bin/id"
+        assert render_sudo_command_line("/usr/bin/id", None) == "/usr/bin/id"
+
+    def test_arguments_alone_when_the_command_is_missing(self):
+        assert render_sudo_command_line("", ["ls", "-la"]) == "ls -la"
+
+    def test_empty_request_renders_empty(self):
+        assert render_sudo_command_line(None, None) == ""
+
+
+# =============================================================================
+# Test: request TTL
+# =============================================================================
+
+
+class TestRequestTtl:
+    """Fix 2: five minutes is unworkable for an unattended VM job."""
+
+    @pytest.mark.asyncio
+    async def test_insert_uses_the_configured_ttl(self):
+        """ttl_seconds and expires_at are written from one configurable value."""
+        svc = SudoGateService()
+        pool, conn = make_db_pool(fetchrow_return={"id": "uuid-ttl"})
+        svc.connect(pool)
+
+        await svc._insert_request(
+            job_id="job-1",
+            vm_name="vm-1",
+            command="ls",
+            arguments=["-la"],
+            cwd="/home",
+            requesting_user="agent",
+            target_user="root",
+            nats_reply_subject="_INBOX.ttl",
+            metadata={},
+        )
+
+        sql = conn.fetchrow.call_args[0][0]
+        assert "INTERVAL '300 seconds'" not in sql
+        assert conn.fetchrow.call_args[0][12] == SUDO_COMMAND_TTL_SECONDS
+
+    @pytest.mark.asyncio
+    async def test_explicit_ttl_overrides_the_default(self):
+        svc = SudoGateService()
+        pool, conn = make_db_pool(fetchrow_return={"id": "uuid-ttl-2"})
+        svc.connect(pool)
+
+        await svc._insert_request(
+            job_id="job-1",
+            vm_name="vm-1",
+            command="ls",
+            arguments=[],
+            cwd="/",
+            requesting_user="agent",
+            target_user="root",
+            nats_reply_subject=None,
+            metadata={},
+            ttl_seconds=90,
+        )
+
+        assert conn.fetchrow.call_args[0][12] == 90
+
+    def test_default_ttl_is_thirty_minutes(self):
+        """VM-tier requests wait for an operator, not for five minutes."""
+        assert SUDO_COMMAND_TTL_SECONDS == 1800
 
 
 class TestShellMetacharRegex:

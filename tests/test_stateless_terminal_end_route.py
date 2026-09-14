@@ -1,20 +1,35 @@
 from __future__ import annotations
 
+from tests import _b09_control_seams as control_seams
+
 from copy import deepcopy
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, patch
 
 import pytest
 from fastapi import HTTPException
 
 import orchestrator.main as main
+from orchestrator.services.container_provisioner import WorkspaceCleanupOutcome
 
 
 THREAD_ID = "11111111-1111-4111-8111-111111111111"
 GENERATION = "22222222-2222-4222-8222-222222222222"
 RUNTIME = "33333333-3333-4333-8333-333333333333"
 FINGERPRINT = "SHA256:" + ("A" * 43)
+
+
+@pytest.fixture(autouse=True)
+def history_cleanup():
+    # These route-only database fixtures contain no previous runtime ledger.
+    # The actual history/namespace proof is covered with migrated PostgreSQL in
+    # test_stateless_workspace_history_cleanup.py.
+    with patch(
+        "orchestrator.services.stateless_workspace_history_cleanup.reclaim_stateless_workspace_history",
+        new=AsyncMock(return_value=True),
+    ) as cleanup:
+        yield cleanup
 
 
 def _settled_thread() -> dict:
@@ -248,7 +263,7 @@ def _settled_cleanup_provisioner(**extra):
 
     # Use the exact class main.py compares against; a second import of the
     # same file under a different module name would fail isinstance.
-    outcome_type = main.WorkspaceCleanupOutcome
+    outcome_type = WorkspaceCleanupOutcome
 
     async def _prepare(_owner, *, reclaim_shared_resources: bool, **_kwargs):
         return {
@@ -307,7 +322,7 @@ async def test_duplicate_soft_end_reuses_settled_proof_without_effects() -> None
         patch.object(main, "snapshot_service", snapshots),
         patch.object(main, "_conclude_conference_if_any", AsyncMock()),
     ):
-        result = await main.end_thread(
+        result = await control_seams.end_thread(
             THREAD_ID, SimpleNamespace(), permanent=False, force=True
         )
 
@@ -340,15 +355,20 @@ async def test_permanent_end_retry_accepts_exact_process_zero_authority() -> Non
             AsyncMock(return_value=({"sub": "user-1"}, thread)),
         ),
         patch.object(main, "postgres_db", db),
-        patch.object(main, "_reconcile_stateless_thread_retirement", reconcile),
+        patch.object(
+            main.thread_retirement_operations,
+            "reconcile_stateless_thread_retirement",
+            reconcile,
+        ),
     ):
-        result = await main.end_thread(
+        result = await control_seams.end_thread(
             THREAD_ID, SimpleNamespace(), permanent=True, force=True
         )
 
     assert result == {"status": "deleted"}
     reconcile.assert_awaited_once_with(
         THREAD_ID,
+        dependencies=ANY,
         force=True,
         permanent=True,
     )
@@ -502,7 +522,7 @@ async def test_process_zero_retry_retires_exact_live_residents_and_shell(
             verify_residents,
         ),
     ):
-        result = await main._reconcile_stateless_thread_retirement(
+        result = await control_seams.reconcile_stateless_thread_retirement(
             THREAD_ID,
             force=True,
             permanent=True,
@@ -552,12 +572,14 @@ async def test_end_holds_before_begin_when_published_runtime_cannot_reach_ready(
 
     with (
         patch.object(main, "postgres_db", db),
-        patch.object(main, "ensure_session_workspace", ensure),
+        patch.object(
+            main.thread_retirement_operations, "ensure_session_workspace", ensure
+        ),
         patch.object(main, "container_provisioner", provisioner),
         patch.object(main, "workspace_suspension_service", suspension),
     ):
         with pytest.raises(HTTPException) as exc:
-            await main._reconcile_stateless_thread_retirement(
+            await control_seams.reconcile_stateless_thread_retirement(
                 THREAD_ID, force=True, permanent=False
             )
 
@@ -585,12 +607,16 @@ async def test_end_continues_exact_runtime_to_ready_before_begin() -> None:
 
     with (
         patch.object(main, "postgres_db", db),
-        patch.object(main, "ensure_session_workspace", AsyncMock()),
+        patch.object(
+            main.thread_retirement_operations,
+            "ensure_session_workspace",
+            AsyncMock(),
+        ),
         patch.object(main, "container_provisioner", SimpleNamespace()),
         patch.object(main, "workspace_suspension_service", SimpleNamespace()),
     ):
         with pytest.raises(HTTPException) as exc:
-            await main._reconcile_stateless_thread_retirement(
+            await control_seams.reconcile_stateless_thread_retirement(
                 THREAD_ID, force=False, permanent=False
             )
 
@@ -621,12 +647,14 @@ async def test_end_holds_when_creation_continuation_leaves_restore_debt() -> Non
 
     with (
         patch.object(main, "postgres_db", db),
-        patch.object(main, "ensure_session_workspace", ensure),
+        patch.object(
+            main.thread_retirement_operations, "ensure_session_workspace", ensure
+        ),
         patch.object(main, "container_provisioner", SimpleNamespace()),
         patch.object(main, "workspace_suspension_service", SimpleNamespace()),
     ):
         with pytest.raises(HTTPException) as exc:
-            await main._reconcile_stateless_thread_retirement(
+            await control_seams.reconcile_stateless_thread_retirement(
                 THREAD_ID, force=True, permanent=False
             )
 
@@ -647,12 +675,14 @@ async def test_end_holds_markerless_ready_workspace_until_restore_clears() -> No
 
     with (
         patch.object(main, "postgres_db", db),
-        patch.object(main, "ensure_session_workspace", ensure),
+        patch.object(
+            main.thread_retirement_operations, "ensure_session_workspace", ensure
+        ),
         patch.object(main, "container_provisioner", SimpleNamespace()),
         patch.object(main, "workspace_suspension_service", SimpleNamespace()),
     ):
         with pytest.raises(HTTPException) as exc:
-            await main._reconcile_stateless_thread_retirement(
+            await control_seams.reconcile_stateless_thread_retirement(
                 THREAD_ID, force=True, permanent=False
             )
 
@@ -677,12 +707,14 @@ async def test_end_begins_only_after_exact_restore_debt_is_cleared() -> None:
 
     with (
         patch.object(main, "postgres_db", db),
-        patch.object(main, "ensure_session_workspace", ensure),
+        patch.object(
+            main.thread_retirement_operations, "ensure_session_workspace", ensure
+        ),
         patch.object(main, "container_provisioner", SimpleNamespace()),
         patch.object(main, "workspace_suspension_service", SimpleNamespace()),
     ):
         with pytest.raises(HTTPException) as exc:
-            await main._reconcile_stateless_thread_retirement(
+            await control_seams.reconcile_stateless_thread_retirement(
                 THREAD_ID, force=False, permanent=False
             )
 
@@ -744,13 +776,13 @@ async def test_delete_acceptance_cannot_finish_until_exact_old_uid_is_404() -> N
         patch.object(main, "container_provisioner", provisioner),
     ):
         with pytest.raises(HTTPException) as exc:
-            await main._reconcile_stateless_thread_retirement(
+            await control_seams.reconcile_stateless_thread_retirement(
                 THREAD_ID, force=True, permanent=False
             )
         assert exc.value.status_code == 503
         db.finish_stateless_thread_workspace_retirement.assert_not_awaited()
 
-        result = await main._reconcile_stateless_thread_retirement(
+        result = await control_seams.reconcile_stateless_thread_retirement(
             THREAD_ID, force=True, permanent=False
         )
 
@@ -831,7 +863,7 @@ async def test_exact_terminal_uid_acknowledges_then_deletes_through_finalizer_pa
         patch.object(main, "postgres_db", db),
         patch.object(main, "container_provisioner", provisioner),
     ):
-        result = await main._reconcile_stateless_thread_retirement(
+        result = await control_seams.reconcile_stateless_thread_retirement(
             THREAD_ID, force=True, permanent=False
         )
 
@@ -867,7 +899,11 @@ async def test_exact_terminal_uid_acknowledges_then_deletes_through_finalizer_pa
 
 
 @pytest.mark.asyncio
-async def test_soft_end_to_permanent_reclaims_snapshot_before_row_delete() -> None:
+@pytest.mark.parametrize("historical_clean", (True, False))
+async def test_soft_end_to_permanent_reclaims_snapshot_before_row_delete(
+    history_cleanup, historical_clean
+) -> None:
+    history_cleanup.return_value = historical_clean
     thread = _settled_thread()
     db = _db_for_settled(thread, permanent=True)
     provisioner = _settled_cleanup_provisioner(
@@ -890,9 +926,22 @@ async def test_soft_end_to_permanent_reclaims_snapshot_before_row_delete() -> No
         patch.object(main, "gitea_client", SimpleNamespace(is_initialized=False)),
         patch.object(main, "_conclude_conference_if_any", AsyncMock()),
     ):
-        result = await main.end_thread(
-            THREAD_ID, SimpleNamespace(), permanent=True, force=True
-        )
+        if historical_clean:
+            result = await control_seams.end_thread(
+                THREAD_ID, SimpleNamespace(), permanent=True, force=True
+            )
+        else:
+            with pytest.raises(HTTPException) as caught:
+                await control_seams.end_thread(
+                    THREAD_ID, SimpleNamespace(), permanent=True, force=True
+                )
+            assert caught.value.status_code == 503
+            assert (
+                caught.value.detail
+                == "Historical workspace permanent cleanup is incomplete"
+            )
+            db.delete_thread.assert_not_awaited()
+            return
 
     assert result == {"status": "deleted"}
     # Permanent reclaim now runs through the durable 0198 cleanup intent, not a
@@ -937,7 +986,7 @@ async def test_snapshot_delete_failure_keeps_settled_thread_retryable() -> None:
         patch.object(main, "_conclude_conference_if_any", AsyncMock()),
     ):
         with pytest.raises(HTTPException) as exc_info:
-            await main.end_thread(
+            await control_seams.end_thread(
                 THREAD_ID, SimpleNamespace(), permanent=True, force=True
             )
 
@@ -1006,7 +1055,7 @@ async def test_missing_runtime_absence_matrix(
         patch.object(main, "container_provisioner", provisioner),
     ):
         if succeeds:
-            result = await main._reconcile_stateless_thread_retirement(
+            result = await control_seams.reconcile_stateless_thread_retirement(
                 THREAD_ID,
                 force=True,
                 permanent=permanent,
@@ -1014,7 +1063,7 @@ async def test_missing_runtime_absence_matrix(
             assert result["state"] == "settled"
         else:
             with pytest.raises(HTTPException) as exc:
-                await main._reconcile_stateless_thread_retirement(
+                await control_seams.reconcile_stateless_thread_retirement(
                     THREAD_ID,
                     force=True,
                     permanent=permanent,
@@ -1050,7 +1099,7 @@ async def test_missing_runtime_nonabsence_refuses_before_queue_close(authority) 
         patch.object(main, "container_provisioner", provisioner),
         pytest.raises(HTTPException) as exc,
     ):
-        await main._reconcile_stateless_thread_retirement(
+        await control_seams.reconcile_stateless_thread_retirement(
             THREAD_ID,
             force=True,
             permanent=False,
@@ -1097,7 +1146,7 @@ async def test_unsupported_absence_settled_proof_cannot_upgrade_to_permanent() -
         patch.object(main, "container_provisioner", provisioner),
     ):
         with pytest.raises(HTTPException) as exc:
-            await main._reconcile_stateless_thread_retirement(
+            await control_seams.reconcile_stateless_thread_retirement(
                 THREAD_ID,
                 force=True,
                 permanent=True,
@@ -1151,10 +1200,14 @@ async def test_direct_permanent_end_does_not_require_an_uncaptured_snapshot(
         patch.object(main, "postgres_db", db),
         patch.object(main, "snapshot_service", snapshots),
         patch.object(main, "gitea_client", SimpleNamespace(is_initialized=False)),
-        patch.object(main, "_reconcile_stateless_thread_retirement", reconcile),
+        patch.object(
+            main.thread_retirement_operations,
+            "reconcile_stateless_thread_retirement",
+            reconcile,
+        ),
         patch.object(main, "_conclude_conference_if_any", AsyncMock()),
     ):
-        result = await main.end_thread(
+        result = await control_seams.end_thread(
             THREAD_ID, SimpleNamespace(), permanent=True, force=True
         )
 
@@ -1208,11 +1261,17 @@ async def test_emptydir_permanent_requires_snapshot_prefix_cleanup_after_restore
             "snapshot_service",
             SimpleNamespace(is_available=False),
         ),
-        patch.object(main, "_reconcile_stateless_thread_retirement", reconcile),
+        patch.object(
+            main.thread_retirement_operations,
+            "reconcile_stateless_thread_retirement",
+            reconcile,
+        ),
         patch.object(main, "_conclude_conference_if_any", AsyncMock()),
         pytest.raises(HTTPException) as exc,
     ):
-        await main.end_thread(THREAD_ID, SimpleNamespace(), permanent=True, force=True)
+        await control_seams.end_thread(
+            THREAD_ID, SimpleNamespace(), permanent=True, force=True
+        )
 
     assert exc.value.status_code == 503
     db.delete_thread.assert_not_awaited()
@@ -1263,13 +1322,13 @@ async def test_permanent_virtual_end_purges_exact_workspace_before_row_delete(
         patch.object(main, "_conclude_conference_if_any", AsyncMock()),
     ):
         if purged:
-            result = await main.end_thread(
+            result = await control_seams.end_thread(
                 THREAD_ID, SimpleNamespace(), permanent=True, force=True
             )
             assert result == {"status": "deleted"}
         else:
             with pytest.raises(HTTPException) as exc:
-                await main.end_thread(
+                await control_seams.end_thread(
                     THREAD_ID, SimpleNamespace(), permanent=True, force=True
                 )
             assert exc.value.status_code == 503
@@ -1309,7 +1368,7 @@ async def test_stateless_legacy_suspend_caller_never_falls_through_to_pod_delete
         patch.object(main, "agent_provisioner", agent),
         patch.object(main, "persistent_provisioner", persistent),
     ):
-        await main._suspend_thread_resources_inner(THREAD_ID)
+        await control_seams.suspend_thread_resources_inner(THREAD_ID)
 
     suspension.suspend_thread_workspace.assert_not_awaited()
     agent.delete_agent_pod_by_thread.assert_not_awaited()
@@ -1366,7 +1425,7 @@ async def test_release_never_starts_while_resident_proof_is_incomplete() -> None
         patch.object(main, "container_provisioner", provisioner),
     ):
         with pytest.raises(HTTPException) as exc_info:
-            await main._reconcile_stateless_thread_retirement(
+            await control_seams.reconcile_stateless_thread_retirement(
                 THREAD_ID,
                 force=True,
                 permanent=False,

@@ -86,3 +86,53 @@ async def test_ext_bytes_exists(tmp_path):
     src.write_bytes(b"E")
     pointer = await store.put_ext_bytes(UID, "a.b", "1.0.0", str(src))
     assert await store.ext_bytes_exists(UID, "a.b", "1.0.0", pointer) is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stored_global", [False, True])
+async def test_seed_missing_profile_blob_still_releases_workspace(stored_global):
+    """A real store removes missing downloads; cleanup must tolerate that."""
+    from pathlib import Path
+    from unittest.mock import AsyncMock
+
+    from orchestrator.services.ide_settings import (
+        SEED_STATE_SENTINEL,
+        seed_ide_profile,
+    )
+
+    s3 = FakeS3()
+    store = IdeProfileStore(s3, "srw-snapshots")
+    if stored_global:
+        s3.objects[("srw-snapshots", store.globalstorage_key(UID))] = b"PROFILE"
+
+    downloads = []
+    original_get = store._get
+
+    async def record_download(pointer, local_path, **kwargs):
+        downloads.append(Path(local_path))
+        return await original_get(pointer, local_path, **kwargs)
+
+    store._get = record_download
+    runner = AsyncMock(return_value=(0, b"", b""))
+    restored = []
+
+    async def push(host, port, local_path, **kwargs):
+        restored.append(Path(local_path).read_bytes())
+        return True
+
+    ready = await seed_ide_profile(
+        user_id=UID,
+        ssh_host="workspace",
+        ssh_port=22,
+        profile_store=store,
+        ext_items={"a.b": {"version": "1.0.0", "source": "bytes"}},
+        _runner=runner,
+        _push_fn=push,
+    )
+
+    assert ready is True
+    runner.assert_awaited_once()
+    assert SEED_STATE_SENTINEL in runner.await_args.args[2]
+    assert restored == ([b"PROFILE"] if stored_global else [])
+    assert len(downloads) == 2
+    assert all(not path.exists() for path in downloads)

@@ -1,0 +1,19 @@
+# A prebuilt VM workspace for building and testing SRW with Docker, k3d and Tilt.
+# This resource stores a recipe; applying it alone does not allocate a VM.
+# Omitted scope uses the authenticated Account (or the CLI's explicit scope).
+apiVersion: srw/v1alpha1
+kind: WorkspaceTemplate
+metadata:
+  name: srw-development
+spec:
+  backend: vm
+  resources:
+    cpu: 12
+    memory: 24Gi
+    storage: 120Gi
+  environment:
+    # Bootable SRW VM disk, published 2026-09-08. Each VM gets its own rootdisk.
+    image: ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base@sha256:db1015a32173c4553d1ad432bdb48760fdb8ba0782d25ae20349d4aaaf26c28f
+    pullPolicy: IfNotPresent
+    cache: Reuse
+  retention: Delete

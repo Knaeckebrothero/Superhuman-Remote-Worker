@@ -57,9 +57,9 @@ def _capability_hint(model_id: str) -> str:
         return "whisper"
     if "tts" in name or name.endswith("-speech") or "text-to-speech" in name:
         return "tts"
-    if "embed" in name or name.endswith("-embedding") or "rerank" in name:
-        # rerank has no dedicated slot today; surfacing as 'embedding' keeps
-        # it out of the chat catalog until we have a rerank consumer.
+    if "rerank" in name:
+        return "rerank"
+    if "embed" in name or name.endswith("-embedding"):
         return "embedding"
     if "vision" in name or "-vl" in name or "multimodal" in name:
         return "vision"

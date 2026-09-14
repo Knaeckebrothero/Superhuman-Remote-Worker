@@ -8,7 +8,7 @@
 
   @include shape.surface;
 
-  border: 1px solid var(--border-color);
+  border: 1px solid var(--border-hairline);
   background: var(--surface-0);
   color: var(--text-primary);
   transition:
@@ -38,16 +38,18 @@
     cursor: pointer;
     user-select: none;
 
+    // Lift, don't shout: a tone step on the border plus the small shadow.
     &:hover:not([data-disabled]) {
-      border-color: var(--accent-color);
+      border-color: var(--surface-2);
+      box-shadow: var(--shadow-sm);
     }
 
     &:focus { outline: none; }
 
     &.cdk-keyboard-focused,
     &:focus-visible {
-      outline: 2px solid var(--accent-color);
-      outline-offset: 2px;
+      outline: none;
+      box-shadow: 0 0 0 3px var(--ring);
     }
   }
 

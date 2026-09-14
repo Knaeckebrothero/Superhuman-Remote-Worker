@@ -62,7 +62,10 @@ def _agent_ingress_rule(policy: dict) -> dict:
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
 def test_workspace_ingress_admits_stateless_agents_only_when_lane_enabled() -> None:
-    disabled = _render_workspace_policies()
+    # Pinned rather than left to the ambient default: helm/ci/test-values.yaml
+    # turns the stateless pool on so CI can validate the KEDA ScaledObject
+    # against its CRD schema, so an unset render is no longer the lane-off case.
+    disabled = _render_workspace_policies(stateless_enabled=False)
     enabled = _render_workspace_policies(stateless_enabled=True)
 
     # The chart renders one policy per configured tier. Exercise every tier so

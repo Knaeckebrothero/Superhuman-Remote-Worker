@@ -1423,8 +1423,14 @@ def _strip_markdown_for_speech(text: str) -> str:
     t = re.sub(r"```[\s\S]*?```", " (code snippet) ", t)
     t = re.sub(r"~~~[\s\S]*?~~~", " (code snippet) ", t)
     # Images ![alt](url) → drop; links [text](url) → text; inline `code` → code.
-    t = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", t)
-    t = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", t)
+    # A destination may contain one bracketed IPv6 authority. Other openers
+    # terminate an attempt, so malformed repeated links cannot rescan a tail.
+    destination = (
+        r"(?:(?:https?:)?//(?:[^/@\s\[\]()]+@)?\[[^\[\]\n]+\][^)\[\n]*"
+        r"|[^)\[\n]*)"
+    )
+    t = re.sub(r"!\[[^\]\[\n]*\]\(" + destination + r"\)", " ", t, flags=re.I)
+    t = re.sub(r"\[([^\]\[\n]*)\]\(" + destination + r"\)", r"\1", t, flags=re.I)
     t = re.sub(r"`([^`]*)`", r"\1", t)
 
     # Line-oriented cleanup: tables → "cell, cell." sentences, and strip leading
@@ -1448,7 +1454,12 @@ def _strip_markdown_for_speech(text: str) -> str:
         line = re.sub(r"^\s{0,3}>\s?", "", line)  # blockquotes
         line = re.sub(r"^\s*[-*+]\s+", "", line)  # bullets
         line = re.sub(r"^\s*\d+[.)]\s+", "", line)  # ordered list
-        if re.fullmatch(r"\s*([-*_])\1{2,}\s*", line):  # horizontal rule
+        stripped_line = line.strip()
+        if (  # horizontal rule
+            re.fullmatch(r"-{3,}", stripped_line)
+            or re.fullmatch(r"\*{3,}", stripped_line)
+            or re.fullmatch(r"_{3,}", stripped_line)
+        ):
             continue
         out_lines.append(line)
     t = "\n".join(out_lines)

@@ -5,7 +5,7 @@ import {TranslocoPipe} from '@jsverse/transloco';
 import {beforeAll, beforeEach, describe, expect, it, vi} from 'vitest';
 import {of} from 'rxjs';
 import en from '../../../../assets/i18n/en.json';
-import {AdminProvidersService} from '../../../core/services/admin-providers.service';
+import {AdminProvidersService, HelmManagedOverview} from '../../../core/services/admin-providers.service';
 import {ModelService} from '../../../core/services/model.service';
 import {AdminDefaultsComponent} from './admin-defaults.component';
 
@@ -21,13 +21,17 @@ const defaults = signal<Record<string, string | null>>({
   search: 'tavily',
   fetch: 'tavily',
   search_fallback: 'searxng',
+  rerank: null,
 });
 const setDefault = vi.fn(() => of({kind: 'search_fallback', model: null}));
 
+const helmManaged = signal<HelmManagedOverview | null>(null);
 const admin = {
   defaults,
   loadDefaults: vi.fn(),
   setDefault,
+  helmManaged,
+  loadHelmManaged: vi.fn(),
 };
 
 const helperModels = [
@@ -43,6 +47,7 @@ const modelService = {
   ttsModels: signal([]),
   searchModels: signal(helperModels),
   fetchModels: signal(helperModels.slice(0, 1)),
+  rerankModels: signal([]),
   load: vi.fn(),
 };
 

@@ -44,6 +44,7 @@ def _loop(**over):
 
 def _db():
     db = AsyncMock()
+    db.get_project.return_value = None
     db.create_job = AsyncMock(return_value={"id": "job-1"})
     # Keep the optional resolution paths inert regardless of EXPERTS_DB_ENABLED.
     db.list_experts_visible = AsyncMock(return_value=[])

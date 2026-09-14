@@ -1,5 +1,7 @@
 """Focused control-plane regressions for stateless worker admission/verbs."""
 
+from tests import _b09_control_seams as control_seams
+
 import asyncio
 import json
 from contextlib import asynccontextmanager
@@ -292,8 +294,13 @@ def test_explicit_lanes_are_unchanged_when_default_is_on(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_create_job_sql_inherits_omitted_parent_lane():
+async def test_create_job_sql_inherits_omitted_parent_lane(monkeypatch):
     conn = AsyncMock()
+    conn.transaction = MagicMock(return_value=_AsyncCM())
+    monkeypatch.setattr(
+        "orchestrator.services.manifest_execution_snapshot.capture_execution",
+        AsyncMock(),
+    )
     conn.fetchrow.return_value = {"id": UUID(JOB_ID), "execution_lane": "stateless"}
     db = _db_with_conn(conn)
 
@@ -310,8 +317,13 @@ async def test_create_job_sql_inherits_omitted_parent_lane():
 
 
 @pytest.mark.asyncio
-async def test_create_job_explicit_lane_is_bound_and_invalid_lane_rejected():
+async def test_create_job_explicit_lane_is_bound_and_invalid_lane_rejected(monkeypatch):
     conn = AsyncMock()
+    conn.transaction = MagicMock(return_value=_AsyncCM())
+    monkeypatch.setattr(
+        "orchestrator.services.manifest_execution_snapshot.capture_execution",
+        AsyncMock(),
+    )
     conn.fetchrow.return_value = {"id": UUID(JOB_ID), "execution_lane": "stateless"}
     db = _db_with_conn(conn)
 
@@ -581,7 +593,7 @@ async def test_final_prepared_delete_removes_queue_and_job_atomically():
         if normalized.startswith("SELECT execution_lane"):
             lock_order.append("job")
             return {"execution_lane": "stateless", "delete_pending": True}
-        if normalized.startswith("SELECT status, completion_outcome_kind FROM jobs"):
+        if normalized.startswith("SELECT status, completion_outcome_kind,"):
             return {"status": "created", "completion_outcome_kind": None}
         raise AssertionError(normalized)
 
@@ -1271,7 +1283,9 @@ async def test_resume_retries_pinned_verb_after_vm_lane_repair(monkeypatch):
     monkeypatch.setattr(main.postgres_db, "queue_job_for_resume", pinned_queue)
     monkeypatch.setattr(main, "_trigger_dispatch", MagicMock())
 
-    result = await main.resume_job(MagicMock(), JOB_ID, main.JobResumeRequest())
+    result = await control_seams.resume_job(
+        MagicMock(), JOB_ID, main.JobResumeRequest()
+    )
 
     assert result["status"] == "queued"
     stateless_queue.assert_awaited_once()
@@ -1308,7 +1322,7 @@ async def test_internal_resume_retries_pinned_verb_after_vm_lane_repair(monkeypa
     monkeypatch.setattr(main.postgres_db, "queue_job_for_resume", pinned_queue)
     monkeypatch.setattr(main, "_trigger_dispatch", MagicMock())
 
-    await main._internal_resume_job(
+    await control_seams.internal_resume_job(
         JOB_ID,
         "continue",
         expected_status="waiting",
@@ -1350,25 +1364,43 @@ async def test_cancel_retries_pinned_verb_after_vm_lane_repair(monkeypatch):
     monkeypatch.setattr(main.postgres_db, "get_job", AsyncMock(return_value=pinned))
     pinned_cancel = AsyncMock(return_value=True)
     monkeypatch.setattr(main.postgres_db, "cancel_job", pinned_cancel)
-    monkeypatch.setattr(main, "_archive_and_cleanup_workspace", AsyncMock())
+    linearize = AsyncMock(return_value=True)
+    monkeypatch.setattr(main.postgres_db, "linearize_pinned_cancel", linearize)
+    monkeypatch.setattr(main.postgres_db, "delete_checkpoint_thread", AsyncMock())
     monkeypatch.setattr(
-        main,
-        "_cascade_cancel_to_children",
+        main.thread_retirement_operations, "archive_and_cleanup_workspace", AsyncMock()
+    )
+    monkeypatch.setattr(
+        main.job_mutation_operations.JobControlOperations,
+        "cascade_cancel_to_children",
         AsyncMock(return_value=True),
     )
-    monkeypatch.setattr(main, "_handle_scholar_completion", AsyncMock())
+    monkeypatch.setattr(
+        main.subjob_completion_operations,
+        "handle_scholar_completion",
+        AsyncMock(),
+    )
     monkeypatch.setattr(main, "maybe_wake_session", AsyncMock())
     monkeypatch.setattr(main, "_kick_session_wake_drain", MagicMock())
     monkeypatch.setattr(main, "_trigger_dispatch", MagicMock())
 
-    assert await main.cancel_job(MagicMock(), JOB_ID) == {"status": "cancelled"}
+    assert await control_seams.cancel_job(MagicMock(), JOB_ID) == {
+        "status": "cancelled"
+    }
 
     pinned_cancel.assert_awaited_once_with(JOB_ID)
+    linearize.assert_awaited_once_with(
+        JOB_ID,
+        expected_status="created",
+        completion_commands_enabled=main.COMPLETION_COMMANDS_ENABLED,
+    )
 
 
 @pytest.mark.asyncio
-async def test_flag_on_pinned_cancel_linearizes_before_agent_post_and_prunes_after(
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_pinned_cancel_linearizes_before_agent_post_and_prunes_after(
     monkeypatch,
+    enabled,
 ):
     from orchestrator import main
 
@@ -1381,7 +1413,7 @@ async def test_flag_on_pinned_cancel_linearizes_before_agent_post_and_prunes_aft
         "context": {},
     }
     order = []
-    monkeypatch.setattr(main, "COMPLETION_COMMANDS_ENABLED", True)
+    monkeypatch.setattr(main, "COMPLETION_COMMANDS_ENABLED", enabled)
     monkeypatch.setattr(
         main,
         "require_internal_or_job_access",
@@ -1424,7 +1456,9 @@ async def test_flag_on_pinned_cancel_linearizes_before_agent_post_and_prunes_aft
         side_effect=lambda *_a, **_k: order.append("post") or response
     )
     monkeypatch.setattr(main.httpx, "AsyncClient", MagicMock(return_value=client))
-    monkeypatch.setattr(main, "_archive_and_cleanup_workspace", AsyncMock())
+    monkeypatch.setattr(
+        main.thread_retirement_operations, "archive_and_cleanup_workspace", AsyncMock()
+    )
     monkeypatch.setattr(main.postgres_db, "cancel_job", AsyncMock(return_value=False))
     monkeypatch.setattr(
         main.postgres_db,
@@ -1434,14 +1468,22 @@ async def test_flag_on_pinned_cancel_linearizes_before_agent_post_and_prunes_aft
     prune = AsyncMock(side_effect=lambda *_: order.append("prune"))
     monkeypatch.setattr(main.postgres_db, "delete_checkpoint_thread", prune)
     monkeypatch.setattr(
-        main, "_cascade_cancel_to_children", AsyncMock(return_value=True)
+        main.job_mutation_operations.JobControlOperations,
+        "cascade_cancel_to_children",
+        AsyncMock(return_value=True),
     )
-    monkeypatch.setattr(main, "_handle_scholar_completion", AsyncMock())
+    monkeypatch.setattr(
+        main.subjob_completion_operations,
+        "handle_scholar_completion",
+        AsyncMock(),
+    )
     monkeypatch.setattr(main, "maybe_wake_session", AsyncMock())
     monkeypatch.setattr(main, "_kick_session_wake_drain", MagicMock())
     monkeypatch.setattr(main, "_trigger_dispatch", MagicMock())
 
-    assert await main.cancel_job(MagicMock(), JOB_ID) == {"status": "cancelled"}
+    assert await control_seams.cancel_job(MagicMock(), JOB_ID) == {
+        "status": "cancelled"
+    }
 
     assert order == ["linearize", "post", "prune"]
 
@@ -1473,13 +1515,22 @@ async def test_flag_on_completed_pinned_cancel_stays_completed_without_cleanup(
         AsyncMock(return_value={**job, "status": "completed"}),
     )
     cleanup = AsyncMock()
-    monkeypatch.setattr(main, "_archive_and_cleanup_workspace", cleanup)
+    monkeypatch.setattr(
+        main.thread_retirement_operations.ThreadRetirementOperations,
+        "archive_and_cleanup_workspace",
+        cleanup,
+    )
     monkeypatch.setattr(main.postgres_db, "cancel_job", AsyncMock())
     monkeypatch.setattr(main.postgres_db, "delete_checkpoint_thread", AsyncMock())
-    monkeypatch.setattr(main, "_cascade_cancel_to_children", AsyncMock())
+    cascade = AsyncMock()
+    monkeypatch.setattr(
+        main.job_mutation_operations.JobControlOperations,
+        "cascade_cancel_to_children",
+        cascade,
+    )
 
     with pytest.raises(HTTPException) as exc:
-        await main.cancel_job(MagicMock(), JOB_ID)
+        await control_seams.cancel_job(MagicMock(), JOB_ID)
 
     assert exc.value.status_code == 400
     linearize.assert_awaited_once_with(
@@ -1490,7 +1541,7 @@ async def test_flag_on_completed_pinned_cancel_stays_completed_without_cleanup(
     cleanup.assert_not_awaited()
     main.postgres_db.cancel_job.assert_not_awaited()
     main.postgres_db.delete_checkpoint_thread.assert_not_awaited()
-    main._cascade_cancel_to_children.assert_not_awaited()
+    cascade.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1579,10 +1630,12 @@ async def test_flag_on_cancel_returns_exact_409_for_active_control_claim(
     monkeypatch.setattr(main.postgres_db, "cancel_stateless_job", stateless_cancel)
     monkeypatch.setattr(main.postgres_db, "linearize_pinned_cancel", pinned_cancel)
     cleanup = AsyncMock()
-    monkeypatch.setattr(main, "_archive_and_cleanup_workspace", cleanup)
+    monkeypatch.setattr(
+        main.thread_retirement_operations, "archive_and_cleanup_workspace", cleanup
+    )
 
     with pytest.raises(HTTPException) as exc:
-        await main.cancel_job(MagicMock(), JOB_ID)
+        await control_seams.cancel_job(MagicMock(), JOB_ID)
 
     assert exc.value.status_code == 409
     assert exc.value.detail.startswith("job control is in progress")
@@ -1624,21 +1677,33 @@ async def test_cancel_endpoint_closes_queued_stateless_unit_without_agent_post(
     cancel = AsyncMock(return_value=(True, True))
     monkeypatch.setattr(main.postgres_db, "cancel_stateless_job", cancel)
     settle = AsyncMock(return_value=True)
-    monkeypatch.setattr(main, "_wait_for_stateless_cancel_settle", settle)
+    monkeypatch.setattr(
+        main.job_mutation_operations.JobControlOperations,
+        "wait_for_stateless_cancel_settle",
+        settle,
+    )
     monkeypatch.setattr(main.postgres_db, "get_agent", AsyncMock())
     cleanup = AsyncMock()
-    monkeypatch.setattr(main, "_archive_and_cleanup_workspace", cleanup)
     monkeypatch.setattr(
-        main,
-        "_cascade_cancel_to_children",
+        main.thread_retirement_operations, "archive_and_cleanup_workspace", cleanup
+    )
+    monkeypatch.setattr(
+        main.job_mutation_operations.JobControlOperations,
+        "cascade_cancel_to_children",
         AsyncMock(return_value=True),
     )
-    monkeypatch.setattr(main, "_handle_scholar_completion", AsyncMock())
+    monkeypatch.setattr(
+        main.subjob_completion_operations,
+        "handle_scholar_completion",
+        AsyncMock(),
+    )
     monkeypatch.setattr(main, "maybe_wake_session", AsyncMock())
     monkeypatch.setattr(main, "_kick_session_wake_drain", MagicMock())
     monkeypatch.setattr(main, "_trigger_dispatch", MagicMock())
 
-    assert await main.cancel_job(MagicMock(), JOB_ID) == {"status": "cancelled"}
+    assert await control_seams.cancel_job(MagicMock(), JOB_ID) == {
+        "status": "cancelled"
+    }
 
     cancel.assert_awaited_once_with(JOB_ID)
     settle.assert_awaited_once_with(JOB_ID)
@@ -1653,6 +1718,7 @@ async def test_blocking_message_status_is_exact_worker_fenced(
     status_cas_wins,
 ):
     from orchestrator import main
+    from orchestrator.services import agent_messaging
 
     # OC-01: the stateless fence used to be inline SQL in send_agent_message.
     # It now lives inside create_routed_blocking_freeze, which commits the
@@ -1673,7 +1739,6 @@ async def test_blocking_message_status_is_exact_worker_fenced(
     async def acquire():
         yield MagicMock()
 
-    monkeypatch.setattr(main, "require_internal", AsyncMock())
     monkeypatch.setattr(
         main.postgres_db,
         "get_job",
@@ -1748,12 +1813,24 @@ async def test_blocking_message_status_is_exact_worker_fenced(
         lease_token=9,
     )
 
+    # The send funnel moved to ``services.agent_messaging``; its collaborators
+    # come from ``main._agent_messaging_dependencies()``, which binds
+    # ``main.postgres_db`` and ``main.notification_service`` — the very objects
+    # monkeypatched above — so those patches still steer the code under test.
+    def _send():
+        return agent_messaging.send_agent_message(
+            MagicMock(),
+            JOB_ID,
+            body,
+            dependencies=main._agent_messaging_dependencies(),
+        )
+
     if status_cas_wins:
-        result = await main.send_agent_message(MagicMock(), JOB_ID, body)
+        result = await _send()
         assert result["status"] == "sent"
     else:
         with pytest.raises(HTTPException) as lost:
-            await main.send_agent_message(MagicMock(), JOB_ID, body)
+            await _send()
         assert lost.value.status_code == 409
         assert lost.value.detail == "Job changed before blocking message was committed"
 
@@ -1786,20 +1863,34 @@ async def test_cancel_endpoint_waits_for_leased_owner_before_workspace_cleanup(
         AsyncMock(return_value=(True, False)),
     )
     settle = AsyncMock(return_value=True)
-    monkeypatch.setattr(main, "_wait_for_stateless_cancel_settle", settle)
-    direct_cleanup = AsyncMock()
-    monkeypatch.setattr(main, "_archive_and_cleanup_workspace", direct_cleanup)
     monkeypatch.setattr(
-        main,
-        "_cascade_cancel_to_children",
+        main.job_mutation_operations.JobControlOperations,
+        "wait_for_stateless_cancel_settle",
+        settle,
+    )
+    direct_cleanup = AsyncMock()
+    monkeypatch.setattr(
+        main.thread_retirement_operations,
+        "archive_and_cleanup_workspace",
+        direct_cleanup,
+    )
+    monkeypatch.setattr(
+        main.job_mutation_operations.JobControlOperations,
+        "cascade_cancel_to_children",
         AsyncMock(return_value=True),
     )
-    monkeypatch.setattr(main, "_handle_scholar_completion", AsyncMock())
+    monkeypatch.setattr(
+        main.subjob_completion_operations,
+        "handle_scholar_completion",
+        AsyncMock(),
+    )
     monkeypatch.setattr(main, "maybe_wake_session", AsyncMock())
     monkeypatch.setattr(main, "_kick_session_wake_drain", MagicMock())
     monkeypatch.setattr(main, "_trigger_dispatch", MagicMock())
 
-    assert await main.cancel_job(MagicMock(), JOB_ID) == {"status": "cancelled"}
+    assert await control_seams.cancel_job(MagicMock(), JOB_ID) == {
+        "status": "cancelled"
+    }
 
     settle.assert_awaited_once_with(JOB_ID)
     # Cleanup belongs to the settle helper after queue closure; the endpoint
@@ -1830,19 +1921,25 @@ async def test_cancel_keeps_root_workspace_when_stateless_child_did_not_settle(
         AsyncMock(return_value=(True, True)),
     )
     monkeypatch.setattr(
-        main,
-        "_cascade_cancel_to_children",
+        main.job_mutation_operations.JobControlOperations,
+        "cascade_cancel_to_children",
         AsyncMock(return_value=False),
     )
     cleanup = AsyncMock()
-    monkeypatch.setattr(main, "_archive_and_cleanup_workspace", cleanup)
-    monkeypatch.setattr(main, "_handle_scholar_completion", AsyncMock())
+    monkeypatch.setattr(
+        main.thread_retirement_operations, "archive_and_cleanup_workspace", cleanup
+    )
+    monkeypatch.setattr(
+        main.subjob_completion_operations,
+        "handle_scholar_completion",
+        AsyncMock(),
+    )
     monkeypatch.setattr(main, "maybe_wake_session", AsyncMock())
     monkeypatch.setattr(main, "_kick_session_wake_drain", MagicMock())
     monkeypatch.setattr(main, "_trigger_dispatch", MagicMock())
 
     with pytest.raises(HTTPException) as error:
-        await main.cancel_job(MagicMock(), JOB_ID)
+        await control_seams.cancel_job(MagicMock(), JOB_ID)
 
     assert error.value.status_code == 503
     assert (
@@ -1873,12 +1970,12 @@ async def test_cascade_cancel_reports_unsettled_stateless_child(monkeypatch):
         AsyncMock(return_value=(True, False)),
     )
     monkeypatch.setattr(
-        main,
-        "_wait_for_stateless_cancel_settle",
+        main.job_mutation_operations.JobControlOperations,
+        "wait_for_stateless_cancel_settle",
         AsyncMock(return_value=False),
     )
 
-    assert not await main._cascade_cancel_to_children(JOB_ID)
+    assert not await control_seams.cascade_cancel_to_children(JOB_ID)
 
 
 @pytest.mark.asyncio
@@ -1905,10 +2002,12 @@ async def test_flag_on_cascade_pinned_control_loser_has_zero_external_io(monkeyp
     monkeypatch.setattr(main.postgres_db, "linearize_pinned_cancel", linearize)
     monkeypatch.setattr(main.postgres_db, "get_job", AsyncMock(return_value=child))
     cleanup = AsyncMock()
-    monkeypatch.setattr(main, "_archive_and_cleanup_workspace", cleanup)
+    monkeypatch.setattr(
+        main.thread_retirement_operations, "archive_and_cleanup_workspace", cleanup
+    )
     monkeypatch.setattr(main.postgres_db, "get_agent", AsyncMock())
 
-    assert not await main._cascade_cancel_to_children(JOB_ID)
+    assert not await control_seams.cascade_cancel_to_children(JOB_ID)
 
     linearize.assert_awaited_once_with(
         PARENT_ID,
@@ -1941,12 +2040,12 @@ async def test_flag_on_cascade_pinned_cancel_linearizes_before_cleanup(monkeypat
         AsyncMock(side_effect=lambda *_a, **_k: order.append("linearize") or True),
     )
     monkeypatch.setattr(
-        main,
-        "_archive_and_cleanup_workspace",
+        main.thread_retirement_operations,
+        "archive_and_cleanup_workspace",
         AsyncMock(side_effect=lambda *_a, **_k: order.append("cleanup")),
     )
 
-    assert await main._cascade_cancel_to_children(JOB_ID)
+    assert await control_seams.cascade_cancel_to_children(JOB_ID)
     assert order == ["linearize", "cleanup"]
 
 
@@ -1974,9 +2073,13 @@ async def test_cascade_cancel_retry_settles_existing_child_cleanup_marker(monkey
     )
     monkeypatch.setattr(main.postgres_db, "get_job", AsyncMock(return_value=child))
     settle = AsyncMock(return_value=True)
-    monkeypatch.setattr(main, "_wait_for_stateless_cancel_settle", settle)
+    monkeypatch.setattr(
+        main.job_mutation_operations.JobControlOperations,
+        "wait_for_stateless_cancel_settle",
+        settle,
+    )
 
-    assert await main._cascade_cancel_to_children(JOB_ID)
+    assert await control_seams.cascade_cancel_to_children(JOB_ID)
     settle.assert_awaited_once_with(child_id)
 
 
@@ -2003,9 +2106,13 @@ async def test_cancel_settle_prunes_then_cleans_workspace(monkeypatch):
         complete,
     )
     cleanup = AsyncMock()
-    monkeypatch.setattr(main, "_archive_and_cleanup_workspace", cleanup)
+    monkeypatch.setattr(
+        main.thread_retirement_operations.ThreadRetirementOperations,
+        "archive_and_cleanup_workspace",
+        cleanup,
+    )
 
-    settled = await main._wait_for_stateless_cancel_settle(
+    settled = await control_seams.wait_for_stateless_cancel_settle(
         JOB_ID,
         timeout_seconds=0.2,
         poll_seconds=0.001,
@@ -2042,9 +2149,13 @@ async def test_cancel_settle_keeps_resume_block_until_workspace_cleanup_succeeds
         complete,
     )
     cleanup = AsyncMock(side_effect=(RuntimeError("teardown busy"), None))
-    monkeypatch.setattr(main, "_archive_and_cleanup_workspace", cleanup)
+    monkeypatch.setattr(
+        main.thread_retirement_operations.ThreadRetirementOperations,
+        "archive_and_cleanup_workspace",
+        cleanup,
+    )
 
-    settled = await main._wait_for_stateless_cancel_settle(
+    settled = await control_seams.wait_for_stateless_cancel_settle(
         JOB_ID,
         timeout_seconds=0.2,
         poll_seconds=0.001,
@@ -2111,10 +2222,14 @@ async def test_concurrent_cancel_settlers_run_destructive_cleanup_once(monkeypat
         complete_mock,
     )
     cleanup_mock = AsyncMock(side_effect=cleanup)
-    monkeypatch.setattr(main, "_archive_and_cleanup_workspace", cleanup_mock)
+    monkeypatch.setattr(
+        main.thread_retirement_operations.ThreadRetirementOperations,
+        "archive_and_cleanup_workspace",
+        cleanup_mock,
+    )
 
     first = asyncio.create_task(
-        main._wait_for_stateless_cancel_settle(
+        control_seams.wait_for_stateless_cancel_settle(
             JOB_ID,
             timeout_seconds=0.5,
             poll_seconds=0.001,
@@ -2122,7 +2237,7 @@ async def test_concurrent_cancel_settlers_run_destructive_cleanup_once(monkeypat
     )
     await first_cleanup_entered.wait()
     second = asyncio.create_task(
-        main._wait_for_stateless_cancel_settle(
+        control_seams.wait_for_stateless_cancel_settle(
             JOB_ID,
             timeout_seconds=0.5,
             poll_seconds=0.001,
@@ -2155,13 +2270,17 @@ async def test_phase_approval_reenqueues_stateless_job(monkeypatch, tmp_path):
         "require_internal_or_job_access",
         AsyncMock(return_value=(None, job)),
     )
-    monkeypatch.setattr(main, "resolve_job_repo", AsyncMock(return_value=(None, None)))
+    monkeypatch.setattr(
+        main.subjob_output_operations,
+        "resolve_job_repo",
+        AsyncMock(return_value=(None, None)),
+    )
     monkeypatch.setattr(main, "gitea_client", SimpleNamespace(is_initialized=False))
     monkeypatch.setattr(main, "workspace_service", SimpleNamespace(base_path=tmp_path))
     queued = AsyncMock(return_value=True)
     monkeypatch.setattr(main.postgres_db, "queue_stateless_job_for_resume", queued)
 
-    result = await main.approve_job(MagicMock(), JOB_ID)
+    result = await control_seams.approve_job(MagicMock(), JOB_ID)
 
     assert result["status"] == "approved_continue"
     queued.assert_awaited_once_with(

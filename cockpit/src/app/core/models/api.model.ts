@@ -176,6 +176,7 @@ export interface EffectiveModels {
 }
 
 export interface ExpertDetail extends Expert {
+  workspace_preference?: {backend: "none" | "virtual" | "sandbox" | "vm"} | null;
   config: Record<string, unknown>;
   instructions: string | null;
   /**
@@ -325,6 +326,7 @@ export interface SkillUpdateRequest {
  */
 export type DatasourceType =
   | 'generic'
+  | 'credentials'
   | 'repository'
   | 'kb'
   | 'postgresql'
@@ -449,6 +451,8 @@ export interface Datasource {
    * "leave blank to keep existing" UX.
    */
   credentials?: Record<string, unknown>;
+  /** Configured names only; values are never returned by connector reads. */
+  env_var_names?: string[];
   cli_hint: string | null;
   default_branch: string | null;
   config?: DatasourceConfig;
@@ -671,7 +675,7 @@ export interface ApiKeySetRequest {
 
 /**
  * Which slot a model fills. Chat is the default; non-chat rows are routed
- * to the matching Admin → Defaults selector (embedding/vision/whisper/tts)
+ * to the matching Admin → Defaults selector (embedding/rerank/vision/whisper/tts)
  * or used as auxiliary LLMs for memory extraction / curation / title gen.
  */
 export type LlmModelCapability =
@@ -682,7 +686,8 @@ export type LlmModelCapability =
   | 'whisper'
   | 'tts'
   | 'search'
-  | 'fetch';
+  | 'fetch'
+  | 'rerank';
 
 /**
  * A user-registered OpenAI-compatible LLM endpoint. Models attached to this
@@ -695,10 +700,26 @@ export interface LlmEndpoint {
   label: string;
   base_url: string;
   key_prefix: string | null;
+  /**
+   * Stable routing marker from `llm_endpoints.transport_kind`.
+   * `'subscription-proxy'` marks the shared CLIProxyAPI deployment that fronts
+   * connected subscription accounts. Branch on this — never on `label`, which
+   * an admin may rename, and never on the hostname.
+   */
+  transport_kind: string | null;
   created_at: string | null;
   updated_at: string | null;
   models: never[];
+  /** Who wrote the row last: the `llm.seed` Job, an admin, or an image-shipped seeder. */
+  source?: HelmProvenanceSource | null;
+  /** Declared with `reconcile: true` in Helm values — re-applied on every `helm upgrade`. */
+  managed_by_helm?: boolean;
+  /** Managed, but last edited in the Cockpit: the next upgrade reverts it. */
+  helm_drift?: boolean;
 }
+
+/** `source` column shared by the Helm-reconciled provider tables. */
+export type HelmProvenanceSource = 'helm' | 'ui' | 'default';
 
 export interface LlmEndpointCreateRequest {
   label: string;
@@ -800,13 +821,15 @@ export type CatalogCapability =
   | 'whisper'
   | 'tts'
   | 'search'
-  | 'fetch';
+  | 'fetch'
+  | 'rerank';
 
 /** Provider anchor for a catalog row. */
 export type CatalogProviderKind = 'system' | 'endpoint';
 
 export const CATALOG_CAPABILITIES: CatalogCapability[] = [
   'chat', 'auxiliary', 'embedding', 'vision', 'whisper', 'tts', 'search', 'fetch',
+  'rerank',
 ];
 
 /**
@@ -837,6 +860,9 @@ export interface CatalogModel {
   notes: string | null;
   created_at: string | null;
   updated_at: string | null;
+  source?: HelmProvenanceSource | null;
+  managed_by_helm?: boolean;
+  helm_drift?: boolean;
 }
 
 export interface CatalogModelCreateRequest {
@@ -963,6 +989,144 @@ export interface PersistentAgentSettings {
 /**
  * Codex proxy status (admin-only, from CLIProxyAPI management API).
  */
+/**
+ * Everything Settings → AI Subscriptions renders, from
+ * `GET /api/subscriptions/status`. Reachability and authentication are
+ * separate: an unreachable proxy is "not enabled", not "signed out".
+ */
+export interface SubscriptionsStatus {
+  reachable: boolean;
+  connected: boolean;
+  proxy_url: string | null;
+  error: string | null;
+  accounts: SubscriptionAccount[];
+  model_count: number;
+  providers: SubscriptionProviderInfo[];
+}
+
+/** One connectable subscription product, from the orchestrator's registry. */
+export interface SubscriptionProviderInfo {
+  key: string;
+  label: string;
+  vendor: string;
+  /** `browser` opens an authorization page; `device` shows a code to enter. */
+  login_flow: 'browser' | 'device';
+  channels: string[];
+  client_protocol: string;
+  has_usage_reader: boolean;
+  /** True only where SRW has live-verified inference through this product. */
+  inference_verified: boolean;
+  notes: string[];
+  connected_accounts: number;
+}
+
+/** Connection state of one account. Mirrors what the proxy actually reports. */
+export type SubscriptionAccountState =
+  | 'connected'
+  | 'pending'
+  | 'refreshing'
+  | 'cooldown'
+  | 'error'
+  | 'disabled'
+  | 'unknown';
+
+/** One connected credential, with every secret stripped server-side. */
+export interface SubscriptionAccount {
+  account_id: string;
+  provider: string | null;
+  channel: string | null;
+  label: string | null;
+  email: string | null;
+  account_type: string | null;
+  state: SubscriptionAccountState;
+  state_detail: string | null;
+  next_retry_after: string | null;
+  updated_at: string | null;
+  last_refresh: string | null;
+  /** `installation` — shared, admin-managed. Private accounts are future work. */
+  scope: string;
+}
+
+/** An in-flight authorization attempt. The upstream OAuth state stays server-side. */
+export interface SubscriptionLogin {
+  login_id: string;
+  provider: string;
+  flow: 'browser' | 'device';
+  /**
+   * `verifying` means upstream reported completion but SRW has not yet seen the
+   * credential appear — it is deliberately not shown as success.
+   */
+  status: 'pending' | 'verifying' | 'connected' | 'failed' | 'cancelled';
+  error: string | null;
+  auth_url: string;
+  user_code: string | null;
+  expires_at: string;
+  account_id: string | null;
+  accepts_callback_url: boolean;
+}
+
+/** Per-account usage. `available: false` carries a reason, never a fake zero. */
+export interface SubscriptionUsage {
+  available: boolean;
+  reason?: string;
+  provider?: string | null;
+  account_id?: string;
+  account?: string | null;
+  plan_type?: string | null;
+  limit_reached?: boolean;
+  primary?: CodexUsageWindow | null;
+  secondary?: CodexUsageWindow | null;
+  per_model?: {
+    name: string;
+    primary: CodexUsageWindow | null;
+    secondary: CodexUsageWindow | null;
+  }[];
+  credits?: { has_credits: boolean; unlimited: boolean; balance?: string | null } | null;
+}
+
+/** How much SRW knows about a discovered model. */
+export type SubscriptionModelSupport = 'supported' | 'unsupported_modality' | 'needs_review';
+
+/** One row of the subscription Discover list. */
+export interface SubscriptionDiscoveredModel {
+  id: string;
+  display_label: string;
+  owned_by: string | null;
+  /** Upstream channels that can serve it — the source attribution. */
+  sources: string[];
+  providers: string[];
+  account_ids: string[];
+  client_protocol: string | null;
+  context_window: number | null;
+  max_output_tokens: number | null;
+  family: string | null;
+  capability_hints: string[];
+  support: SubscriptionModelSupport;
+  support_reason: string | null;
+  registered: boolean;
+  catalog_id: string | null;
+  routing_drift: boolean;
+}
+
+/** Result of a subscription-aware endpoint discovery. */
+export interface SubscriptionDiscoveryResult {
+  subscription: true;
+  ok: boolean;
+  probe_url: string;
+  error: string | null;
+  models: SubscriptionDiscoveredModel[];
+  unreadable_account_ids: string[];
+  /** False when enrichment failed — sources are unknown, not absent. */
+  attribution_complete: boolean;
+}
+
+/** Outcome of a bulk catalog import. */
+export interface SubscriptionImportResult {
+  created: string[];
+  skipped: string[];
+  rejected: { id: string; reason: string }[];
+}
+
 export interface CodexStatus {
   connected: boolean;
   /**
@@ -2107,6 +2271,7 @@ export interface Job {
  * Keep view state and internal delegation/identity commands outside this type.
  */
 export interface JobCreateRequest {
+  workspace?: Record<string, unknown> | null;
   description: string;
   upload_id?: string;
   config_upload_id?: string;
@@ -2720,3 +2885,65 @@ export interface Contact {
   created_at: string;
   updated_at: string;
 }
+
+// =============================================================================
+// Stateless run_queue state (stateless_turn_resilience.md, step 2)
+// =============================================================================
+
+/** Why a session's queue unit was parked. Mirrors run_queue.park_reason. */
+export type SessionQueueParkReason =
+  | 'attach_failed'
+  | 'shutdown_cancelled'
+  | 'completion_cas_failed'
+  | 'reaper_max_attempts'
+  | string;
+
+/**
+ * The `queue` block the orchestrator returns on the input accept response,
+ * on `/connection`, and on `GET /persistent/threads/{id}/queue`. `state` is
+ * the run_queue row state ('queued' | 'leased' | 'parked' | 'done'); a parked
+ * unit accepts input but nothing can claim it until it is retried.
+ */
+export interface SessionQueueState {
+  state: string;
+  park_reason: SessionQueueParkReason | null;
+  parked_at: string | null;
+  retryable: boolean;
+  attempts: number;
+  pending_input: boolean;
+}
+
+/** One parked unit as listed on GET /api/admin/capacity. */
+export interface AdminCapacityParkedRow {
+  unit_id: string;
+  unit_kind: string;
+  thread_id: string | null;
+  title: string | null;
+  owner: string | null;
+  park_reason: SessionQueueParkReason | null;
+  parked_at: string | null;
+  attempts: number;
+  pending_input: boolean;
+}
+
+/** GET /api/admin/capacity — what the KEDA scaler sees, plus the parked worklist. */
+export interface AdminCapacity {
+  observed_at: string;
+  executors: { total: number | null; ready: number | null; busy: number };
+  queued: { session_turn: number; worker_batch: number; total: number };
+  oldest_queued_age_s: number;
+  desired: number;
+  params: { min_replicas: number; reserve: number };
+  parked?: AdminCapacityParkedRow[];
+}
+
+/** POST /api/admin/run-queue/{unit}/unpark */
+export interface RunQueueUnparkResult {
+  unit_id: string;
+  state: string;
+}
+
+/** POST /api/persistent/threads/{id}/queue/retry, folded to a discriminated outcome. */
+export type SessionQueueRetryOutcome =
+  | { kind: 'ok'; state: string }
+  | { kind: 'refused'; status: number; code: string };

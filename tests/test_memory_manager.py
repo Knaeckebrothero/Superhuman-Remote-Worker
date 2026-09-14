@@ -898,6 +898,71 @@ class TestRerankerScorer:
         with pytest.raises(ValueError, match="base_url"):
             _build_reranker(runtime)
 
+    def _runtime(self, **cfg):
+        from shared.runtime.core.loader import RerankerConfig
+
+        return MemoryRuntime(
+            memory_config=SimpleNamespace(reranker=RerankerConfig(**cfg)),
+            auxiliary_config=SimpleNamespace(base_url=None, api_key=None),
+        )
+
+    def test_factory_no_pin_resolves_the_qwen_default_model(self, monkeypatch):
+        from agent.services.memory.plugins.reranker import _build_reranker
+
+        monkeypatch.delenv("RERANK_MODEL", raising=False)
+        monkeypatch.delenv("RERANK_BASE_URL", raising=False)
+        monkeypatch.setenv("EMBEDDING_BASE_URL", "https://ai.h4ll.app/v1")
+        scorer = _build_reranker(self._runtime())
+        assert scorer.model == "qwen3-reranker-8b"
+
+    def test_factory_catalog_pin_wins_over_embedding_transport(self, monkeypatch):
+        # The `rerank` catalog slot arrives as RERANK_* env at dispatch. It
+        # selects the host AND the key as a pair — the embedding key must not
+        # follow the request to a different host.
+        from agent.services.memory.plugins.reranker import _build_reranker
+
+        monkeypatch.setenv("EMBEDDING_BASE_URL", "https://ai.h4ll.app/v1")
+        monkeypatch.setenv("EMBEDDING_API_KEY", "embed-key")
+        monkeypatch.setenv("RERANK_MODEL", "rerank-english-v3.0")
+        monkeypatch.setenv("RERANK_BASE_URL", "https://api.cohere.com/v2")
+        monkeypatch.delenv("RERANK_API_KEY", raising=False)
+        scorer = _build_reranker(self._runtime())
+        assert scorer.model == "rerank-english-v3.0"
+        assert scorer.endpoint == "https://api.cohere.com/v2/rerank"
+        assert scorer.api_key is None
+        monkeypatch.setenv("RERANK_API_KEY", "cohere-key")
+        assert _build_reranker(self._runtime()).api_key == "cohere-key"
+
+    def test_factory_rerank_model_alone_rides_the_embedding_endpoint(self, monkeypatch):
+        # A system-provider rerank row delivers a model (and maybe a key) but
+        # no base_url: the transport stays the embedding endpoint's pair.
+        from agent.services.memory.plugins.reranker import _build_reranker
+
+        monkeypatch.setenv("EMBEDDING_BASE_URL", "https://ai.h4ll.app/v1")
+        monkeypatch.setenv("EMBEDDING_API_KEY", "embed-key")
+        monkeypatch.setenv("RERANK_MODEL", "qwen3-reranker-8b")
+        monkeypatch.delenv("RERANK_BASE_URL", raising=False)
+        monkeypatch.setenv("RERANK_API_KEY", "stray-key")
+        scorer = _build_reranker(self._runtime())
+        assert scorer.model == "qwen3-reranker-8b"
+        assert scorer.endpoint == "https://ai.h4ll.app/v1/rerank"
+        assert scorer.api_key == "embed-key"
+
+    def test_factory_explicit_config_beats_the_catalog_pin(self, monkeypatch):
+        from agent.services.memory.plugins.reranker import _build_reranker
+
+        monkeypatch.setenv("RERANK_MODEL", "pinned")
+        monkeypatch.setenv("RERANK_BASE_URL", "https://pinned/v1")
+        monkeypatch.setenv("RERANK_API_KEY", "pinned-key")
+        scorer = _build_reranker(
+            self._runtime(model="explicit", base_url="https://explicit/v1", api_key="k")
+        )
+        assert (scorer.model, scorer.endpoint, scorer.api_key) == (
+            "explicit",
+            "https://explicit/v1/rerank",
+            "k",
+        )
+
     def test_parse_reranker_config(self):
         cfg = _parse_memory_config(
             {
@@ -915,7 +980,8 @@ class TestRerankerScorer:
         assert cfg.reranker.keep_pinned_first is False
         assert cfg.reranker.base_url is None
         # defaults when section absent
-        assert _parse_memory_config({}).reranker.model == "qwen3-reranker-8b"
+        # null = the `rerank` catalog pin (RERANK_MODEL) resolves at bind time
+        assert _parse_memory_config({}).reranker.model is None
 
     def test_reranker_is_registered(self):
         assert "reranker" in available_memory_plugins("scorer")["scorer"]

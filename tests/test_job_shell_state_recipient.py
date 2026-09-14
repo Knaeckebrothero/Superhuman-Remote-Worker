@@ -8,6 +8,8 @@ import pytest
 from fastapi import HTTPException
 
 from orchestrator import main
+from orchestrator.routers import job_diagnostics as job_diagnostics_routes
+from orchestrator.services import job_diagnostics as job_diagnostics_operations
 from agent.api.models import PinnedJobRecipient
 
 
@@ -133,6 +135,35 @@ class _Client:
         return _Response()
 
 
+def _owner_route_dependencies(prepare):
+    """The owner route's dependencies, composed as ``main`` composes them.
+
+    The handler moved into ``orchestrator.routers.job_diagnostics`` (R1.B02);
+    the recipient attestation it calls is still main's, injected here.
+    """
+
+    async def job_access(_request, _store, _job_id):
+        return (
+            {"id": "owner"},
+            {
+                "id": JOB_ID,
+                "status": "processing",
+                "assigned_agent_id": AGENT_ID,
+            },
+        )
+
+    return job_diagnostics_routes.JobDiagnosticsDependencies(
+        store=MagicMock(),
+        operations=job_diagnostics_operations.JobDiagnosticsDependencies(
+            workspace=MagicMock(),
+            snapshots=MagicMock(),
+            audit_reader=MagicMock(),
+            prepare_pinned_job_mutation_target=prepare,
+        ),
+        require_job_access=job_access,
+    )
+
+
 @pytest.mark.asyncio
 async def test_owner_route_uses_fresh_recipient_and_exact_agent_endpoint():
     recipient = _recipient()
@@ -141,33 +172,16 @@ async def test_owner_route_uses_fresh_recipient_and_exact_agent_endpoint():
         recipient=recipient,
     )
     _Client.posts = []
+    prepare = AsyncMock(return_value=target)
     with ExitStack() as stack:
         stack.enter_context(
-            patch.object(
-                main,
-                "require_job_access",
-                AsyncMock(
-                    return_value=(
-                        {"id": "owner"},
-                        {
-                            "id": JOB_ID,
-                            "status": "processing",
-                            "assigned_agent_id": AGENT_ID,
-                        },
-                    )
-                ),
-            )
+            patch.object(job_diagnostics_operations.httpx, "AsyncClient", _Client)
         )
-        prepare = stack.enter_context(
-            patch.object(
-                main,
-                "_prepare_pinned_job_mutation_target",
-                AsyncMock(return_value=target),
-            )
+        result = await job_diagnostics_routes.get_job_shell_state(
+            MagicMock(),
+            JOB_ID,
+            dependencies=_owner_route_dependencies(prepare),
         )
-        stack.enter_context(patch.object(main.httpx, "AsyncClient", _Client))
-
-        result = await main.get_job_shell_state(MagicMock(), JOB_ID)
 
     assert result["tabs"][0]["recent_output"] == "exact A output"
     prepare.assert_awaited_once_with(
@@ -187,29 +201,14 @@ async def test_owner_route_uses_fresh_recipient_and_exact_agent_endpoint():
 async def test_owner_route_never_dials_unattested_reused_ip():
     client = MagicMock()
     with (
-        patch.object(
-            main,
-            "require_job_access",
-            AsyncMock(
-                return_value=(
-                    {"id": "owner"},
-                    {
-                        "id": JOB_ID,
-                        "status": "processing",
-                        "assigned_agent_id": AGENT_ID,
-                    },
-                )
-            ),
-        ),
-        patch.object(
-            main,
-            "_prepare_pinned_job_mutation_target",
-            AsyncMock(return_value=None),
-        ),
-        patch.object(main.httpx, "AsyncClient", client),
+        patch.object(job_diagnostics_operations.httpx, "AsyncClient", client),
         pytest.raises(HTTPException) as exc,
     ):
-        await main.get_job_shell_state(MagicMock(), JOB_ID)
+        await job_diagnostics_routes.get_job_shell_state(
+            MagicMock(),
+            JOB_ID,
+            dependencies=_owner_route_dependencies(AsyncMock(return_value=None)),
+        )
 
     assert exc.value.status_code == 409
     assert exc.value.detail == {"code": "pinned_recipient_unavailable"}

@@ -171,10 +171,18 @@ class TestCategories:
 
     def test_known_experts_is_the_union_of_the_membership_map(self):
         assert KNOWN_EXPERTS == frozenset(
-            {"scholar", "designer", "developer", "general-worker"}
+            {"scholar", "designer", "developer", "engineer", "general-worker"}
             | {"product-qa", "bughunter", "critic"}
             | {"writer"}
         )
+
+    def test_executor_default_is_the_engineer(self):
+        # dev-vs-eng-01 (engineer_expert.md §6): equal completion at 0.1-0.2x
+        # the wall time. The developer stays selectable for strict-TDD briefs.
+        assert default_expert(EXECUTOR) == "engineer"
+        assert expert_fits_category("engineer", EXECUTOR)
+        assert expert_fits_category("engineer", RESEARCHER)
+        assert not expert_fits_category("engineer", TESTER)
 
     def test_writer_is_an_executor_only(self):
         # B7. Prose for a reader is a shipped artifact under projects/<slug>/,
@@ -310,7 +318,7 @@ class TestClassifyTicket:
         pinned = classify_ticket(["ready", "category:executor", "expert:designer"])
         assert resolve_expert(pinned) == "designer"
         bare = classify_ticket(["ready", "category:executor"])
-        assert resolve_expert(bare) == "developer"
+        assert resolve_expert(bare) == "engineer"
         assert resolve_expert(classify_ticket(["ready", "category:tester"])) == (
             "product-qa"
         )

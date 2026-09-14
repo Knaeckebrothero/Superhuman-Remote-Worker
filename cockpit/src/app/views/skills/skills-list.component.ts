@@ -1,3 +1,4 @@
+import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
 import {Component, inject, OnInit, signal} from '@angular/core';
 import {Router} from '@angular/router';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
@@ -21,7 +22,7 @@ export function isBundledSkill(s: Skill): boolean {
   selector: 'app-skills-list',
   standalone: true,
   imports: [
-    TranslocoPipe,
+    SidebarToggleComponent, TranslocoPipe,
     AppButtonComponent,
     AppIconButtonComponent,
     AppBadgeComponent,
@@ -35,7 +36,10 @@ export function isBundledSkill(s: Skill): boolean {
   template: `
     <div class="skills">
       <header class="head">
-        <h1>{{ 'skills.title' | transloco }}</h1>
+        <div class="head-left">
+          <app-sidebar-toggle />
+          <h1>{{ 'skills.title' | transloco }}</h1>
+        </div>
         <div class="head-actions">
           <app-button variant="secondary" (clicked)="fileInput.click()">
             {{ 'skills.import' | transloco }}
@@ -52,7 +56,7 @@ export function isBundledSkill(s: Skill): boolean {
       } @else if (rows().length === 0) {
         <p class="empty">{{ 'skills.empty' | transloco }}</p>
       } @else {
-        <table class="grid">
+        <table class="grid app-table">
           <thead>
             <tr>
               <th>{{ 'skills.colName' | transloco }}</th>
@@ -199,20 +203,17 @@ export function isBundledSkill(s: Skill): boolean {
       .head h1 {
         margin: 0;
       }
+      .head-left {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+      }
       .head-actions {
         display: flex;
         gap: 0.5rem;
       }
-      .grid {
-        width: 100%;
-        border-collapse: collapse;
-      }
       .grid th,
       .grid td {
-        text-align: left;
-        padding: 0.5rem;
-        border-bottom: 1px solid var(--border-color);
-        color: var(--text-primary);
         vertical-align: top;
       }
       .name-cell .name-inner {
@@ -240,7 +241,7 @@ export function isBundledSkill(s: Skill): boolean {
       .banner {
         margin-top: 1rem;
         padding: 0.5rem 0.75rem;
-        border-radius: 6px;
+        border-radius: var(--radius-control);
       }
       .banner.ok {
         background: var(--success-tint);

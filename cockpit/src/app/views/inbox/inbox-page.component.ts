@@ -172,7 +172,7 @@ function relativeTime(iso: string, nowLabel: string, now: number): string {
                         {{ ('notifications.severity.' + item.notification.severity) | transloco }}
                       </app-badge>
                     }
-                    {{ item.subtitle || (('notifications.category.' + item.category) | transloco) }}
+                    <span class="item-subtitle-text">{{ item.subtitle || (('notifications.category.' + item.category) | transloco) }}</span>
                   </div>
                 </div>
               </button>
@@ -408,13 +408,22 @@ function relativeTime(iso: string, nowLabel: string, now: number): string {
     .item-subtitle {
       font-size: 11px;
       color: var(--text-muted);
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
       margin-top: 2px;
       display: flex;
       align-items: center;
       gap: 4px;
+      min-width: 0;
+    }
+
+    /* The ellipsis has to live on a real element: text-overflow never applies
+       to the anonymous flex item a bare text node becomes, so the subtitle
+       used to clip mid-word at the pane edge. */
+    .item-subtitle-text {
+      flex: 1;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
 
     .load-more {

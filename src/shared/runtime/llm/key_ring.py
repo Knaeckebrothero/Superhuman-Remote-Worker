@@ -18,7 +18,7 @@ Usage:
     # Rotate on failure:
     new_key = ring.rotate("quota exceeded")  # Returns next key or None
 
-Keys are masked in log output (first 8 chars + "...") to prevent leaking.
+Logs identify keys by their slot; status snapshots retain masked key labels.
 """
 
 import logging
@@ -30,9 +30,13 @@ logger = logging.getLogger(__name__)
 
 
 def _mask_key(key: str) -> str:
-    """Mask an API key for safe logging. Shows first 8 chars only."""
+    """Mask an API key for safe logging. Shows first 8 chars only.
+
+    A short key discloses nothing: half of an 8-character secret is most of
+    it, so only full-length keys keep an identifying prefix.
+    """
     if len(key) <= 8:
-        return key[:4] + "..."
+        return "..."
     return key[:8] + "..."
 
 
@@ -98,14 +102,20 @@ class KeyRing:
         # Maps key index -> timestamp when cooldown expires (0 = not on cooldown)
         self._cooldown_until: Dict[int, float] = {}
 
-        if len(keys) > 1:
+        if len(self._keys) > 1:
             logger.info(
-                f"KeyRing[{provider}]: initialized with {len(keys)} keys "
-                f"(cooldown={cooldown_seconds}s). "
-                f"Active: {_mask_key(keys[0])}"
+                "KeyRing[%s]: initialized with %d keys (cooldown=%ss). Active slot: %d",
+                provider,
+                len(self._keys),
+                cooldown_seconds,
+                self._current_index,
             )
         else:
-            logger.debug(f"KeyRing[{provider}]: single key mode ({_mask_key(keys[0])})")
+            logger.debug(
+                "KeyRing[%s]: single key mode (slot %d)",
+                provider,
+                self._current_index,
+            )
 
     @property
     def current_key(self) -> str:
@@ -139,17 +149,15 @@ class KeyRing:
                     del self._cooldown_until[idx]
                     if idx != self._current_index:
                         logger.info(
-                            f"KeyRing[{self._provider}]: key {_mask_key(self._keys[idx])} "
+                            f"KeyRing[{self._provider}]: key slot {idx} "
                             f"cooldown expired, switching back (priority)"
                         )
 
                 if idx != self._current_index:
-                    old = _mask_key(self._keys[self._current_index])
-                    new = _mask_key(self._keys[idx])
                     if idx < self._current_index:
                         logger.info(
                             f"KeyRing[{self._provider}]: "
-                            f"preferring higher-priority key {new} over {old}"
+                            f"preferring higher-priority key slot {idx} over slot {self._current_index}"
                         )
                     self._current_index = idx
                 return self._keys[idx]
@@ -181,14 +189,13 @@ class KeyRing:
             The next available API key, or None if all keys are exhausted.
         """
         with self._lock:
-            failed_key = self._keys[self._current_index]
             failed_idx = self._current_index
 
             # Put failed key on cooldown
             self._cooldown_until[failed_idx] = time.monotonic() + self._cooldown_seconds
 
             logger.warning(
-                f"KeyRing[{self._provider}]: rotating away from {_mask_key(failed_key)} "
+                f"KeyRing[{self._provider}]: rotating away from slot {failed_idx} "
                 f"(reason: {reason}, cooldown: {self._cooldown_seconds}s)"
             )
 
@@ -199,7 +206,7 @@ class KeyRing:
             try:
                 new_key = self._get_available_key()
                 logger.info(
-                    f"KeyRing[{self._provider}]: rotated to {_mask_key(new_key)}"
+                    f"KeyRing[{self._provider}]: rotated to slot {self._current_index}"
                 )
                 return new_key
             except RuntimeError:

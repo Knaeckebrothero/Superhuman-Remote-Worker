@@ -499,7 +499,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       .step-badge {
         padding: 2px 6px;
         border-radius: var(--radius-tag);
-        font-size: 10px;
+        font-size: 11px;
         font-weight: 600;
         color: var(--timeline-bg);
         text-transform: uppercase;

@@ -1,9 +1,11 @@
 """Unit tests for stale-agent background sweeps."""
 
 import asyncio
+import logging
 from contextlib import asynccontextmanager
 
 import pytest
+from fastapi import HTTPException
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import orchestrator.main as main
@@ -13,6 +15,7 @@ from orchestrator.database.postgres import (
     OrphanRecoveryBatch,
     RecoveredJob,
 )
+from orchestrator.services.pinned_retirement import PinnedRetirementOperations
 
 
 def _mock_db(shutdown_event: asyncio.Event, stall_return: int = 0):
@@ -262,21 +265,23 @@ def test_virtual_binding_agent_zero_requires_exact_nonphysical_shape(
         "ssh_host_key_fingerprint": None,
         **binding_patch,
     }
-    assert not main._captured_virtual_binding_agent_zero_only(
+    assert not main._pinned_retirement_operations().captured_virtual_binding_agent_zero_only(
         context, workspace, binding
     )
 
 
 def test_virtual_binding_agent_zero_accepts_exact_project_cloud_shape():
-    assert main._captured_virtual_binding_agent_zero_only(
-        {"workspace_backend": "virtual"},
-        {},
-        {
-            "generation": "66666666-6666-4666-8666-666666666666",
-            "kind": "virtual",
-            "backing_id": f"rclone:{'a' * 64}",
-            "ssh_host_key_fingerprint": None,
-        },
+    assert (
+        main._pinned_retirement_operations().captured_virtual_binding_agent_zero_only(
+            {"workspace_backend": "virtual"},
+            {},
+            {
+                "generation": "66666666-6666-4666-8666-666666666666",
+                "kind": "virtual",
+                "backing_id": f"rclone:{'a' * 64}",
+                "ssh_host_key_fingerprint": None,
+            },
+        )
     )
 
 
@@ -301,16 +306,24 @@ async def test_captured_agent_stop_retries_after_exact_pod_disappeared(
         side_effect=[first_authority, "exact_absent"]
     )
     provisioner.release_agent_pod_finalizer_exact = AsyncMock(return_value=True)
-    original_wait = main._wait_for_captured_agent_pod_retired
 
-    async def immediate_observation(*args, **kwargs):
-        return await original_wait(*args, **kwargs, timeout_s=0)
+    async def immediate_observation(
+        _self, pod_name, pod_uid, *, namespace, allowed, **_kwargs
+    ):
+        state = await provisioner.agent_pod_authority(
+            pod_name, expected_pod_uid=pod_uid, namespace=namespace
+        )
+        return state if state in allowed else None
 
     monkeypatch.setattr(main, "agent_provisioner", provisioner)
     monkeypatch.setattr(
-        main, "_wait_for_captured_agent_pod_retired", immediate_observation
+        PinnedRetirementOperations,
+        "_wait_for_captured_agent_pod_retired",
+        immediate_observation,
     )
-    await main._stop_captured_retirement_agent(retirement)
+    await main._pinned_retirement_operations().stop_captured_retirement_agent(
+        retirement
+    )
     provisioner.delete_agent_pod_exact.assert_awaited_once_with(
         "captured-agent",
         expected_pod_uid="captured-uid",
@@ -346,17 +359,25 @@ async def test_captured_agent_stop_refuses_unproven_initial_absence(
     provisioner.delete_agent_pod_exact = AsyncMock(return_value=True)
     provisioner.agent_pod_authority = AsyncMock(return_value=authority)
     provisioner.release_agent_pod_finalizer_exact = AsyncMock(return_value=True)
-    original_wait = main._wait_for_captured_agent_pod_retired
 
-    async def immediate_observation(*args, **kwargs):
-        return await original_wait(*args, **kwargs, timeout_s=0)
+    async def immediate_observation(
+        _self, pod_name, pod_uid, *, namespace, allowed, **_kwargs
+    ):
+        state = await provisioner.agent_pod_authority(
+            pod_name, expected_pod_uid=pod_uid, namespace=namespace
+        )
+        return state if state in allowed else None
 
     monkeypatch.setattr(main, "agent_provisioner", provisioner)
     monkeypatch.setattr(
-        main, "_wait_for_captured_agent_pod_retired", immediate_observation
+        PinnedRetirementOperations,
+        "_wait_for_captured_agent_pod_retired",
+        immediate_observation,
     )
     with pytest.raises(RuntimeError, match="exact agent Pod termination is retryable"):
-        await main._stop_captured_retirement_agent(retirement)
+        await main._pinned_retirement_operations().stop_captured_retirement_agent(
+            retirement
+        )
     provisioner.release_agent_pod_finalizer_exact.assert_not_awaited()
 
 
@@ -414,8 +435,16 @@ async def test_detector_retries_durable_attach_abort_after_request_task_failure(
         with (
             patch.object(main, "_schedule_attach_abort_successor", schedule_from_sweep),
             patch.object(main, "_trigger_dispatch", MagicMock()),
-            patch.object(main, "_release_thread_resources", AsyncMock()),
-            patch.object(main, "_suspend_thread_resources", AsyncMock()),
+            patch.object(
+                main.thread_retirement_operations,
+                "release_thread_resources",
+                AsyncMock(),
+            ),
+            patch.object(
+                main.thread_retirement_operations,
+                "suspend_thread_resources",
+                AsyncMock(),
+            ),
         ):
             await main.stale_agent_detector(shutdown_event)
         assert len(scheduled) == 1
@@ -436,8 +465,12 @@ async def test_stale_detector_uses_graph_progress_stall_window():
     with (
         patch.object(main, "postgres_db", db),
         patch.object(main, "_trigger_dispatch", MagicMock()),
-        patch.object(main, "_release_thread_resources", AsyncMock()),
-        patch.object(main, "_suspend_thread_resources", AsyncMock()),
+        patch.object(
+            main.thread_retirement_operations, "release_thread_resources", AsyncMock()
+        ),
+        patch.object(
+            main.thread_retirement_operations, "suspend_thread_resources", AsyncMock()
+        ),
     ):
         await main.stale_agent_detector(shutdown_event)
 
@@ -467,8 +500,12 @@ async def test_stale_detector_triggers_dispatch_on_graph_progress_stall():
     with (
         patch.object(main, "postgres_db", db),
         patch.object(main, "_trigger_dispatch") as trigger_dispatch,
-        patch.object(main, "_release_thread_resources", AsyncMock()),
-        patch.object(main, "_suspend_thread_resources", AsyncMock()),
+        patch.object(
+            main.thread_retirement_operations, "release_thread_resources", AsyncMock()
+        ),
+        patch.object(
+            main.thread_retirement_operations, "suspend_thread_resources", AsyncMock()
+        ),
     ):
         await main.stale_agent_detector(shutdown_event)
 
@@ -495,8 +532,12 @@ async def test_step_failure_does_not_block_downstream_recovery():
     with (
         patch.object(main, "postgres_db", db),
         patch.object(main, "_trigger_dispatch", MagicMock()),
-        patch.object(main, "_release_thread_resources", AsyncMock()),
-        patch.object(main, "_suspend_thread_resources", AsyncMock()),
+        patch.object(
+            main.thread_retirement_operations, "release_thread_resources", AsyncMock()
+        ),
+        patch.object(
+            main.thread_retirement_operations, "suspend_thread_resources", AsyncMock()
+        ),
     ):
         await main.stale_agent_detector(shutdown_event)
 
@@ -536,8 +577,12 @@ async def test_lease_expiry_recovery_runs_and_triggers_dispatch():
         patch.object(main, "_kick_officer_event_drain") as kick_wake_drain,
         patch.object(main, "notify_all_officers", AsyncMock()) as notify_all,
         patch.object(main, "notify_owning_officers", AsyncMock()) as notify_owning,
-        patch.object(main, "_release_thread_resources", AsyncMock()),
-        patch.object(main, "_suspend_thread_resources", AsyncMock()),
+        patch.object(
+            main.thread_retirement_operations, "release_thread_resources", AsyncMock()
+        ),
+        patch.object(
+            main.thread_retirement_operations, "suspend_thread_resources", AsyncMock()
+        ),
     ):
         await main.stale_agent_detector(shutdown_event)
 
@@ -578,8 +623,12 @@ async def test_lease_recovery_groups_wakes_per_owning_project():
         patch.object(main, "_kick_officer_event_drain"),
         patch.object(main, "notify_all_officers", AsyncMock()) as notify_all,
         patch.object(main, "notify_owning_officers", AsyncMock()) as notify_owning,
-        patch.object(main, "_release_thread_resources", AsyncMock()),
-        patch.object(main, "_suspend_thread_resources", AsyncMock()),
+        patch.object(
+            main.thread_retirement_operations, "release_thread_resources", AsyncMock()
+        ),
+        patch.object(
+            main.thread_retirement_operations, "suspend_thread_resources", AsyncMock()
+        ),
     ):
         await main.stale_agent_detector(shutdown_event)
 
@@ -611,8 +660,12 @@ async def test_lease_recovery_of_projectless_jobs_notifies_nobody():
         patch.object(main, "_kick_officer_event_drain") as kick_wake_drain,
         patch.object(main, "notify_all_officers", AsyncMock()) as notify_all,
         patch.object(main, "notify_owning_officers", AsyncMock()) as notify_owning,
-        patch.object(main, "_release_thread_resources", AsyncMock()),
-        patch.object(main, "_suspend_thread_resources", AsyncMock()),
+        patch.object(
+            main.thread_retirement_operations, "release_thread_resources", AsyncMock()
+        ),
+        patch.object(
+            main.thread_retirement_operations, "suspend_thread_resources", AsyncMock()
+        ),
     ):
         await main.stale_agent_detector(shutdown_event)
 
@@ -647,8 +700,12 @@ async def test_orphan_recovery_wakes_only_the_owning_projects_officer():
         patch.object(main, "_kick_officer_event_drain"),
         patch.object(main, "notify_all_officers", AsyncMock()) as notify_all,
         patch.object(main, "notify_owning_officers", AsyncMock()) as notify_owning,
-        patch.object(main, "_release_thread_resources", AsyncMock()),
-        patch.object(main, "_suspend_thread_resources", AsyncMock()),
+        patch.object(
+            main.thread_retirement_operations, "release_thread_resources", AsyncMock()
+        ),
+        patch.object(
+            main.thread_retirement_operations, "suspend_thread_resources", AsyncMock()
+        ),
     ):
         await main.stale_agent_detector(shutdown_event)
 
@@ -693,8 +750,12 @@ async def test_agents_offline_scopes_to_derived_projects_and_falls_back_global()
         patch.object(main, "_kick_officer_event_drain") as kick_wake_drain,
         patch.object(main, "notify_all_officers", AsyncMock()) as notify_all,
         patch.object(main, "notify_owning_officers", AsyncMock()) as notify_owning,
-        patch.object(main, "_release_thread_resources", AsyncMock()),
-        patch.object(main, "_suspend_thread_resources", AsyncMock()),
+        patch.object(
+            main.thread_retirement_operations, "release_thread_resources", AsyncMock()
+        ),
+        patch.object(
+            main.thread_retirement_operations, "suspend_thread_resources", AsyncMock()
+        ),
     ):
         await main.stale_agent_detector(shutdown_event)
 
@@ -730,8 +791,12 @@ async def test_agents_offline_fully_derivable_skips_the_fleet_fanout():
         patch.object(main, "_kick_officer_event_drain"),
         patch.object(main, "notify_all_officers", AsyncMock()) as notify_all,
         patch.object(main, "notify_owning_officers", AsyncMock()) as notify_owning,
-        patch.object(main, "_release_thread_resources", AsyncMock()),
-        patch.object(main, "_suspend_thread_resources", AsyncMock()),
+        patch.object(
+            main.thread_retirement_operations, "release_thread_resources", AsyncMock()
+        ),
+        patch.object(
+            main.thread_retirement_operations, "suspend_thread_resources", AsyncMock()
+        ),
     ):
         await main.stale_agent_detector(shutdown_event)
 
@@ -750,8 +815,12 @@ async def test_lease_recovery_uses_strict_audit_fingerprint_reader():
         patch.object(main, "postgres_db", db),
         patch.object(main, "audit_reader", reader),
         patch.object(main, "_trigger_dispatch", MagicMock()),
-        patch.object(main, "_release_thread_resources", AsyncMock()),
-        patch.object(main, "_suspend_thread_resources", AsyncMock()),
+        patch.object(
+            main.thread_retirement_operations, "release_thread_resources", AsyncMock()
+        ),
+        patch.object(
+            main.thread_retirement_operations, "suspend_thread_resources", AsyncMock()
+        ),
     ):
         await main.stale_agent_detector(shutdown_event)
 
@@ -785,8 +854,12 @@ async def test_lease_circuit_trip_kicks_only_durable_wake_drain_not_dispatch():
         patch.object(main, "_trigger_dispatch") as trigger_dispatch,
         patch.object(main, "_kick_officer_event_drain") as kick_wake_drain,
         patch.object(main, "notify_all_officers", AsyncMock()) as notify_all,
-        patch.object(main, "_release_thread_resources", AsyncMock()),
-        patch.object(main, "_suspend_thread_resources", AsyncMock()),
+        patch.object(
+            main.thread_retirement_operations, "release_thread_resources", AsyncMock()
+        ),
+        patch.object(
+            main.thread_retirement_operations, "suspend_thread_resources", AsyncMock()
+        ),
     ):
         await main.stale_agent_detector(shutdown_event)
 
@@ -806,8 +879,12 @@ async def test_lease_recovery_survives_orphan_recovery_failure():
     with (
         patch.object(main, "postgres_db", db),
         patch.object(main, "_trigger_dispatch", MagicMock()),
-        patch.object(main, "_release_thread_resources", AsyncMock()),
-        patch.object(main, "_suspend_thread_resources", AsyncMock()),
+        patch.object(
+            main.thread_retirement_operations, "release_thread_resources", AsyncMock()
+        ),
+        patch.object(
+            main.thread_retirement_operations, "suspend_thread_resources", AsyncMock()
+        ),
     ):
         await main.stale_agent_detector(shutdown_event)
 
@@ -815,3 +892,378 @@ async def test_lease_recovery_survives_orphan_recovery_failure():
         completion_commands_enabled=main.COMPLETION_COMMANDS_ENABLED
     )
     db.gc_offline_agents.assert_awaited_once()
+
+
+def _lite_retirement(*, backend="none", permanent=False):
+    """A retired pinned lite-tier actor: agent Pod, no workspace, no binding."""
+
+    thread_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2"
+    generation = "11111111-1111-4111-8111-111111111112"
+    token = "22222222-2222-4222-8222-222222222223"
+    agent_id = "33333333-3333-4333-8333-333333333334"
+    attach_token = "44444444-4444-4444-8444-444444444445"
+    context = {
+        "thread_id": thread_id,
+        "generation": generation,
+        "settle_status": "ended",
+        "runtime_authority_exposed": True,
+        "agent_id": agent_id,
+        "runtime_attach_token": attach_token,
+        "agent_pod": {
+            "pod_name": "persistent-lite",
+            "pod_uid": "lite-pod-uid",
+            "namespace": "agents-a",
+            "protection_protocol": "finalizer_v1",
+        },
+        "workspace_backend": backend,
+        "workspace_container": None,
+        "workspace_binding": None,
+    }
+    retirement = {
+        "generation": generation,
+        "token": token,
+        "permanent": permanent,
+        "context": context,
+    }
+    current = {
+        "id": thread_id,
+        "runtime_generation": generation,
+        "runtime_retirement_token": token,
+        "runtime_retirement_local_quiescence": None,
+        "metadata": {},
+    }
+    return retirement, current
+
+
+def _lite_recovery_mocks(current):
+    db = AsyncMock()
+    db.get_thread = AsyncMock(return_value=current)
+    db.acknowledge_pinned_thread_local_quiescence = AsyncMock(
+        return_value={"version": 1}
+    )
+
+    @asynccontextmanager
+    async def lifecycle_lock(_thread_id):
+        yield True
+
+    db.try_thread_advisory_lock = MagicMock(side_effect=lifecycle_lock)
+    provisioner = MagicMock(is_available=True)
+    provisioner.delete_agent_pod_exact = AsyncMock(return_value=True)
+    provisioner.release_agent_pod_finalizer_exact = AsyncMock(return_value=True)
+    provisioner.agent_pod_authority = AsyncMock(
+        side_effect=["exact_terminal", "exact_absent"]
+    )
+    return db, provisioner
+
+
+def _vm_retirement(*, backend="vm"):
+    retirement, current = _lite_retirement(backend=backend, permanent=True)
+    generation = "55555555-5555-4555-8555-555555555556"
+    vm_uid = "vm-incarnation-uid"
+    retirement["context"]["vm"] = {
+        "status": "ready",
+        "provision_generation": generation,
+        "identity_provision_generation": generation,
+        "identity_authenticated": True,
+        "vm_uid": vm_uid,
+        "_runtime_incarnation": vm_uid,
+        "rootdisk_pvc_uid": "rootdisk-pvc-uid",
+        "ssh_host": "192.0.2.44",
+        "ssh_port": 22,
+        "ssh_host_key_fingerprint": "SHA256:" + "A" * 43,
+        "credential_runtime_started": True,
+    }
+    return retirement, current
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("permanent", [False, True])
+async def test_lite_backend_retirement_recovers_through_agent_runtime_zero(
+    monkeypatch, permanent
+):
+    """A `none`-backend pinned actor is process-zero once its exact Pod is gone.
+
+    Officers and conferences run on the lite tier: an agent Pod and no
+    workspace at all. The design names their proof `agent_runtime_zero_v1`
+    and the receipt trigger already accepts it for backend `none`; only the
+    Python recovery gate refused everything but `sandbox`/`virtual`, so every
+    lite retirement whose agent stopped answering stayed pending forever.
+    """
+    retirement, current = _lite_retirement(permanent=permanent)
+    db, provisioner = _lite_recovery_mocks(current)
+
+    async def immediate_observation(
+        _self, pod_name, pod_uid, *, namespace, allowed, **_kwargs
+    ):
+        state = await provisioner.agent_pod_authority(
+            pod_name, expected_pod_uid=pod_uid, namespace=namespace
+        )
+        return state if state in allowed else None
+
+    monkeypatch.setattr(
+        PinnedRetirementOperations,
+        "_wait_for_captured_agent_pod_retired",
+        immediate_observation,
+    )
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "agent_provisioner", provisioner),
+    ):
+        assert await main._recover_captured_sandbox_process_zero(retirement)
+
+    provisioner.delete_agent_pod_exact.assert_awaited_once_with(
+        "persistent-lite", expected_pod_uid="lite-pod-uid", namespace="agents-a"
+    )
+    db.acknowledge_pinned_thread_local_quiescence.assert_awaited_once_with(
+        retirement["context"]["thread_id"],
+        expected_runtime_generation=retirement["generation"],
+        expected_retirement_token=retirement["token"],
+        expected_agent_id=retirement["context"]["agent_id"],
+        expected_attach_token=retirement["context"]["runtime_attach_token"],
+        expected_settle_status="ended",
+        expected_quiescence_protocol="agent_runtime_zero_v1",
+        expected_workspace_generation=None,
+        expected_workspace_runtime_incarnation=None,
+        quiescence_actor="orchestrator",
+        expected_agent_pod_uid="lite-pod-uid",
+        require_zero_admission=True,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["vm", "remote"])
+async def test_non_sandbox_recovery_uses_the_captured_vm_actuator(monkeypatch, backend):
+    """Leader recovery must break the VM receipt/End retry dependency cycle."""
+    from orchestrator.services.vm_provisioner import VMTeardownResult
+
+    retirement, current = _vm_retirement(backend=backend)
+    db, provisioner = _lite_recovery_mocks(current)
+    vm_provisioner = MagicMock(lifecycle_available=True)
+    vm_provisioner.release_vm_captured = AsyncMock(
+        return_value=VMTeardownResult("completed", True)
+    )
+
+    async def immediate_observation(
+        _self, pod_name, pod_uid, *, namespace, allowed, **_kwargs
+    ):
+        state = await provisioner.agent_pod_authority(
+            pod_name, expected_pod_uid=pod_uid, namespace=namespace
+        )
+        return state if state in allowed else None
+
+    monkeypatch.setattr(
+        PinnedRetirementOperations,
+        "_wait_for_captured_agent_pod_retired",
+        immediate_observation,
+    )
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "agent_provisioner", provisioner),
+        patch.object(main, "vm_provisioner", vm_provisioner),
+    ):
+        assert await main._recover_captured_sandbox_process_zero(retirement)
+
+    provisioner.delete_agent_pod_exact.assert_awaited_once_with(
+        "persistent-lite", expected_pod_uid="lite-pod-uid", namespace="agents-a"
+    )
+    vm_provisioner.release_vm_captured.assert_awaited_once()
+    call = vm_provisioner.release_vm_captured.await_args
+    assert call.args[0] == retirement["context"]["thread_id"]
+    assert (
+        call.args[1].provision_generation
+        == retirement["context"]["vm"]["provision_generation"]
+    )
+    assert call.args[1].vm_uid == retirement["context"]["vm"]["vm_uid"]
+    assert call.args[1].rootdisk_pvc_uid == "rootdisk-pvc-uid"
+    assert call.kwargs == {
+        "ssh_host": "192.0.2.44",
+        "ssh_port": 22,
+        "purge_disk": True,
+        "entity_type": "thread",
+        "capture_snapshot": False,
+    }
+    db.acknowledge_pinned_thread_local_quiescence.assert_awaited_once_with(
+        retirement["context"]["thread_id"],
+        expected_runtime_generation=retirement["generation"],
+        expected_retirement_token=retirement["token"],
+        expected_agent_id=retirement["context"]["agent_id"],
+        expected_attach_token=retirement["context"]["runtime_attach_token"],
+        expected_settle_status="ended",
+        expected_quiescence_protocol="workspace_actuator_zero_v1",
+        expected_workspace_generation=retirement["context"]["vm"][
+            "provision_generation"
+        ],
+        expected_workspace_runtime_incarnation=retirement["context"]["vm"]["vm_uid"],
+        quiescence_actor="orchestrator",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["vm", "remote"])
+async def test_unactuated_backend_recovery_refusal_is_logged(
+    monkeypatch, caplog, backend
+):
+    """A backend with no crash-recovery actuator must say so, not go quiet."""
+    retirement, current = _lite_retirement(backend=backend)
+    db, provisioner = _lite_recovery_mocks(current)
+    caplog.set_level(logging.WARNING)
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "agent_provisioner", provisioner),
+    ):
+        assert not await main._recover_captured_sandbox_process_zero(retirement)
+
+    provisioner.delete_agent_pod_exact.assert_not_awaited()
+    db.acknowledge_pinned_thread_local_quiescence.assert_not_awaited()
+    refusals = [
+        r for r in caplog.records if "no process-zero actuator" in r.getMessage()
+    ]
+    assert len(refusals) == 1
+    assert backend in refusals[0].getMessage()
+    assert retirement["context"]["thread_id"] in refusals[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_pending_retirement_retry_refusal_is_logged(monkeypatch, caplog):
+    """A 409/503 refusal is a retry outcome, not silence.
+
+    Before this, a retirement that could never finish retried every sweep
+    with zero log output: the refusal was swallowed into `False`, and the
+    caller only logged successes. Fourteen hours of that on dev looked
+    exactly like nothing being wrong.
+    """
+    thread_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3"
+    generation = "11111111-1111-4111-8111-111111111113"
+    token = "22222222-2222-4222-8222-222222222224"
+    candidate = {
+        "id": thread_id,
+        "runtime_generation": generation,
+        "runtime_retirement_token": token,
+        "runtime_retirement_permanent": False,
+        "runtime_retirement_context": {
+            "thread_id": thread_id,
+            "generation": generation,
+            "settle_status": "ended",
+            "runtime_authority_exposed": False,
+        },
+    }
+    db = AsyncMock()
+    db.get_thread = AsyncMock(return_value={"id": thread_id})
+    refused = HTTPException(
+        status_code=409, detail={"code": "pinned_runtime_identity_mismatch"}
+    )
+    caplog.set_level(logging.WARNING)
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "_end_thread_flow", AsyncMock(side_effect=refused)),
+    ):
+        assert await main._retry_pending_pinned_retirement(candidate) is False
+
+    refusals = [r for r in caplog.records if thread_id in r.getMessage()]
+    assert len(refusals) == 1
+    assert "409" in refusals[0].getMessage()
+    assert "pinned_runtime_identity_mismatch" in refusals[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_sweep_reports_unresolved_pinned_retirements(caplog):
+    """An all-failing retry pass must leave a trace in the log."""
+    shutdown_event = asyncio.Event()
+    db = _mock_db(shutdown_event)
+    db.list_retryable_pinned_retirements = AsyncMock(
+        return_value=[{"id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa4"}]
+    )
+    caplog.set_level(logging.WARNING)
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "_trigger_dispatch", MagicMock()),
+        patch.object(
+            main.thread_retirement_operations, "release_thread_resources", AsyncMock()
+        ),
+        patch.object(
+            main.thread_retirement_operations, "suspend_thread_resources", AsyncMock()
+        ),
+        patch.object(
+            main, "_retry_pending_pinned_retirement", AsyncMock(return_value=False)
+        ),
+    ):
+        await main.stale_agent_detector(shutdown_event)
+
+    unresolved = [r for r in caplog.records if "remain unresolved" in r.getMessage()]
+    assert len(unresolved) == 1
+    assert unresolved[0].getMessage().startswith("1 ")
+
+
+@pytest.mark.asyncio
+async def test_pending_retirement_retry_logs_when_recovery_cannot_prove_zero(
+    caplog,
+):
+    """Recovery returning False is a refusal too, and must say so."""
+    retirement, current = _lite_retirement()
+    context = dict(retirement["context"])
+    candidate = {
+        "id": context["thread_id"],
+        "runtime_generation": retirement["generation"],
+        "runtime_retirement_token": retirement["token"],
+        "runtime_retirement_permanent": False,
+        "runtime_retirement_context": context,
+    }
+    db = AsyncMock()
+    db.get_thread = AsyncMock(return_value=current)
+    caplog.set_level(logging.WARNING)
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(
+            main,
+            "_recover_captured_sandbox_process_zero",
+            AsyncMock(return_value=False),
+        ),
+        patch.object(main, "_end_thread_flow", AsyncMock()) as end_flow,
+    ):
+        assert await main._retry_pending_pinned_retirement(candidate) is False
+
+    end_flow.assert_not_awaited()
+    refusals = [
+        r for r in caplog.records if "could not prove process zero" in r.getMessage()
+    ]
+    assert len(refusals) == 1
+    assert context["thread_id"] in refusals[0].getMessage()
+    assert "'none'" in refusals[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_recovery_logs_when_the_receipt_is_refused_after_the_pod_stop(
+    monkeypatch, caplog
+):
+    """The Pod is gone but the DB refused the receipt: name it, don't hide it."""
+    retirement, current = _lite_retirement()
+    db, provisioner = _lite_recovery_mocks(current)
+    db.acknowledge_pinned_thread_local_quiescence = AsyncMock(return_value=None)
+    db.acknowledge_settled_virtual_actor_exit = AsyncMock(return_value=None)
+
+    async def immediate_observation(
+        _self, pod_name, pod_uid, *, namespace, allowed, **_kwargs
+    ):
+        state = await provisioner.agent_pod_authority(
+            pod_name, expected_pod_uid=pod_uid, namespace=namespace
+        )
+        return state if state in allowed else None
+
+    monkeypatch.setattr(
+        PinnedRetirementOperations,
+        "_wait_for_captured_agent_pod_retired",
+        immediate_observation,
+    )
+    caplog.set_level(logging.WARNING)
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "agent_provisioner", provisioner),
+    ):
+        assert not await main._recover_captured_sandbox_process_zero(retirement)
+
+    # Both contracts were consulted for this used-or-created lite life.
+    db.acknowledge_pinned_thread_local_quiescence.assert_awaited_once()
+    db.acknowledge_settled_virtual_actor_exit.assert_awaited_once()
+    refusals = [r for r in caplog.records if "receipt refused" in r.getMessage()]
+    assert len(refusals) == 1
+    assert retirement["context"]["thread_id"] in refusals[0].getMessage()

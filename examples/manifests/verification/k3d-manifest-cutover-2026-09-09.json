@@ -1,0 +1,166 @@
+{
+  "status": "passed",
+  "date": "2026-09-09",
+  "scope": "Deployed configuration/resource API and migration acceptance; execution proofs are recorded separately.",
+  "helm": {
+    "release": "srw",
+    "namespace": "srw",
+    "context": "k3d-srw",
+    "revision": 335,
+    "status": "deployed",
+    "tiltWatcher": {
+      "runtimeStatus": "ok",
+      "updateStatus": "ok"
+    },
+    "earlierTiltCiPassedRevision": 331
+  },
+  "configuration": {
+    "passed": true,
+    "context": "k3d-srw",
+    "namespace": "srw",
+    "api": "https://api.localhost",
+    "pod": "srw-orchestrator-6cd5598d64-899dj",
+    "image": "srw-registry:5000/srw-orchestrator:tilt-092db2f46ea3e951",
+    "imageID": "srw-registry:5000/srw-orchestrator@sha256:092db2f46ea3e95101aaec27bbdc75f29e07c73d1270bbc642f6771eff6277f2",
+    "sourceFilesMatched": 11,
+    "sourceDigest": "7e7b1e80f1c29be8ebc60b0806b2d5c143559bf566f32e54f4f0831e3e8cc907",
+    "checks": [
+      "all four endpoints reject missing and invalid authentication",
+      "real Keycloak authentication, packaged schema, and all 9 example resources",
+      "reference resolution, opaque harness settings, secret references, and pending admission checks",
+      "YAML and JSON export/preview round trips preserve references and ownership",
+      "project defaults and explicit workspace/connector opt-outs",
+      "malformed/oversized input and unresolved references fail with HTTP 422"
+    ]
+  },
+  "resourceCutover": {
+    "gate": "manifest-http-cutover",
+    "context": "k3d-srw",
+    "gateIdentity": "cutover-b32edf98af41-",
+    "startedAt": "2026-09-09T11:24:33.938811+00:00",
+    "status": "passed",
+    "scope": "Deployed HTTP/auth/desired-state/PostgreSQL cutover; no admitted job or session execution",
+    "deployment": {
+      "pod": "srw-orchestrator-6cd5598d64-899dj",
+      "imageID": "srw-registry:5000/srw-orchestrator@sha256:092db2f46ea3e95101aaec27bbdc75f29e07c73d1270bbc642f6771eff6277f2",
+      "sourceFilesMatched": 62,
+      "sourceDigest": "aa70f6b00d36db7efaf963ccb817cec1eefe0a1b4934b1045a9fb3addf4cfa14",
+      "nativeHostingEnabled": false,
+      "nativeNamespace": "srw-native"
+    },
+    "checks": [
+      "Real Keycloak authentication; resource list and apply reject anonymous callers",
+      "Expert stored preview, list/get, JSON/YAML export, identical apply and idempotency replay",
+      "Expert version/CAS conflicts and generic editor boundary preserve canonical content",
+      "Existing SRW Expert editor reads/writes/exports the same canonical resource; legacy payload columns are empty",
+      "Project list projection, atomic failed activation, versioned upgrade, managed-child retirement and active defaults",
+      "Exact-version Project deletion retires its managed definitions and domain identity",
+      "Unverified hosting returns HostingCapabilityUnavailable 503 and rolls the entire generic Job bundle back without execution effects",
+      "All disposable Account and Project resources retired; immutable audit history retained"
+    ],
+    "observations": {
+      "rejectedAdmission": {
+        "rejectedResources": 0,
+        "rejectedOperations": 0,
+        "rejectedJobs": 0,
+        "rejectedExecutions": 0,
+        "rejectedAttempts": 0,
+        "rejectedWorkspaceBindings": 0
+      },
+      "nativeObjectInventoryUnchanged": true
+    },
+    "cleanup": {
+      "complete": true,
+      "activeOwnedResources": 0,
+      "ownedProjects": 0,
+      "failedOperations": 0,
+      "historicalRevisionsRetained": true
+    },
+    "finishedAt": "2026-09-09T11:24:37.540565+00:00"
+  },
+  "regression": {
+    "status": "passed",
+    "command": "SRW_PYTHON=.venv/bin/python SRW_PYTEST_WORKERS=8 ./scripts/pytest-fast.sh tests/ -q --tb=short",
+    "python": "3.13.15",
+    "previousRun": {
+      "passed": 29925,
+      "skipped": 237,
+      "failed": 1,
+      "resolution": "Removed a class fixture that bypassed module-global state restoration in test_turn_executor.py; both involved modules then passed together in one process (120 tests)."
+    },
+    "cleanupReplayFollowUp": {
+      "historyAndProvenance": 25,
+      "existingReplayResidueAndPermanentEnd": 81,
+      "migrationAndDiscovery": 51
+    },
+    "changedPythonRuff": {
+      "files": 141,
+      "check": "passed",
+      "format": "passed"
+    },
+    "passed": 29935,
+    "skipped": 237,
+    "failed": 0,
+    "warnings": 182,
+    "durationSeconds": 1002.92,
+    "importContracts": {
+      "kept": 20,
+      "broken": 0
+    },
+    "followUpVerification": {
+      "smokeScript": {
+        "passed": 20,
+        "scope": "Bounded explicit-503 cleanup retry, immutable workload ownership checks, transport/non-503 nonreplay, timeout and already-absent handling; script changes made after full-suite collection."
+      }
+    }
+  },
+  "databaseRehearsal": {
+    "schemaMigrationHead": "0237",
+    "passed": true,
+    "experts": {
+      "migrated": 2,
+      "preserved": 0
+    },
+    "bundled": {
+      "added": 18,
+      "preserved": 2
+    },
+    "projects": {
+      "migrated": 1,
+      "preserved": 0
+    },
+    "history": {
+      "requires-resolution": 52
+    },
+    "job_states_unchanged": true,
+    "repeated_migration_unchanged": true
+  },
+  "installedSrwImageUpgrade": {
+    "operation": "apply",
+    "counts": {
+      "byScope": {
+        "Account": 1,
+        "Catalog": 20
+      },
+      "executionSnapshots": 2,
+      "experts": 21,
+      "projects": 0
+    },
+    "fromImage": "srw-registry:5000/srw-agent:tilt-5b3055bf79bb9eac",
+    "toImage": "srw-registry:5000/srw-agent:tilt-a2242c3a891301a2",
+    "invariants": {
+      "executionHistoryUnchanged": true,
+      "noAffectedProjectGeneration": true,
+      "onlyImageAndVersionBookkeeping": true,
+      "priorResourceRevisionsUnchanged": true,
+      "privateSettingsAndAuthorityUnchanged": true,
+      "unrelatedResourcesUnchanged": true
+    },
+    "planRevision": "sha256:bade012c8568d29f58ac353acdef02c7743e20bc9f902a63211fb7c511daf523"
+  },
+  "executionEvidence": {
+    "srwAdapter": "k3d-srw-adapter-2026-09-09.json",
+    "genericHarnessAndProviderEgress": "k3d-native-provider-egress-2026-09-09.json",
+    "scope": "Separate live gates: SRW on the deployed local installation at schema 0237; generic harness/retained workspace/provider egress on disposable Cilium at schema 0236. The later SRW cleanup migrations do not change generic execution."
+  }
+}

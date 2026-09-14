@@ -422,10 +422,10 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       }
 
       .section-label {
-        font-size: 10px;
+        font-size: 11px;
         font-weight: 600;
         text-transform: uppercase;
-        letter-spacing: 1px;
+        letter-spacing: 0.06em;
         color: var(--text-muted);
         margin-bottom: 8px;
         padding-left: 4px;
@@ -453,9 +453,9 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       }
 
       .metric-label {
-        font-size: 10px;
+        font-size: 11px;
         text-transform: uppercase;
-        letter-spacing: 0.5px;
+        letter-spacing: 0.06em;
         color: var(--text-muted);
         margin-top: 4px;
       }
@@ -548,11 +548,11 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       .type-badge {
         padding: 2px 6px;
         border-radius: var(--radius-tag);
-        font-size: 10px;
+        font-size: 11px;
         font-weight: 600;
         font-family: 'JetBrains Mono', monospace;
         text-transform: uppercase;
-        letter-spacing: 0.5px;
+        letter-spacing: 0.06em;
         white-space: nowrap;
         flex-shrink: 0;
       }
@@ -608,10 +608,10 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       }
 
       .detail-label {
-        font-size: 10px;
+        font-size: 11px;
         font-weight: 600;
         text-transform: uppercase;
-        letter-spacing: 0.5px;
+        letter-spacing: 0.06em;
         color: var(--text-muted);
         margin-bottom: 4px;
       }

@@ -158,6 +158,46 @@ class TestGpt56Family:
         )
 
 
+class TestGpt6Family:
+    """GPT-6 Astra (GA 2026-09-03) — 1.05M ctx, 922K max input, 128K output."""
+
+    def test_gpt6_registered_in_matrix(self):
+        matrix = _load_settings_matrix()
+        assert "gpt-6" in matrix
+        assert matrix["gpt-6"]["temperature"] == 1.0
+        assert matrix["gpt-6"]["multimodal"] is True  # text + image in
+        assert matrix["gpt-6"]["parallel_tool_calls"] is True
+        assert matrix["gpt-6"]["model_max_context_tokens"] == 1050000
+        # Single context value per family — leaves derive at load, no `limits` here.
+        assert "limits" not in matrix["gpt-6"]
+
+    def test_gpt6_settings_applied(self):
+        data = {"llm": {"model": "gpt-6-astra"}}
+        _apply_settings_matrix(data, expert_llm_keys=set())
+        assert data["llm"]["temperature"] == 1.0
+        assert data["llm"]["model_max_context_tokens"] == 1050000
+        assert data["limits"]["model_max_context_tokens"] == 1050000
+        assert data["limits"]["context_threshold_tokens"] == 840000  # 1050000 * 0.80
+        assert data["limits"]["message_count_min_tokens"] == int(
+            1050000 * MESSAGE_COUNT_MIN_FRACTION
+        )
+
+    def test_compaction_fires_below_the_922k_input_ceiling(self):
+        """Astra's context window (1.05M) exceeds its max INPUT (922K). The
+        derived threshold must sit under that ceiling or every long turn dies
+        on an oversized-input 400 before compaction ever runs."""
+        data = {"llm": {"model": "gpt-6-astra"}}
+        _apply_settings_matrix(data, expert_llm_keys=set())
+        assert data["limits"]["context_threshold_tokens"] < 922000
+
+    def test_gpt6_does_not_borrow_gpt5_settings(self):
+        """gpt-6 is its own family, not a gpt-5/gpt-5.6 alias."""
+        data = {"llm": {"model": "gpt-6-astra"}}
+        _apply_settings_matrix(data, expert_llm_keys=set())
+        assert data["llm"]["model_max_context_tokens"] != 1000000  # gpt-5.6
+        assert data["llm"]["model_max_context_tokens"] != 128000  # matrix default
+
+
 # =============================================================================
 # _load_settings_matrix
 # =============================================================================
@@ -990,6 +1030,7 @@ class TestRealMatrixFamilies:
             ("deepseek-v4-pro", 1000000),  # V4 Pro: 1M true max
             ("deepseek-v4-flash", 1000000),  # shares the deepseek family
             ("gpt-5.6-sol", 1000000),  # GPT-5.6 (Luna/Terra/Sol): 1M ctx
+            ("gpt-6-astra", 1050000),  # GPT-6 Astra: 1.05M ctx
             ("gemini-2.0-flash", 1000000),
             ("gpt-oss-120b", 131072),
             ("some-unknown-model", 128000),  # default entry

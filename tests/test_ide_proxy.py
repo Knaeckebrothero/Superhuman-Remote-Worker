@@ -40,6 +40,23 @@ async def _raw_http_server(response_parts: list[bytes]):
         await server.wait_closed()
 
 
+def _ide_dependencies(db, proxy, **gates):
+    """Bind the IDE router's collaborators the way the application does.
+
+    ``postgres_db``, ``ide_proxy_service`` and the auth gates used to be
+    ``main`` globals these tests patched; they are ``IdeDependencies`` fields
+    now, so an override is passed in rather than patched onto a module.
+    """
+    from orchestrator.routers.ide import IdeDependencies
+
+    return IdeDependencies(
+        store=db,
+        ide_sessions=MagicMock(),
+        ide_proxy=proxy,
+        **gates,
+    )
+
+
 # =============================================================================
 # IdeProxyService — pod IP resolution and caching
 # =============================================================================
@@ -801,7 +818,8 @@ class TestVmIdeProxyAuthority:
 
     @pytest.mark.asyncio
     async def test_http_route_returns_typed_vm_transport_refusal(self):
-        from orchestrator import main
+        from orchestrator.routers.ide import ide_proxy_http
+        from orchestrator.services.ide_proxy import IdeProxyUnavailable
 
         request = MagicMock()
         request.headers = {"accept": "text/html"}
@@ -810,7 +828,7 @@ class TestVmIdeProxyAuthority:
         request.client = None
         proxy = SimpleNamespace(
             resolve_target=AsyncMock(
-                side_effect=main.IdeProxyUnavailable(
+                side_effect=IdeProxyUnavailable(
                     "vm_ide_transport_unavailable",
                     "VM IDE transport requires an exact guest tunnel",
                 )
@@ -818,22 +836,18 @@ class TestVmIdeProxyAuthority:
             evict=MagicMock(),
         )
         db = SimpleNamespace(get_thread=AsyncMock(return_value=None))
-        with (
-            patch.object(main, "postgres_db", db),
-            patch.object(main, "ide_proxy_service", proxy),
-            patch.object(
-                main,
-                "require_approved_user",
-                AsyncMock(return_value={"id": "user-a"}),
-            ),
-            patch.object(
-                main,
-                "user_can_access_ide_entity",
-                AsyncMock(return_value=True),
-            ),
-            pytest.raises(HTTPException) as exc,
-        ):
-            await main.ide_proxy_http(request, self._JOB_ID, "workspace")
+        with pytest.raises(HTTPException) as exc:
+            await ide_proxy_http(
+                request,
+                self._JOB_ID,
+                "workspace",
+                dependencies=_ide_dependencies(
+                    db,
+                    proxy,
+                    require_approved_user=AsyncMock(return_value={"id": "user-a"}),
+                    user_can_access_ide_entity=AsyncMock(return_value=True),
+                ),
+            )
 
         assert exc.value.status_code == 503
         assert exc.value.detail["code"] == "vm_ide_transport_unavailable"
@@ -1073,10 +1087,10 @@ class TestProxyHeaderPolicy:
     """The auth-none boundary uses positive request/response allowlists."""
 
     def test_allowlists_are_minimal_and_have_no_identity_fields(self):
-        from orchestrator import main
+        from orchestrator.services import ide_proxy_gateway
 
-        request = main._IDE_PROXY_REQUEST_ALLOW_HEADERS
-        response = main._IDE_PROXY_RESPONSE_ALLOW_HEADERS
+        request = ide_proxy_gateway._IDE_PROXY_REQUEST_ALLOW_HEADERS
+        response = ide_proxy_gateway._IDE_PROXY_RESPONSE_ALLOW_HEADERS
         assert {"accept", "range", "if-none-match"} <= request
         assert {"content-type", "etag"} <= response
         assert "accept-encoding" not in request
@@ -1097,7 +1111,7 @@ class TestIdeProxySecurityBoundary:
 
     @pytest.mark.asyncio
     async def test_http_strips_request_and_response_credentials(self):
-        from orchestrator import main
+        from orchestrator.routers import ide as ide_routes
 
         target = SimpleNamespace(
             backend="docker",
@@ -1144,25 +1158,23 @@ class TestIdeProxySecurityBoundary:
         request.client = SimpleNamespace(host="192.0.2.10")
 
         with (
-            patch.object(main, "postgres_db", db),
-            patch.object(main, "ide_proxy_service", proxy),
-            patch.object(
-                main,
-                "require_approved_user",
-                AsyncMock(return_value={"id": "user-a"}),
-            ),
-            patch.object(
-                main,
-                "user_can_access_ide_entity",
-                AsyncMock(return_value=True),
-            ),
-            patch.object(main, "_request_exact_ide_http", request_upstream),
+            patch.object(ide_routes, "_request_exact_ide_http", request_upstream),
             patch(
                 "orchestrator.services.ssh_helpers.orchestrator_can_reach",
                 return_value=True,
             ),
         ):
-            response = await main.ide_proxy_http(request, "job-a", "workspace")
+            response = await ide_routes.ide_proxy_http(
+                request,
+                "job-a",
+                "workspace",
+                dependencies=_ide_dependencies(
+                    db,
+                    proxy,
+                    require_approved_user=AsyncMock(return_value={"id": "user-a"}),
+                    user_can_access_ide_entity=AsyncMock(return_value=True),
+                ),
+            )
 
         forwarded = {
             key.lower(): value
@@ -1197,7 +1209,7 @@ class TestIdeProxySecurityBoundary:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("method", ["POST", "PUT", "PATCH", "DELETE"])
     async def test_mutating_http_is_contained_before_body_or_target_use(self, method):
-        from orchestrator import main
+        from orchestrator.routers import ide as ide_routes
 
         consumed = False
 
@@ -1212,21 +1224,23 @@ class TestIdeProxySecurityBoundary:
         request.stream = MagicMock(side_effect=body)
         proxy = SimpleNamespace(resolve_target=AsyncMock(), evict=MagicMock())
         with (
-            patch.object(main, "ide_proxy_service", proxy),
             patch.object(
-                main,
-                "require_approved_user",
-                AsyncMock(return_value={"id": "user-a"}),
-            ),
-            patch.object(
-                main,
-                "user_can_access_ide_entity",
-                AsyncMock(return_value=True),
-            ),
-            patch.object(main, "_request_exact_ide_http", AsyncMock()) as upstream,
+                ide_routes, "_request_exact_ide_http", AsyncMock()
+            ) as upstream,
             pytest.raises(HTTPException) as exc,
         ):
-            await main.ide_proxy_http(request, "job-a", "effect")
+            await ide_routes.ide_proxy_http(
+                request,
+                "job-a",
+                "effect",
+                dependencies=_ide_dependencies(
+                    # No store: reaching the lifecycle fence at all is a failure.
+                    None,
+                    proxy,
+                    require_approved_user=AsyncMock(return_value={"id": "user-a"}),
+                    user_can_access_ide_entity=AsyncMock(return_value=True),
+                ),
+            )
 
         assert exc.value.status_code == 503
         assert exc.value.detail["code"] == ("ide_mutation_operation_lease_unavailable")
@@ -1237,19 +1251,24 @@ class TestIdeProxySecurityBoundary:
 
     @pytest.mark.asyncio
     async def test_transport_helper_cannot_bypass_mutation_containment(self):
-        from orchestrator import main
+        from orchestrator.services.ide_proxy import (
+            IdeProxyUnavailable,
+            ide_proxy_service,
+        )
+        from orchestrator.services import ide_proxy_gateway
 
         constructor = MagicMock()
         with (
-            patch.object(main.httpx, "AsyncClient", constructor),
-            pytest.raises(main.IdeProxyUnavailable) as exc,
+            patch.object(ide_proxy_gateway.httpx, "AsyncClient", constructor),
+            pytest.raises(IdeProxyUnavailable) as exc,
         ):
-            await main._request_exact_ide_http(
+            await ide_proxy_gateway._request_exact_ide_http(
                 target=SimpleNamespace(backend="docker"),
                 method="POST",
                 url="http://10.42.0.7:38080/effect",
                 headers={},
                 content=b"must-not-cross",
+                ide_proxy=ide_proxy_service,
             )
 
         assert exc.value.code == "ide_mutation_operation_lease_unavailable"
@@ -1258,19 +1277,24 @@ class TestIdeProxySecurityBoundary:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("backend", ["k8s", "vm"])
     async def test_remote_target_is_contained_before_connect(self, backend):
-        from orchestrator import main
+        from orchestrator.services.ide_proxy import (
+            IdeProxyUnavailable,
+            ide_proxy_service,
+        )
+        from orchestrator.services import ide_proxy_gateway
 
         constructor = MagicMock()
         with (
-            patch.object(main.httpx, "AsyncClient", constructor),
-            pytest.raises(main.IdeProxyUnavailable) as exc,
+            patch.object(ide_proxy_gateway.httpx, "AsyncClient", constructor),
+            pytest.raises(IdeProxyUnavailable) as exc,
         ):
-            await main._request_exact_ide_http(
+            await ide_proxy_gateway._request_exact_ide_http(
                 target=SimpleNamespace(backend=backend),
                 method="GET",
                 url="http://10.42.0.7:38080/data",
                 headers={},
                 content=None,
+                ide_proxy=ide_proxy_service,
             )
 
         assert exc.value.code == "ide_remote_transport_unavailable"
@@ -1285,7 +1309,7 @@ class TestIdeProxySecurityBoundary:
         rejected there. Assert both halves — the refusal is lifted, and the
         request actually carries the credential.
         """
-        from orchestrator import main
+        from orchestrator.services import ide_proxy_gateway
 
         sent: list[dict] = []
 
@@ -1311,16 +1335,16 @@ class TestIdeProxySecurityBoundary:
 
         proxy = SimpleNamespace(revalidate_target=AsyncMock(return_value=True))
         browser_headers = {"accept": "text/html"}
-        with (
-            patch.object(main, "ide_proxy_service", proxy),
-            patch.object(main.httpx, "AsyncClient", MagicMock(return_value=Client())),
+        with patch.object(
+            ide_proxy_gateway.httpx, "AsyncClient", MagicMock(return_value=Client())
         ):
-            response = await main._request_exact_ide_http(
+            response = await ide_proxy_gateway._request_exact_ide_http(
                 target=SimpleNamespace(backend="k8s", credential="c0ffee"),
                 method="GET",
                 url="http://10.42.0.7:38080/data",
                 headers=browser_headers,
                 content=None,
+                ide_proxy=proxy,
             )
 
         assert response.status_code == 200
@@ -1332,19 +1356,24 @@ class TestIdeProxySecurityBoundary:
     @pytest.mark.asyncio
     async def test_remote_target_without_a_credential_is_still_refused(self):
         """Re-scoping the guard must not become "K8s is fine now"."""
-        from orchestrator import main
+        from orchestrator.services.ide_proxy import (
+            IdeProxyUnavailable,
+            ide_proxy_service,
+        )
+        from orchestrator.services import ide_proxy_gateway
 
         constructor = MagicMock()
         with (
-            patch.object(main.httpx, "AsyncClient", constructor),
-            pytest.raises(main.IdeProxyUnavailable) as exc,
+            patch.object(ide_proxy_gateway.httpx, "AsyncClient", constructor),
+            pytest.raises(IdeProxyUnavailable) as exc,
         ):
-            await main._request_exact_ide_http(
+            await ide_proxy_gateway._request_exact_ide_http(
                 target=SimpleNamespace(backend="k8s", credential=None),
                 method="GET",
                 url="http://10.42.0.7:38080/data",
                 headers={},
                 content=None,
+                ide_proxy=ide_proxy_service,
             )
 
         assert exc.value.code == "ide_remote_transport_unavailable"
@@ -1352,7 +1381,7 @@ class TestIdeProxySecurityBoundary:
 
     @pytest.mark.asyncio
     async def test_http_connection_trace_refuses_authority_loss_before_send(self):
-        from orchestrator import main
+        from orchestrator.services import ide_proxy_gateway
 
         events: list[str] = []
 
@@ -1375,16 +1404,16 @@ class TestIdeProxySecurityBoundary:
         proxy = SimpleNamespace(revalidate_target=AsyncMock(return_value=False))
         constructor = MagicMock(return_value=Client())
         with (
-            patch.object(main, "ide_proxy_service", proxy),
-            patch.object(main.httpx, "AsyncClient", constructor),
-            pytest.raises(main._IdeProxyAuthorityLost),
+            patch.object(ide_proxy_gateway.httpx, "AsyncClient", constructor),
+            pytest.raises(ide_proxy_gateway._IdeProxyAuthorityLost),
         ):
-            await main._request_exact_ide_http(
+            await ide_proxy_gateway._request_exact_ide_http(
                 target=SimpleNamespace(backend="docker"),
                 method="GET",
                 url="http://10.42.0.7:38080/data",
                 headers={},
                 content=None,
+                ide_proxy=proxy,
             )
 
         assert events == ["connected"]
@@ -1394,7 +1423,7 @@ class TestIdeProxySecurityBoundary:
     async def test_real_tcp_connect_sends_zero_bytes_after_failed_attestation(self):
         """Prove the httpcore trace boundary against a real TCP listener."""
 
-        from orchestrator import main
+        from orchestrator.services import ide_proxy_gateway
 
         connected = asyncio.Event()
         received: list[bytes] = []
@@ -1409,16 +1438,14 @@ class TestIdeProxySecurityBoundary:
         port = server.sockets[0].getsockname()[1]
         proxy = SimpleNamespace(revalidate_target=AsyncMock(return_value=False))
         try:
-            with (
-                patch.object(main, "ide_proxy_service", proxy),
-                pytest.raises(main._IdeProxyAuthorityLost),
-            ):
-                await main._request_exact_ide_http(
+            with pytest.raises(ide_proxy_gateway._IdeProxyAuthorityLost):
+                await ide_proxy_gateway._request_exact_ide_http(
                     target=SimpleNamespace(backend="docker"),
                     method="GET",
                     url=f"http://127.0.0.1:{port}/data",
                     headers={},
                     content=None,
+                    ide_proxy=proxy,
                 )
             await asyncio.wait_for(connected.wait(), timeout=1)
             for _ in range(50):
@@ -1432,7 +1459,7 @@ class TestIdeProxySecurityBoundary:
 
     @pytest.mark.asyncio
     async def test_http_response_is_suppressed_if_authority_changes_after_effect(self):
-        from orchestrator import main
+        from orchestrator.services import ide_proxy_gateway
 
         class Client:
             async def __aenter__(self):
@@ -1458,23 +1485,23 @@ class TestIdeProxySecurityBoundary:
 
         proxy = SimpleNamespace(revalidate_target=AsyncMock(side_effect=[True, False]))
         with (
-            patch.object(main, "ide_proxy_service", proxy),
-            patch.object(main.httpx, "AsyncClient", return_value=Client()),
-            pytest.raises(main._IdeProxyAuthorityLost),
+            patch.object(ide_proxy_gateway.httpx, "AsyncClient", return_value=Client()),
+            pytest.raises(ide_proxy_gateway._IdeProxyAuthorityLost),
         ):
-            await main._request_exact_ide_http(
+            await ide_proxy_gateway._request_exact_ide_http(
                 target=SimpleNamespace(backend="docker"),
                 method="GET",
                 url="http://10.42.0.7:38080/data",
                 headers={},
                 content=None,
+                ide_proxy=proxy,
             )
 
         assert proxy.revalidate_target.await_count == 2
 
     @pytest.mark.asyncio
     async def test_compressed_response_remains_raw_with_consistent_headers(self):
-        from orchestrator import main
+        from orchestrator.services import ide_proxy_gateway
 
         decoded = b"code-server asset" * 128
         encoded = gzip.compress(decoded)
@@ -1490,15 +1517,15 @@ class TestIdeProxySecurityBoundary:
         ]
         proxy = SimpleNamespace(revalidate_target=AsyncMock(return_value=True))
         async with _raw_http_server(response) as port:
-            with patch.object(main, "ide_proxy_service", proxy):
-                result = await main._request_exact_ide_http(
-                    target=SimpleNamespace(backend="docker"),
-                    method="GET",
-                    url=f"http://127.0.0.1:{port}/asset.js",
-                    headers={"accept-encoding": "identity"},
-                    content=None,
-                    max_response_body_bytes=len(encoded),
-                )
+            result = await ide_proxy_gateway._request_exact_ide_http(
+                target=SimpleNamespace(backend="docker"),
+                method="GET",
+                url=f"http://127.0.0.1:{port}/asset.js",
+                headers={"accept-encoding": "identity"},
+                content=None,
+                max_response_body_bytes=len(encoded),
+                ide_proxy=proxy,
+            )
 
         assert result.body == encoded
         headers = dict(result.headers)
@@ -1508,7 +1535,8 @@ class TestIdeProxySecurityBoundary:
 
     @pytest.mark.asyncio
     async def test_chunked_response_over_limit_is_rejected_before_return(self):
-        from orchestrator import main
+        from orchestrator.services.ide_proxy import IdeProxyUnavailable
+        from orchestrator.services import ide_proxy_gateway
 
         limit = 64
         first = b"a" * limit
@@ -1522,24 +1550,22 @@ class TestIdeProxySecurityBoundary:
         ]
         proxy = SimpleNamespace(revalidate_target=AsyncMock(return_value=True))
         async with _raw_http_server(response) as port:
-            with (
-                patch.object(main, "ide_proxy_service", proxy),
-                pytest.raises(main.IdeProxyUnavailable) as exc,
-            ):
-                await main._request_exact_ide_http(
+            with pytest.raises(IdeProxyUnavailable) as exc:
+                await ide_proxy_gateway._request_exact_ide_http(
                     target=SimpleNamespace(backend="docker"),
                     method="GET",
                     url=f"http://127.0.0.1:{port}/large",
                     headers={"accept-encoding": "identity"},
                     content=None,
                     max_response_body_bytes=limit,
+                    ide_proxy=proxy,
                 )
 
         assert exc.value.code == "ide_response_too_large"
 
     @pytest.mark.asyncio
     async def test_chunked_response_at_exact_limit_is_accepted(self):
-        from orchestrator import main
+        from orchestrator.services import ide_proxy_gateway
 
         limit = 64
         body = b"z" * limit
@@ -1551,15 +1577,15 @@ class TestIdeProxySecurityBoundary:
         ]
         proxy = SimpleNamespace(revalidate_target=AsyncMock(return_value=True))
         async with _raw_http_server(response) as port:
-            with patch.object(main, "ide_proxy_service", proxy):
-                result = await main._request_exact_ide_http(
-                    target=SimpleNamespace(backend="docker"),
-                    method="GET",
-                    url=f"http://127.0.0.1:{port}/boundary",
-                    headers={"accept-encoding": "identity"},
-                    content=None,
-                    max_response_body_bytes=limit,
-                )
+            result = await ide_proxy_gateway._request_exact_ide_http(
+                target=SimpleNamespace(backend="docker"),
+                method="GET",
+                url=f"http://127.0.0.1:{port}/boundary",
+                headers={"accept-encoding": "identity"},
+                content=None,
+                max_response_body_bytes=limit,
+                ide_proxy=proxy,
+            )
 
         assert result.body == body
         assert len(result.body) == limit
@@ -1580,26 +1606,34 @@ class TestIsBrowserNavigation:
         return req
 
     def test_sec_fetch_mode_navigate(self):
-        from orchestrator.main import _is_browser_navigation
+        from orchestrator.services.ide_proxy_gateway import (
+            _is_browser_navigation,
+        )
 
         assert _is_browser_navigation(self._req({"sec-fetch-mode": "navigate"})) is True
 
     def test_sec_fetch_mode_cors_is_not_navigation(self):
-        from orchestrator.main import _is_browser_navigation
+        from orchestrator.services.ide_proxy_gateway import (
+            _is_browser_navigation,
+        )
 
         # code-server's own asset/XHR sub-requests — must NOT be treated as navs.
         req = self._req({"sec-fetch-mode": "cors", "accept": "application/json"})
         assert _is_browser_navigation(req) is False
 
     def test_accept_html_fallback(self):
-        from orchestrator.main import _is_browser_navigation
+        from orchestrator.services.ide_proxy_gateway import (
+            _is_browser_navigation,
+        )
 
         # Older browsers without Sec-Fetch-Mode: fall back to Accept: text/html.
         req = self._req({"accept": "text/html,application/xhtml+xml"})
         assert _is_browser_navigation(req) is True
 
     def test_no_signal_is_not_navigation(self):
-        from orchestrator.main import _is_browser_navigation
+        from orchestrator.services.ide_proxy_gateway import (
+            _is_browser_navigation,
+        )
 
         assert _is_browser_navigation(self._req({})) is False
 
@@ -1619,17 +1653,22 @@ class TestIdeProxyHttpAuthRedirect:
 
     @pytest.mark.asyncio
     async def test_navigation_401_redirects_to_login(self):
-        import orchestrator.main
+        from orchestrator.routers.ide import ide_proxy_http
 
-        with patch(
-            "orchestrator.main.require_approved_user",
-            AsyncMock(
-                side_effect=HTTPException(status_code=401, detail="Not authenticated")
+        resp = await ide_proxy_http(
+            self._req({"sec-fetch-mode": "navigate"}),
+            "thread-123",
+            "",
+            dependencies=_ide_dependencies(
+                None,
+                MagicMock(),
+                require_approved_user=AsyncMock(
+                    side_effect=HTTPException(
+                        status_code=401, detail="Not authenticated"
+                    )
+                ),
             ),
-        ):
-            resp = await orchestrator.main.ide_proxy_http(
-                self._req({"sec-fetch-mode": "navigate"}), "thread-123", ""
-            )
+        )
 
         assert isinstance(resp, RedirectResponse)
         assert resp.status_code == 302
@@ -1637,39 +1676,45 @@ class TestIdeProxyHttpAuthRedirect:
 
     @pytest.mark.asyncio
     async def test_xhr_401_is_not_redirected(self):
-        import orchestrator.main
+        from orchestrator.routers.ide import ide_proxy_http
 
-        with patch(
-            "orchestrator.main.require_approved_user",
-            AsyncMock(
-                side_effect=HTTPException(status_code=401, detail="Not authenticated")
-            ),
-        ):
-            with pytest.raises(HTTPException) as exc_info:
-                await orchestrator.main.ide_proxy_http(
-                    self._req({"sec-fetch-mode": "cors", "accept": "application/json"}),
-                    "thread-123",
-                    "",
-                )
+        with pytest.raises(HTTPException) as exc_info:
+            await ide_proxy_http(
+                self._req({"sec-fetch-mode": "cors", "accept": "application/json"}),
+                "thread-123",
+                "",
+                dependencies=_ide_dependencies(
+                    None,
+                    MagicMock(),
+                    require_approved_user=AsyncMock(
+                        side_effect=HTTPException(
+                            status_code=401, detail="Not authenticated"
+                        )
+                    ),
+                ),
+            )
 
         assert exc_info.value.status_code == 401
 
     @pytest.mark.asyncio
     async def test_navigation_403_is_not_redirected(self):
-        import orchestrator.main
+        from orchestrator.routers.ide import ide_proxy_http
 
-        with patch(
-            "orchestrator.main.require_approved_user",
-            AsyncMock(
-                side_effect=HTTPException(
-                    status_code=403, detail="Account pending approval."
-                )
-            ),
-        ):
-            with pytest.raises(HTTPException) as exc_info:
-                await orchestrator.main.ide_proxy_http(
-                    self._req({"sec-fetch-mode": "navigate"}), "thread-123", ""
-                )
+        with pytest.raises(HTTPException) as exc_info:
+            await ide_proxy_http(
+                self._req({"sec-fetch-mode": "navigate"}),
+                "thread-123",
+                "",
+                dependencies=_ide_dependencies(
+                    None,
+                    MagicMock(),
+                    require_approved_user=AsyncMock(
+                        side_effect=HTTPException(
+                            status_code=403, detail="Account pending approval."
+                        )
+                    ),
+                ),
+            )
 
         assert exc_info.value.status_code == 403
 
@@ -1814,7 +1859,7 @@ class TestIdeWebSocketTransport:
     @pytest.mark.asyncio
     async def test_credential_bound_stream_carries_the_cookie(self):
         """The handshake is what a foreign runtime refuses — bind it there."""
-        from orchestrator import main
+        from orchestrator.routers import ide as ide_routes
 
         target = SimpleNamespace(
             backend="k8s",
@@ -1834,17 +1879,10 @@ class TestIdeWebSocketTransport:
             return self._upstream()
 
         with (
-            patch.object(main, "ide_proxy_service", proxy),
             patch.object(
-                main,
-                "resolve_ws_user",
-                AsyncMock(return_value={"id": "u", "is_approved": True}),
-            ),
-            patch.object(
-                main, "user_can_access_ide_entity", AsyncMock(return_value=True)
-            ),
-            patch.object(
-                main, "_require_stateless_ide_lifecycle", AsyncMock(return_value=None)
+                ide_routes,
+                "_require_stateless_ide_lifecycle",
+                AsyncMock(return_value=None),
             ),
             patch(
                 "orchestrator.services.ssh_helpers.orchestrator_can_reach",
@@ -1852,7 +1890,19 @@ class TestIdeWebSocketTransport:
             ),
             patch("websockets.connect", side_effect=connect),
         ):
-            await main.ide_proxy_ws(ws, "thread-a", "stable/connection")
+            await ide_routes.ide_proxy_ws(
+                ws,
+                "thread-a",
+                "stable/connection",
+                dependencies=_ide_dependencies(
+                    MagicMock(),
+                    proxy,
+                    resolve_ws_user=AsyncMock(
+                        return_value={"id": "u", "is_approved": True}
+                    ),
+                    user_can_access_ide_entity=AsyncMock(return_value=True),
+                ),
+            )
 
         ws.accept.assert_awaited_once()
         url, kwargs = calls[0]
@@ -1864,30 +1914,34 @@ class TestIdeWebSocketTransport:
 
     @pytest.mark.asyncio
     async def test_vm_refusal_closes_instead_of_raising(self):
-        from orchestrator import main
+        from orchestrator.routers import ide as ide_routes
+        from orchestrator.services.ide_proxy import IdeProxyUnavailable
 
         proxy = MagicMock()
         proxy.resolve_target = AsyncMock(
-            side_effect=main.IdeProxyUnavailable(
+            side_effect=IdeProxyUnavailable(
                 "vm_ide_transport_unavailable", "VM IDE needs an exact tunnel"
             )
         )
         ws = self._ws()
-        with (
-            patch.object(main, "ide_proxy_service", proxy),
-            patch.object(
-                main,
-                "resolve_ws_user",
-                AsyncMock(return_value={"id": "u", "is_approved": True}),
-            ),
-            patch.object(
-                main, "user_can_access_ide_entity", AsyncMock(return_value=True)
-            ),
-            patch.object(
-                main, "_require_stateless_ide_lifecycle", AsyncMock(return_value=None)
-            ),
+        with patch.object(
+            ide_routes,
+            "_require_stateless_ide_lifecycle",
+            AsyncMock(return_value=None),
         ):
-            await main.ide_proxy_ws(ws, "thread-a", "")
+            await ide_routes.ide_proxy_ws(
+                ws,
+                "thread-a",
+                "",
+                dependencies=_ide_dependencies(
+                    MagicMock(),
+                    proxy,
+                    resolve_ws_user=AsyncMock(
+                        return_value={"id": "u", "is_approved": True}
+                    ),
+                    user_can_access_ide_entity=AsyncMock(return_value=True),
+                ),
+            )
 
         ws.accept.assert_not_awaited()
         ws.close.assert_awaited_once_with(
@@ -1902,20 +1956,24 @@ class TestIdeWebSocketLifecycleSupervisor:
         backend="k8s", credential="c0ffee", host="10.42.0.7", port=38080
     )
 
-    async def _current(self, main, *, resolve):
-        with (
-            patch.object(main, "ide_proxy_service", MagicMock(resolve_target=resolve)),
-            patch.object(
-                main, "_require_stateless_ide_lifecycle", AsyncMock(return_value=None)
-            ),
+    async def _current(self, gateway, *, resolve):
+        with patch.object(
+            gateway, "_require_stateless_ide_lifecycle", AsyncMock(return_value=None)
         ):
-            return await main._ide_ws_runtime_is_current("thread-a", self.TARGET)
+            return await gateway._ide_ws_runtime_is_current(
+                "thread-a",
+                self.TARGET,
+                store=MagicMock(),
+                ide_proxy=MagicMock(resolve_target=resolve),
+            )
 
     @pytest.mark.asyncio
     async def test_same_runtime_keeps_the_stream(self):
-        from orchestrator import main
+        from orchestrator.services import ide_proxy_gateway
 
-        assert await self._current(main, resolve=AsyncMock(return_value=self.TARGET))
+        assert await self._current(
+            ide_proxy_gateway, resolve=AsyncMock(return_value=self.TARGET)
+        )
 
     @pytest.mark.asyncio
     async def test_status_churn_alone_does_not_drop_a_working_ide(self):
@@ -1924,7 +1982,7 @@ class TestIdeWebSocketLifecycleSupervisor:
         This is why the check is not ``revalidate_target``: that compares the
         owner lifecycle projection too, which moves during ordinary use.
         """
-        from orchestrator import main
+        from orchestrator.services import ide_proxy_gateway
 
         churned = SimpleNamespace(
             backend="k8s",
@@ -1934,29 +1992,35 @@ class TestIdeWebSocketLifecycleSupervisor:
             identity=("something", "else"),
         )
 
-        assert await self._current(main, resolve=AsyncMock(return_value=churned))
+        assert await self._current(
+            ide_proxy_gateway, resolve=AsyncMock(return_value=churned)
+        )
 
     @pytest.mark.asyncio
     async def test_replacement_runtime_closes_the_stream(self):
-        from orchestrator import main
+        from orchestrator.services import ide_proxy_gateway
 
         successor = SimpleNamespace(
             backend="k8s", credential="decafbad", host="10.42.0.9", port=38080
         )
 
-        assert not await self._current(main, resolve=AsyncMock(return_value=successor))
+        assert not await self._current(
+            ide_proxy_gateway, resolve=AsyncMock(return_value=successor)
+        )
 
     @pytest.mark.asyncio
     async def test_ended_owner_closes_the_stream(self):
-        from orchestrator import main
+        from orchestrator.services import ide_proxy_gateway
 
-        assert not await self._current(main, resolve=AsyncMock(return_value=None))
+        assert not await self._current(
+            ide_proxy_gateway, resolve=AsyncMock(return_value=None)
+        )
 
     @pytest.mark.asyncio
     async def test_inconclusive_check_closes_the_stream(self):
         """Never hold a stream open because the check itself failed."""
-        from orchestrator import main
+        from orchestrator.services import ide_proxy_gateway
 
         assert not await self._current(
-            main, resolve=AsyncMock(side_effect=RuntimeError("api down"))
+            ide_proxy_gateway, resolve=AsyncMock(side_effect=RuntimeError("api down"))
         )

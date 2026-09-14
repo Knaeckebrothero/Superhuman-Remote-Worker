@@ -76,7 +76,7 @@
 }
 
 :host.cdk-keyboard-focused .app-textarea__field {
-  outline: 2px solid var(--accent-color);
-  outline-offset: 1px;
+  outline: none;
   border-color: var(--accent-color);
+  box-shadow: 0 0 0 3px var(--ring);
 }

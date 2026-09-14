@@ -291,7 +291,7 @@ import {AppBadgeComponent} from '../../../ui/badge';
       font-size: 12px;
       color: var(--text-muted);
       text-transform: uppercase;
-      letter-spacing: 0.5px;
+      letter-spacing: 0.06em;
     }
     .user-row {
       border-top: 1px solid var(--border-color);

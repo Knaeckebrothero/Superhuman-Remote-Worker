@@ -1092,6 +1092,113 @@ def test_cleanup_rejects_nonexact_ledger_ids_before_any_request(
         application.cleanup(ledger)
 
 
+def test_provider_cleanup_waits_for_required_background_work_before_reset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cleanup_clock
+) -> None:
+    run_id = "provider-cleanup-run"
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    ledger = {
+        "kubeconfig": str(tmp_path / "kubeconfig.yaml"),
+        "run_dir": str(run_dir),
+    }
+    resource_ledger = {"run_id": run_id}
+    states = [
+        {
+            "pending_calls": 1,
+            "remaining_required_responses": 1,
+            "unexpected_count": 0,
+            "calls": [],
+        },
+        {
+            "pending_calls": 0,
+            "remaining_required_responses": 0,
+            "unexpected_count": 0,
+            "calls": [{"outcome": "success"}],
+        },
+        {
+            "pending_calls": 0,
+            "remaining_required_responses": 0,
+            "unexpected_count": 0,
+            "calls": [{"outcome": "success"}],
+        },
+    ]
+    overview = {
+        "runs": [states[-1]],
+        "unscoped_unexpected_calls": 0,
+        "unscoped_calls_truncated": 0,
+        "unscoped_calls": [],
+    }
+    requests: list[tuple[str, str]] = []
+
+    def fake_request(url: str, **kwargs):
+        method = kwargs.get("method", "GET")
+        requests.append((method, url))
+        if method == "DELETE":
+            return 200, b"{}"
+        if url.endswith(f"/{run_id}"):
+            return 200, json.dumps(states.pop(0)).encode()
+        return 200, json.dumps(overview).encode()
+
+    application = harness.ApplicationE2EHarness(tmp_path / "state")
+    monkeypatch.setattr(
+        application,
+        "_load_secrets",
+        lambda _ledger: type("Secrets", (), {"provider_control_token": "token"})(),
+    )
+    monkeypatch.setattr(harness, "_http_request", fake_request)
+    monkeypatch.setenv("APP_E2E_PROVIDER_SETTLE_SECONDS", "1")
+    application._cleanup_provider_run(ledger, resource_ledger)
+
+    assert requests[-1][0] == "DELETE"
+    receipt = json.loads((run_dir / "provider-cleanup-state.json").read_text())
+    assert receipt == {"scenario": overview["runs"][0], "overview": overview}
+
+
+def test_provider_cleanup_refuses_global_unscoped_rejections(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cleanup_clock
+) -> None:
+    run_id = "provider-unscoped-run"
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    ledger = {
+        "kubeconfig": str(tmp_path / "kubeconfig.yaml"),
+        "run_dir": str(run_dir),
+    }
+    settled = {
+        "pending_calls": 0,
+        "remaining_required_responses": 0,
+        "unexpected_count": 0,
+        "calls": [{"outcome": "success"}],
+    }
+    overview = {
+        "runs": [settled],
+        "unscoped_unexpected_calls": 1,
+        "unscoped_calls_truncated": 0,
+        "unscoped_calls": [{"outcome": "run_correlation_required"}],
+    }
+    requests: list[str] = []
+
+    def fake_request(url: str, **kwargs):
+        requests.append(kwargs.get("method", "GET"))
+        if url.endswith(f"/{run_id}"):
+            return 200, json.dumps(settled).encode()
+        return 200, json.dumps(overview).encode()
+
+    application = harness.ApplicationE2EHarness(tmp_path / "state")
+    monkeypatch.setattr(
+        application,
+        "_load_secrets",
+        lambda _ledger: type("Secrets", (), {"provider_control_token": "token"})(),
+    )
+    monkeypatch.setattr(harness, "_http_request", fake_request)
+    monkeypatch.setenv("APP_E2E_PROVIDER_SETTLE_SECONDS", "0")
+
+    with pytest.raises(harness.HarnessError, match="rejected or unscoped requests"):
+        application._cleanup_provider_run(ledger, {"run_id": run_id})
+    assert "DELETE" not in requests
+
+
 def test_exact_cleanup_request_receives_the_full_remaining_lifecycle_budget(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1217,20 +1324,22 @@ def test_e2e_values_keep_only_required_stack_and_exact_provider_egress() -> None
     assert models[0]["capabilities"] == ["chat", "auxiliary"]
     assert models[0]["contextWindow"] == 128000
     assert models[1]["capabilities"] == ["embedding"]
+    assert models[2]["capabilities"] == ["rerank"]
 
 
-def test_stateless_sandbox_values_enable_only_the_session_executor_profile() -> None:
+def test_stateless_sandbox_values_enable_session_executor_and_skill_catalogue() -> None:
     values = yaml.safe_load(
         harness.STATELESS_SANDBOX_VALUES_FILE.read_text(encoding="utf-8")
     )
 
     assert values == {
         "agent": {
+            "skillsDbEnabled": "true",
             "stateless": {
                 "enabled": True,
                 "replicas": 2,
                 "worker": {"enabled": False, "defaultEnabled": False},
-            }
+            },
         },
         "workspace": {
             "pvcEnabled": True,
@@ -1296,7 +1405,16 @@ def test_stateless_sandbox_profile_renders_current_executor_and_workspace_images
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
-@pytest.mark.parametrize("profile_name", ["pinned-virtual", "stateless-sandbox"])
+@pytest.mark.parametrize(
+    "profile_name",
+    [
+        "pinned-virtual",
+        "stateless-sandbox",
+        "forge-sandbox",
+        "cloud-sandbox",
+        "officer-watchdog",
+    ],
+)
 def test_session_profiles_do_not_render_an_extra_catalog_provider(
     profile_name: str,
 ) -> None:
@@ -1333,19 +1451,533 @@ def test_session_profiles_do_not_render_an_extra_catalog_provider(
     assert "SEARXNG_BASE_URL" not in {item["name"] for item in environment}
 
 
+def test_forge_sandbox_profile_composes_the_sandbox_overlay_and_adds_the_forge() -> (
+    None
+):
+    """The forge profile *extends* stateless-sandbox; it never replaces it.
+
+    B03's central lifecycle needs the forge, but its knowledge and citation
+    work still needs a workspace-backed session, so both overlays apply and the
+    shared baseline is the first file in the list.
+    """
+    sandbox = harness.resolve_profile("stateless-sandbox")
+    forge = harness.resolve_profile("forge-sandbox")
+
+    assert forge.values_files[: len(sandbox.values_files)] == sandbox.values_files
+    assert forge.values_files[-1] == harness.FORGE_SANDBOX_VALUES_FILE
+    assert forge.values_files[0] == harness.VALUES_FILE
+    assert forge.workspace_backend == sandbox.workspace_backend == "sandbox"
+    assert forge.execution_lane == sandbox.execution_lane == "stateless"
+    assert forge.include_workspace_image is True
+    assert forge.stateless_agents is True
+    assert forge.forge_enabled is True
+    assert forge.additional_deployments == sandbox.additional_deployments
+    assert forge.additional_statefulsets == ("srw-e2e-gitea",)
+    # The cheap baseline and the sandbox overlay must not have acquired a forge.
+    assert harness.resolve_profile("pinned-virtual").forge_enabled is False
+    assert sandbox.forge_enabled is False
+    assert sandbox.additional_statefulsets == ()
+    # And none of the three has acquired a cloud backend.
+    for name in ("pinned-virtual", "stateless-sandbox", "forge-sandbox"):
+        assert harness.resolve_profile(name).cloud_enabled is False
+
+
+def test_cloud_sandbox_extends_forge_sandbox_without_replacing_it() -> None:
+    """B04's profile *extends* forge-sandbox; it never replaces it.
+
+    B04 needs the workspace-backed stateless session (mounts, staging, End) and
+    the forge (repo reads, diff review, export), and adds the one thing neither
+    provides: a real main-cloud backend to attest, mount, stage and reload
+    against.
+    """
+    forge = harness.resolve_profile("forge-sandbox")
+    cloud = harness.resolve_profile("cloud-sandbox")
+
+    assert cloud.values_files[: len(forge.values_files)] == forge.values_files
+    assert cloud.values_files[-1] == harness.CLOUD_SANDBOX_VALUES_FILE
+    assert cloud.values_files[0] == harness.VALUES_FILE
+    assert cloud.workspace_backend == forge.workspace_backend == "sandbox"
+    assert cloud.execution_lane == forge.execution_lane == "stateless"
+    assert cloud.include_workspace_image is True
+    assert cloud.stateless_agents is True
+    assert cloud.forge_enabled is True
+    assert cloud.cloud_enabled is True
+    # A bound backend is not protected cloud mode. Without the flag every
+    # protected route answers "disabled" and the mount builders are never asked
+    # for a payload, which is the gap B04's acceptance recorded.
+    assert cloud.protected_cloud_enabled is True
+    for name in ("pinned-virtual", "stateless-sandbox", "forge-sandbox"):
+        assert harness.resolve_profile(name).protected_cloud_enabled is False
+    # The forge StatefulSet is inherited and the object store is added: without
+    # a blob store a protected session stages nothing and the review surface
+    # answers 200 with an empty diff.
+    assert set(forge.additional_statefulsets) < set(cloud.additional_statefulsets)
+    assert "srw-e2e-garage" in cloud.additional_statefulsets
+    # The backend is a Deployment, so it must be waited on as one.
+    assert "srw-e2e-nextcloud" in cloud.additional_deployments
+    assert set(forge.additional_deployments) <= set(cloud.additional_deployments)
+
+
+def test_officer_watchdog_extends_forge_sandbox_and_only_flips_reconciliation() -> None:
+    """B07's final gate *extends* forge-sandbox; it never replaces it.
+
+    The Officer watchdog's third duty submits a missing runtime to the shared
+    durable lifecycle owner, and that owner drops every automatic submission
+    while the chart default stands. The overlay exists to flip exactly that
+    one decision, so the profile must inherit the forge stack unchanged and
+    must not have acquired a cloud backend or protected cloud mode along the
+    way.
+    """
+    forge = harness.resolve_profile("forge-sandbox")
+    watchdog = harness.resolve_profile("officer-watchdog")
+
+    assert watchdog.values_files[: len(forge.values_files)] == forge.values_files
+    assert watchdog.values_files[-1] == harness.OFFICER_WATCHDOG_VALUES_FILE
+    assert watchdog.values_files[0] == harness.VALUES_FILE
+    assert watchdog.workspace_backend == forge.workspace_backend == "sandbox"
+    assert watchdog.execution_lane == forge.execution_lane == "stateless"
+    assert watchdog.include_workspace_image is True
+    assert watchdog.stateless_agents is True
+    assert watchdog.forge_enabled is True
+    assert watchdog.additional_deployments == forge.additional_deployments
+    assert watchdog.additional_statefulsets == forge.additional_statefulsets
+    # The one behavioural difference, in both directions.
+    assert watchdog.persistent_reconciliation_enabled is True
+    for name in (
+        "pinned-virtual",
+        "stateless-sandbox",
+        "forge-sandbox",
+        "cloud-sandbox",
+    ):
+        assert harness.resolve_profile(name).persistent_reconciliation_enabled is False
+    # And the gate under test did not drag a backend in with it.
+    assert watchdog.cloud_enabled is False
+    assert watchdog.protected_cloud_enabled is False
+
+
 @pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
-def test_generated_app_secret_covers_every_required_rendered_key() -> None:
+def test_officer_watchdog_profile_renders_the_reconciliation_flag(
+    tmp_path: Path,
+) -> None:
+    """The flag must reach the orchestrator, not just the values file.
+
+    The orchestrator Deployment does not ``envFrom`` the shared ConfigMap, so
+    a key that renders into the ConfigMap and is never referenced by the
+    Deployment would leave the duty just as unobservable as the default.
+    """
+    sha = "a" * 40
+    run_id = "20260824-123456-ab12cd34"
+    profile = harness.resolve_profile("officer-watchdog")
+    images, _commands = harness.build_image_commands(
+        sha, run_id, include_workspace=profile.include_workspace_image
+    )
+    image_values = tmp_path / "images.yaml"
+    image_values.write_text(
+        harness._image_values(images, sha, run_id), encoding="utf-8"
+    )
+    command = [
+        "helm",
+        "template",
+        "srw-e2e",
+        str(harness.REPO_ROOT / "helm"),
+        "-n",
+        harness.NAMESPACE,
+    ]
+    for values_file in profile.values_files:
+        command.extend(("-f", str(values_file)))
+    command.extend(("-f", str(image_values)))
     rendered = subprocess.run(
-        [
-            "helm",
-            "template",
-            "srw-e2e",
-            str(harness.REPO_ROOT / "helm"),
-            "-n",
-            harness.NAMESPACE,
-            "-f",
-            str(harness.VALUES_FILE),
-        ],
+        command, check=True, capture_output=True, text=True, timeout=120
+    ).stdout
+    documents = [document for document in yaml.safe_load_all(rendered) if document]
+    configs = [
+        document
+        for document in documents
+        if document.get("kind") == "ConfigMap"
+        and "PERSISTENT_AGENT_RECONCILIATION_ENABLED" in (document.get("data") or {})
+    ]
+    assert len(configs) == 1
+    assert configs[0]["data"]["PERSISTENT_AGENT_RECONCILIATION_ENABLED"] == "true"
+    deployments = [
+        document
+        for document in documents
+        if document.get("kind") == "Deployment"
+        and document["metadata"]["name"] == "srw-e2e-orchestrator"
+    ]
+    assert len(deployments) == 1
+    referenced = {
+        entry["name"]
+        for container in deployments[0]["spec"]["template"]["spec"]["containers"]
+        for entry in (container.get("env") or [])
+        if (entry.get("valueFrom") or {}).get("configMapKeyRef", {}).get("key")
+        == "PERSISTENT_AGENT_RECONCILIATION_ENABLED"
+    }
+    assert referenced == {"PERSISTENT_AGENT_RECONCILIATION_ENABLED"}
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
+def test_cloud_sandbox_renders_exactly_one_bundled_backend(tmp_path: Path) -> None:
+    """Nextcloud renders and is the selected backend; OpenCloud does not.
+
+    The chart defaults OpenCloud on and the configmap prefers it over
+    Nextcloud, so an overlay that only switched Nextcloud on would deploy a
+    second backend and select the wrong one.
+    """
+    sha = "a" * 40
+    run_id = "20260824-123456-ab12cd34"
+    profile = harness.resolve_profile("cloud-sandbox")
+    images, _commands = harness.build_image_commands(
+        sha, run_id, include_workspace=True
+    )
+    image_values = tmp_path / "images.yaml"
+    image_values.write_text(
+        harness._image_values(images, sha, run_id), encoding="utf-8"
+    )
+    command = [
+        "helm",
+        "template",
+        "srw-e2e",
+        str(harness.REPO_ROOT / "helm"),
+        "-n",
+        harness.NAMESPACE,
+    ]
+    for values_file in profile.values_files:
+        command.extend(("-f", str(values_file)))
+    command.extend(("-f", str(image_values)))
+    rendered = subprocess.run(
+        command, check=True, capture_output=True, text=True, timeout=120
+    ).stdout
+    documents = [document for document in yaml.safe_load_all(rendered) if document]
+    names = {
+        (document.get("kind"), document.get("metadata", {}).get("name"))
+        for document in documents
+    }
+    assert ("Deployment", "srw-e2e-nextcloud") in names
+    assert ("Service", "srw-e2e-nextcloud") in names
+    assert not any("opencloud" in (name or "") for _kind, name in names)
+    config = next(
+        document
+        for document in documents
+        if document.get("kind") == "ConfigMap"
+        and document.get("metadata", {}).get("name") == "srw-e2e-config"
+    )
+    # Without this the main-cloud endpoints answer "no backend bound" and every
+    # mount/stage assertion would be vacuous.
+    assert config["data"]["MAIN_CLOUD_BACKEND"] == "nextcloud"
+    assert config["data"]["NEXTCLOUD_URL"] == "http://srw-e2e-nextcloud"
+    assert "OPENCLOUD_URL" not in config["data"]
+    # Filesystem storage: a disposable cluster has no object store.
+    backend = next(
+        document
+        for document in documents
+        if document.get("kind") == "Deployment"
+        and document.get("metadata", {}).get("name") == "srw-e2e-nextcloud"
+    )
+    environment = {
+        item["name"]: item.get("value")
+        for item in backend["spec"]["template"]["spec"]["containers"][0]["env"]
+        if "name" in item
+    }
+    assert "SQLITE_DATABASE" in environment
+    assert not any(key.startswith("OBJECTSTORE_S3") for key in environment)
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
+def test_cloud_sandbox_renders_the_protected_effect_lane(tmp_path: Path) -> None:
+    """Protected cloud mode is on, and the server lane it needs is deployed.
+
+    ``agent.protectedCloudModeEnabled`` alone is inert: ``nextcloud.py`` answers
+    NOT_SUPPORTED on every capability request unless the effect lane is running,
+    so the chart derives the lane from the flag on a bundled, internal Nextcloud.
+    This asserts the derivation actually happened rather than trusting it, and
+    that the effect root is reachable by the orchestrator and by nothing in a
+    workspace.
+    """
+    sha = "a" * 40
+    run_id = "20260824-123456-ab12cd34"
+    profile = harness.resolve_profile("cloud-sandbox")
+    images, _commands = harness.build_image_commands(
+        sha, run_id, include_workspace=True
+    )
+    image_values = tmp_path / "images.yaml"
+    image_values.write_text(
+        harness._image_values(images, sha, run_id), encoding="utf-8"
+    )
+    command = [
+        "helm",
+        "template",
+        "srw-e2e",
+        str(harness.REPO_ROOT / "helm"),
+        "-n",
+        harness.NAMESPACE,
+    ]
+    for values_file in profile.values_files:
+        command.extend(("-f", str(values_file)))
+    command.extend(("-f", str(image_values)))
+    rendered = subprocess.run(
+        command, check=True, capture_output=True, text=True, timeout=120
+    ).stdout
+    documents = [document for document in yaml.safe_load_all(rendered) if document]
+
+    config = next(
+        document
+        for document in documents
+        if document.get("kind") == "ConfigMap"
+        and document.get("metadata", {}).get("name") == "srw-e2e-config"
+    )
+    assert config["data"]["PROTECTED_CLOUD_MODE_ENABLED"] == "true"
+    assert config["data"]["NEXTCLOUD_PROTECTED_EFFECT_URL"] == (
+        f"http://{harness.PROTECTED_EFFECT_SECRET_NAME}"
+    )
+
+    backend = next(
+        document
+        for document in documents
+        if document.get("kind") == "Deployment"
+        and document.get("metadata", {}).get("name") == "srw-e2e-nextcloud"
+    )
+    containers = [
+        container["name"]
+        for container in backend["spec"]["template"]["spec"]["containers"]
+    ]
+    assert containers == [
+        "nextcloud",
+        "nextcloud-protected-effect-fpm",
+        "nextcloud-protected-effect-nginx",
+    ]
+
+    kinds = {
+        (document.get("kind"), document.get("metadata", {}).get("name"))
+        for document in documents
+    }
+    assert ("Service", harness.PROTECTED_EFFECT_SECRET_NAME) in kinds
+    # The bundled object store, and the endpoint the chart derives from it.
+    assert ("StatefulSet", "srw-e2e-garage") in kinds
+    assert config["data"]["S3_ENDPOINT"] == "http://srw-e2e-garage:3900"
+    assert ("NetworkPolicy", harness.PROTECTED_EFFECT_SECRET_NAME) in kinds
+    # The chart must not create the effect Secret here: `secrets.create` is
+    # false on this stack, so the overlay names one and the harness mints it.
+    assert ("Secret", harness.PROTECTED_EFFECT_SECRET_NAME) not in kinds
+
+    orchestrator = next(
+        document
+        for document in documents
+        if document.get("kind") == "Deployment"
+        and document.get("metadata", {}).get("name") == "srw-e2e-orchestrator"
+    )
+    environment = {
+        item["name"]: item
+        for item in orchestrator["spec"]["template"]["spec"]["containers"][0]["env"]
+    }
+    hmac = environment["NEXTCLOUD_PROTECTED_EFFECT_HMAC_KEY"]["valueFrom"][
+        "secretKeyRef"
+    ]
+    assert hmac["name"] == harness.PROTECTED_EFFECT_SECRET_NAME
+    assert hmac["optional"] is False
+    # The effect root must never travel in the bundle agent Pods mount whole.
+    minted = harness.generated_secret_data(
+        harness.SecretBundle.generate(run_id),
+        vm_private_key="unused",
+        vm_public_key="unused",
+    )
+    assert "NEXTCLOUD_PROTECTED_EFFECT_HMAC_KEY" not in minted["srw-e2e-app-secrets"]
+    assert set(minted[harness.PROTECTED_EFFECT_SECRET_NAME]) == {
+        "NEXTCLOUD_PROTECTED_EFFECT_HMAC_KEY"
+    }
+
+
+@pytest.mark.parametrize("profile_name", sorted(harness.APPLICATION_E2E_PROFILES))
+def test_generated_app_secret_covers_the_backend_required_secrets(
+    profile_name: str,
+) -> None:
+    """A cloud profile must mint every secret the *application* requires.
+
+    The render check above reads Kubernetes: it can only see a `secretKeyRef`
+    the chart marks non-optional. `NEXTCLOUD_AGENT_PASSWORD` is not one of
+    those — the orchestrator mounts it `optional: true` — and yet
+    `services/cloud/config.py` lists `agent_password` in
+    `_REQUIRED_SECRET_ENVS["nextcloud"]`. Without it the main-cloud
+    installation authority never initialises, and the backend then reports
+    itself *bound* while refusing every effect with "does not support 'durable
+    active backend-instance authority'". Nothing fails; project cloud folders,
+    user homes and protected mounts simply never exist.
+
+    That is what B04's cloud acceptance actually ran against, so this reads the
+    application's own table rather than restating the key by hand.
+    """
+    profile = harness.resolve_profile(profile_name)
+    if not profile.cloud_enabled:
+        pytest.skip("profile binds no main-cloud backend")
+
+    from orchestrator.services.cloud.config import _REQUIRED_SECRET_ENVS
+
+    minted = set(
+        harness.SecretBundle.generate("20260824-123456-ab12cd34").app_secret_data()
+    )
+    # The cloud overlay selects the bundled Nextcloud; assert against that
+    # backend's own required set rather than a copy of it.
+    required = _REQUIRED_SECRET_ENVS["nextcloud"]
+    missing = sorted(
+        field
+        for field, env_vars in required.items()
+        if not any(env_var in minted for env_var in env_vars)
+    )
+    assert not missing, (
+        f"profile {profile_name!r} binds nextcloud but mints no secret for "
+        f"{missing}; the backend will report itself bound and refuse every "
+        "cloud effect"
+    )
+
+
+def test_generated_app_secret_mints_the_ide_credential_root() -> None:
+    """Every profile must mint `IDE_CREDENTIAL_KEY`, for the same reason as above.
+
+    The chart mounts it `optional: true` — deliberately, because unset must mean
+    "no credential can be derived, so the browser IDE stays contained" and never
+    "fall back to an unauthenticated code-server". So the render check two tests
+    up cannot see it missing, and neither can Kubernetes: pods start, the API
+    answers, and only the IDE lane is quietly dead. `services/ide_proxy.py`
+    reports `ide_credential_key_unconfigured` and withholds the URL.
+
+    R1.B05 froze with "the live IDE HTTP/WebSocket proxy is unexercised" as a
+    qualification for exactly this reason: its refusals were covered, its success
+    path could not be reached on any profile. This asserts the fixture can reach
+    it.
+    """
+    minted = harness.SecretBundle.generate("20260824-123456-ab12cd34").app_secret_data()
+
+    assert "IDE_CREDENTIAL_KEY" in minted, (
+        "no profile mints IDE_CREDENTIAL_KEY; the orchestrator will refuse every "
+        "browser-IDE URL with ide_credential_key_unconfigured and no pod will "
+        "fail to say so"
+    )
+    # A short root would derive weak per-workspace credentials; the chart's own
+    # generator is randAlphaNum(48).
+    assert len(minted["IDE_CREDENTIAL_KEY"]) >= 32
+
+
+def test_profile_overlays_have_no_duplicate_top_level_keys() -> None:
+    """A repeated top-level key in an overlay silently drops the first block.
+
+    PyYAML — and Helm — keep the last mapping entry, so appending a second
+    ``nextcloud:`` to an overlay that already had one deletes
+    ``nextcloud.enabled`` without a word. Nothing else in this suite would
+    notice: the render still succeeds, it just deploys the wrong thing.
+    """
+
+    for profile in harness.APPLICATION_E2E_PROFILES.values():
+        for values_file in profile.values_files:
+            document = yaml.safe_load(values_file.read_text(encoding="utf-8"))
+            assert isinstance(document, dict)
+            text = values_file.read_text(encoding="utf-8")
+            top_level = [
+                line.split(":", 1)[0]
+                for line in text.splitlines()
+                if line
+                and not line[0].isspace()
+                and not line.startswith("#")
+                and ":" in line
+            ]
+            duplicates = sorted({key for key in top_level if top_level.count(key) > 1})
+            assert not duplicates, (
+                f"{values_file.name} repeats top-level key(s) {duplicates}; "
+                "the later block silently replaces the earlier one"
+            )
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
+def test_forge_sandbox_renders_the_bundled_forge_without_a_second_database(
+    tmp_path: Path,
+) -> None:
+    """Gitea renders, on sqlite3, with no `srw-giteadb` StatefulSet."""
+    sha = "a" * 40
+    run_id = "20260824-123456-ab12cd34"
+    profile = harness.resolve_profile("forge-sandbox")
+    images, _commands = harness.build_image_commands(
+        sha, run_id, include_workspace=True
+    )
+    image_values = tmp_path / "images.yaml"
+    image_values.write_text(
+        harness._image_values(images, sha, run_id), encoding="utf-8"
+    )
+    command = [
+        "helm",
+        "template",
+        "srw-e2e",
+        str(harness.REPO_ROOT / "helm"),
+        "-n",
+        harness.NAMESPACE,
+    ]
+    for values_file in profile.values_files:
+        command.extend(("-f", str(values_file)))
+    command.extend(("-f", str(image_values)))
+    rendered = subprocess.run(
+        command, check=True, capture_output=True, text=True, timeout=120
+    ).stdout
+    documents = [document for document in yaml.safe_load_all(rendered) if document]
+    names = {
+        (document.get("kind"), document.get("metadata", {}).get("name"))
+        for document in documents
+    }
+    assert ("StatefulSet", "srw-e2e-gitea") in names
+    assert ("Service", "srw-e2e-gitea") in names
+    assert not any(
+        kind == "StatefulSet" and (name or "").endswith("giteadb")
+        for kind, name in names
+    )
+    forge = next(
+        document
+        for document in documents
+        if document.get("kind") == "StatefulSet"
+        and document.get("metadata", {}).get("name") == "srw-e2e-gitea"
+    )
+    environment = {
+        item["name"]: item.get("value")
+        for item in forge["spec"]["template"]["spec"]["containers"][0]["env"]
+    }
+    assert environment["GITEA__database__DB_TYPE"] == "sqlite3"
+    config = next(
+        document
+        for document in documents
+        if document.get("kind") == "ConfigMap"
+        and document.get("metadata", {}).get("name") == "srw-e2e-config"
+    )
+    # The orchestrator reaches the forge in-cluster; without this the client
+    # reports `Gitea not reachable` and every project falls back.
+    assert config["data"]["GITEA_INTERNAL_URL"] == "http://srw-e2e-gitea:3000"
+    # Composition is real, not just declared: the sandbox overlay still applies.
+    assert config["data"]["STATELESS_SESSION_ENABLED"] == "true"
+    assert config["data"]["WORKSPACE_IMAGE"] == images["workspace"]
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
+@pytest.mark.parametrize("profile_name", sorted(harness.APPLICATION_E2E_PROFILES))
+def test_generated_app_secret_covers_every_required_rendered_key(
+    profile_name: str,
+) -> None:
+    """Every profile's non-optional secret refs must be keys the harness mints.
+
+    Parametrized over all profiles, not just the baseline. A profile that
+    enables a component pulls in that component's `secretKeyRef`s, and a key the
+    bundle does not mint is a `CreateContainerConfigError` — which, for anything
+    Keycloak-adjacent, stalls every pod that waits on Keycloak, i.e. every pod.
+    That is exactly how `cloud-sandbox` first failed: enabling the bundled
+    Nextcloud made the Keycloak bootstrap require `NEXTCLOUD_OIDC_CLIENT_SECRET`,
+    and the baseline-only render here could not see it.
+    """
+    profile = harness.resolve_profile(profile_name)
+    command = [
+        "helm",
+        "template",
+        "srw-e2e",
+        str(harness.REPO_ROOT / "helm"),
+        "-n",
+        harness.NAMESPACE,
+    ]
+    for values_file in profile.values_files:
+        command.extend(("-f", str(values_file)))
+    rendered = subprocess.run(
+        command,
         check=True,
         capture_output=True,
         text=True,
@@ -1366,18 +1998,37 @@ def test_generated_app_secret_covers_every_required_rendered_key() -> None:
 
     for document in documents:
         walk(document)
+    minted = harness.generated_secret_data(
+        harness.SecretBundle.generate("20260824-123456-ab12cd34"),
+        vm_private_key="unused",
+        vm_public_key="unused",
+    )
     required_app_keys = {
         ref["key"]
         for ref in refs
         if ref.get("name") == "srw-e2e-app-secrets"
         and ref.get("optional", False) is not True
     }
-    generated_keys = set(
-        harness.SecretBundle.generate("20260824-123456-ab12cd34").app_secret_data()
-    )
 
-    assert required_app_keys <= generated_keys
+    # Every required reference, not only the ones aimed at the application
+    # bundle. A component whose key lives in a Secret of its own -- the
+    # protected-effect root, say -- fails exactly the same way, and filtering on
+    # one Secret name cannot see it.
+    missing = sorted(
+        f"{ref['name']}/{ref['key']}"
+        for ref in refs
+        if ref.get("optional", False) is not True
+        and ref["key"] not in minted.get(ref.get("name"), ())
+    )
+    assert not missing, (
+        f"profile {profile_name!r} renders secret keys the harness never mints: "
+        f"{missing}"
+    )
     assert {"GITEA_ADMIN_USER", "GITEA_ADMIN_PASSWORD"} <= required_app_keys
+    if profile.cloud_enabled:
+        assert "NEXTCLOUD_OIDC_CLIENT_SECRET" in required_app_keys
+    if profile_name != harness.DEFAULT_PROFILE_NAME:
+        return
 
     shared_config = next(
         document

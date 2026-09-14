@@ -1,3 +1,4 @@
+import {workspaceCreationFields, workspacePreviewConfig} from "../agent-settings/workspace-selection";
 import {Component, computed, effect, inject, OnInit, signal, ViewChild} from '@angular/core';
 import {ActivatedRoute, Router} from '@angular/router';
 import {HttpClient} from '@angular/common/http';
@@ -106,6 +107,7 @@ interface Expert {
 }
 
 interface ExpertDetail extends Expert {
+  workspace_preference?: {backend: "none" | "virtual" | "sandbox" | "vm"} | null;
   config: Record<string, unknown>;
   instructions: string | null;
   settings_matrix?: Record<string, Record<string, unknown>>;
@@ -187,11 +189,9 @@ interface ExpertDetail extends Expert {
              "Show all experts" lists every role — the server accepts a
              cross-role pick and resolves it on the session overlay. -->
         <app-form-field [label]="'sessions.create.expertLabel' | transloco">
-          <div class="expert-toolbar">
-            <app-switch size="sm" [checked]="showAllExperts()" [disabled]="creating()" (changed)="setShowAllExperts($event)">
-              {{ 'experts.showAll' | transloco }}
-            </app-switch>
-          </div>
+          <app-switch formFieldAction size="sm" [checked]="showAllExperts()" [disabled]="creating()" (changed)="setShowAllExperts($event)">
+            {{ 'experts.showAll' | transloco }}
+          </app-switch>
           @if (loadingExperts()) {
             <div class="loading-hint">{{ 'sessions.create.expertLoading' | transloco }}</div>
           } @else if (experts().length > 0) {
@@ -229,9 +229,12 @@ interface ExpertDetail extends Expert {
         </app-form-field>
 
         <!-- Agent Settings (horizontal tabs: Settings / Advanced) -->
+        @if (expertDetail()?.workspace_preference?.backend; as preference) {
+          <p class="field-hint">{{ 'agentSettings.execution.workspaceRecommendation' | transloco:{tier: preference} }}</p>
+        }
         <app-agent-settings
           mode="session"
-          [config]="expertDetail()?.config ?? frameworkDefaults() ?? {}"
+          [config]="workspaceConfig()"
           [resolvedToolset]="toolPreview()"
           [readsResolvedToolset]="true"
           [disabled]="creating()"
@@ -245,6 +248,7 @@ interface ExpertDetail extends Expert {
           [initialDatasourceIds]="prefillDatasourceIds()"
           [loadingExpert]="loadingExpert()"
           [gatedCapabilities]="capabilities.grants() ?? null"
+          (change)="loadToolPreview()"
           (retryDatasources)="loadDatasourcesList()"
         />
 
@@ -266,7 +270,7 @@ interface ExpertDetail extends Expert {
           <app-button
             variant="primary"
             [loading]="creating()"
-            [disabled]="loadingDatasources() || datasourceLoadError()"
+            [disabled]="loadingDatasources() || datasourceLoadError() || loadingExpert() || loadingWorkspacePreview()"
             (clicked)="createSession()"
           >
             {{ creating() ? ('sessions.create.creating' | transloco) : ('sessions.create.createSession' | transloco) }}
@@ -328,7 +332,7 @@ interface ExpertDetail extends Expert {
       border-radius: var(--radius-control);
       background: var(--danger-tint);
       border: 1px solid var(--danger-tint);
-      color: var(--danger-color);
+      color: var(--danger);
       font-size: 13px;
     }
 
@@ -355,11 +359,6 @@ interface ExpertDetail extends Expert {
       font-size: 12px;
       color: var(--text-muted);
       padding: 8px 0;
-    }
-    .expert-toolbar {
-      display: flex;
-      justify-content: flex-end;
-      margin-bottom: 8px;
     }
     .expert-grid {
       display: grid;
@@ -520,7 +519,12 @@ export class SessionCreateComponent implements OnInit {
    * anyone remembering to check a flag.
    */
   readonly toolPreview = signal<SessionToolGroupsResponse | null>(null);
+  readonly workspaceConfig = computed(() => workspacePreviewConfig(
+    this.expertDetail()?.config ?? this.frameworkDefaults() ?? {}, this.toolPreview()?.workspace,
+  ));
   private toolPreviewSerial = 0;
+  private expertDetailSerial = 0;
+  readonly loadingWorkspacePreview = signal(false);
   readonly loadingExperts = signal(false);
   readonly loadingExpert = signal(false);
   readonly datasources = signal<EligibleDatasource[]>([]);
@@ -887,11 +891,14 @@ export class SessionCreateComponent implements OnInit {
   }
 
   private fetchExpertDetail(expertId: string): void {
+    const serial = ++this.expertDetailSerial;
+    this.expertDetail.set(null);
     this.loadingExpert.set(true);
     this.http.get<ExpertDetail>(
-      `${environment.apiUrl}/experts/${expertId}?account_defaults=true`,
+      `${environment.apiUrl}/experts/${expertId}?account_defaults=true&role=session`,
     ).subscribe({
       next: (detail) => {
+        if (serial !== this.expertDetailSerial) return;
         this.expertDetail.set(detail);
         if (detail?.config) this.agentSettings?.prefillFromConfig(detail.config);
         // Must run AFTER prefillFromConfig: that call resets the model group
@@ -899,8 +906,9 @@ export class SessionCreateComponent implements OnInit {
         // win over a model override applied before it.
         this.applyModelPrefillOnce();
         this.loadingExpert.set(false);
+        this.loadToolPreview();
       },
-      error: () => this.loadingExpert.set(false),
+      error: () => { if (serial === this.expertDetailSerial) this.loadingExpert.set(false); },
     });
     this.loadToolPreview();
   }
@@ -940,8 +948,9 @@ export class SessionCreateComponent implements OnInit {
    * the same late-response bug the live pane's forkJoin exists to prevent,
    * rebuilt on the other surface.
    */
-  private loadToolPreview(): void {
+  loadToolPreview(): void {
     const serial = ++this.toolPreviewSerial;
+    this.loadingWorkspacePreview.set(true);
     const expert = this.selectedExpert();
     const projectIds = Array.from(this.selectedProjectIds());
     // Routed EXACTLY as createSession routes it. A preview that resolved a
@@ -949,11 +958,14 @@ export class SessionCreateComponent implements OnInit {
     // series' defect in the surface built to prevent it.
     const {configName, expertId} = this.expertRouting(expert);
     this.api.previewToolGroups({
+      config_override: this.agentSettings?.getOverrides() ?? {},
+      workspace_preference: this.expertDetail()?.workspace_preference?.backend ?? null,
       config_name: configName,
       expert_id: expertId ?? null,
       project_id: projectIds.length === 1 ? projectIds[0] : null,
     }).subscribe((preview) => {
       if (serial !== this.toolPreviewSerial) return;
+      this.loadingWorkspacePreview.set(false);
       this.toolPreview.set(preview);
       const categories = preview?.categories;
       if (categories && !this.agentSettings?.hasToolEdits()) {
@@ -982,7 +994,7 @@ export class SessionCreateComponent implements OnInit {
   }
 
   async createSession(): Promise<void> {
-    if (this.loadingDatasources() || this.datasourceLoadError()) return;
+    if (this.loadingDatasources() || this.datasourceLoadError() || this.loadingExpert() || this.loadingWorkspacePreview()) return;
     this.creating.set(true);
 
     const expert = this.selectedExpert();
@@ -990,7 +1002,8 @@ export class SessionCreateComponent implements OnInit {
     const projectIds = Array.from(this.selectedProjectIds());
 
     // Build config_override from settings component
-    const configOverride = this.agentSettings?.getOverrides() ?? {};
+    const workspaceFields = workspaceCreationFields(this.agentSettings?.getOverrides() ?? {}, this.toolPreview()?.workspace);
+    const configOverride = workspaceFields.config_override;
 
     // Extract permission_mode and model from overrides (session-specific handling).
     // Only send permission_mode when the user actually picked a per-session
@@ -1017,6 +1030,8 @@ export class SessionCreateComponent implements OnInit {
     if (hasNonTrivialOverrides) {
       body['config_override'] = configOverride;
     }
+
+    if ("workspace" in workspaceFields) body["workspace"] = workspaceFields.workspace;
 
     // Datasource IDs
     const dsIds = this.agentSettings?.getSelectedDatasourceIds() ?? [];

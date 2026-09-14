@@ -38,6 +38,9 @@ ASSET_ROOT: Final = REPO_ROOT / "tests/e2e/app"
 K3D_TEMPLATE: Final = ASSET_ROOT / "k3d.yaml"
 VALUES_FILE: Final = ASSET_ROOT / "values-e2e.yaml"
 STATELESS_SANDBOX_VALUES_FILE: Final = ASSET_ROOT / "values-stateless-sandbox.yaml"
+FORGE_SANDBOX_VALUES_FILE: Final = ASSET_ROOT / "values-forge-sandbox.yaml"
+CLOUD_SANDBOX_VALUES_FILE: Final = ASSET_ROOT / "values-cloud-sandbox.yaml"
+OFFICER_WATCHDOG_VALUES_FILE: Final = ASSET_ROOT / "values-officer-watchdog.yaml"
 PROVIDER_MANIFEST: Final = ASSET_ROOT / "deterministic_provider/kubernetes.yaml"
 PROVIDER_DOCKERFILE: Final = ASSET_ROOT / "deterministic_provider/Dockerfile"
 PLAYWRIGHT_RUNNER_DOCKERFILE: Final = ASSET_ROOT / "Dockerfile.playwright"
@@ -67,6 +70,11 @@ RELEASE: Final = "srw-e2e"
 BASE_HOST: Final = "srw-e2e.test"
 BASE_URL: Final = f"http://{BASE_HOST}"
 PROVIDER_IMAGE_PLACEHOLDER: Final = "srw-e2e-model-fixture:local"
+# The protected-effect lane's dedicated HMAC Secret. The cloud profile names
+# it through `nextcloud.protectedEffect.hmacSecretName`; the chart then does
+# not create one, which is what lets the lane render under `secrets.create:
+# false`.
+PROTECTED_EFFECT_SECRET_NAME: Final = "srw-e2e-protected-effect"
 PROVIDER_SERVICE_BASE: Final = (
     "http://srw-e2e-model-fixture.srw-e2e.svc.cluster.local:8000/v1"
 )
@@ -117,6 +125,39 @@ class ApplicationE2EProfile:
     execution_lane: str
     include_workspace_image: bool = False
     additional_deployments: tuple[str, ...] = ()
+    #: Extra StatefulSets whose rollout must settle before the journey runs.
+    #: Deployments and StatefulSets are separate `kubectl rollout status`
+    #: resource kinds, so a forge cannot be waited on through the field above.
+    additional_statefulsets: tuple[str, ...] = ()
+    #: This profile runs the stateless executor Deployment. A behavioural flag
+    #: rather than a name comparison so that adding a profile which composes
+    #: the stateless overlay cannot silently skip the executor image check.
+    stateless_agents: bool = False
+    #: This profile deploys the bundled forge. Project provisioning, project
+    #: repositories and knowledge-vault materialisation all go through it.
+    forge_enabled: bool = False
+    #: This profile deploys a bundled main-cloud backend, so ``MAIN_CLOUD_BACKEND``
+    #: resolves and the cloud mount/stage/settings surfaces answer for real
+    #: rather than as "no backend bound". A behavioural flag, not a name
+    #: comparison, so a later profile composing this overlay cannot silently
+    #: skip the backend check.
+    cloud_enabled: bool = False
+    #: This profile turns protected cloud mode on, so a marked session is
+    #: actually admitted: an RO reader is provisioned, the capture overlay is
+    #: built, and ``cloud_mount`` reaches the workspace runtime. A bound backend
+    #: alone does not do this -- with the mode off every protected route answers
+    #: the "disabled" refusal and the mount builders are never asked for a
+    #: payload. Behavioural, for the same reason as the flag above.
+    protected_cloud_enabled: bool = False
+    #: This profile lets the shared durable lifecycle owner accept an
+    #: *automatic* submission. The Officer watchdog's third duty hands a
+    #: missing runtime to that owner rather than repairing it itself, and the
+    #: owner drops every automatic submission while the chart default
+    #: (``PERSISTENT_AGENT_RECONCILIATION_ENABLED: false``) stands, so the duty
+    #: is unobservable without it. Behavioural, for the same reason as the
+    #: flags above: a later profile composing this overlay must not silently
+    #: lose the property the check depends on.
+    persistent_reconciliation_enabled: bool = False
 
 
 APPLICATION_E2E_PROFILES: Final = {
@@ -133,6 +174,61 @@ APPLICATION_E2E_PROFILES: Final = {
         execution_lane="stateless",
         include_workspace_image=True,
         additional_deployments=("srw-e2e-agent-stateless",),
+        stateless_agents=True,
+    ),
+    "forge-sandbox": ApplicationE2EProfile(
+        name="forge-sandbox",
+        values_files=(
+            VALUES_FILE,
+            STATELESS_SANDBOX_VALUES_FILE,
+            FORGE_SANDBOX_VALUES_FILE,
+        ),
+        workspace_backend="sandbox",
+        execution_lane="stateless",
+        include_workspace_image=True,
+        additional_deployments=("srw-e2e-agent-stateless",),
+        additional_statefulsets=("srw-e2e-gitea",),
+        stateless_agents=True,
+        forge_enabled=True,
+    ),
+    "cloud-sandbox": ApplicationE2EProfile(
+        name="cloud-sandbox",
+        values_files=(
+            VALUES_FILE,
+            STATELESS_SANDBOX_VALUES_FILE,
+            FORGE_SANDBOX_VALUES_FILE,
+            CLOUD_SANDBOX_VALUES_FILE,
+        ),
+        workspace_backend="sandbox",
+        execution_lane="stateless",
+        include_workspace_image=True,
+        additional_deployments=("srw-e2e-agent-stateless", "srw-e2e-nextcloud"),
+        # Garage is the bundled object store. It is waited on here, not merely
+        # deployed: staging a captured overlay writes a tar through
+        # `snapshot_service.upload_blob_file`, so a protected session whose
+        # store is not up yet stages nothing and reports an empty diff.
+        additional_statefulsets=("srw-e2e-gitea", "srw-e2e-garage"),
+        stateless_agents=True,
+        forge_enabled=True,
+        cloud_enabled=True,
+        protected_cloud_enabled=True,
+    ),
+    "officer-watchdog": ApplicationE2EProfile(
+        name="officer-watchdog",
+        values_files=(
+            VALUES_FILE,
+            STATELESS_SANDBOX_VALUES_FILE,
+            FORGE_SANDBOX_VALUES_FILE,
+            OFFICER_WATCHDOG_VALUES_FILE,
+        ),
+        workspace_backend="sandbox",
+        execution_lane="stateless",
+        include_workspace_image=True,
+        additional_deployments=("srw-e2e-agent-stateless",),
+        additional_statefulsets=("srw-e2e-gitea",),
+        stateless_agents=True,
+        forge_enabled=True,
+        persistent_reconciliation_enabled=True,
     ),
 }
 
@@ -219,7 +315,55 @@ class SecretBundle:
     session_jwt_secret: str = dataclasses.field(repr=False)
     mcp_internal_key: str = dataclasses.field(repr=False)
     gitea_oidc_secret: str = dataclasses.field(repr=False)
+    nextcloud_oidc_secret: str = dataclasses.field(repr=False)
+    nextcloud_admin_password: str = dataclasses.field(repr=False)
+    #: The `agent-service` account's password. Required, not decorative: the
+    #: orchestrator's main-cloud loader lists `agent_password` in
+    #: `_REQUIRED_SECRET_ENVS["nextcloud"]`, and without it the installation
+    #: authority never initialises -- so the backend is *bound* but every cloud
+    #: effect refuses with "does not support durable active backend-instance
+    #: authority". Nextcloud's own setup hook creates `agent-service` with this
+    #: value, so both halves must read the same key or the orchestrator
+    #: authenticates as an account whose password only Nextcloud knows.
+    nextcloud_agent_password: str = dataclasses.field(repr=False)
+    #: Root key for per-workspace code-server credentials. The orchestrator's
+    #: `secretKeyRef` for `IDE_CREDENTIAL_KEY` is `optional: true` and
+    #: `services/ide_proxy.py` fails *closed* without it: the thread's IDE
+    #: status answers `ide_credential_key_unconfigured` and withholds the URL
+    #: rather than handing out one the proxy would refuse. That is the correct
+    #: production default and a silent hole in a fixture -- the whole browser
+    #: IDE lane (HTTP proxy, WebSocket upgrade, content and stream delivery)
+    #: is unreachable, and nothing fails to say so. R1.B05 shipped with exactly
+    #: that gap as a recorded qualification. Minted unconditionally like the
+    #: Gitea/Nextcloud keys so the secret topology does not vary by profile.
+    #:
+    #: This one belongs in ``app_secret_data()`` and not in its own Secret, in
+    #: deliberate contrast to ``protected_effect_hmac_key``: the chart puts
+    #: `IDE_CREDENTIAL_KEY` in the same application Secret in production
+    #: (`helm/templates/secret.yaml`), so a dedicated Secret here would make the
+    #: fixture exercise a topology no deployment has. The wider question of
+    #: agent Pods receiving the whole bundle through ``envFrom`` is a real and
+    #: separate posture issue; it is not resolved by making this profile lie.
+    ide_credential_key: str = dataclasses.field(repr=False)
     gitea_admin_password: str = dataclasses.field(repr=False)
+    #: The protected-effect lane's adoption-once HMAC root. Deliberately NOT a
+    #: member of ``app_secret_data()``: dynamic agent Pods consume that bundle
+    #: through ``envFrom``, and the effect root must never be readable from a
+    #: workspace. It is minted into its own Secret, named by the cloud profile's
+    #: ``nextcloud.protectedEffect.hmacSecretName``.
+    protected_effect_hmac_key: str = dataclasses.field(repr=False)
+    #: The bundled object store's credentials. Garage's `key/import` accepts
+    #: only its native format, and `secret.yaml` refuses anything else rather
+    #: than generating a replacement, so these are not free-form tokens:
+    #: the RPC secret and each S3 secret are 64 hex characters, and an access
+    #: key id is "GK" followed by 24. An id and its secret are one credential
+    #: and are minted together.
+    garage_rpc_secret: str = dataclasses.field(repr=False)
+    garage_admin_token: str = dataclasses.field(repr=False)
+    snapshot_s3_access_key_id: str = dataclasses.field(repr=False)
+    snapshot_s3_secret_access_key: str = dataclasses.field(repr=False)
+    virtual_workspace_s3_access_key_id: str = dataclasses.field(repr=False)
+    virtual_workspace_s3_secret_access_key: str = dataclasses.field(repr=False)
 
     @classmethod
     def generate(cls, run_id: str) -> SecretBundle:
@@ -245,7 +389,21 @@ class SecretBundle:
             session_jwt_secret=token(48),
             mcp_internal_key=token(48),
             gitea_oidc_secret=token(48),
+            nextcloud_oidc_secret=token(48),
+            nextcloud_admin_password=token(24),
+            nextcloud_agent_password=token(24),
+            # `secret.yaml` generates randAlphaNum(48) for this key when the
+            # chart owns the Secret; match that length here.
+            ide_credential_key=token(36),
             gitea_admin_password=token(36),
+            # The chart floor is 32 bytes; 48 matches its own randAlphaNum(48).
+            protected_effect_hmac_key=token(48),
+            garage_rpc_secret=secrets.token_hex(32),
+            garage_admin_token=token(24),
+            snapshot_s3_access_key_id=f"GK{secrets.token_hex(12)}",
+            snapshot_s3_secret_access_key=secrets.token_hex(32),
+            virtual_workspace_s3_access_key_id=f"GK{secrets.token_hex(12)}",
+            virtual_workspace_s3_secret_access_key=secrets.token_hex(32),
         )
 
     @classmethod
@@ -283,12 +441,51 @@ class SecretBundle:
             "KC_REALM_ADMIN_PASSWORD": self.realm_test_password,
             "KC_CLIENT_SECRET": self.keycloak_client_secret,
             "GITEA_OIDC_CLIENT_SECRET": self.gitea_oidc_secret,
+            "NEXTCLOUD_OIDC_CLIENT_SECRET": self.nextcloud_oidc_secret,
+            "NEXTCLOUD_ADMIN_USER": "admin",
+            "NEXTCLOUD_ADMIN_PASSWORD": self.nextcloud_admin_password,
+            # Not optional in any sense that matters. The orchestrator's
+            # `secretKeyRef` for it is `optional: true`, so a render check
+            # cannot see it missing -- but `services/cloud/config.py` lists
+            # `agent_password` as a REQUIRED secret for the nextcloud backend,
+            # and an unset one leaves the installation authority uninitialised.
+            # The backend then reports itself bound while refusing every effect
+            # with "does not support 'durable active backend-instance
+            # authority'": no project cloud folder, no user home, no protected
+            # mount. Nextcloud's setup hook creates `agent-service` with this
+            # exact value, so the two sides must agree.
+            "NEXTCLOUD_AGENT_PASSWORD": self.nextcloud_agent_password,
+            # Minted unconditionally like the rest: the profile that enables
+            # the bundled object store pulls these in, and a key the harness
+            # does not mint is a pod that never starts.
+            "GARAGE_RPC_SECRET": self.garage_rpc_secret,
+            "GARAGE_ADMIN_TOKEN": self.garage_admin_token,
+            "SNAPSHOT_S3_ACCESS_KEY_ID": self.snapshot_s3_access_key_id,
+            "SNAPSHOT_S3_SECRET_ACCESS_KEY": self.snapshot_s3_secret_access_key,
+            "VIRTUAL_WORKSPACE_S3_ACCESS_KEY_ID": (
+                self.virtual_workspace_s3_access_key_id
+            ),
+            "VIRTUAL_WORKSPACE_S3_SECRET_ACCESS_KEY": (
+                self.virtual_workspace_s3_secret_access_key
+            ),
+            # Minted unconditionally, like the Gitea one above: the Keycloak
+            # bootstrap job mounts NEXTCLOUD_OIDC_CLIENT_SECRET by key whenever
+            # `nextcloud.enabled`, and a missing key is a
+            # CreateContainerConfigError that stalls every pod waiting on
+            # Keycloak — which is every pod. Minting it always keeps the secret
+            # shape identical across profiles.
             # The orchestrator keeps non-optional bootstrap refs for these
             # even when the bundled Gitea workload is disabled.
             "GITEA_ADMIN_USER": "e2e-gitea-admin",
             "GITEA_ADMIN_PASSWORD": self.gitea_admin_password,
             "SESSION_JWT_SECRET": self.session_jwt_secret,
             "MCP_INTERNAL_KEY": self.mcp_internal_key,
+            # Without this the browser IDE lane cannot be exercised at all --
+            # see the field's own note. `optional: true` on the chart side
+            # means no render check can catch its absence, so
+            # `test_generated_app_secret_mints_the_ide_credential_root` guards
+            # it the same way the Nextcloud agent password is guarded.
+            "IDE_CREDENTIAL_KEY": self.ide_credential_key,
             "OPENAI_API_KEY": "",
             "ANTHROPIC_API_KEY": "",
             "GROQ_API_KEY": "",
@@ -306,6 +503,41 @@ class SecretBundle:
             "APP_E2E_CHAT_MODEL": "e2e-chat",
             "APP_E2E_EMBEDDING_MODEL": "e2e-embedding",
         }
+
+
+def generated_secret_data(
+    bundle: SecretBundle, *, vm_private_key: str, vm_public_key: str
+) -> dict[str, dict[str, str]]:
+    """Every Kubernetes Secret this harness mints, keyed by name.
+
+    One source of truth. ``create_secrets_and_fixture`` applies exactly these
+    manifests, and ``test_harness.py`` checks every non-optional
+    ``secretKeyRef`` in every profile's render against them. A required key
+    nothing mints is a ``CreateContainerConfigError``, and for anything a
+    Keycloak-adjacent pod mounts that stalls every pod which waits on Keycloak
+    — a deploy that never finishes rather than a failure that says so.
+
+    All four are minted on every profile, so the secret topology does not vary
+    with the overlay set. ``srw-e2e-protected-effect`` is deliberately its own
+    Secret rather than a key in the application bundle: dynamic agent Pods
+    consume that bundle wholesale through ``envFrom``, and the protected-effect
+    root must never be readable from a workspace.
+    """
+
+    return {
+        "srw-e2e-app-secrets": bundle.app_secret_data(),
+        "srw-e2e-vm-ssh-key": {
+            "ssh-privatekey": vm_private_key,
+            "ssh-publickey": vm_public_key,
+        },
+        "srw-e2e-model-fixture": {
+            "control-token": bundle.provider_control_token,
+            "inference-api-key": bundle.provider_api_key,
+        },
+        PROTECTED_EFFECT_SECRET_NAME: {
+            "NEXTCLOUD_PROTECTED_EFFECT_HMAC_KEY": bundle.protected_effect_hmac_key,
+        },
+    }
 
 
 def utc_now() -> str:
@@ -1921,32 +2153,15 @@ class ApplicationE2EHarness:
             {
                 "apiVersion": "v1",
                 "kind": "Secret",
-                "metadata": {"name": "srw-e2e-app-secrets", "namespace": NAMESPACE},
+                "metadata": {"name": name, "namespace": NAMESPACE},
                 "type": "Opaque",
-                "stringData": bundle.app_secret_data(),
-            },
-            {
-                "apiVersion": "v1",
-                "kind": "Secret",
-                "metadata": {"name": "srw-e2e-vm-ssh-key", "namespace": NAMESPACE},
-                "type": "Opaque",
-                "stringData": {
-                    "ssh-privatekey": private_key.read_text(encoding="utf-8"),
-                    "ssh-publickey": (run_dir / "vm-ssh-key.pub").read_text(
-                        encoding="utf-8"
-                    ),
-                },
-            },
-            {
-                "apiVersion": "v1",
-                "kind": "Secret",
-                "metadata": {"name": "srw-e2e-model-fixture", "namespace": NAMESPACE},
-                "type": "Opaque",
-                "stringData": {
-                    "control-token": bundle.provider_control_token,
-                    "inference-api-key": bundle.provider_api_key,
-                },
-            },
+                "stringData": data,
+            }
+            for name, data in generated_secret_data(
+                bundle,
+                vm_private_key=private_key.read_text(encoding="utf-8"),
+                vm_public_key=(run_dir / "vm-ssh-key.pub").read_text(encoding="utf-8"),
+            ).items()
         ]
         # Secret values travel over stdin, never process argv or harness output.
         for index, manifest in enumerate(manifests, start=1):
@@ -2025,12 +2240,19 @@ class ApplicationE2EHarness:
                 "E2E Helm install must preserve failed state for diagnostics"
             )
         self.runner.run(command, timeout=960, label="E2E Helm deployment")
-        for deployment in (
-            "srw-e2e-orchestrator",
-            "srw-e2e-cockpit",
-            "srw-e2e-keycloak",
-            *profile.additional_deployments,
-        ):
+        workloads = [
+            f"deployment/{name}"
+            for name in (
+                "srw-e2e-orchestrator",
+                "srw-e2e-cockpit",
+                "srw-e2e-keycloak",
+                *profile.additional_deployments,
+            )
+        ]
+        workloads.extend(
+            f"statefulset/{name}" for name in profile.additional_statefulsets
+        )
+        for workload in workloads:
             self.runner.run(
                 self._kubectl(
                     ledger,
@@ -2038,14 +2260,66 @@ class ApplicationE2EHarness:
                     NAMESPACE,
                     "rollout",
                     "status",
-                    f"deployment/{deployment}",
+                    workload,
                     "--timeout=300s",
                 ),
                 timeout=310,
-                label=f"{deployment} rollout readiness",
+                label=f"{workload} rollout readiness",
             )
         self._verify_deployed_images(ledger)
+        self._attest_cloud_backend_after_rollout(ledger, profile)
         self._mark_layer(ledger, "helm-workloads")
+
+    def _attest_cloud_backend_after_rollout(
+        self, ledger: dict[str, Any], profile: ApplicationE2EProfile
+    ) -> None:
+        """Restart the orchestrator once the cloud backend is actually up.
+
+        The orchestrator attests its main-cloud installation **once**, during
+        `lifespan`, and there is no retry: if the backend was not reachable at
+        that moment it logs "installation authority is unavailable" and every
+        cloud effect stays disabled for the life of the process. The admin
+        reload endpoint cannot recover it either — `reload_active_main_cloud_instance`
+        returns `None` when no durable instance exists, which the route reports
+        as a 409 telling the caller to retry something that can never succeed.
+
+        On this stack the backend loses that race every time: bundled Nextcloud
+        installs itself on first boot and its protected-effect sidecars then
+        wait for the front controllers to appear, so it is minutes behind the
+        orchestrator. Nothing in the chart makes the orchestrator wait for it —
+        deliberately, since the cloud tier is optional and must not gate the
+        API.
+
+        The rollouts above have already settled by the time this runs, so one
+        restart is enough, and it is the same recovery an operator performs
+        when a backend comes up late.
+        """
+        if not profile.cloud_enabled:
+            return
+        self.runner.run(
+            self._kubectl(
+                ledger,
+                "-n",
+                NAMESPACE,
+                "rollout",
+                "restart",
+                "deployment/srw-e2e-orchestrator",
+            ),
+            label="orchestrator restart for main-cloud attestation",
+        )
+        self.runner.run(
+            self._kubectl(
+                ledger,
+                "-n",
+                NAMESPACE,
+                "rollout",
+                "status",
+                "deployment/srw-e2e-orchestrator",
+                "--timeout=300s",
+            ),
+            timeout=310,
+            label="orchestrator readiness after main-cloud attestation",
+        )
 
     def _verify_deployed_images(self, ledger: Mapping[str, Any]) -> None:
         profile = profile_from_ledger(ledger)
@@ -2054,7 +2328,7 @@ class ApplicationE2EHarness:
             "deployment/srw-e2e-cockpit": str(ledger["images"]["cockpit"]),
             "deployment/srw-e2e-model-fixture": str(ledger["images"]["provider"]),
         }
-        if profile.name == "stateless-sandbox":
+        if profile.stateless_agents:
             checks["deployment/srw-e2e-agent-stateless"] = str(
                 ledger["images"]["agent"]
             )
@@ -3092,14 +3366,73 @@ class ApplicationE2EHarness:
             assert forward.local_port is not None
             root = f"http://127.0.0.1:{forward.local_port}/control/scenarios/{urllib.parse.quote(run_id)}"
             headers = {"Authorization": f"Bearer {bundle.provider_control_token}"}
-            state_status, state_body = _http_request(
-                root, headers=headers, expected=(200, 404)
+            try:
+                settle_seconds = float(
+                    os.environ.get("APP_E2E_PROVIDER_SETTLE_SECONDS", "5")
+                )
+                timeout_seconds = float(
+                    os.environ.get("APP_E2E_PROVIDER_SETTLE_TIMEOUT_SECONDS", "120")
+                )
+            except ValueError as exc:
+                raise HarnessError(
+                    "provider settlement bounds must be numeric"
+                ) from exc
+            if settle_seconds < 0 or timeout_seconds <= 0:
+                raise HarnessError("provider settlement bounds are invalid")
+
+            deadline = time.monotonic() + timeout_seconds
+            stable_since: float | None = None
+            stable_call_count: int | None = None
+            state: dict[str, Any] | None = None
+            while time.monotonic() < deadline:
+                state_status, state_body = _http_request(
+                    root, headers=headers, expected=(200, 404)
+                )
+                if state_status == 404:
+                    return
+                candidate = _json_body(state_body, label="provider cleanup state")
+                if not isinstance(candidate, dict):
+                    raise HarnessError("provider cleanup state is invalid")
+                if candidate.get("unexpected_count") != 0:
+                    raise HarnessError("provider scenario ended with unexpected calls")
+                call_count = len(candidate.get("calls", []))
+                settled = (
+                    candidate.get("pending_calls") == 0
+                    and candidate.get("remaining_required_responses") == 0
+                )
+                now = time.monotonic()
+                if settled and call_count == stable_call_count:
+                    stable_since = stable_since if stable_since is not None else now
+                    if now - stable_since >= settle_seconds:
+                        state = candidate
+                        break
+                else:
+                    stable_since = now if settled else None
+                    stable_call_count = call_count if settled else None
+                time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+            if state is None:
+                raise HarnessError(
+                    "provider scenario did not settle with all required calls consumed"
+                )
+
+            overview_root = root.rsplit("/", maxsplit=1)[0]
+            _overview_status, overview_body = _http_request(
+                overview_root, headers=headers
             )
-            if state_status == 404:
-                return
-            state = _json_body(state_body, label="provider cleanup state")
-            if not isinstance(state, dict) or state.get("unexpected_count") != 0:
-                raise HarnessError("provider scenario ended with unexpected calls")
+            overview = _json_body(overview_body, label="provider cleanup overview")
+            if (
+                not isinstance(overview, dict)
+                or overview.get("unscoped_unexpected_calls") != 0
+                or overview.get("unscoped_calls_truncated") != 0
+                or overview.get("unscoped_calls") != []
+            ):
+                raise HarnessError(
+                    "provider cleanup found rejected or unscoped requests"
+                )
+            write_private_json(
+                self._run_dir(ledger) / "provider-cleanup-state.json",
+                {"scenario": state, "overview": overview},
+            )
             _http_request(root, method="DELETE", headers=headers, expected=(200,))
 
     def cleanup(self, ledger: Mapping[str, Any]) -> None:

@@ -14,6 +14,11 @@ Harness mirrors tests/test_dispatch_phase_credentials.py.
 
 from __future__ import annotations
 
+from tests._expert_catalog import patch_service_method
+from orchestrator.services import expert_catalog as expert_catalog_module
+from orchestrator.services import session_config_resolution
+
+
 import json
 import os
 from unittest.mock import AsyncMock, MagicMock
@@ -218,6 +223,13 @@ async def test_resolved_session_uses_canonical_mount_projects_for_kb_gate(monkey
         AsyncMock(return_value=True),
         raising=True,
     )
+    # R1.B05 lane P: ``_resolve_default_models``, ``resolve_config`` and
+    # ``inject_blob_credentials`` are resolved in
+    # ``services.session_config_resolution``'s own namespace once main
+    # delegates, so each is patched on BOTH modules — the main entry is the
+    # transitional half. Reachedness is proved below by
+    # ``project_lookup.assert_awaited_once_with`` and by the result equalling
+    # the value only ``fake_resolve_config`` can produce.
     monkeypatch.setattr(
         orchestrator.main,
         "_resolve_default_models",
@@ -225,10 +237,16 @@ async def test_resolved_session_uses_canonical_mount_projects_for_kb_gate(monkey
         raising=True,
     )
     monkeypatch.setattr(
-        orchestrator.main,
-        "_gather_in_scope_skills",
-        AsyncMock(return_value=[]),
+        session_config_resolution,
+        "resolve_default_models",
+        AsyncMock(return_value={}),
         raising=True,
+    )
+    patch_service_method(
+        monkeypatch,
+        expert_catalog_module.ExpertCatalogService,
+        "gather_in_scope_skills",
+        AsyncMock(return_value=[]),
     )
     monkeypatch.setattr(
         orchestrator.main,
@@ -258,6 +276,9 @@ async def test_resolved_session_uses_canonical_mount_projects_for_kb_gate(monkey
     monkeypatch.setattr(
         orchestrator.main, "resolve_config", fake_resolve_config, raising=True
     )
+    monkeypatch.setattr(
+        session_config_resolution, "resolve_config", fake_resolve_config, raising=True
+    )
 
     async def fake_inject_blob(blob, callback):
         await callback({})
@@ -266,11 +287,20 @@ async def test_resolved_session_uses_canonical_mount_projects_for_kb_gate(monkey
     monkeypatch.setattr(
         orchestrator.main, "inject_blob_credentials", fake_inject_blob, raising=True
     )
+    monkeypatch.setattr(
+        session_config_resolution,
+        "inject_blob_credentials",
+        fake_inject_blob,
+        raising=True,
+    )
     # The helper imports this function inside the call; patch the source module.
     monkeypatch.setattr(
         "shared.runtime.core.skill_resolution.filter_bound_skills", MagicMock()
     )
 
+    monkeypatch.setattr(
+        orchestrator.main.postgres_db, "fetchrow", AsyncMock(return_value=None)
+    )
     result = await orchestrator.main._resolve_session_config(
         {"id": thread_id, "project_id": None, "config_name": "persistent_defaults"},
         {},

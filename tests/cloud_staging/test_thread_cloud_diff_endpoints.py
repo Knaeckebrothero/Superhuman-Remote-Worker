@@ -5,7 +5,8 @@ Owner-facing review surface for protected cloud mode (Slice C): ``GET
 ``POST .../cloud-diff/restage``. All three share one gate — 404 unless the
 thread is protected (``metadata.protected_cloud``) AND
 ``PROTECTED_CLOUD_MODE_ENABLED`` — and one resolver
-(``main._thread_cloud_diff_source``) that builds a real ``UpperdirDiffSource``
+(``thread_cloud_diff._thread_cloud_diff_source``) that builds a real
+``UpperdirDiffSource``
 (Task 7) off a fake S3 manifest + tar via a patched ``snapshot_service``, so
 these tests exercise the actual diff-source logic rather than re-mocking it.
 
@@ -17,22 +18,30 @@ restage needs a live workspace.
 Follows the house pattern in tests/test_job_diff_endpoints.py and
 tests/cloud_staging/test_stage_triggers.py: ``import main`` (conftest puts
 orchestrator/ on sys.path), ExitStack-patch its module globals
-(``require_thread_owner`` / ``postgres_db`` / ``snapshot_service`` /
-``main_cloud_router``), and call the endpoint coroutines directly.
+(``postgres_db`` / ``snapshot_service`` / ``main_cloud_router``), build the
+route dependencies from main's own factory inside those patches, and call the
+endpoint coroutines directly.
+
+R1.B04 moved the routes to ``routers.thread_cloud_diff`` and the gate and
+resolver to ``services.thread_cloud_diff``. The owner gate is a declared
+dependency now, so it is injected rather than patched onto ``main``.
 """
 
 import hashlib
 import io
 import json
 import tarfile
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
 
 import orchestrator.main
+from orchestrator.routers import thread_cloud_diff as diff_routes
 from orchestrator.services.cloud.protected_reader_authority import (
     ProtectedNextcloudReaderGrantPlan,
 )
@@ -200,6 +209,7 @@ def _cloud_router(backend):
     return router
 
 
+@contextmanager
 def _patch_endpoint(
     *,
     user: dict,
@@ -209,20 +219,22 @@ def _patch_endpoint(
     snapshot_service=None,
     backend=None,
     require_thread_owner_result=None,
-) -> tuple[ExitStack, MagicMock]:
-    """Patch every global the three endpoints touch. Returns (stack, db)."""
+):
+    """Patch every global the three endpoints touch; yield db + dependencies.
+
+    ``require_thread_owner`` is a declared field on
+    ``ThreadCloudDiffRouteDependencies`` (defaulted to the real
+    ``security.access`` gate, which main's factory leaves alone), so it is
+    injected with ``dataclasses.replace``. The rest are still main globals, and
+    ``main._thread_cloud_diff_dependencies()`` reads them live — which is why
+    it is called inside this stack.
+    """
     stack = ExitStack()
-    if require_thread_owner_result is not None:
-        stack.enter_context(
-            patch("orchestrator.main.require_thread_owner", require_thread_owner_result)
-        )
-    else:
-        stack.enter_context(
-            patch(
-                "orchestrator.main.require_thread_owner",
-                AsyncMock(return_value=(user, thread)),
-            )
-        )
+    gate = (
+        require_thread_owner_result
+        if require_thread_owner_result is not None
+        else AsyncMock(return_value=(user, thread))
+    )
     db = MagicMock()
     db.get_ro_mount_by_thread = AsyncMock(return_value=ro_mount_row)
     db.list_thread_mounts = AsyncMock(return_value=thread_mounts or [])
@@ -242,7 +254,18 @@ def _patch_endpoint(
     stack.enter_context(
         patch("orchestrator.main._is_protected_cloud_mode_enabled", lambda: True)
     )
-    return stack, db
+    with stack:
+        dependencies = replace(
+            orchestrator.main._thread_cloud_diff_dependencies(),
+            require_thread_owner=gate,
+        )
+        # Proof the patches intercept: the factory resolves these globals at
+        # call time, and protected mode is env-off by default, so a missed
+        # patch would 404 every protected case below.
+        assert dependencies.operations.store is db
+        assert dependencies.operations.is_protected_cloud_mode_enabled() is True
+        assert dependencies.require_thread_owner is gate
+        yield SimpleNamespace(db=db, dependencies=dependencies, gate=gate)
 
 
 # --------------------------------------------------------------------------- #
@@ -274,7 +297,7 @@ class TestCloudDiffSummary:
                 f"cloud-staging/{THREAD_ID}/upper.tar": tar_bytes,
             }
         )
-        stack, _db = _patch_endpoint(
+        with _patch_endpoint(
             user=user,
             thread=thread,
             ro_mount_row=row,
@@ -284,10 +307,9 @@ class TestCloudDiffSummary:
                 _thread_mounts_row(mountpoint="ReplacementB", cloud_handle="99")
             ],
             snapshot_service=svc,
-        )
-        with stack:
-            result = await orchestrator.main.get_thread_cloud_diff_summary(
-                THREAD_ID, fake_request
+        ) as wired:
+            result = await diff_routes.get_thread_cloud_diff_summary(
+                THREAD_ID, fake_request, dependencies=wired.dependencies
             )
 
         assert result == {
@@ -307,15 +329,14 @@ class TestCloudDiffSummary:
         user = _make_user()
         thread = _make_thread()
         row = _mount_row(staged_summary=None)
-        stack, _db = _patch_endpoint(
+        with _patch_endpoint(
             user=user,
             thread=thread,
             ro_mount_row=row,
             thread_mounts=[_thread_mounts_row()],
-        )
-        with stack:
-            result = await orchestrator.main.get_thread_cloud_diff_summary(
-                THREAD_ID, fake_request
+        ) as wired:
+            result = await diff_routes.get_thread_cloud_diff_summary(
+                THREAD_ID, fake_request, dependencies=wired.dependencies
             )
 
         assert result == {
@@ -331,10 +352,12 @@ class TestCloudDiffSummary:
     async def test_summary_404_when_thread_not_protected(self, fake_request):
         user = _make_user()
         thread = _make_thread(protected=False)
-        stack, _db = _patch_endpoint(user=user, thread=thread)
-        with stack, pytest.raises(HTTPException) as ei:
-            await orchestrator.main.get_thread_cloud_diff_summary(
-                THREAD_ID, fake_request
+        with (
+            _patch_endpoint(user=user, thread=thread) as wired,
+            pytest.raises(HTTPException) as ei,
+        ):
+            await diff_routes.get_thread_cloud_diff_summary(
+                THREAD_ID, fake_request, dependencies=wired.dependencies
             )
         assert ei.value.status_code == 404
 
@@ -363,16 +386,15 @@ class TestCloudDiffSummary:
                 f"cloud-staging/{THREAD_ID}/upper.tar": tar_bytes,
             }
         )
-        stack, _db = _patch_endpoint(
+        with _patch_endpoint(
             user=user,
             thread=thread,
             ro_mount_row=row,
             thread_mounts=[_thread_mounts_row()],
             snapshot_service=svc,
-        )
-        with stack:
-            result = await orchestrator.main.get_thread_cloud_diff_summary(
-                THREAD_ID, fake_request
+        ) as wired:
+            result = await diff_routes.get_thread_cloud_diff_summary(
+                THREAD_ID, fake_request, dependencies=wired.dependencies
             )
 
         assert result["epoch"] == 4
@@ -410,17 +432,16 @@ class TestCloudDiffFile:
         )
         backend = FakeMainCloudBackend()
         backend.seed_project_file(_SOURCE.native_id, "mod.txt", b"oldv")
-        stack, _db = _patch_endpoint(
+        with _patch_endpoint(
             user=user,
             thread=thread,
             ro_mount_row=row,
             thread_mounts=[_thread_mounts_row(cloud_handle="proj-1")],
             snapshot_service=svc,
             backend=backend,
-        )
-        with stack:
-            result = await orchestrator.main.get_thread_cloud_diff_file(
-                THREAD_ID, "mod.txt", fake_request
+        ) as wired:
+            result = await diff_routes.get_thread_cloud_diff_file(
+                THREAD_ID, "mod.txt", fake_request, dependencies=wired.dependencies
             )
 
         assert result == {
@@ -453,16 +474,21 @@ class TestCloudDiffFile:
                 f"cloud-staging/{THREAD_ID}/upper.tar": tar_bytes,
             }
         )
-        stack, _db = _patch_endpoint(
-            user=user,
-            thread=thread,
-            ro_mount_row=row,
-            thread_mounts=[_thread_mounts_row()],
-            snapshot_service=svc,
-        )
-        with stack, pytest.raises(HTTPException) as ei:
-            await orchestrator.main.get_thread_cloud_diff_file(
-                THREAD_ID, "does-not-exist.txt", fake_request
+        with (
+            _patch_endpoint(
+                user=user,
+                thread=thread,
+                ro_mount_row=row,
+                thread_mounts=[_thread_mounts_row()],
+                snapshot_service=svc,
+            ) as wired,
+            pytest.raises(HTTPException) as ei,
+        ):
+            await diff_routes.get_thread_cloud_diff_file(
+                THREAD_ID,
+                "does-not-exist.txt",
+                fake_request,
+                dependencies=wired.dependencies,
             )
         assert ei.value.status_code == 404
         # The code is what lets the review UI say which of the three
@@ -498,16 +524,18 @@ class TestCloudDiffFile:
                 f"cloud-staging/{THREAD_ID}/upper.tar": tar_bytes,
             }
         )
-        stack, _db = _patch_endpoint(
-            user=user,
-            thread=thread,
-            ro_mount_row=row,
-            thread_mounts=[_thread_mounts_row()],
-            snapshot_service=svc,
-        )
-        with stack, pytest.raises(HTTPException) as ei:
-            await orchestrator.main.get_thread_cloud_diff_file(
-                THREAD_ID, "mod.txt", fake_request
+        with (
+            _patch_endpoint(
+                user=user,
+                thread=thread,
+                ro_mount_row=row,
+                thread_mounts=[_thread_mounts_row()],
+                snapshot_service=svc,
+            ) as wired,
+            pytest.raises(HTTPException) as ei,
+        ):
+            await diff_routes.get_thread_cloud_diff_file(
+                THREAD_ID, "mod.txt", fake_request, dependencies=wired.dependencies
             )
         assert ei.value.status_code == 404
         assert ei.value.detail["code"] == "staged_content_unreadable"
@@ -524,48 +552,56 @@ class TestCloudDiffRestage:
         user = _make_user()
         thread = _make_thread(workspace=True)
         row = _mount_row(staged_summary=None)
-        stack, _db = _patch_endpoint(
-            user=user,
-            thread=thread,
-            ro_mount_row=row,
-        )
         stage_mock = AsyncMock(return_value={"epoch": 1, "counts": {}})
-        orchestrator.main._cloud_stage_tasks.clear()
+        # ``_cloud_stage_tasks`` is now the ``stage`` half of the
+        # application-owned ``CloudTaskRegistry``; the property is the live
+        # dict, so seeding and eviction are observed exactly as before.
+        stage_tasks = orchestrator.main.cloud_task_registry.cloud_stage_tasks
+        stage_tasks.clear()
         with (
-            stack,
+            _patch_endpoint(
+                user=user,
+                thread=thread,
+                ro_mount_row=row,
+            ) as wired,
             patch(
                 "orchestrator.services.cloud_staging.stage.stage_thread_cloud_diff",
                 stage_mock,
             ),
         ):
-            result = await orchestrator.main.restage_thread_cloud_diff(
-                THREAD_ID, fake_request
+            result = await diff_routes.restage_thread_cloud_diff(
+                THREAD_ID, fake_request, dependencies=wired.dependencies
             )
             assert result == {"scheduled": True}
-            assert len(orchestrator.main._cloud_stage_tasks) == 1
-            task = next(iter(orchestrator.main._cloud_stage_tasks.values()))
+            assert len(stage_tasks) == 1
+            task = next(iter(stage_tasks.values()))
             await task
 
             # Assert inside the patch context: main.postgres_db/snapshot_service
-            # are only the patched fakes while ``stack`` is still active.
+            # are only the patched fakes while the stack is still active.
             call = stage_mock.await_args
             assert call.kwargs["thread_id"] == THREAD_ID
             assert call.kwargs["postgres_db"] is orchestrator.main.postgres_db
             assert call.kwargs["snapshot_service"] is orchestrator.main.snapshot_service
             assert call.kwargs["authority"]["source_binding_sha256"] == _SOURCE.sha256
-        assert not orchestrator.main._cloud_stage_tasks
+        assert not stage_tasks
 
     @pytest.mark.asyncio
     async def test_restage_409_without_workspace(self, fake_request):
         user = _make_user()
         thread = _make_thread(workspace=False)
-        stack, _db = _patch_endpoint(user=user, thread=thread)
-        orchestrator.main._cloud_stage_tasks.clear()
-        with stack, pytest.raises(HTTPException) as ei:
-            await orchestrator.main.restage_thread_cloud_diff(THREAD_ID, fake_request)
+        stage_tasks = orchestrator.main.cloud_task_registry.cloud_stage_tasks
+        stage_tasks.clear()
+        with (
+            _patch_endpoint(user=user, thread=thread) as wired,
+            pytest.raises(HTTPException) as ei,
+        ):
+            await diff_routes.restage_thread_cloud_diff(
+                THREAD_ID, fake_request, dependencies=wired.dependencies
+            )
         assert ei.value.status_code == 409
         assert ei.value.detail == {"code": "no_workspace"}
-        assert THREAD_ID not in orchestrator.main._cloud_stage_tasks
+        assert THREAD_ID not in stage_tasks
 
 
 # --------------------------------------------------------------------------- #
@@ -579,13 +615,16 @@ class TestOwnerAuthPropagation:
         denied = AsyncMock(
             side_effect=HTTPException(status_code=403, detail="Not your thread")
         )
-        stack, _db = _patch_endpoint(
-            user=_make_user(),
-            thread=_make_thread(),
-            require_thread_owner_result=denied,
-        )
-        with stack, pytest.raises(HTTPException) as ei:
-            await orchestrator.main.get_thread_cloud_diff_summary(
-                THREAD_ID, fake_request
+        with (
+            _patch_endpoint(
+                user=_make_user(),
+                thread=_make_thread(),
+                require_thread_owner_result=denied,
+            ) as wired,
+            pytest.raises(HTTPException) as ei,
+        ):
+            await diff_routes.get_thread_cloud_diff_summary(
+                THREAD_ID, fake_request, dependencies=wired.dependencies
             )
         assert ei.value.status_code == 403
+        denied.assert_awaited_once()

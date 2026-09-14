@@ -1,0 +1,58 @@
+{{- $namespace := .Values.manifestHosting.namespace | default (printf "%s-native" (include "srw.fullname" . | trunc 56 | trimSuffix "-")) -}}
+{{- if eq $namespace .Release.Namespace -}}
+{{- fail "manifestHosting.namespace must be separate from the SRW control-plane namespace" -}}
+{{- end -}}
+# This baseline exists before native hosting is enabled. A conformant CNI must
+# enforce it from the first container instruction; policy object existence alone
+# is not the operator's networkIsolationVerified acceptance gate.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ $namespace }}
+  annotations:
+    helm.sh/resource-policy: keep
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: srw-native-default-deny
+  namespace: {{ $namespace }}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: srw-native-runtime
+  namespace: {{ $namespace }}
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch, create, delete, patch]
+  - apiGroups: [""]
+    resources: [pods/finalizers]
+    verbs: [get, update, patch]
+  - apiGroups: [""]
+    resources: [persistentvolumeclaims]
+    verbs: [get, create, delete]
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get, create, delete]
+  - apiGroups: [networking.k8s.io]
+    resources: [networkpolicies]
+    verbs: [get, create, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: srw-native-runtime
+  namespace: {{ $namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: srw-native-runtime
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "srw.orchestratorServiceAccountName" . }}
+    namespace: {{ .Release.Namespace }}

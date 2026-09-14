@@ -198,14 +198,20 @@ class TestDelegationTimeout:
     (inert without a producer — nothing freezes with ``delegation`` any more)."""
 
     def test_timeout_sweeper_function_exists(self):
-        """Verify the timeout sweeper is defined in orchestrator.main."""
-        # orchestrator.main can't be imported directly in tests (heavy deps),
-        # so verify via source inspection
+        """Verify the timeout policy and application-owned task wiring."""
+        import inspect
         import pathlib
 
+        from orchestrator.services import completion_recovery
+
+        assert inspect.iscoroutinefunction(
+            completion_recovery.check_delegation_timeouts
+        )
+        assert inspect.iscoroutinefunction(
+            completion_recovery.delegation_timeout_sweeper
+        )
         main_src = pathlib.Path("src/orchestrator/main.py").read_text()
-        assert "async def _check_delegation_timeouts" in main_src
-        assert "async def delegation_timeout_sweeper" in main_src
+        assert "completion_recovery_operations.delegation_timeout_sweeper" in main_src
         assert "delegation_timeout_task" in main_src
 
 

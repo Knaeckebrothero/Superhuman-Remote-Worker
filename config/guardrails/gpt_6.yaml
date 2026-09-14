@@ -1,0 +1,11 @@
+# GPT-6 Astra guardrails
+#
+# Astra shares the GPT-5 wire format (Responses API, standard parens-form tool
+# serialization), so this file is intentionally empty and `gpt-6` resolves
+# through `default.yaml` exactly like `gpt_5.yaml` / `gpt_5_6.yaml`. Kept as a
+# separate file so Astra-specific drift can be added later without touching
+# the matrix.
+
+tool_examples: {}
+
+nudges: {}

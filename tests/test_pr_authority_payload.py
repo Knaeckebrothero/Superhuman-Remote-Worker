@@ -1,5 +1,7 @@
 """Server-owned repository datasource identity across runtime payload paths."""
 
+from tests import _b09_control_seams as control_seams
+
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -7,6 +9,7 @@ import pytest
 
 from orchestrator import main as orch_main
 from shared.runtime_actor import RuntimeActorContext
+from orchestrator.services import session_attach_payload
 
 DATASOURCE_ID = "22222222-2222-4222-8222-222222222222"
 FOREIGN_ID = "33333333-3333-4333-8333-333333333333"
@@ -78,6 +81,7 @@ def _credential_passthrough(_job_row, config, **_kwargs):
 @pytest.mark.asyncio
 async def test_fresh_dispatch_payload_uses_resolved_repository_uuid():
     with (
+        patch.object(orch_main.postgres_db, "fetchrow", AsyncMock(return_value=None)),
         patch.object(
             orch_main,
             "_resolve_authorized_job_datasources",
@@ -104,7 +108,7 @@ async def test_fresh_dispatch_payload_uses_resolved_repository_uuid():
             AsyncMock(return_value=_worker_actor()),
         ),
     ):
-        request = await orch_main._build_job_start_request(_job())
+        request = await control_seams.build_job_start_request(_job())
 
     assert request is not None
     assert request.datasources[0]["datasource_id"] == DATASOURCE_ID
@@ -139,6 +143,7 @@ async def test_resume_payload_uses_resolved_repository_uuid():
     _Client.posts = []
     job = _job(status="paused")
     conn = MagicMock()
+    conn.fetchrow = AsyncMock(return_value=None)
     conn.execute = AsyncMock()
 
     @asynccontextmanager
@@ -197,8 +202,8 @@ async def test_resume_payload_uses_resolved_repository_uuid():
             ),
         ),
         patch.object(
-            orch_main,
-            "_pinned_k8s_job_workspace_authority_is_current",
+            orch_main.job_workspace_authority,
+            "pinned_k8s_job_workspace_authority_is_current",
             AsyncMock(return_value=True),
         ),
         patch.object(
@@ -232,7 +237,7 @@ async def test_resume_payload_uses_resolved_repository_uuid():
         patch.object(orch_main.httpx, "AsyncClient", _Client),
         patch.object(orch_main, "COMPLETION_COMMANDS_ENABLED", False),
     ):
-        accepted = await orch_main._resume_job_on_agent(
+        accepted = await control_seams.resume_job_on_agent(
             job,
             {
                 "id": AGENT_ID,
@@ -292,8 +297,10 @@ async def test_persistent_reattach_payload_uses_resolved_repository_uuid():
             orch_main, "mint_thread_runtime_actor", AsyncMock(return_value=actor)
         ),
     ):
-        payload = await orch_main._assemble_session_attach_payload(
-            thread["id"], runtime_agent_id=AGENT_ID
+        payload = await session_attach_payload.assemble_session_attach_payload(
+            thread["id"],
+            runtime_agent_id=AGENT_ID,
+            dependencies=orch_main._session_attach_payload_dependencies(),
         )
 
     assert payload is not None

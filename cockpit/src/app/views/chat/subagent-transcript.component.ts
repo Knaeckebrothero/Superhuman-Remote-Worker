@@ -187,7 +187,7 @@ import {AppIconComponent} from '../../ui/icon';
       color: var(--text-muted);
       font-size: 11px;
       text-transform: uppercase;
-      letter-spacing: 0.04em;
+      letter-spacing: 0.06em;
     }
     .message-content,
     .thinking pre,

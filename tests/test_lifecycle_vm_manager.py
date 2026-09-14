@@ -96,7 +96,10 @@ def _make_manager(
 
     async def _fetchrow(sql, *args):
         identity = str(args[0]) if args else ""
-        if "job_completion_sweep_exclusions" in sql:
+        if (
+            "SELECT command_id, route" in sql
+            and "FROM job_completion_sweep_exclusions" in sql
+        ):
             return (
                 {
                     "command_id": "44444444-4444-4444-8444-444444444444",
@@ -1055,6 +1058,82 @@ class TestDelete:
 
 class TestCompletionControlLifecycleOwnership:
     @pytest.mark.asyncio
+    async def test_retry_pending_delete_releases_claim_for_next_attempt(self):
+        """A known incomplete delete is retryable, not ambiguous ownership."""
+
+        job = {
+            "id": "job-1",
+            "status": "completed",
+            "execution_lane": "pinned",
+            "context": {},
+        }
+        mgr, provisioner, _, _, db = _make_manager(
+            job_rows=[job], completion_commands_enabled=True
+        )
+        provisioner.release_vm_captured.return_value = VMTeardownResult(
+            "retry_pending", False
+        )
+        inst = Instance(
+            kind="vm",
+            id="agent-vm-job-1",
+            bound_to="job-1",
+            metadata={
+                "scope": "job",
+                "job_status": "completed",
+                "execution_lane": "pinned",
+                "provision_generation": "00000000-0000-4000-8000-000000000001",
+                "vm_uid": "vm-uid-1",
+                "rootdisk_pvc_uid": "rootdisk-uid-1",
+            },
+        )
+
+        await mgr.delete(inst, grace_s=0)
+
+        provisioner.release_vm_captured.assert_awaited_once()
+        conn = db.acquire.return_value.__aenter__.return_value
+        assert any(
+            "- '_completion_control_claim'" in str(call.args[0])
+            for call in conn.fetchrow.await_args_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_unknown_delete_retains_claim_as_ambiguous(self):
+        job = {
+            "id": "job-1",
+            "status": "completed",
+            "execution_lane": "pinned",
+            "context": {},
+        }
+        mgr, provisioner, _, _, db = _make_manager(
+            job_rows=[job], completion_commands_enabled=True
+        )
+        provisioner.release_vm_captured.return_value = VMTeardownResult(
+            "identity_unknown", False
+        )
+        inst = Instance(
+            kind="vm",
+            id="agent-vm-job-1",
+            bound_to="job-1",
+            metadata={
+                "scope": "job",
+                "job_status": "completed",
+                "execution_lane": "pinned",
+                "provision_generation": "00000000-0000-4000-8000-000000000001",
+                "vm_uid": "vm-uid-1",
+                "rootdisk_pvc_uid": "rootdisk-uid-1",
+            },
+        )
+
+        await mgr.delete(inst, grace_s=0)
+
+        provisioner.release_vm_captured.assert_awaited_once()
+        conn = db.acquire.return_value.__aenter__.return_value
+        assert not any(
+            "- '_completion_control_claim'" in str(call.args[0])
+            for call in conn.fetchrow.await_args_list
+        )
+
+    @pytest.mark.asyncio
     async def test_action_time_recheck_blocks_snapshot_delete_and_give_up(self):
         mgr, provisioner, _, snapshot, db = _make_manager(
             job_rows=[
@@ -1858,6 +1937,37 @@ class TestKeptDiskSweep:
         db.merge_vm_context.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_retry_pending_purge_releases_claim_for_next_attempt(self):
+        vm_context = {
+            "rootdisk": "kept",
+            "provision_generation": "00000000-0000-4000-8000-000000000001",
+            "vm_uid": "vm-uid-1",
+            "rootdisk_pvc_uid": "rootdisk-uid-1",
+        }
+        job = {
+            "id": "job-1",
+            "status": "completed",
+            "execution_lane": "pinned",
+            "context": {"vm": vm_context},
+            "vm_context": vm_context,
+        }
+        mgr, provisioner, _, _, db = _make_manager(
+            job_rows=[job], completion_commands_enabled=True
+        )
+        provisioner.release_vm_captured.return_value = VMTeardownResult(
+            "retry_pending", False
+        )
+
+        assert await mgr.purge_kept_disks() == 0
+
+        db.merge_vm_context.assert_not_awaited()
+        conn = db.acquire.return_value.__aenter__.return_value
+        assert any(
+            "- '_completion_control_claim'" in str(call.args[0])
+            for call in conn.fetchrow.await_args_list
+        )
+
+    @pytest.mark.asyncio
     async def test_nothing_to_do_is_silent(self):
         mgr, provisioner, _ = self._mgr_with_kept([])
         assert await mgr.purge_kept_disks() == 0
@@ -1892,3 +2002,31 @@ class TestKeptDiskSweep:
         await mgr.reap_orphans()
 
         provisioner.release_vm_captured.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_preparing_dispatchable_job_never_takes_teardown_claim(monkeypatch):
+    """An unavailable identity probe must not park unrelated VM preparation."""
+    row = {
+        "id": "c7d46b72-57f5-4dbd-af5a-255f8f981654",
+        "status": "created",
+        "execution_lane": "pinned",
+        "unassigned": True,
+        "freeze_free": True,
+        "context": {"vm": {"status": "waiting_preparation"}},
+    }
+    manager, provisioner, _, _, db = _make_manager(
+        job_rows=[row], completion_commands_enabled=True
+    )
+    provisioner.capture_vm_teardown_identity.side_effect = RuntimeError(
+        "probe unavailable"
+    )
+    monkeypatch.setattr(manager, "reap_orphans", AsyncMock(return_value=0))
+    await InstanceLifecycleReconciler([manager]).tick()
+    provisioner.capture_vm_teardown_identity.assert_not_awaited()
+    provisioner.delete_vm_captured.assert_not_awaited()
+    conn = db.acquire.return_value.__aenter__.return_value
+    assert not any(
+        "UPDATE jobs" in call.args[0] and "_completion_control_claim" in call.args[0]
+        for call in conn.fetchrow.await_args_list
+    )

@@ -53,6 +53,9 @@ async def db(pg_dsn):
                 error_message text,
                 error_details jsonb,
                 updated_at timestamptz DEFAULT now()
+            );
+            CREATE TABLE IF NOT EXISTS srw_execution_specs (
+                work_kind text, work_id uuid, harness_adapter text
             )
             """
         )

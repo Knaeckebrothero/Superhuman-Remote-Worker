@@ -1192,6 +1192,19 @@ async def create_loop_job(
 
     target_project_ids = [project_id] if project_id else []
 
+    from orchestrator.services.manifest_workspace_selection import (
+        select_project_workspace_default,
+    )
+
+    config_override, workspace_selection = await select_project_workspace_default(
+        db,
+        owner_id,
+        project_id,
+        config_override,
+    )
+    if workspace_selection is not None:
+        workspace_backend = config_override["workspace"]["backend"]
+
     # Resolve immediately before materialization so every loop iteration uses
     # the owner's current policy. The policy service applies scope/membership
     # checks and silently filters repository defaults for lite tiers. A revoked
@@ -1217,6 +1230,11 @@ async def create_loop_job(
         datasource_origin = "explicit"
 
     job = await db.create_job(
+        **(
+            {"workspace_selection": workspace_selection}
+            if workspace_selection is not None
+            else {}
+        ),
         origin="loop",
         description=description,
         config_name=config_name,

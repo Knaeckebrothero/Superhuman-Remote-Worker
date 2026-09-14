@@ -408,12 +408,12 @@ def _route_client(monkeypatch, *, record, gateway, store):
         assert thread_id == THREAD_ID
         return {"id": USER_ID}, _thread()
 
-    monkeypatch.setattr(canvases, "_get_db", lambda: db)
     monkeypatch.setattr(canvases, "_get_canvas_service", lambda received: service)
     monkeypatch.setattr(canvases, "_get_file_gateway", lambda received=None: gateway)
     monkeypatch.setattr(canvases, "_get_snapshot_store", lambda received: store)
     monkeypatch.setattr(canvases, "require_thread_owner", owner)
     app = FastAPI()
+    app.state.store = db
     app.include_router(canvases.router)
     return TestClient(app)
 

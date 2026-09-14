@@ -2093,20 +2093,40 @@ describe('persistent-chat host wiring', () => {
     return source.slice(open, i + 1);
   }
 
+  /** Net `{`/`}` depth of `source`: 0 means every brace opened in it has
+   *  also closed, i.e. its end sits at the same nesting level as its start. */
+  function netBraceDepth(source: string): number {
+    let depth = 0;
+    for (const ch of source) {
+      if (ch === '{') depth++;
+      else if (ch === '}') depth--;
+    }
+    return depth;
+  }
+
   it('renders the pending-review action OUTSIDE the connection gate', () => {
-    // PC-25: the status bar is rendered only while chat.isConnected(), and it
-    // used to contain the only way to open a review. An ended thread with a
-    // genuine staged diff could not reach it.
+    // PC-25: the header actions used to be rendered only while
+    // chat.isConnected() (first inside a dedicated status bar, and still
+    // today inside `.header-left`'s badge row and `.header-right`'s action
+    // list), and one of those gated spots used to be the only way to open a
+    // review. An ended thread with a genuine staged diff could not reach it.
     expect(src).toContain('<app-cloud-review-banner');
-    const between = src.slice(
-      src.indexOf('<!-- Status bar -->'),
-      src.indexOf('<app-cloud-review-banner'),
+    const headerIndex = src.indexOf('<div class="chat-header"');
+    const bannerIndex = src.indexOf('<app-cloud-review-banner');
+    expect(headerIndex).toBeGreaterThan(-1);
+    expect(bannerIndex).toBeGreaterThan(headerIndex);
+    // The banner must sit at the same brace-nesting depth as the header's own
+    // opening tag — i.e. every `@if (chat.isConnected()) { … }` opened inside
+    // the header (there are two today: the row-1 badges and the action menu)
+    // has already closed by the time the banner appears. A depth other than
+    // zero means the banner ended up a descendant of a gate, not a sibling.
+    expect(netBraceDepth(src.slice(headerIndex, bannerIndex))).toBe(0);
+    // The invariant is only meaningful if the file actually still gates
+    // connected-only header content — guard against both sides degrading
+    // into a vacuous pass (e.g. the gate being deleted entirely).
+    expect(src.slice(headerIndex, bannerIndex)).toContain(
+      '@if (chat.isConnected())',
     );
-    // The status bar's `@if (chat.isConnected()) {` is opened at six spaces of
-    // indentation; a closing brace at that same level between it and the
-    // banner proves the banner is a sibling of the gate, not inside it.
-    expect(between).toContain('@if (chat.isConnected()) {');
-    expect(between).toMatch(/\n {6}\}\n/);
   });
 
   it('no longer ships the passive status badge as the review opener', () => {

@@ -100,6 +100,12 @@ import {
     UserCapabilities,
     VoiceCapabilities,
 } from '../models/api.model';
+import type {
+  AdminCapacity,
+  SessionQueueState,
+  SessionQueueRetryOutcome,
+  RunQueueUnparkResult,
+} from '../models/api.model';
 import {
   ThreadUploadEvent,
   ThreadUploadResponse,
@@ -211,7 +217,28 @@ export interface SessionToolCategory {
   configured?: string[];
 }
 
+/** One `subagent_type` the expert's `delegate_agent` can name. */
+export interface SessionSubagentRosterEntry {
+  name: string;
+  /** What the parent model sees next to the type; null on a raw `$ref` the server could not resolve. */
+  description: string | null;
+  /** `subagents/explorer`, `experts/critic`, a DB expert id — or null for an inline entry. */
+  ref: string | null;
+}
+
+/**
+ * What a Delegation tick reaches: the roster as the resolve materialised it.
+ * `roster: []` is a real answer — the expert has no roster and every
+ * `delegate_agent` call will error — and is rendered as such. Absent on an
+ * orchestrator older than this contract, where nothing is claimed.
+ */
+export interface SessionSubagentRoster {
+  default: string | null;
+  roster: SessionSubagentRosterEntry[];
+}
+
 export interface SessionToolGroupsResponse {
+  workspace?: import("../models/workspace.model").WorkspacePreview;
   thread_id: string;
   /** Which agent path the PREDICTION models. Says nothing about `origin`. */
   source: 'resolved' | 'legacy' | 'error';
@@ -236,6 +263,8 @@ export interface SessionToolGroupsResponse {
   backend?: Record<string, boolean> | null;
   tool_groups: Record<string, boolean> | null;
   categories?: Record<string, SessionToolCategory> | null;
+  /** The delegation roster the resolve materialised; null when the resolve failed. */
+  subagents?: SessionSubagentRoster | null;
   /**
    * Categories that refuse `tools.<c>: true` at the write boundary, mapped to
    * the enumeration to send instead (`{shell: ["run_command", ...]}`).
@@ -1980,6 +2009,8 @@ export class ApiService {
      * Same deadline and same silent-null contract as the thread read.
      */
     previewToolGroups(body: {
+        workspace?: Record<string, unknown> | null;
+        workspace_preference?: 'none' | 'virtual' | 'sandbox' | 'vm' | null;
         config_name?: string | null;
         expert_id?: string | null;
         project_id?: string | null;
@@ -3149,5 +3180,83 @@ export class ApiService {
     return this.http.get<MemoryListResponse>(
       `${this.baseUrl}/jobs/${jobId}/memories`, { params },
     ).pipe(catchError(() => of(null)));
+  }
+
+  // ---------------------------------------------------------------------------
+  // Stateless run_queue state (stateless_turn_resilience.md, step 2)
+  // ---------------------------------------------------------------------------
+
+  /** Executors, runnable depth, `desired`, and the parked worklist. Admin-only. */
+  getAdminCapacity(): Observable<AdminCapacity | null> {
+    return this.http.get<AdminCapacity>(`${this.baseUrl}/admin/capacity`).pipe(
+      catchError((error) => {
+        console.error('Failed to fetch capacity:', error);
+        return of(null);
+      }),
+    );
+  }
+
+  /** Operator verb: parked → queued (attempts reset). Null on any refusal. */
+  unparkRunQueueUnit(unitId: string): Observable<RunQueueUnparkResult | null> {
+    return this.http
+      .post<RunQueueUnparkResult>(`${this.baseUrl}/admin/run-queue/${unitId}/unpark`, {})
+      .pipe(
+        catchError((error) => {
+          console.error(`Failed to unpark ${unitId}:`, error);
+          return of(null);
+        }),
+      );
+  }
+
+  /** The thread's durable queue block — polled while a send awaits a claim,
+   *  and while a start panel is still up on a thread that may already have
+   *  finished its turn.
+   *
+   *  `GET …/queue` answers with the block wrapped in a `{thread_id, queue}`
+   *  envelope, unlike `/input` and `/connection`, which carry the same block
+   *  inline. Unwrapping here was missing, so every poll resolved to an
+   *  envelope whose `state` is undefined and the caller's type guard dropped
+   *  it — the poll ran and never applied anything. A bare block is still
+   *  accepted so a rolling deploy of either shape lands. */
+  getThreadQueue(threadId: string): Observable<SessionQueueState | null> {
+    return this.http
+      .get<SessionQueueState | { queue?: SessionQueueState | null }>(
+        `${this.baseUrl}/persistent/threads/${threadId}/queue`,
+      )
+      .pipe(
+        map((body): SessionQueueState | null => {
+          if (!body || typeof body !== 'object') return null;
+          const enveloped = (body as { queue?: SessionQueueState | null }).queue;
+          if (enveloped && typeof enveloped === 'object') return enveloped;
+          return typeof (body as SessionQueueState).state === 'string'
+            ? (body as SessionQueueState)
+            : null;
+        }),
+        catchError(() => of(null)),
+      );
+  }
+
+  /**
+   * Owner verb: a parked, retryable unit → queued. 409 carries a `{code}`
+   * detail (stop markers / claim-loss hold), 404 means "not parked".
+   */
+  retryThreadQueue(threadId: string): Observable<SessionQueueRetryOutcome> {
+    return this.http
+      .post<{ state: string }>(`${this.baseUrl}/persistent/threads/${threadId}/queue/retry`, {})
+      .pipe(
+        map((data): SessionQueueRetryOutcome => ({ kind: 'ok', state: data?.state ?? 'queued' })),
+        catchError((err: HttpErrorResponse): Observable<SessionQueueRetryOutcome> => {
+          const detail = err.error?.detail;
+          const code =
+            detail && typeof detail === 'object' && typeof detail.code === 'string'
+              ? detail.code
+              : typeof detail === 'string'
+                ? detail
+                : err.status === 404
+                  ? 'not_parked'
+                  : 'retry_failed';
+          return of({ kind: 'refused', status: err.status ?? 0, code });
+        }),
+      );
   }
 }

@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from shared.runtime.core.srw_manifest_config import (
+    srw_config_fragment as _srw_config_fragment,
+)
+
 from pathlib import Path
 
 import pytest
@@ -262,7 +266,9 @@ def test_frozen_framework_child_scaffold_is_preferred():
 
 def test_library_entries_cover_all_return_shapes():
     kinds = {
-        yaml.safe_load(leaf.read_text(encoding="utf-8")).get("return", "summary")
+        _srw_config_fragment(yaml.safe_load(leaf.read_text(encoding="utf-8"))).get(
+            "return", "summary"
+        )
         for leaf in _LIBRARY
     }
     assert kinds == {"summary", "structured", "evidence", "diff"}

@@ -14,6 +14,8 @@ See knowledge-base/knowledge/issues/vm_reliability_assessment.md P1-7.
 
 from __future__ import annotations
 
+from tests import _b09_control_seams as control_seams
+
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -53,7 +55,7 @@ async def _cleanup_thread(status):
             orch_main, "container_provisioner", SimpleNamespace(is_available=False)
         ),
     ):
-        await orch_main._archive_and_cleanup_workspace("t1", entity_type="threads")
+        await control_seams.archive_and_cleanup_workspace("t1", entity_type="threads")
     return vm_provisioner, identity
 
 
@@ -127,7 +129,7 @@ class TestThreadVmReleasedOnTeardown:
             ),
         ):
             with pytest.raises(RuntimeError, match="retry_pending"):
-                await orch_main._archive_and_cleanup_workspace(
+                await control_seams.archive_and_cleanup_workspace(
                     "t1", entity_type="threads"
                 )
 
@@ -161,7 +163,7 @@ async def _cleanup_job(status):
             orch_main, "container_provisioner", SimpleNamespace(is_available=False)
         ),
     ):
-        await orch_main._archive_and_cleanup_workspace("j1")
+        await control_seams.archive_and_cleanup_workspace("j1")
     return vm_provisioner, identity
 
 

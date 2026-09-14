@@ -118,9 +118,24 @@ jobs:
           # promotion. The other jobs in this workflow still replay the complete
           # chain, regenerate all schema artifacts, and enforce unique prefixes
           # on this PR.
-          if [ "${{ github.event_name }}" = "pull_request" ] \
-             && [ "${{ github.base_ref }}" = "main" ] \
-             && [ "${{ github.head_ref }}" = "develop" ]; then
+          #
+          # BOTH halves of the promotion need this. Merging the release PR fires
+          # a *push* to main whose `github.event.before` is main's PREVIOUS
+          # release tip, so the diff spans the entire release exactly as the PR
+          # did -- the PR-only guard skipped the PR and then reddened the merge.
+          # Observed on run 34089638677, which re-linted 41 frozen migrations
+          # (0189-0225, vector 0022-0026) and failed on findings in app/0203 and
+          # app/0204: applied, checksum-frozen files whose bytes must never
+          # change (see .squawk.toml's app/0183 note for what editing one costs).
+          # main only ever receives develop promotions, so this makes squawk a
+          # develop-admission gate; a migration pushed straight to main would
+          # bypass it, which is why direct pushes of migrations to main are not
+          # the release path.
+          if { [ "${{ github.event_name }}" = "pull_request" ] \
+                 && [ "${{ github.base_ref }}" = "main" ] \
+                 && [ "${{ github.head_ref }}" = "develop" ]; } \
+             || { [ "${{ github.event_name }}" = "push" ] \
+                 && [ "${{ github.ref_name }}" = "main" ]; }; then
             echo "Develop-to-main promotion: relying on develop admission gates; skipping immutable-history re-lint."
             exit 0
           fi

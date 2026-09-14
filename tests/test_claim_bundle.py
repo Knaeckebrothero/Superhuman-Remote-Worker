@@ -11,10 +11,24 @@ wrong lane / assembly refused.
 
 import asyncio
 from copy import deepcopy
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
 from fastapi import HTTPException
+
+# R1.B06: the route moved to ``routers/unit_claim`` and its policy to
+# ``services/unit_claim_bundle``, which calls the B05 operations directly
+# rather than through main's wrappers. These cases therefore steer the B05
+# services themselves; ``main``'s dependency factory still reads main's own
+# attributes at call time, so every ``monkeypatch.setattr(orch_main, ...)``
+# below keeps steering exactly what it steered before.
+from orchestrator.services import (  # noqa: E402
+    dispatch_credentials,
+    job_start_bundle,
+    job_workspace_authority,
+    session_attach_payload,
+    unit_claim_bundle,
+)
 
 UNIT_ID = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
 POD_NAME = "stateless-agent-1"
@@ -181,7 +195,9 @@ def _patch(monkeypatch, orch_main, db, *, attach="SENTINEL"):
         orch_main, "_thread_has_knowledge_scope", AsyncMock(return_value=False)
     )
     inject = AsyncMock(side_effect=lambda co, **kw: co)
-    monkeypatch.setattr(orch_main, "_inject_thread_dispatch_credentials", inject)
+    monkeypatch.setattr(
+        dispatch_credentials, "inject_thread_dispatch_credentials", inject
+    )
     assembly = AsyncMock(
         return_value=(
             {
@@ -196,7 +212,9 @@ def _patch(monkeypatch, orch_main, db, *, attach="SENTINEL"):
             else attach
         )
     )
-    monkeypatch.setattr(orch_main, "_assemble_session_attach_payload", assembly)
+    monkeypatch.setattr(
+        session_attach_payload, "assemble_session_attach_payload", assembly
+    )
     return inject, assembly
 
 
@@ -323,8 +341,12 @@ async def test_happy_path_returns_watermarks_and_shared_assembly(monkeypatch):
     db = FakeDB(run_queue_row=dict(LEASED_ROW), thread=_thread())
     inject, assembly = _patch(monkeypatch, orch_main, db)
 
-    out = await orch_main.internal_unit_claim_bundle(
-        UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+    out = await unit_claim_bundle.claim_bundle_for_unit(
+        UNIT_ID,
+        lease_token=7,
+        pod_name=POD_NAME,
+        pod_uid=POD_UID,
+        dependencies=orch_main._unit_claim_bundle_dependencies(),
     )
 
     # One SELECT validated the lease AND carried the watermarks.
@@ -371,7 +393,13 @@ async def test_session_bundle_stolen_during_slow_assembly_is_rejected(monkeypatc
 
     assembly.side_effect = _slow_assembly
     request_task = asyncio.create_task(
-        orch_main.internal_unit_claim_bundle(UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID)
+        unit_claim_bundle.claim_bundle_for_unit(
+            UNIT_ID,
+            lease_token=7,
+            pod_name=POD_NAME,
+            pod_uid=POD_UID,
+            dependencies=orch_main._unit_claim_bundle_dependencies(),
+        )
     )
     await asyncio.wait_for(entered.wait(), timeout=2)
     # The reaper/successor owns a newer token by the time assembly returns.
@@ -404,7 +432,13 @@ async def test_protected_cloud_flip_during_assembly_blocks_final_credentials(
 
     assembly.side_effect = _slow_assembly
     request_task = asyncio.create_task(
-        orch_main.internal_unit_claim_bundle(UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID)
+        unit_claim_bundle.claim_bundle_for_unit(
+            UNIT_ID,
+            lease_token=7,
+            pod_name=POD_NAME,
+            pod_uid=POD_UID,
+            dependencies=orch_main._unit_claim_bundle_dependencies(),
+        )
     )
     await asyncio.wait_for(entered.wait(), timeout=2)
     db._thread["metadata"] = {
@@ -435,8 +469,12 @@ async def test_malformed_or_pinned_session_class_refuses_claim_credentials(
     _patch(monkeypatch, orch_main, db)
 
     with pytest.raises(HTTPException) as exc:
-        await orch_main.internal_unit_claim_bundle(
-            UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+        await unit_claim_bundle.claim_bundle_for_unit(
+            UNIT_ID,
+            lease_token=7,
+            pod_name=POD_NAME,
+            pod_uid=POD_UID,
+            dependencies=orch_main._unit_claim_bundle_dependencies(),
         )
     assert exc.value.status_code in {403, 409}
     db.conn.fetchval.assert_not_awaited()
@@ -460,7 +498,13 @@ async def test_session_class_flip_during_assembly_blocks_final_credentials(
 
     assembly.side_effect = _slow_assembly
     request_task = asyncio.create_task(
-        orch_main.internal_unit_claim_bundle(UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID)
+        unit_claim_bundle.claim_bundle_for_unit(
+            UNIT_ID,
+            lease_token=7,
+            pod_name=POD_NAME,
+            pod_uid=POD_UID,
+            dependencies=orch_main._unit_claim_bundle_dependencies(),
+        )
     )
     await asyncio.wait_for(entered.wait(), timeout=2)
     db._thread["metadata"]["config_override"]["officer"] = {"enabled": "yes"}
@@ -480,8 +524,12 @@ async def test_token_mismatch_and_not_leased_are_one_generic_403(monkeypatch):
     db = FakeDB(run_queue_row=dict(LEASED_ROW), thread=_thread())
     _patch(monkeypatch, orch_main, db)
     with pytest.raises(HTTPException) as exc_token:
-        await orch_main.internal_unit_claim_bundle(
-            UNIT_ID, MagicMock(), 6, POD_NAME, POD_UID
+        await unit_claim_bundle.claim_bundle_for_unit(
+            UNIT_ID,
+            lease_token=6,
+            pod_name=POD_NAME,
+            pod_uid=POD_UID,
+            dependencies=orch_main._unit_claim_bundle_dependencies(),
         )
     assert exc_token.value.status_code == 403
 
@@ -490,8 +538,12 @@ async def test_token_mismatch_and_not_leased_are_one_generic_403(monkeypatch):
     db2 = FakeDB(run_queue_row=row, thread=_thread())
     _patch(monkeypatch, orch_main, db2)
     with pytest.raises(HTTPException) as exc_state:
-        await orch_main.internal_unit_claim_bundle(
-            UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+        await unit_claim_bundle.claim_bundle_for_unit(
+            UNIT_ID,
+            lease_token=7,
+            pod_name=POD_NAME,
+            pod_uid=POD_UID,
+            dependencies=orch_main._unit_claim_bundle_dependencies(),
         )
     assert exc_state.value.status_code == 403
 
@@ -523,8 +575,12 @@ async def test_present_falsey_stop_marker_refuses_credentials(
     _patch(monkeypatch, orch_main, db)
 
     with pytest.raises(HTTPException) as exc:
-        await orch_main.internal_unit_claim_bundle(
-            UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+        await unit_claim_bundle.claim_bundle_for_unit(
+            UNIT_ID,
+            lease_token=7,
+            pod_name=POD_NAME,
+            pod_uid=POD_UID,
+            dependencies=orch_main._unit_claim_bundle_dependencies(),
         )
     assert exc.value.status_code == 403
 
@@ -536,29 +592,41 @@ async def test_absent_unit_row_404(monkeypatch):
     db = FakeDB(run_queue_row=None, thread=_thread())
     _patch(monkeypatch, orch_main, db)
     with pytest.raises(HTTPException) as exc:
-        await orch_main.internal_unit_claim_bundle(
-            UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+        await unit_claim_bundle.claim_bundle_for_unit(
+            UNIT_ID,
+            lease_token=7,
+            pod_name=POD_NAME,
+            pod_uid=POD_UID,
+            dependencies=orch_main._unit_claim_bundle_dependencies(),
         )
     assert exc.value.status_code == 404
 
     # Malformed unit id short-circuits to the same 404 (no DataError 500).
     with pytest.raises(HTTPException) as exc2:
-        await orch_main.internal_unit_claim_bundle(
-            "not-a-uuid", MagicMock(), 7, POD_NAME, POD_UID
+        await unit_claim_bundle.claim_bundle_for_unit(
+            "not-a-uuid",
+            lease_token=7,
+            pod_name=POD_NAME,
+            pod_uid=POD_UID,
+            dependencies=orch_main._unit_claim_bundle_dependencies(),
         )
     assert exc2.value.status_code == 404
 
 
 @pytest.mark.asyncio
-async def test_wrong_lane_and_non_session_kind_409(monkeypatch):
+async def test_wrong_lane_and_unknown_unit_kind_409(monkeypatch):
     from orchestrator import main as orch_main
 
     # Pinned-lane thread behind a leased session unit.
     db = FakeDB(run_queue_row=dict(LEASED_ROW), thread=_thread(execution_lane="pinned"))
     _patch(monkeypatch, orch_main, db)
     with pytest.raises(HTTPException) as exc:
-        await orch_main.internal_unit_claim_bundle(
-            UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+        await unit_claim_bundle.claim_bundle_for_unit(
+            UNIT_ID,
+            lease_token=7,
+            pod_name=POD_NAME,
+            pod_uid=POD_UID,
+            dependencies=orch_main._unit_claim_bundle_dependencies(),
         )
     assert exc.value.status_code == 409
 
@@ -566,20 +634,84 @@ async def test_wrong_lane_and_non_session_kind_409(monkeypatch):
     db2 = FakeDB(run_queue_row=dict(LEASED_ROW), thread=None)
     _patch(monkeypatch, orch_main, db2)
     with pytest.raises(HTTPException) as exc2:
-        await orch_main.internal_unit_claim_bundle(
-            UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+        await unit_claim_bundle.claim_bundle_for_unit(
+            UNIT_ID,
+            lease_token=7,
+            pod_name=POD_NAME,
+            pod_uid=POD_UID,
+            dependencies=orch_main._unit_claim_bundle_dependencies(),
         )
     assert exc2.value.status_code == 409
 
-    # Non-session unit kinds carry no attach bundle.
-    row = dict(LEASED_ROW, unit_kind="bg_task")
+    # Unknown unit kinds carry no attach bundle.
+    row = dict(LEASED_ROW, unit_kind="unknown")
     db3 = FakeDB(run_queue_row=row, thread=_thread())
     _patch(monkeypatch, orch_main, db3)
     with pytest.raises(HTTPException) as exc3:
-        await orch_main.internal_unit_claim_bundle(
-            UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+        await unit_claim_bundle.claim_bundle_for_unit(
+            UNIT_ID,
+            lease_token=7,
+            pod_name=POD_NAME,
+            pod_uid=POD_UID,
+            dependencies=orch_main._unit_claim_bundle_dependencies(),
         )
     assert exc3.value.status_code == 409
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refused", [False, True])
+async def test_bg_task_bundle_uses_cloud_only_builder(monkeypatch, refused):
+    from orchestrator import main as orch_main
+    from orchestrator.services import cloud_push_recovery
+
+    db = FakeDB(run_queue_row=dict(LEASED_ROW, unit_kind="bg_task"), thread=_thread())
+    _patch(monkeypatch, orch_main, db)
+    result = {"unit_id": UNIT_ID, "unit_kind": "bg_task", "obsolete": True}
+    builder = AsyncMock(
+        return_value=result,
+        side_effect=(
+            cloud_push_recovery.CloudPushBundleRefused("private refusal reason")
+            if refused
+            else None
+        ),
+    )
+    monkeypatch.setattr(cloud_push_recovery, "build_cloud_push_bundle", builder)
+    attach = AsyncMock(side_effect=AssertionError("session attach is forbidden"))
+    monkeypatch.setattr(
+        session_attach_payload, "assemble_session_attach_payload", attach
+    )
+    if refused:
+        with pytest.raises(HTTPException) as exc:
+            await unit_claim_bundle.claim_bundle_for_unit(
+                UNIT_ID,
+                lease_token=7,
+                pod_name=POD_NAME,
+                pod_uid=POD_UID,
+                dependencies=orch_main._unit_claim_bundle_dependencies(),
+            )
+        assert exc.value.status_code == 403
+        assert exc.value.detail == "Lease validation failed"
+    else:
+        assert (
+            await unit_claim_bundle.claim_bundle_for_unit(
+                UNIT_ID,
+                lease_token=7,
+                pod_name=POD_NAME,
+                pod_uid=POD_UID,
+                dependencies=orch_main._unit_claim_bundle_dependencies(),
+            )
+            == result
+        )
+    builder.assert_awaited_once_with(
+        db,
+        unit_id=UNIT_ID,
+        lease_token=7,
+        pod_name=POD_NAME,
+        pod_uid=POD_UID,
+        resolve_workspace=ANY,
+    )
+    assert callable(builder.await_args.kwargs["resolve_workspace"])
+    attach.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -606,16 +738,26 @@ async def test_worker_bundle_reuses_job_start_builder_and_rechecks_lease(monkeyp
     monkeypatch.setattr(orch_main, "postgres_db", db)
     built = orch_main.JobStartRequest(job_id=UNIT_ID, description="work")
     builder = AsyncMock(return_value=built)
-    monkeypatch.setattr(orch_main, "_build_job_start_request", builder)
+    monkeypatch.setattr(job_start_bundle, "build_job_start_request", builder)
     inherit = AsyncMock(return_value=("proceed", None))
-    monkeypatch.setattr(orch_main, "_resolve_subjob_inherited_workspace", inherit)
+    monkeypatch.setattr(
+        job_workspace_authority, "resolve_subjob_inherited_workspace", inherit
+    )
     attest = _patch_worker_attestation(monkeypatch, orch_main)
 
-    out = await orch_main.internal_unit_claim_bundle(
-        UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+    out = await unit_claim_bundle.claim_bundle_for_unit(
+        UNIT_ID,
+        lease_token=7,
+        pod_name=POD_NAME,
+        pod_uid=POD_UID,
+        dependencies=orch_main._unit_claim_bundle_dependencies(),
     )
 
-    inherit.assert_awaited_once_with(job)
+    # R1.B06: the bundle calls the B05 operation directly now, so the call
+    # also carries its injected ``dependencies``. Assert the subject, not
+    # the plumbing.
+    inherit.assert_awaited_once()
+    assert inherit.await_args.args == (job,)
     builder.assert_awaited_once()
     attested_job = builder.await_args.args[0]
     assert attested_job is not job
@@ -630,7 +772,10 @@ async def test_worker_bundle_reuses_job_start_builder_and_rechecks_lease(monkeyp
     assert attested_job["config_override"]["workspace"]["remote"]["host"] == (
         "10.0.0.9"
     )
-    assert builder.await_args.kwargs == {"persist_dispatch_state": False}
+    # R1.B06: the bundle calls job_start_bundle directly, so the call also
+    # carries its injected ``dependencies``. The subject of this assertion
+    # is the flag.
+    assert builder.await_args.kwargs["persist_dispatch_state"] is False
     assert attest.await_count == 2
     assert attest.await_args_list[0].args[0] == orch_main.WorkspaceOwner.job(UNIT_ID)
     db.conn.fetchval.assert_awaited_once()
@@ -681,16 +826,20 @@ async def test_worker_vm_bundle_uses_attested_endpoint_and_stamps_host_key_pin(
     builder = AsyncMock(
         return_value=orch_main.JobStartRequest(job_id=UNIT_ID, description="vm work")
     )
-    monkeypatch.setattr(orch_main, "_build_job_start_request", builder)
+    monkeypatch.setattr(job_start_bundle, "build_job_start_request", builder)
     monkeypatch.setattr(
-        orch_main,
-        "_resolve_subjob_inherited_workspace",
+        job_workspace_authority,
+        "resolve_subjob_inherited_workspace",
         AsyncMock(return_value=("proceed", None)),
     )
     attest = _patch_vm_worker_attestation(monkeypatch, orch_main)
 
-    out = await orch_main.internal_unit_claim_bundle(
-        UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+    out = await unit_claim_bundle.claim_bundle_for_unit(
+        UNIT_ID,
+        lease_token=7,
+        pod_name=POD_NAME,
+        pod_uid=POD_UID,
+        dependencies=orch_main._unit_claim_bundle_dependencies(),
     )
 
     assert attest.await_count == 2
@@ -728,11 +877,15 @@ async def test_worker_vm_bundle_refuses_external_topology(monkeypatch):
     monkeypatch.setattr(orch_main, "require_internal", AsyncMock())
     monkeypatch.setattr(orch_main, "postgres_db", db)
     builder = AsyncMock()
-    monkeypatch.setattr(orch_main, "_build_job_start_request", builder)
+    monkeypatch.setattr(job_start_bundle, "build_job_start_request", builder)
 
     with pytest.raises(HTTPException) as exc:
-        await orch_main.internal_unit_claim_bundle(
-            UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+        await unit_claim_bundle.claim_bundle_for_unit(
+            UNIT_ID,
+            lease_token=7,
+            pod_name=POD_NAME,
+            pod_uid=POD_UID,
+            dependencies=orch_main._unit_claim_bundle_dependencies(),
         )
 
     assert exc.value.status_code == 409
@@ -766,17 +919,21 @@ async def test_worker_vm_bundle_refuses_incomplete_ready_context(
     monkeypatch.setattr(orch_main, "require_internal", AsyncMock())
     monkeypatch.setattr(orch_main, "postgres_db", db)
     builder = AsyncMock()
-    monkeypatch.setattr(orch_main, "_build_job_start_request", builder)
+    monkeypatch.setattr(job_start_bundle, "build_job_start_request", builder)
     monkeypatch.setattr(
-        orch_main,
-        "_resolve_subjob_inherited_workspace",
+        job_workspace_authority,
+        "resolve_subjob_inherited_workspace",
         AsyncMock(return_value=("proceed", None)),
     )
     attest = _patch_vm_worker_attestation(monkeypatch, orch_main)
 
     with pytest.raises(HTTPException) as exc:
-        await orch_main.internal_unit_claim_bundle(
-            UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+        await unit_claim_bundle.claim_bundle_for_unit(
+            UNIT_ID,
+            lease_token=7,
+            pod_name=POD_NAME,
+            pod_uid=POD_UID,
+            dependencies=orch_main._unit_claim_bundle_dependencies(),
         )
 
     assert exc.value.status_code == 409
@@ -807,8 +964,8 @@ async def test_worker_bundle_stolen_during_assembly_is_rejected(monkeypatch):
     monkeypatch.setattr(orch_main, "require_internal", AsyncMock())
     monkeypatch.setattr(orch_main, "postgres_db", db)
     monkeypatch.setattr(
-        orch_main,
-        "_build_job_start_request",
+        job_start_bundle,
+        "build_job_start_request",
         AsyncMock(
             return_value=orch_main.JobStartRequest(
                 job_id=UNIT_ID, description="secret-bearing"
@@ -816,15 +973,19 @@ async def test_worker_bundle_stolen_during_assembly_is_rejected(monkeypatch):
         ),
     )
     monkeypatch.setattr(
-        orch_main,
-        "_resolve_subjob_inherited_workspace",
+        job_workspace_authority,
+        "resolve_subjob_inherited_workspace",
         AsyncMock(return_value=("proceed", None)),
     )
     _patch_worker_attestation(monkeypatch, orch_main)
 
     with pytest.raises(HTTPException) as exc:
-        await orch_main.internal_unit_claim_bundle(
-            UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+        await unit_claim_bundle.claim_bundle_for_unit(
+            UNIT_ID,
+            lease_token=7,
+            pod_name=POD_NAME,
+            pod_uid=POD_UID,
+            dependencies=orch_main._unit_claim_bundle_dependencies(),
         )
 
     assert exc.value.status_code == 403
@@ -868,8 +1029,8 @@ async def test_worker_bundle_rejects_rotated_repository_authority(monkeypatch):
         }
     ]
     monkeypatch.setattr(
-        orch_main,
-        "_build_job_start_request",
+        job_start_bundle,
+        "build_job_start_request",
         AsyncMock(
             return_value=orch_main.JobStartRequest(
                 job_id=UNIT_ID,
@@ -879,15 +1040,19 @@ async def test_worker_bundle_rejects_rotated_repository_authority(monkeypatch):
         ),
     )
     monkeypatch.setattr(
-        orch_main,
-        "_resolve_subjob_inherited_workspace",
+        job_workspace_authority,
+        "resolve_subjob_inherited_workspace",
         AsyncMock(return_value=("proceed", None)),
     )
     _patch_worker_attestation(monkeypatch, orch_main)
 
     with pytest.raises(HTTPException) as exc:
-        await orch_main.internal_unit_claim_bundle(
-            UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+        await unit_claim_bundle.claim_bundle_for_unit(
+            UNIT_ID,
+            lease_token=7,
+            pod_name=POD_NAME,
+            pod_uid=POD_UID,
+            dependencies=orch_main._unit_claim_bundle_dependencies(),
         )
 
     assert exc.value.status_code == 409
@@ -918,15 +1083,15 @@ async def test_worker_bundle_rejects_workspace_drift_after_slow_assembly(monkeyp
     monkeypatch.setattr(orch_main, "require_internal", AsyncMock())
     monkeypatch.setattr(orch_main, "postgres_db", db)
     monkeypatch.setattr(
-        orch_main,
-        "_build_job_start_request",
+        job_start_bundle,
+        "build_job_start_request",
         AsyncMock(
             return_value=orch_main.JobStartRequest(job_id=UNIT_ID, description="x")
         ),
     )
     monkeypatch.setattr(
-        orch_main,
-        "_resolve_subjob_inherited_workspace",
+        job_workspace_authority,
+        "resolve_subjob_inherited_workspace",
         AsyncMock(return_value=("proceed", None)),
     )
     initial = _worker_attestation(orch_main)
@@ -937,8 +1102,12 @@ async def test_worker_bundle_rejects_workspace_drift_after_slow_assembly(monkeyp
     _patch_worker_attestation(monkeypatch, orch_main, initial, changed)
 
     with pytest.raises(HTTPException) as exc:
-        await orch_main.internal_unit_claim_bundle(
-            UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+        await unit_claim_bundle.claim_bundle_for_unit(
+            UNIT_ID,
+            lease_token=7,
+            pod_name=POD_NAME,
+            pod_uid=POD_UID,
+            dependencies=orch_main._unit_claim_bundle_dependencies(),
         )
 
     assert exc.value.status_code == 409
@@ -970,18 +1139,22 @@ async def test_inherited_worker_attests_parent_but_keeps_child_tmux_owner(monkey
     monkeypatch.setattr(orch_main, "require_internal", AsyncMock())
     monkeypatch.setattr(orch_main, "postgres_db", db)
     monkeypatch.setattr(
-        orch_main,
-        "_resolve_subjob_inherited_workspace",
+        job_workspace_authority,
+        "resolve_subjob_inherited_workspace",
         AsyncMock(return_value=("proceed", None)),
     )
     builder = AsyncMock(
         return_value=orch_main.JobStartRequest(job_id=UNIT_ID, description="child")
     )
-    monkeypatch.setattr(orch_main, "_build_job_start_request", builder)
+    monkeypatch.setattr(job_start_bundle, "build_job_start_request", builder)
     attest = _patch_worker_attestation(monkeypatch, orch_main)
 
-    out = await orch_main.internal_unit_claim_bundle(
-        UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+    out = await unit_claim_bundle.claim_bundle_for_unit(
+        UNIT_ID,
+        lease_token=7,
+        pod_name=POD_NAME,
+        pod_uid=POD_UID,
+        dependencies=orch_main._unit_claim_bundle_dependencies(),
     )
 
     assert attest.await_count == 2
@@ -1043,14 +1216,18 @@ async def test_pre_0175_inherited_worker_final_reread_converges_parent(monkeypat
     builder = AsyncMock(
         return_value=orch_main.JobStartRequest(job_id=UNIT_ID, description="child")
     )
-    monkeypatch.setattr(orch_main, "_build_job_start_request", builder)
+    monkeypatch.setattr(job_start_bundle, "build_job_start_request", builder)
     exact = _worker_attestation(orch_main)
     attest = _patch_worker_attestation(
         monkeypatch, orch_main, exact, exact, exact, exact, exact, exact, exact
     )
 
-    out = await orch_main.internal_unit_claim_bundle(
-        UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+    out = await unit_claim_bundle.claim_bundle_for_unit(
+        UNIT_ID,
+        lease_token=7,
+        pod_name=POD_NAME,
+        pod_uid=POD_UID,
+        dependencies=orch_main._unit_claim_bundle_dependencies(),
     )
 
     builder.assert_awaited_once()
@@ -1112,7 +1289,7 @@ async def test_inherited_worker_rejects_parent_change_after_assembly(
     builder = AsyncMock(
         return_value=orch_main.JobStartRequest(job_id=UNIT_ID, description="child")
     )
-    monkeypatch.setattr(orch_main, "_build_job_start_request", builder)
+    monkeypatch.setattr(job_start_bundle, "build_job_start_request", builder)
     predecessor = _worker_attestation(orch_main)
     replacement = _worker_attestation(
         orch_main,
@@ -1168,8 +1345,12 @@ async def test_inherited_worker_rejects_parent_change_after_assembly(
     )
 
     with pytest.raises(HTTPException) as exc:
-        await orch_main.internal_unit_claim_bundle(
-            UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+        await unit_claim_bundle.claim_bundle_for_unit(
+            UNIT_ID,
+            lease_token=7,
+            pod_name=POD_NAME,
+            pod_uid=POD_UID,
+            dependencies=orch_main._unit_claim_bundle_dependencies(),
         )
 
     assert exc.value.status_code == 409
@@ -1191,7 +1372,7 @@ async def test_stateless_bundle_refusal_never_mutates_job_status(monkeypatch):
         AsyncMock(side_effect=HTTPException(status_code=409, detail="revoked")),
     )
 
-    built = await orch_main._build_job_start_request(
+    built = await job_start_bundle.build_job_start_request(
         {
             "id": UNIT_ID,
             "description": "work",
@@ -1199,6 +1380,7 @@ async def test_stateless_bundle_refusal_never_mutates_job_status(monkeypatch):
             "config_override": {"workspace": {"backend": "sandbox"}},
         },
         persist_dispatch_state=False,
+        dependencies=orch_main._job_start_bundle_dependencies(),
     )
 
     assert built is None
@@ -1222,8 +1404,12 @@ async def test_non_lite_workspace_refused_before_attach_assembly(monkeypatch, ba
     inject, assembly = _patch(monkeypatch, orch_main, db)
 
     with pytest.raises(HTTPException) as exc:
-        await orch_main.internal_unit_claim_bundle(
-            UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+        await unit_claim_bundle.claim_bundle_for_unit(
+            UNIT_ID,
+            lease_token=7,
+            pod_name=POD_NAME,
+            pod_uid=POD_UID,
+            dependencies=orch_main._unit_claim_bundle_dependencies(),
         )
 
     assert exc.value.status_code == 409
@@ -1257,8 +1443,12 @@ async def test_upgraded_lite_claim_refused_before_credentials_or_assembly(
     inject, assembly = _patch(monkeypatch, orch_main, db)
 
     with pytest.raises(HTTPException) as exc:
-        await orch_main.internal_unit_claim_bundle(
-            UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+        await unit_claim_bundle.claim_bundle_for_unit(
+            UNIT_ID,
+            lease_token=7,
+            pod_name=POD_NAME,
+            pod_uid=POD_UID,
+            dependencies=orch_main._unit_claim_bundle_dependencies(),
         )
 
     assert exc.value.status_code == 409
@@ -1275,8 +1465,12 @@ async def test_assembly_refusal_is_generic_409(monkeypatch):
     db = FakeDB(run_queue_row=dict(LEASED_ROW), thread=_thread())
     _patch(monkeypatch, orch_main, db, attach=None)
     with pytest.raises(HTTPException) as exc:
-        await orch_main.internal_unit_claim_bundle(
-            UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+        await unit_claim_bundle.claim_bundle_for_unit(
+            UNIT_ID,
+            lease_token=7,
+            pod_name=POD_NAME,
+            pod_uid=POD_UID,
+            dependencies=orch_main._unit_claim_bundle_dependencies(),
         )
     assert exc.value.status_code == 409
     # Generic reason — must not leak which fail-closed rule refused.
@@ -1293,10 +1487,19 @@ async def test_internal_auth_failure_is_401_before_any_lookup(monkeypatch):
     db = FakeDB(run_queue_row=dict(LEASED_ROW), thread=_thread())
     monkeypatch.setattr(orch_main, "postgres_db", db)
 
+    # R1.B06: the transport guard is the router's, so this drives the router.
+    # The point of the case is unchanged and still worth holding: the 401 must
+    # land before the service is entered at all, which is why the db assertion
+    # below is the real assertion.
+    from orchestrator.routers import unit_claim as unit_claim_router
+
     request = MagicMock()
     request.headers = {"X-Internal-Key": ""}
+    request.app.state.unit_claim_bundle_dependencies_factory = (
+        orch_main._unit_claim_bundle_dependencies
+    )
     with pytest.raises(HTTPException) as exc:
-        await orch_main.internal_unit_claim_bundle(
+        await unit_claim_router.internal_unit_claim_bundle(
             UNIT_ID, request, 7, POD_NAME, POD_UID
         )
     assert exc.value.status_code == 401

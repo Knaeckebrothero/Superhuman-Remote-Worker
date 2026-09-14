@@ -23,6 +23,10 @@ export function isRepositoryDatasource(type: DatasourceType | string): boolean {
   return (type || '').toString().toLowerCase() === 'repository';
 }
 
+export function requiresShellWorkspace(type: DatasourceType | string): boolean {
+  return isRepositoryDatasource(type) || type === 'credentials';
+}
+
 /** Stable identity of a datasource set (order-independent). */
 export function datasourceSetKey(datasources: {id: string}[]): string {
   return datasources
@@ -99,7 +103,7 @@ export function selectedDatasourceIds(
     datasources, selection, defaultIds, serverDefaultsEnabled,
   );
   return datasources
-    .filter(d => active.has(d.id) && !(isLiteBackend && isRepositoryDatasource(d.type)))
+    .filter(d => active.has(d.id) && !(isLiteBackend && requiresShellWorkspace(d.type)))
     .map(d => d.id);
 }
 
@@ -115,7 +119,7 @@ export function allDatasourcesSelected(
 ): boolean {
   const locked = new Set(lockedIds ?? []);
   const selectable = datasources.filter(
-    d => !(isLiteBackend && isRepositoryDatasource(d.type)) && !locked.has(d.id),
+    d => !(isLiteBackend && requiresShellWorkspace(d.type)) && !locked.has(d.id),
   );
   if (selectable.length === 0) return false;
   const active = activeDatasourceIds(
@@ -167,10 +171,12 @@ export function allDatasourcesSelected(
                 </span>
                 @if (isLiteExcluded(ds)) {
                   <span class="ds-desc">Requires a sandbox or VM workspace</span>
+                } @else if (ds.unavailable && ds.type === 'credentials') {
+                  <span class="ds-desc">{{ 'agentSettings.datasources.credentialsUnavailable' | transloco }}</span>
                 } @else if (ds.unavailable) {
                   <span class="ds-desc">{{ 'agentSettings.datasources.unavailableLive' | transloco }}</span>
                 } @else if (isLocked(ds)) {
-                  <span class="ds-desc">{{ 'agentSettings.datasources.lockedLive' | transloco }}</span>
+                  <span class="ds-desc">{{ (ds.type === 'credentials' ? 'agentSettings.datasources.credentialsLocked' : 'agentSettings.datasources.lockedLive') | transloco }}</span>
                 } @else if (ds.description) {
                   <span class="ds-desc">{{ ds.description }}</span>
                 }
@@ -244,7 +250,7 @@ export function allDatasourcesSelected(
       font-size: 11px;
       font-weight: 600;
       text-transform: uppercase;
-      letter-spacing: 0.5px;
+      letter-spacing: 0.06em;
       color: var(--text-muted, var(--text-muted));
     }
     .select-all-btn {
@@ -256,8 +262,6 @@ export function allDatasourcesSelected(
       font-family: inherit;
       font-size: 11px;
       font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
       color: var(--accent-color, var(--accent-color));
     }
     .select-all-btn:hover:not(:disabled) {
@@ -329,10 +333,10 @@ export function allDatasourcesSelected(
       white-space: normal;
     }
     .ds-type-badge {
-      font-size: 10px;
+      font-size: 11px;
       font-weight: 500;
       text-transform: uppercase;
-      letter-spacing: 0.3px;
+      letter-spacing: 0.06em;
       padding: 2px 6px;
       border-radius: var(--radius-tag);
       background: rgba(255, 255, 255, 0.06);
@@ -377,7 +381,7 @@ export class DatasourcesGroupComponent {
   contextKey = input('standalone');
   /**
    * When a lite workspace backend (virtual/none) is selected, clone-based
-   * repository datasources are unavailable. `kb` repositories are indexed by
+   * repositories and credentials are unavailable. `kb` repositories are indexed by
    * the orchestrator, so they remain selectable.
    */
   isLiteBackend = input(false);
@@ -447,19 +451,20 @@ export class DatasourcesGroupComponent {
       this.selection(),
       this.isLiteBackend(),
       this.defaultIds(),
-      this.lockedIds(),
+      this.datasources().filter(ds => this.isLocked(ds)).map(ds => ds.id),
       this.datasourceDefaultsEnabled(),
     )
   );
 
-  /** A repository datasource can't be used under a lite backend. */
+  /** Repositories and credentials require a shell-capable workspace. */
   isLiteExcluded(ds: Datasource): boolean {
-    return this.isLiteBackend() && isRepositoryDatasource(ds.type);
+    return this.isLiteBackend() && requiresShellWorkspace(ds.type);
   }
 
   /** Frozen at its current state — rendered, never toggleable. */
   isLocked(ds: Datasource): boolean {
-    return this.lockedIds().includes(ds.id);
+    return this.lockedIds().includes(ds.id) ||
+      (ds.type === 'credentials' && (this.initialSelectedIds()?.includes(ds.id) ?? false));
   }
 
   isChecked(ds: Datasource): boolean {
@@ -473,7 +478,8 @@ export class DatasourcesGroupComponent {
   }
 
   toggle(id: string): void {
-    if (this.lockedIds().includes(id)) return;
+    const ds = this.datasources().find(item => item.id === id);
+    if (!ds || this.isLocked(ds) || this.isLiteExcluded(ds)) return;
     const next = new Set(
       activeDatasourceIds(
         this.datasources(), this.selection(), this.defaultIds(),
@@ -518,6 +524,7 @@ export class DatasourcesGroupComponent {
 
   getTypeIcon(type: DatasourceType | string): string {
     const icons: Record<string, string> = {
+      credentials: 'key',
       postgresql: 'database',
       neo4j: 'hub',
       mongodb: 'eco',

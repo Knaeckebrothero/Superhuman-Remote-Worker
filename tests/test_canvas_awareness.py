@@ -21,10 +21,14 @@ _THREAD_ID = "a3333333-3333-3333-3333-333333333333"
 _SOURCE_VERSION = "sha256:" + "a" * 64
 
 
-def _request(*, disconnects: list[bool] | None = None) -> MagicMock:
+def _request(
+    *, store: object | None = None, disconnects: list[bool] | None = None
+) -> MagicMock:
     request = MagicMock()
     request.cookies = {"srw_session": "opaque"}
     request.headers = {}
+    # The routes read the store off the application handling this request.
+    request.app.state.store = store
     request.is_disconnected = AsyncMock(side_effect=disconnects or [True])
     return request
 
@@ -50,7 +54,7 @@ def test_awareness_routes_publish_the_exact_lane_free_contract() -> None:
 @pytest.mark.asyncio
 async def test_put_awareness_is_owner_gated_and_lane_free(monkeypatch) -> None:
     db = object()
-    request = _request()
+    request = _request(store=db)
     owner = AsyncMock(return_value=({"id": "owner"}, {"id": _THREAD_ID}))
     expires_at = datetime.now(timezone.utc) + timedelta(seconds=15)
     mutate = AsyncMock(
@@ -62,7 +66,6 @@ async def test_put_awareness_is_owner_gated_and_lane_free(monkeypatch) -> None:
             expires_at=expires_at,
         )
     )
-    monkeypatch.setattr(canvases, "_get_db", lambda: db)
     monkeypatch.setattr(canvases, "require_thread_owner", owner)
     monkeypatch.setattr(canvases, "mutate_canvas_awareness", mutate)
 
@@ -112,7 +115,6 @@ async def test_put_awareness_is_owner_gated_and_lane_free(monkeypatch) -> None:
 async def test_put_awareness_maps_conflicts(
     monkeypatch, code: str, status: int
 ) -> None:
-    monkeypatch.setattr(canvases, "_get_db", lambda: object())
     monkeypatch.setattr(
         canvases, "require_thread_owner", AsyncMock(return_value=({}, {}))
     )
@@ -133,7 +135,7 @@ async def test_put_awareness_maps_conflicts(
                 presentation_revision=1,
                 source_version=_SOURCE_VERSION,
             ),
-            _request(),
+            _request(store=object()),
         )
     assert exc.value.status_code == status
     assert exc.value.detail["code"] == code
@@ -142,7 +144,7 @@ async def test_put_awareness_maps_conflicts(
 @pytest.mark.asyncio
 async def test_stream_emits_complete_named_snapshots_without_ids(monkeypatch) -> None:
     db = object()
-    request = _request(disconnects=[False, False, True])
+    request = _request(store=db, disconnects=[False, False, True])
     owner = AsyncMock(return_value=({"id": "owner"}, {"id": _THREAD_ID}))
     editor = CanvasAwarenessEditor(
         sender_id="b3333333-3333-4333-8333-333333333333",
@@ -155,7 +157,6 @@ async def test_stream_emits_complete_named_snapshots_without_ids(monkeypatch) ->
     )
     fetch = AsyncMock(side_effect=[(editor,), ()])
     cleanup = AsyncMock(return_value=0)
-    monkeypatch.setattr(canvases, "_get_db", lambda: db)
     monkeypatch.setattr(canvases, "require_thread_owner", owner)
     monkeypatch.setattr(canvases, "fetch_canvas_awareness_snapshot", fetch)
     monkeypatch.setattr(canvases, "cleanup_canvas_awareness", cleanup)
@@ -190,10 +191,9 @@ async def test_stream_reauthorizes_and_sends_separate_idle_keepalive(
     monkeypatch,
 ) -> None:
     db = object()
-    request = _request(disconnects=[False, False, True])
+    request = _request(store=db, disconnects=[False, False, True])
     owner = AsyncMock(return_value=({"id": "owner"}, {"id": _THREAD_ID}))
     fetch = AsyncMock(return_value=())
-    monkeypatch.setattr(canvases, "_get_db", lambda: db)
     monkeypatch.setattr(canvases, "require_thread_owner", owner)
     monkeypatch.setattr(canvases, "fetch_canvas_awareness_snapshot", fetch)
     monkeypatch.setattr(canvases, "cleanup_canvas_awareness", AsyncMock(return_value=0))
@@ -221,7 +221,7 @@ async def test_stream_reauthorizes_and_sends_separate_idle_keepalive(
 @pytest.mark.asyncio
 async def test_stream_closes_when_periodic_owner_check_fails(monkeypatch) -> None:
     db = object()
-    request = _request(disconnects=[False])
+    request = _request(store=db, disconnects=[False])
     owner = AsyncMock(
         side_effect=[
             ({"id": "owner"}, {"id": _THREAD_ID}),
@@ -229,7 +229,6 @@ async def test_stream_closes_when_periodic_owner_check_fails(monkeypatch) -> Non
         ]
     )
     fetch = AsyncMock(return_value=())
-    monkeypatch.setattr(canvases, "_get_db", lambda: db)
     monkeypatch.setattr(canvases, "require_thread_owner", owner)
     monkeypatch.setattr(canvases, "fetch_canvas_awareness_snapshot", fetch)
     monkeypatch.setattr(canvases, "cleanup_canvas_awareness", AsyncMock(return_value=0))

@@ -1,0 +1,45 @@
+{
+  "context": "k3d-srw",
+  "nodes": [
+    "k3d-srw-server-0"
+  ],
+  "workspaceImage": "srw-registry:5000/srw-pane-gate-workspace@sha256:935c00d1582ee9c62dac747fe98fa1c4bbcfe6b7dac37c6fd659f1b9664fc721",
+  "baseline": "18f73043606767efe3168aa775bedb8c43d25b69",
+  "candidate": "a000c8d3936f25e3d99aa89e5968eea9dcfaabd6",
+  "checks": [
+    "pinned: closed tab pruned; survivor and replacement usable",
+    "pinned: whole-session loss still raises workspace error",
+    "stateless-token: closed tab pruned; survivor and replacement usable",
+    "stale token refused; newer owner remains usable",
+    "stateless-token: whole-session loss still raises workspace error"
+  ],
+  "scope": "Real SSH/tmux and production workspace adapter; not a RunQueue or VM recovery gate.",
+  "namespace": "srw-native-gate-6e6424b4302a",
+  "workspace": {
+    "state": "Attached",
+    "generation": 1,
+    "pvc_uid": "6854ad5e-0f31-47a8-a611-2d48a77dca9b",
+    "pod_uid": "a877bfd1-67e5-4e21-aabe-b8b491b7f45b",
+    "initialized": true
+  },
+  "initialShellResults": [
+    "Exit code: 0\nCWD: /home/agent-host/workspace\n--- stdout ---\nsurvivor-ready",
+    "Exit code: 0\nCWD: /home/agent-host/workspace\n--- stdout ---\nsurvivor-ready",
+    "Exit code: 0\nCWD: /home/agent-host/workspace\n--- stdout ---\nsurvivor-ready"
+  ],
+  "baselineFalseWorkspaceLossReproduced": true,
+  "status": "passed",
+  "namespaceRemoved": true,
+  "testDriverSHA256": "b8c33fd7cb25caa52de851c2f67a7a7140377cf0ed05e0d0a3bc78463bfacd32",
+  "remoteBackendSHA256": "bf6f8ced5f62cf95da6191a71f60c51508a522d575fd5fa5d8fcb22be98da71f",
+  "priorAttempts": [
+    {
+      "result": "fixture failed; exact cleanup passed",
+      "reason": "Two initial probes expected captured stdout from a command without a trailing newline. The command exited zero; the probe was corrected to use newline-terminated marker output."
+    },
+    {
+      "result": "fixture refused; exact cleanup passed",
+      "reason": "The stateless probe initially omitted backing/runtime incarnation identity. The existing process-tag fence refused it with exit 81. The corrected probe supplies its exact owned PVC and Pod UIDs; no runtime fence was weakened."
+    }
+  ]
+}

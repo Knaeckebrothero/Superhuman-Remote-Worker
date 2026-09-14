@@ -17,7 +17,7 @@ import shutil
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
-from agent.services.cloud_sync.base import WorkspaceSyncBase
+from agent.services.cloud_sync.base import CloudSyncFenceLost, WorkspaceSyncBase
 
 
 class LocalFsWorkspaceSync(WorkspaceSyncBase):
@@ -38,6 +38,7 @@ class LocalFsWorkspaceSync(WorkspaceSyncBase):
             workspace_backend=workspace_backend,
             mount_subdir=mount_subdir,
         )
+        self.conditional_writes: list[tuple[str, Optional[str], bool]] = []
         self._remote_root = Path(remote_root)
         self._remote_root.mkdir(parents=True, exist_ok=True)
 
@@ -59,28 +60,51 @@ class LocalFsWorkspaceSync(WorkspaceSyncBase):
         if rel_dir and rel_dir != ".":
             (self._remote_root / rel_dir).mkdir(parents=True, exist_ok=True)
 
+    def _etag_of(self, rel_path: str) -> Optional[str]:
+        p = self._remote_root / rel_path
+        if not p.is_file():
+            return None
+        return hashlib.sha256(p.read_bytes()).hexdigest()
+
     async def _upload_file(
         self,
         rel_path: str,
         local_path: str,
         *,
         before_write: Optional[Callable[[], Awaitable[None]]] = None,
-    ) -> None:
+        if_match: Optional[str] = None,
+        if_none_match: bool = False,
+    ) -> Optional[str]:
         if before_write is not None:
             await before_write()
+        current = self._etag_of(rel_path)
+        # RFC 4918 preconditions, exactly as a WebDAV server applies them.
+        if if_match and current != if_match:
+            raise CloudSyncFenceLost(f"If-Match failed for {rel_path}")
+        if if_none_match and current is not None:
+            raise CloudSyncFenceLost(f"If-None-Match: * failed for {rel_path}")
+        self.conditional_writes.append((rel_path, if_match, if_none_match))
         dst = self._remote_root / rel_path
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(local_path, dst)
+        return self._etag_of(rel_path)
 
     async def _delete_remote_file(
         self,
         rel_path: str,
         *,
         before_write: Optional[Callable[[], Awaitable[None]]] = None,
+        if_match: Optional[str] = None,
     ) -> None:
         if before_write is not None:
             await before_write()
+        current = self._etag_of(rel_path)
+        if if_match and current is not None and current != if_match:
+            raise CloudSyncFenceLost(f"If-Match failed for delete of {rel_path}")
         (self._remote_root / rel_path).unlink(missing_ok=True)
+
+    async def _remote_etag(self, rel_path: str) -> Optional[str]:
+        return self._etag_of(rel_path)
 
     async def _list_remote_files(self, rel_dir: str = "") -> list[dict]:
         # Deliberately ignores ``rel_dir`` and lists recursively — the base
@@ -129,7 +153,9 @@ class FailingLocalFsWorkspaceSync(LocalFsWorkspaceSync):
         local_path: str,
         *,
         before_write: Optional[Callable[[], Awaitable[None]]] = None,
-    ) -> None:
+        if_match: Optional[str] = None,
+        if_none_match: bool = False,
+    ) -> Optional[str]:
         # ``_ensure_remote_dirs`` deliberately swallows mkdir errors (treats
         # them as "already exists"), so failing on dir creation won't
         # surface to the strict-mode caller. Failing on the actual upload

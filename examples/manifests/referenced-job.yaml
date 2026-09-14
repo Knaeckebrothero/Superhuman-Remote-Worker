@@ -1,0 +1,27 @@
+apiVersion: srw/v1alpha1
+kind: Job
+metadata:
+  name: implement-cpp-feature
+  scope: {kind: Project, name: cpp-product}
+spec:
+  task:
+    text: Implement and test the assigned C++ feature.
+    data: {ticket: example-42}
+  execution:
+    expert:
+      ref:
+        name: cpp-developer
+        scope: {kind: Catalog, name: shared}
+    workspace:
+      template:
+        ref:
+          name: cpp-terraform-react
+          scope: {kind: Catalog, name: shared}
+    connectors:
+      source:
+        ref:
+          name: application-source
+          scope: {kind: Account, name: personal}
+  completion: {mode: Reported}
+  retry: {maxAttempts: 1}
+  timeoutSeconds: 3600

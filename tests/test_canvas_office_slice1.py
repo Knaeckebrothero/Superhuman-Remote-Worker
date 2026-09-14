@@ -320,10 +320,11 @@ def _wopi_client(monkeypatch):
 
     tokens = _RouteTokenService()
     gateway = _RouteGateway()
-    monkeypatch.setattr(wopi, "_get_token_service", lambda: tokens)
-    monkeypatch.setattr(wopi, "_get_file_gateway", lambda: gateway)
+    monkeypatch.setattr(wopi, "_get_token_service", lambda db: tokens)
+    monkeypatch.setattr(wopi, "_get_file_gateway", lambda db: gateway)
     monkeypatch.setattr(wopi, "_get_collabora_config", _config)
     app = FastAPI()
+    app.state.store = object()
     app.include_router(wopi.router)
     return TestClient(app), tokens, gateway
 

@@ -11,6 +11,7 @@ import {MARKED_EXTENSIONS, MARKED_OPTIONS, SANITIZE, provideMarkdown} from 'ngx-
 import {citationExtension} from './core/markdown/citation-extension';
 import {mathExtension} from './core/markdown/math-extension';
 import {externalImageExtension} from './core/markdown/external-image-extension';
+import {markdownLinkExtension} from './core/markdown/link-extension';
 import {sanitizeMarkdownHtml} from './core/markdown/markdown-sanitizer';
 import {SessionService} from './core/services/session.service';
 import {UserService} from './core/services/user.service';
@@ -123,6 +124,13 @@ export const appConfig: ApplicationConfig = {
           provide: MARKED_EXTENSIONS,
           multi: true,
           useValue: externalImageExtension(),
+        },
+        {
+          // No agent-written link may navigate this document: external ones
+          // open in a new tab, workspace paths become inert in-app controls.
+          provide: MARKED_EXTENSIONS,
+          multi: true,
+          useValue: markdownLinkExtension(),
         },
         {
           provide: MARKED_EXTENSIONS,

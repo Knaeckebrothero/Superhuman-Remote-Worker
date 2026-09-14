@@ -39,6 +39,7 @@ import pytest
 from fastapi import HTTPException
 
 import orchestrator.main as orch_main
+from orchestrator.routers import officers as officers_router
 from orchestrator.services.agent_pod_entrypoint import (
     InvalidConfigNameError,
     validate_config_name,
@@ -178,7 +179,9 @@ class TestAgentThreadCreateWriteBoundary:
 
     @pytest.mark.asyncio
     async def test_hostile_name_is_refused_before_any_insert(self, fake_db):
-        from orchestrator.main import AgentThreadCreateRequest, agent_create_thread
+        import orchestrator.main as main
+        from orchestrator.main import AgentThreadCreateRequest
+        from orchestrator.services.agent_child_threads import agent_create_thread
 
         fake_db.create_thread = AsyncMock()
         with patch("orchestrator.main.postgres_db", fake_db):
@@ -187,6 +190,7 @@ class TestAgentThreadCreateWriteBoundary:
                     await agent_create_thread(
                         MagicMock(),
                         AgentThreadCreateRequest(config_name="a; rm -rf /"),
+                        dependencies=main._agent_child_threads_dependencies(),
                     )
 
         assert exc.value.status_code == 422
@@ -202,7 +206,8 @@ class TestJobCreateWriteBoundary:
     async def test_hostile_name_is_refused_before_any_insert(
         self, name, user_a, fake_db, fake_request
     ):
-        from orchestrator.main import JobCreate, create_job
+        from orchestrator.main import JobCreate
+        from tests._b09_control_seams import create_job
 
         fake_db.create_job = AsyncMock()
         # No default project: the boundary under test must fire on a plain,
@@ -229,7 +234,8 @@ class TestProjectDefaultConfigNameWriteBoundary:
     async def test_create_project_refuses_hostile_default(
         self, user_a, fake_db, fake_request
     ):
-        from orchestrator.main import ProjectCreate, create_project
+        from orchestrator.routers.projects import create_project
+        from orchestrator.schemas.projects import ProjectCreate
 
         fake_db.create_project = AsyncMock()
         with _patch_caller(user_a, fake_db):
@@ -241,6 +247,7 @@ class TestProjectDefaultConfigNameWriteBoundary:
                         default_config_name="scholar && curl evil",
                     ),
                     fake_request,
+                    dependencies=orch_main._projects_dependencies(),
                 )
 
         assert exc.value.status_code == 422
@@ -250,7 +257,8 @@ class TestProjectDefaultConfigNameWriteBoundary:
     async def test_patch_project_refuses_hostile_default(
         self, user_a, project_a, fake_db, fake_request
     ):
-        from orchestrator.main import ProjectUpdate, update_project
+        from orchestrator.routers.projects import update_project
+        from orchestrator.schemas.projects import ProjectUpdate
 
         fake_db.update_project = AsyncMock(return_value=True)
         with _patch_caller(user_a, fake_db):
@@ -263,6 +271,7 @@ class TestProjectDefaultConfigNameWriteBoundary:
                         str(project_a["id"]),
                         ProjectUpdate(default_config_name="../../etc/passwd"),
                         fake_request,
+                        dependencies=orch_main._projects_dependencies(),
                     )
 
         assert exc.value.status_code == 422
@@ -292,21 +301,26 @@ class TestSessionPrepareWriteBoundary:
         db.get_thread = AsyncMock(return_value=thread)
         scheduled: list = []
 
-        with patch.object(sessions_router, "_get_db", lambda: db):
+        # The router reads its store off the application answering the request.
+        request = MagicMock()
+        request.app.state.sessions_dependencies_factory = lambda: SimpleNamespace(
+            store=db
+        )
+
+        with patch.object(
+            sessions_router, "require_approved_user", AsyncMock(return_value=user_a)
+        ):
             with patch.object(
-                sessions_router, "require_approved_user", AsyncMock(return_value=user_a)
+                sessions_router,
+                "_schedule_prepare_task",
+                lambda coro: (coro.close(), scheduled.append(coro))[0],
             ):
-                with patch.object(
-                    sessions_router,
-                    "_schedule_prepare_task",
-                    lambda coro: (coro.close(), scheduled.append(coro))[0],
-                ):
-                    with pytest.raises(HTTPException) as exc:
-                        await sessions_router.prepare_session(
-                            str(thread["id"]),
-                            MagicMock(),
-                            sessions_router.PrepareRequest(config_name="a b"),
-                        )
+                with pytest.raises(HTTPException) as exc:
+                    await sessions_router.prepare_session(
+                        request,
+                        str(thread["id"]),
+                        sessions_router.PrepareRequest(config_name="a b"),
+                    )
 
         assert exc.value.status_code == 422
         assert scheduled == []
@@ -593,9 +607,17 @@ def _resume_stack(user: dict, db, thread_row: dict) -> ExitStack:
         patch("orchestrator.main.ensure_session_workspace", AsyncMock())
     )
     stack.enter_context(
-        patch("orchestrator.main._thread_config_drift", AsyncMock(return_value=[]))
+        patch(
+            "orchestrator.main.thread_resume_operations.thread_config_drift",
+            AsyncMock(return_value=[]),
+        )
     )
-    stack.enter_context(patch("orchestrator.main._await_late_cloud_setup", AsyncMock()))
+    stack.enter_context(
+        patch(
+            "orchestrator.main.thread_resume_operations.await_late_cloud_setup",
+            AsyncMock(),
+        )
+    )
     stack.enter_context(
         patch(
             "orchestrator.main._await_protected_cloud_runtime_ready",
@@ -620,7 +642,7 @@ class TestResumeReprovisionFailsLoudly:
     async def test_refused_config_name_records_a_failed_state(
         self, user_a, fake_request
     ):
-        from orchestrator.main import resume_thread
+        from tests._b09_control_seams import resume_thread
 
         thread_row = _preparable_thread(
             user_id=str(user_a["id"]),
@@ -659,7 +681,7 @@ class TestResumeReprovisionFailsLoudly:
     async def test_legacy_path_refusal_records_a_failed_state(
         self, user_a, fake_request
     ):
-        from orchestrator.main import resume_thread
+        from tests._b09_control_seams import resume_thread
 
         thread_row = _preparable_thread(
             user_id=str(user_a["id"]),
@@ -735,6 +757,32 @@ class TestMagicLinkWakeProvisioningFailsLoudly:
         assert "config_name" in recorder.failures[0]["reason"]
 
 
+def _officer_recycle_request(db, recycler):
+    """The Post's recycle route resolves its store, provisioner and recycler
+    from ``request.app.state`` now — rebinding the three ``orchestrator.main``
+    globals no longer reaches it."""
+    from orchestrator.services.officer_post_lifecycle import (
+        OfficerPostLifecycleDependencies,
+    )
+    from orchestrator.services.officer_post_policy import (
+        OfficerPostPolicyDependencies,
+    )
+
+    dependencies = OfficerPostLifecycleDependencies(
+        store=db,
+        persistent_provisioner=MagicMock(is_available=True, expected_build_sha="sha"),
+        persistent_thread_recycler=recycler,
+        policy=OfficerPostPolicyDependencies(auto_pull_release_enabled=lambda: False),
+        kick_officer_event_drain=MagicMock(),
+        deliver_officer_note=AsyncMock(),
+        create_thread=AsyncMock(),
+        end_thread_flow=AsyncMock(),
+    )
+    request = MagicMock()
+    request.app.state.officer_post_lifecycle_dependencies_factory = lambda: dependencies
+    return request
+
+
 class TestOfficerRecycleRouteAnswers4xx:
     """A row poisoned before the write boundary existed must fail its
     provisioning attempt with something an operator can act on."""
@@ -745,9 +793,10 @@ class TestOfficerRecycleRouteAnswers4xx:
         db.get_officer_thread_for_project = AsyncMock(
             return_value={"id": THREAD_ID, "project_id": "p"}
         )
-        monkeypatch.setattr(orch_main, "postgres_db", db)
         monkeypatch.setattr(
-            orch_main, "require_project_owner", AsyncMock(return_value=(None, None))
+            officers_router,
+            "require_project_owner",
+            AsyncMock(return_value=(None, None)),
         )
         recycler = MagicMock()
         recycler.observe = AsyncMock(return_value=None)
@@ -756,15 +805,10 @@ class TestOfficerRecycleRouteAnswers4xx:
                 "config_name must not contain a '..' segment: '../../x'"
             )
         )
-        monkeypatch.setattr(orch_main, "_persistent_thread_recycler", recycler)
-        monkeypatch.setattr(
-            orch_main,
-            "persistent_provisioner",
-            MagicMock(is_available=True, expected_build_sha="sha"),
-        )
+        request = _officer_recycle_request(db, recycler)
 
         with pytest.raises(HTTPException) as exc:
-            await orch_main.recycle_project_officer(MagicMock(), "p")
+            await officers_router.recycle_project_officer(request, "p")
 
         assert exc.value.status_code == 422
         assert "'..' segment" in str(exc.value.detail)
@@ -777,19 +821,15 @@ class TestOfficerRecycleRouteAnswers4xx:
         db.get_officer_thread_for_project = AsyncMock(
             return_value={"id": THREAD_ID, "project_id": "p"}
         )
-        monkeypatch.setattr(orch_main, "postgres_db", db)
         monkeypatch.setattr(
-            orch_main, "require_project_owner", AsyncMock(return_value=(None, None))
+            officers_router,
+            "require_project_owner",
+            AsyncMock(return_value=(None, None)),
         )
         recycler = MagicMock()
         recycler.observe = AsyncMock(return_value=None)
         recycler.request_and_reconcile = AsyncMock(side_effect=RuntimeError("boom"))
-        monkeypatch.setattr(orch_main, "_persistent_thread_recycler", recycler)
-        monkeypatch.setattr(
-            orch_main,
-            "persistent_provisioner",
-            MagicMock(is_available=True, expected_build_sha="sha"),
-        )
+        request = _officer_recycle_request(db, recycler)
 
         with pytest.raises(RuntimeError):
-            await orch_main.recycle_project_officer(MagicMock(), "p")
+            await officers_router.recycle_project_officer(request, "p")

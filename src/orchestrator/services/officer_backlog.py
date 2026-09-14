@@ -910,6 +910,18 @@ async def _dispatch_one(
     effective_owner_user_id = preparation.owner_user_id or (
         str(owner_user_id) if owner_user_id else None
     )
+    from orchestrator.services.manifest_workspace_selection import (
+        select_project_workspace_default,
+    )
+
+    prepared_config, workspace_selection = await select_project_workspace_default(
+        db,
+        effective_owner_user_id,
+        project_id,
+        prepared_config,
+    )
+    if workspace_selection is not None:
+        config_override = prepared_config
     if enforce_grants is not None:
         await enforce_grants(
             prepared_config,
@@ -975,6 +987,11 @@ async def _dispatch_one(
             ticket_claim_source="tick",
             strict_provisioning=True,
             job_kwargs={
+                **(
+                    {"workspace_selection": workspace_selection}
+                    if workspace_selection is not None
+                    else {}
+                ),
                 "description": f"[{category}] {title}",
                 "config_name": expert,
                 # The final helper applies the authoritative slot patch again

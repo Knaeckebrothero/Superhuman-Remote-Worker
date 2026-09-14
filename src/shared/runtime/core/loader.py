@@ -281,8 +281,12 @@ def strip_loader_owned_keys(override: Any) -> Any:
     if isinstance(nested_extra, dict):
         cleaned["extra"] = strip_loader_owned_keys(nested_extra)
     if dropped:
+        # Name the keys, never the mapping: an override layer's VALUES are
+        # caller-supplied and routinely hold credentials.
         logger.warning(
-            "Dropped loader-owned keys from a config override layer: %s", dropped
+            "Dropped %d loader-owned key(s) from a config override layer: %s",
+            len(dropped),
+            ", ".join(dropped),
         )
     return cleaned
 
@@ -722,8 +726,9 @@ def load_and_merge_config(
         if _root_name_for_path(config_path) is not None:
             root_path, _ = resolve_config_path(ROLE_ROOTS[role])
             return load_and_merge_config(root_path)
-    with open(config_path, "r", encoding="utf-8") as f:
-        config_data = yaml.safe_load(f)
+    from shared.runtime.core.srw_manifest_config import read_srw_config
+
+    config_data = read_srw_config(config_path)
 
     # Normalisation seam 1 of 6: every bundled YAML and every link of the
     # $extends chain. Runs BEFORE the merge because expansion is layer-local —
@@ -1959,6 +1964,8 @@ class PhaseLLMOverride:
     # Provider-specific request-body params (merged into the factory's
     # extra_body; family settings-matrix `extra_body` resolves here per phase).
     extra_body: Optional[Dict[str, Any]] = None
+    # Transport headers for this phase's route (see LLMConfig.extra_headers).
+    extra_headers: Optional[Dict[str, str]] = None
 
 
 @dataclass
@@ -2011,6 +2018,13 @@ class LLMConfig:
     # settings matrix (`settings.extra_body`) or explicit config; declared
     # values win over factory-computed extra_body entries.
     extra_body: Optional[Dict[str, Any]] = None
+    # Transport headers for the resolved route, injected at DISPATCH from the
+    # model's routing metadata — never set from YAML. Today only the
+    # subscription proxy uses it: a Claude-Code-served model needs an
+    # `Anthropic-Beta` list without the redaction beta or its reasoning comes
+    # back as empty thinking blocks (shared.subscription_routing). Honoured by
+    # the OpenAI-compatible factories; other providers ignore it.
+    extra_headers: Optional[Dict[str, str]] = None
     # OpenAI cache-routing hint, injected at RUNTIME by callers that own a
     # stable conversation identity (the session paths pass a per-thread key so
     # the provider-side prefix cache survives pod rotation on the stateless
@@ -2085,6 +2099,9 @@ class LLMConfig:
             extra_body=override.extra_body
             if override.extra_body is not None
             else self.extra_body,
+            extra_headers=override.extra_headers
+            if override.extra_headers is not None
+            else self.extra_headers,
             # Phase overrides not inherited to resolved config
             summarization=None,
         )
@@ -2379,17 +2396,22 @@ class RerankerConfig:
     """memory.reranker — options for the 'reranker' scorer (overhaul Phase 3).
 
     Only consulted when ``reranker`` appears in ``memory.pipeline.scorers``.
-    ``base_url``/``api_key`` default to the **embedding** endpoint at bind time
-    (``EMBEDDING_BASE_URL``/``EMBEDDING_API_KEY`` — the same router serves the
-    ``qwen3-reranker-8b`` ``/rerank`` route and ``qwen3-embedding-8b``), so
-    production needs no extra credential plumbing. It does NOT ride the
-    auxiliary model (that coupling crashed startup on OpenRouter auxiliaries;
-    see knowledge-base/knowledge/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md).
+    The transport comes from the ``rerank`` catalog slot (Admin → Models):
+    dispatch injects ``RERANK_MODEL``/``RERANK_BASE_URL``/``RERANK_API_KEY``
+    from the pinned row, and explicit values here override them. With no
+    ``RERANK_*`` at all the scorer rides the **embedding** endpoint
+    (``EMBEDDING_BASE_URL``/``EMBEDDING_API_KEY`` — the single-router layout
+    where ``qwen3-reranker-8b`` and ``qwen3-embedding-8b`` share a host). It
+    never rides the auxiliary model (that coupling crashed startup on
+    OpenRouter auxiliaries; see
+    knowledge-base/knowledge/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md).
+    Resolution order per field lives in
+    ``agent.services.memory.plugins.reranker.resolve_reranker_transport``.
     """
 
-    model: str = "qwen3-reranker-8b"
-    base_url: Optional[str] = None  # null = EMBEDDING_BASE_URL
-    api_key: Optional[str] = None  # null = EMBEDDING_API_KEY
+    model: Optional[str] = None  # null = RERANK_MODEL, then qwen3-reranker-8b
+    base_url: Optional[str] = None  # null = RERANK_BASE_URL, then EMBEDDING_BASE_URL
+    api_key: Optional[str] = None  # null = the key paired with the chosen base_url
     top_k: int = 64  # rerank at most this many candidates per assemble
     timeout: float = 10.0  # seconds per rerank call
     # Transient-fault budget (timeouts / connection drops / 5xx): extra
@@ -2584,6 +2606,12 @@ class AuxiliaryConfig:
     # be threaded through to create_llm or an OpenRouter aux misroutes to
     # api.openai.com (knowledge-base/knowledge/issues/openrouter_auxiliary_misrouted_to_openai.md).
     provider: Optional[str] = None
+    # Route transport headers, injected at dispatch alongside base_url/api_key
+    # (LLMConfig.extra_headers). Threaded for the same reason `provider` is: an
+    # aux model on a subscription-proxy Claude account needs its Anthropic-Beta
+    # list, and rebuilding the LLMConfig without it silently drops the route's
+    # header.
+    extra_headers: Optional[Dict[str, str]] = None
     temperature: float = 0.0
     max_iterations: int = 15  # Cap for agent mode loops
     timeout: float = 120.0  # Seconds per LLM call (quick interactive tasks)
@@ -2811,6 +2839,7 @@ def _parse_phase_override(data: Optional[Dict[str, Any]]) -> Optional[PhaseLLMOv
         max_output_tokens=data.get("max_output_tokens"),
         model_max_context_tokens=data.get("model_max_context_tokens"),
         extra_body=data.get("extra_body"),
+        extra_headers=data.get("extra_headers"),
     )
 
 
@@ -2849,6 +2878,7 @@ def _parse_llm_config(llm_data: Dict[str, Any]) -> LLMConfig:
         max_output_tokens=llm_data.get("max_output_tokens"),
         model_max_context_tokens=llm_data.get("model_max_context_tokens"),
         extra_body=llm_data.get("extra_body"),
+        extra_headers=llm_data.get("extra_headers"),
         summarization=_parse_phase_override(llm_data.get("summarization")),
     )
 
@@ -2952,7 +2982,7 @@ def _parse_memory_config(data: Dict[str, Any]) -> MemoryConfig:
     )
     reranker_data = data.get("reranker", {}) or {}
     reranker = RerankerConfig(
-        model=reranker_data.get("model", "qwen3-reranker-8b"),
+        model=reranker_data.get("model") or None,
         base_url=reranker_data.get("base_url"),
         api_key=reranker_data.get("api_key"),
         top_k=int(reranker_data.get("top_k", 64)),
@@ -3073,6 +3103,7 @@ def _parse_auxiliary_config(data: Dict[str, Any]) -> AuxiliaryConfig:
         base_url=data.get("base_url"),
         api_key=data.get("api_key"),
         provider=data.get("provider"),
+        extra_headers=data.get("extra_headers"),
         temperature=data.get("temperature", 0.0),
         max_iterations=data.get("max_iterations", 15),
         timeout=data.get("timeout", 120.0),
@@ -3825,7 +3856,11 @@ def _should_use_reasoning_summary(model: str) -> bool:
     model_lower = model.lower()
     if "/" in model_lower:
         return False
-    reasoning_prefixes = ("o1", "o3", "o4", "gpt-5")
+    # gpt-6 (Astra) MUST be here: it serves tool calls only on the Responses
+    # API, and `max` effort exists only there. Without the prefix the codex
+    # factory would fall through to a Chat-Completions `reasoning_effort`,
+    # dropping the reasoning summary and silently degrading `max`.
+    reasoning_prefixes = ("o1", "o3", "o4", "gpt-5", "gpt-6")
     return any(model_lower.startswith(p) for p in reasoning_prefixes)
 
 
@@ -4295,6 +4330,13 @@ def _create_openai_llm(
     if extra_body:
         llm_kwargs["extra_body"] = extra_body
 
+    # Route-level transport headers injected at dispatch (LLMConfig.extra_headers).
+    # The subscription proxy's Claude executor decides thinking visibility from
+    # the inbound Anthropic-Beta header, so this is the difference between a
+    # readable reasoning summary and an empty thinking block.
+    if config.extra_headers:
+        llm_kwargs["default_headers"] = dict(config.extra_headers)
+
     max_tokens = _resolve_max_output_tokens(config, limits)
     llm_kwargs["max_tokens"] = max_tokens
 
@@ -4323,7 +4365,8 @@ def _create_openai_llm(
         f"Created OpenAI LLM: model={config.model}, temp={config.temperature}, "
         f"base_url={base_url or 'default'}, timeout={llm_kwargs.get('timeout')}s, "
         f"max_retries={config.max_retries}, max_context_tokens={max_context_tokens or 'default'}, "
-        f"max_tokens={max_tokens}, reasoning={reasoning_mode}, keys={key_info}"
+        f"max_tokens={max_tokens}, reasoning={reasoning_mode}, keys={key_info}, "
+        f"headers={sorted(config.extra_headers) if config.extra_headers else 'none'}"
     )
 
     return llm
@@ -4635,6 +4678,11 @@ def _create_openrouter_llm(
         default_headers["HTTP-Referer"] = referer
     if title:
         default_headers["X-Title"] = title
+    # Dispatch-injected route headers (LLMConfig.extra_headers) win over the
+    # attribution headers above — they are the ones that change provider
+    # behaviour, not just the leaderboard entry.
+    if config.extra_headers:
+        default_headers.update(config.extra_headers)
     if default_headers:
         llm_kwargs["default_headers"] = default_headers
 
@@ -5945,6 +5993,26 @@ def resolve_config_path(config_name: str) -> tuple[str, Optional[str]]:
     return (str(single_file_config), None)
 
 
+def resolve_bundled_config_path(config_name: str) -> tuple[str, Optional[str]]:
+    """Resolve a request's config selector within the installed config tree.
+
+    The CLI resolver also accepts operator-supplied external files. Requests
+    may only select installed assets, including legacy relative YAML paths.
+    Resolve symlinks before containment checks and before returning paths.
+    """
+    config_path, deployment_dir = resolve_config_path(config_name)
+    root = (get_project_root() / "config").resolve()
+    path = Path(config_path).resolve()
+    if not path.is_relative_to(root):
+        raise ValueError("Config must select an asset inside the installed config tree")
+    if deployment_dir is not None:
+        directory = Path(deployment_dir).resolve()
+        if not directory.is_relative_to(root):
+            raise ValueError("Config assets must stay inside the installed config tree")
+        deployment_dir = str(directory)
+    return str(path), deployment_dir
+
+
 def _root_name_for_path(config_path: str) -> Optional[str]:
     """The public root name whose file ``config_path`` is, else ``None``."""
     try:
@@ -5978,8 +6046,9 @@ def chain_root(config_path: str) -> Optional[str]:
             return None
         seen.add(current)
         try:
-            with open(current, "r", encoding="utf-8") as f:
-                raw = yaml.safe_load(f) or {}
+            from shared.runtime.core.srw_manifest_config import read_srw_config
+
+            raw = read_srw_config(current)
         except Exception:
             return None
         parent = raw.get("$extends") if isinstance(raw, dict) else None
@@ -6021,8 +6090,9 @@ def authored_llm_keys(config_path: str) -> Set[str]:
     """
     path = canonical_config_name(str(config_path))
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            raw = yaml.safe_load(f) or {}
+        from shared.runtime.core.srw_manifest_config import read_srw_config
+
+        raw = read_srw_config(path)
     except Exception:
         return set()
     if not isinstance(raw, dict):

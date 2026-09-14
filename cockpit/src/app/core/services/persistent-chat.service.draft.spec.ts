@@ -9,8 +9,8 @@
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
 import {signal} from '@angular/core';
 import {TestBed} from '@angular/core/testing';
-import {HttpClient} from '@angular/common/http';
-import {of, throwError} from 'rxjs';
+import {HttpClient, HttpErrorResponse} from '@angular/common/http';
+import {of, Subject, throwError} from 'rxjs';
 import {TranslocoService} from '@jsverse/transloco';
 import {draftTitleFrom, PersistentChatService} from './persistent-chat.service';
 import {ApiService} from './api.service';
@@ -49,19 +49,29 @@ const isInput = (url: unknown) => String(url).endsWith('/input');
 
 function createService(opts: {
     projects?: any[];
-    eligible?: any[];
+    datasourceIds?: string[];
     createFails?: boolean;
+    createError?: unknown;
     policyAvailable?: boolean;
 } = {}) {
     const mockHttp: any = {
         get: vi.fn().mockImplementation((url: string) => {
             if (url.includes('/projects')) return of(opts.projects ?? []);
+            if (url.endsWith('/state')) return of({
+                thread_id: 't-new', snapshot_source: 'durable_journal',
+                event_cursor: {epoch: 1, seq: 0}, replay_cursor: {epoch: 1, seq: 0},
+            });
             return of({status: 'active', total_turns: 0, messages: [], total: 0});
         }),
-        post: vi.fn().mockImplementation((url: string) => {
+        post: vi.fn().mockImplementation((url: string, body: any) => {
+            if (url.endsWith('/persistent/threads/preview')) return of({
+                project_ids: body.project_ids ?? [],
+                workspace_backend: body.config_override?.workspace?.backend ?? 'virtual',
+                datasource_ids: body.datasource_ids ?? opts.datasourceIds ?? [],
+            });
             if (isThreadsCreate(url)) {
                 return opts.createFails
-                    ? throwError(() => new Error('create failed'))
+                    ? throwError(() => opts.createError ?? new Error('create failed'))
                     : of({thread_id: 't-new'});
             }
             return of({});
@@ -73,7 +83,6 @@ function createService(opts: {
         uploadOneToThread: vi.fn().mockReturnValue(of({kind: 'done', files: []})),
         deleteThreadUpload: vi.fn().mockReturnValue(of(undefined)),
         humanizeUploadError: vi.fn().mockReturnValue('upload failed'),
-        getEligibleDatasources: vi.fn().mockReturnValue(of(opts.eligible ?? [])),
     };
     const mockCache: any = {
         getThreadCursor: vi.fn().mockResolvedValue(null),
@@ -137,7 +146,10 @@ function createService(opts: {
             {provide: IndexedDbService, useValue: mockCache},
             {provide: AppToastService, useValue: mockToast},
             {provide: NotificationService, useValue: mockNotifications},
-            {provide: TranslocoService, useValue: {translate: (k: string) => k}},
+            {provide: TranslocoService, useValue: {translate: (k: string) => ({
+                'errors.http.5xx': 'Something went wrong on the server.',
+                'errors.sessions.createFailed': 'Could not create the session.',
+            } as Record<string, string>)[k] ?? k}},
             PersistentChatService,
         ],
     });
@@ -196,10 +208,7 @@ describe('PersistentChatService — instant-landing draft sessions', () => {
     it('first send creates the thread with a minimal body and carries the message', async () => {
         const ctx = createService({
             projects: [{id: 'p-def', is_default: true}, {id: 'p2'}],
-            eligible: [
-                {id: 'auto', default_selected: true},
-                {id: 'manual', default_selected: false},
-            ],
+            datasourceIds: ['compatible-auto'],
         });
         ctx.service.enterDraftSession();
         await flushTick();
@@ -212,8 +221,12 @@ describe('PersistentChatService — instant-landing draft sessions', () => {
         expect(creates[0][1]).toEqual({
             title: 'fix the login bug',
             project_ids: ['p-def'],
-            datasource_ids: ['auto'],
+            datasource_ids: ['compatible-auto'],
         });
+        expect(ctx.mockHttp.post).toHaveBeenCalledWith(
+            expect.stringContaining('/persistent/threads/preview'),
+            {project_ids: ['p-def'], use_datasource_defaults: true},
+        );
         expect(ctx.service.isDraftSession()).toBe(false);
         expect(ctx.service.threadId()).toBe('t-new');
         // The message is queued (not posted) until the session goes ready…
@@ -234,12 +247,15 @@ describe('PersistentChatService — instant-landing draft sessions', () => {
         const ctx = createService({
             policyAvailable: false,
             projects: [{id: 'p-def', is_default: true}],
-            eligible: [{id: 'auto', default_selected: true}],
+            datasourceIds: ['auto'],
         });
         ctx.service.enterDraftSession();
         await flushTick();
 
-        expect(ctx.mockApi.getEligibleDatasources).not.toHaveBeenCalled();
+        expect(ctx.mockHttp.post).toHaveBeenCalledWith(
+            expect.stringContaining('/persistent/threads/preview'),
+            {project_ids: ['p-def'], datasource_ids: []},
+        );
         expect(ctx.service.draftDatasourceIds()).toEqual([]);
     });
 
@@ -255,12 +271,13 @@ describe('PersistentChatService — instant-landing draft sessions', () => {
     });
 
     it('lets the user opt out of reviewed draft defaults', async () => {
-        const ctx = createService({eligible: [{id: 'auto', default_selected: true}]});
+        const ctx = createService({datasourceIds: ['auto']});
         ctx.service.enterDraftSession();
         await flushTick();
         expect(ctx.service.draftDatasourceIds()).toEqual(['auto']);
 
         ctx.service.setDraftConnectorsEnabled(false);
+        await flushTick();
         await ctx.service.sendMessage('no credentials');
         await flushTick();
 
@@ -276,7 +293,7 @@ describe('PersistentChatService — instant-landing draft sessions', () => {
         // threadId() was null, and it bailed with 'Cannot upload: no active
         // thread' BEFORE _createFromDraftSession — so the composer was stuck
         // with a chip it could neither send nor recover from.
-        const ctx = createService({eligible: []});
+        const ctx = createService();
         ctx.service.enterDraftSession();
         await flushTick();
 
@@ -346,6 +363,111 @@ describe('PersistentChatService — instant-landing draft sessions', () => {
         expect(ctx.service.outbox().map((i) => i.displayContent)).toEqual(['hello']);
         // The optimistic bubble was re-shown on the error state.
         expect(ctx.service.turns().filter(isUserTurn).length).toBe(1);
+    });
+
+    it('shows a 400 refusal and retries the retained message once after changing workspace', async () => {
+        const detail = 'Repository and credential connectors require a sandbox or VM workspace';
+        const opts = {createFails: true, createError: new HttpErrorResponse({status: 400, error: {detail}})};
+        const ctx = createService(opts);
+        ctx.service.enterDraftSession();
+        await flushTick();
+        await ctx.service.sendMessage('inspect my repository');
+        await flushTick();
+        expect(ctx.service.error()).toBe(detail);
+        expect(ctx.service.threadId()).toBeNull();
+
+        ctx.service.setDraftWorkspaceBackend('sandbox');
+        await flushTick();
+        expect(ctx.mockHttp.post).toHaveBeenCalledWith(
+            expect.stringContaining('/persistent/threads/preview'),
+            {config_override: {workspace: {backend: 'sandbox'}}, use_datasource_defaults: true},
+        );
+        opts.createFails = false;
+        await Promise.all([ctx.service.retryDraftSession(), ctx.service.retryDraftSession()]);
+        expect(createPosts(ctx)).toHaveLength(2); // one refusal, one successful creation
+        expect(createPosts(ctx)[1][1]).toMatchObject({config_override: {workspace: {backend: 'sandbox'}}});
+        expect(ctx.service.error()).toBeNull();
+        expect(ctx.service.outbox().map(i => i.displayContent)).toEqual(['inspect my repository']);
+        fireSseOpen(ctx.sseInstances[0]);
+        fireSseMessage(ctx.sseInstances[0], {method: 'ready', params: {}}, '1:1');
+        await flushTick();
+        expect(inputPosts(ctx)).toHaveLength(1);
+        expect(ctx.service.outbox()).toEqual([]);
+        await ctx.service.retryDraftSession();
+        expect(createPosts(ctx)).toHaveLength(2);
+    });
+
+    it('retains attachment bytes and message identity when retrying without connectors', async () => {
+        const opts = {createFails: true, datasourceIds: ['auto']};
+        const ctx = createService(opts);
+        ctx.service.enterDraftSession();
+        await flushTick();
+        const file = new File(['image'], 'shot.png', {type: 'image/png'});
+        ctx.service.addAttachments([{id: 'shot', file, name: file.name, size: file.size, mimeType: file.type}]);
+        await ctx.service.sendMessage('look at this');
+        await flushTick();
+        const queued = ctx.service.outbox()[0];
+        ctx.service.setDraftConnectorsEnabled(false);
+        await flushTick();
+        opts.createFails = false;
+        await ctx.service.retryDraftSession();
+        expect(ctx.service.outbox()[0].localId).toBe(queued.localId);
+        expect(ctx.service.outbox()[0].pendingFiles?.[0].file).toBe(file);
+        expect(createPosts(ctx)[1][1].datasource_ids).toEqual([]);
+        fireSseOpen(ctx.sseInstances[0]);
+        fireSseMessage(ctx.sseInstances[0], {method: 'ready', params: {}}, '1:1');
+        await flushTick();
+        expect(ctx.mockApi.uploadOneToThread).toHaveBeenCalledTimes(1);
+        expect(inputPosts(ctx)).toHaveLength(1);
+    });
+
+    it('does not expose internal 500 response details', async () => {
+        const ctx = createService({createFails: true, createError: new HttpErrorResponse({
+            status: 500, error: {detail: 'private internal exception'},
+        })});
+        ctx.service.enterDraftSession();
+        await flushTick();
+        await ctx.service.sendMessage('hello');
+        await flushTick();
+        expect(ctx.service.error()).not.toContain('private internal exception');
+        expect(ctx.service.error()).toBeTruthy();
+    });
+
+    it('fails closed while preview is unavailable, then allows a retry', async () => {
+        const ctx = createService();
+        const post = ctx.mockHttp.post.getMockImplementation();
+        ctx.mockHttp.post.mockImplementation(() => throwError(() => new HttpErrorResponse({
+            status: 403, error: {detail: 'Project access changed'},
+        })));
+        ctx.service.enterDraftSession();
+        await flushTick();
+        expect(ctx.service.error()).toBe('Project access changed');
+        expect(ctx.service.draftDefaultsError()).toBe(true);
+        expect(await ctx.service.sendMessage('hello')).toBe(false);
+        expect(ctx.service.outbox()).toEqual([]);
+        expect(createPosts(ctx)).toEqual([]);
+        ctx.mockHttp.post.mockImplementation(post);
+        await ctx.service.retryDraftDefaults();
+        expect(await ctx.service.sendMessage('hello')).toBe(true);
+        await flushTick();
+        expect(createPosts(ctx)).toHaveLength(1);
+    });
+
+    it('ignores a stale preview after a workspace change', async () => {
+        const ctx = createService();
+        const oldPreview = new Subject<any>();
+        const newPreview = new Subject<any>();
+        ctx.mockHttp.post.mockReturnValueOnce(oldPreview).mockReturnValueOnce(newPreview);
+        ctx.service.enterDraftSession();
+        await flushTick();
+        ctx.service.setDraftWorkspaceBackend('sandbox');
+        await flushTick();
+        newPreview.next({project_ids: [], workspace_backend: 'sandbox', datasource_ids: ['repo']});
+        await flushTick();
+        oldPreview.next({project_ids: [], workspace_backend: 'virtual', datasource_ids: []});
+        await flushTick();
+        expect(ctx.service.draftDatasourceIds()).toEqual(['repo']);
+        expect(ctx.service.draftDefaultsLoading()).toBe(false);
     });
 
     it('connecting to a real thread leaves draft mode', async () => {

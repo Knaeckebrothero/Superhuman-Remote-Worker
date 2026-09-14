@@ -25,6 +25,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import orchestrator.main as m
+from orchestrator.routers import agent_child_threads as _child_routes
+from orchestrator.routers import job_inspection as job_inspection_routes
 
 UTC = timezone.utc
 NOW = datetime(2026, 8, 29, 12, 0, 0, tzinfo=UTC)
@@ -32,6 +34,24 @@ GENERATION = uuid.UUID("dddddddd-1111-4222-8333-444444444444")
 NEXT_GENERATION = uuid.UUID("eeeeeeee-1111-4222-8333-444444444444")
 DELIVERY = uuid.UUID("ffffffff-1111-4222-8333-444444444444")
 AGENT = uuid.UUID("99999999-1111-4222-8333-444444444444")
+
+
+@pytest.fixture(autouse=True)
+def _child_thread_routes_resolve_from_main(monkeypatch):
+    """R1.B06: these routes moved to ``routers/agent_child_threads``.
+
+    They resolve their collaborators from ``request.app.state``, and the cases
+    below hand the handlers bare ``SimpleNamespace()`` / ``MagicMock()``
+    requests. Resolving through main's real factory keeps every
+    ``monkeypatch.setattr(m, ...)`` below steering exactly what it steered when
+    these were main functions — including the internal gate, which is now
+    ``dependencies.require_internal`` inside the route body.
+    """
+    monkeypatch.setattr(
+        _child_routes,
+        "get_agent_child_thread_dependencies",
+        lambda request: m._agent_child_threads_dependencies(),
+    )
 
 
 def _authority(job_id: str):
@@ -125,7 +145,7 @@ def create_env(monkeypatch):
         return m.AgentSubagentThreadCreateRequest(**kw)
 
     async def call(**kw):
-        return await m.agent_create_subagent_thread(
+        return await _child_routes.agent_create_subagent_thread(
             SimpleNamespace(), job_id, body(**kw)
         )
 
@@ -136,7 +156,9 @@ def create_env(monkeypatch):
 
 class TestCreateEndpoint:
     def test_it_is_a_pure_internal_route(self, create_env):
-        params = set(inspect.signature(m.agent_create_subagent_thread).parameters)
+        params = set(
+            inspect.signature(_child_routes.agent_create_subagent_thread).parameters
+        )
         assert params == {"request", "job_id", "body"}
 
     @pytest.mark.asyncio
@@ -161,7 +183,7 @@ class TestCreateEndpoint:
         request = MagicMock()
         request.headers = {}
         with pytest.raises(m.HTTPException) as excinfo:
-            await m.agent_create_subagent_thread(
+            await _child_routes.agent_create_subagent_thread(
                 request,
                 str(uuid.uuid4()),
                 m.AgentSubagentThreadCreateRequest(
@@ -298,10 +320,10 @@ class TestGenerationEndpoints:
         monkeypatch.setattr(m, "require_internal", gate)
 
         query = m.AgentSubagentThreadQueryRequest(parent_authority=_authority(job_id))
-        live = await m.agent_list_live_subagent_threads(
+        live = await _child_routes.agent_list_live_subagent_threads(
             SimpleNamespace(), job_id, query
         )
-        exact = await m.agent_get_subagent_thread(
+        exact = await _child_routes.agent_get_subagent_thread(
             SimpleNamespace(), job_id, child_id, query
         )
 
@@ -339,7 +361,7 @@ class TestGenerationEndpoints:
             parent_authority=_authority(job_id),
         )
 
-        result = await m.agent_reopen_subagent_thread(
+        result = await _child_routes.agent_reopen_subagent_thread(
             SimpleNamespace(), job_id, child_id, body
         )
         assert result["runtime_generation"] == str(NEXT_GENERATION)
@@ -356,7 +378,7 @@ class TestGenerationEndpoints:
             "runtime_generation": str(NEXT_GENERATION),
         }
         with pytest.raises(m.HTTPException) as excinfo:
-            await m.agent_reopen_subagent_thread(
+            await _child_routes.agent_reopen_subagent_thread(
                 SimpleNamespace(), job_id, child_id, body
             )
         assert excinfo.value.status_code == 409
@@ -393,7 +415,7 @@ class TestGenerationEndpoints:
         )
 
         assert (
-            await m.agent_terminalize_subagent_thread(
+            await _child_routes.agent_terminalize_subagent_thread(
                 SimpleNamespace(), job_id, child_id, body
             )
             == applied
@@ -434,14 +456,14 @@ class TestGenerationEndpoints:
             subagent_status="completed",
         )
         with pytest.raises(m.HTTPException) as excinfo:
-            await m.agent_terminalize_subagent_thread(
+            await _child_routes.agent_terminalize_subagent_thread(
                 SimpleNamespace(), job_id, child_id, body
             )
         assert excinfo.value.status_code == 409
 
         db.terminalize_subagent_thread_and_enqueue.side_effect = ValueError("bad")
         with pytest.raises(m.HTTPException) as excinfo:
-            await m.agent_terminalize_subagent_thread(
+            await _child_routes.agent_terminalize_subagent_thread(
                 SimpleNamespace(), job_id, child_id, body
             )
         assert excinfo.value.status_code == 400
@@ -462,7 +484,9 @@ def roster_env(monkeypatch):
     monkeypatch.setattr(m, "require_job_access", guard)
 
     async def call():
-        return await m.get_job_subagents(SimpleNamespace(), job_id)
+        return await job_inspection_routes.get_job_subagents(
+            SimpleNamespace(), job_id, dependencies=m._job_inspection_dependencies()
+        )
 
     return SimpleNamespace(job_id=job_id, db=db, guard=guard, call=call)
 
@@ -471,8 +495,10 @@ class TestRosterShape:
     def test_the_route_takes_no_filter_parameters(self):
         """The roster is a property of the job, not of the caller's view —
         pinned on the signature exactly as the subjobs roster is."""
-        params = set(inspect.signature(m.get_job_subagents).parameters)
-        assert params == {"request", "job_id"}
+        params = set(
+            inspect.signature(job_inspection_routes.get_job_subagents).parameters
+        )
+        assert params == {"request", "job_id", "dependencies"}
 
     @pytest.mark.asyncio
     async def test_it_reads_the_job_walk_not_the_sessions_list(self, roster_env):
@@ -603,7 +629,9 @@ class TestRosterAuthorization:
             ),
             patch.object(m, "postgres_db", db),
         ):
-            return await m.get_job_subagents(MagicMock(), job_id)
+            return await job_inspection_routes.get_job_subagents(
+                MagicMock(), job_id, dependencies=m._job_inspection_dependencies()
+            )
 
     @pytest.mark.asyncio
     async def test_the_job_owner_reads_the_roster(self, user_a, job_a, fake_db):

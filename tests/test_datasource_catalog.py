@@ -7,6 +7,7 @@ from pathlib import Path
 
 import yaml
 
+from orchestrator.schemas.datasources import DatasourceCreate
 from orchestrator.security.credential_files import (
     CREDENTIAL_FILE_TYPES as ORCHESTRATOR_CREDENTIAL_FILE_TYPES,
 )
@@ -53,13 +54,22 @@ def test_datasource_catalog_matches_agent_consumers():
 
 
 def test_orchestrator_validation_consumes_the_catalog():
-    source = (_ROOT / "src" / "orchestrator" / "main.py").read_text(encoding="utf-8")
+    # R1.B03 moved the connector CRUD out of ``main.py`` into this service, so
+    # the slice terminator moved with it: the service module carries no
+    # ``@app.`` decorators, and the next declaration after ``create_datasource``
+    # is ``update_datasource``.
+    source = (_ROOT / "src" / "orchestrator" / "services" / "datasources.py").read_text(
+        encoding="utf-8"
+    )
     create_route = source.split("async def create_datasource(", 1)[1].split(
-        "\n\n@app.", 1
+        "\n\nasync def update_datasource(", 1
     )[0]
 
     assert "valid_types = DATASOURCE_TYPES" in create_route
-    assert "description=f\"Connector type: {', '.join(DATASOURCE_TYPE_IDS)}\"" in source
+    assert (
+        DatasourceCreate.model_json_schema()["properties"]["type"]["description"]
+        == f"Connector type: {', '.join(DATASOURCE_TYPE_IDS)}"
+    )
 
 
 def test_datasource_catalog_matches_cockpit_consumers():

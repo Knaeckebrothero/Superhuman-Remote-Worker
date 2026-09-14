@@ -8,7 +8,7 @@ import {UserService} from '../../core/services/user.service';
  * the onboarding checklist when the runtime isn't ready:
  *
  *   1. At least one provider key or endpoint configured.
- *   2. At least one chat / embedding / auxiliary catalog row.
+ *   2. At least one chat / embedding / auxiliary / rerank catalog row.
  *   3. A default model pinned for each required capability.
  *   4. A DB-backed application expert selected for workers and sessions.
  *
@@ -51,7 +51,7 @@ import {UserService} from '../../core/services/user.service';
             </li>
             <li [class.done]="hasAllCapabilities()">
               @if (hasAllCapabilities()) {
-                ✓ <span>Models added for chat, embedding, auxiliary</span>
+                ✓ <span>Models added for chat, embedding, auxiliary, rerank</span>
               } @else {
                 <a routerLink="/admin/models" [queryParams]="{tab: 'catalog'}" class="banner-link">
                   Add models for: {{ missingCapabilitiesText() }}

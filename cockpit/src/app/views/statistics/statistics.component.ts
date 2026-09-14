@@ -324,7 +324,7 @@ import {
         font-weight: 500;
         color: var(--text-muted, var(--text-muted));
         text-transform: uppercase;
-        font-size: 10px;
+        font-size: 11px;
       }
 
       .daily-row {

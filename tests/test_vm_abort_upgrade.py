@@ -18,6 +18,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+# R1.B06: these handlers moved to services/thread_config_update with their
+# routes in routers/thread_config. main's dependency factory still reads
+# main's attributes at call time, so the patches below keep steering what
+# they steered before.
+from orchestrator.services import thread_config_update  # noqa: E402
+
 import orchestrator.main as orch_main
 
 
@@ -46,7 +52,11 @@ class TestAbortThreadVmUpgrade:
             patch.object(orch_main, "vm_provisioner", _provisioner()),
         ):
             with pytest.raises(orch_main.HTTPException) as exc:
-                await orch_main.agent_abort_thread_vm_upgrade(MagicMock(), "tid")
+                await thread_config_update.agent_abort_thread_vm_upgrade(
+                    MagicMock(),
+                    "tid",
+                    dependencies=orch_main._thread_config_update_dependencies(),
+                )
         assert exc.value.status_code == 404
 
     @pytest.mark.asyncio
@@ -58,7 +68,11 @@ class TestAbortThreadVmUpgrade:
             patch.object(orch_main, "postgres_db", db),
             patch.object(orch_main, "vm_provisioner", prov),
         ):
-            out = await orch_main.agent_abort_thread_vm_upgrade(MagicMock(), "tid")
+            out = await thread_config_update.agent_abort_thread_vm_upgrade(
+                MagicMock(),
+                "tid",
+                dependencies=orch_main._thread_config_update_dependencies(),
+            )
 
         prov.delete_thread_vm.assert_awaited_once_with("tid")
         db.merge_thread_vm_context.assert_awaited_once_with(
@@ -76,7 +90,11 @@ class TestAbortThreadVmUpgrade:
             patch.object(orch_main, "vm_provisioner", prov),
         ):
             with pytest.raises(orch_main.HTTPException) as exc:
-                await orch_main.agent_abort_thread_vm_upgrade(MagicMock(), "tid")
+                await thread_config_update.agent_abort_thread_vm_upgrade(
+                    MagicMock(),
+                    "tid",
+                    dependencies=orch_main._thread_config_update_dependencies(),
+                )
 
         prov.delete_thread_vm.assert_not_called()
         db.merge_thread_vm_context.assert_not_awaited()
@@ -96,7 +114,11 @@ class TestAbortThreadVmUpgrade:
             patch.object(orch_main, "vm_provisioner", prov),
         ):
             with pytest.raises(orch_main.HTTPException) as exc:
-                await orch_main.agent_abort_thread_vm_upgrade(MagicMock(), "tid")
+                await thread_config_update.agent_abort_thread_vm_upgrade(
+                    MagicMock(),
+                    "tid",
+                    dependencies=orch_main._thread_config_update_dependencies(),
+                )
 
         db.merge_thread_vm_context.assert_not_awaited()
         assert exc.value.status_code == 503

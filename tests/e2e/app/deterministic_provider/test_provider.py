@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import subprocess
 
 import httpx
 import pytest
@@ -454,6 +456,191 @@ async def test_tool_call_scenario_requires_tool_result_before_final_response(
     assert final.json()["choices"][0]["message"]["content"] == f"E2E_REPLY:{run_id}"
     final_state = (await control.get(f"/control/scenarios/{run_id}")).json()
     assert final_state["remaining_required_responses"] == 0
+
+
+async def test_worker_job_scenario_completes_without_any_off_pod_tool(
+    control: httpx.AsyncClient,
+    inference: httpx.AsyncClient,
+) -> None:
+    """The hermetic sibling of search-job/fetch-job.
+
+    Those two require a live third-party provider by design. This one must
+    reach `job_complete` binding only core tools, so a worker job can be
+    accepted in a profile that deliberately has no research or fetch provider.
+    """
+    run_id = "worker-job-001"
+    await arm(control, run_id, scenario="worker-job", required_responses=1)
+
+    # Tool-phase calls deliberately do not consume a required response, so the
+    # armed budget is settled by one ordinary reply, as in the sibling tests.
+    incidental = await inference.post("/v1/chat/completions", json=chat_request(run_id))
+    assert incidental.status_code == 200
+    assert incidental.json()["choices"][0]["message"]["content"] == (
+        f"E2E_REPLY:{run_id}"
+    )
+
+    def tools(*names: str) -> list[dict]:
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": "test",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+            for name in names
+        ]
+
+    async def next_function(*names: str) -> dict:
+        response = await inference.post(
+            "/v1/chat/completions",
+            json=chat_request(run_id, extra={"tools": tools(*names)}),
+        )
+        assert response.status_code == 200
+        return response.json()["choices"][0]["message"]["tool_calls"][0]["function"]
+
+    bound = ("read_file", "todo_complete", "next_phase_todos", "job_complete")
+
+    guide = await next_function(*bound)
+    assert guide == {
+        "name": "read_file",
+        "arguments": '{"path":"skills/todo-guide/SKILL.md"}',
+    }
+    for _ in range(4):
+        assert (await next_function(*bound))["name"] == "todo_complete"
+
+    staged = await next_function(*bound)
+    assert staged["name"] == "next_phase_todos"
+    assert json.loads(staged["arguments"])["phase_name"] == "Hermetic worker-job gate"
+
+    for _ in range(2):
+        assert (await next_function(*bound))["name"] == "todo_complete"
+
+    verify = await next_function(*bound)
+    assert verify == {
+        "name": "read_file",
+        "arguments": '{"path":"skills/verify-before-done/SKILL.md"}',
+    }
+
+    completion = await next_function(*bound)
+    assert completion["name"] == "job_complete"
+    assert json.loads(completion["arguments"])["summary"] == (
+        f"Completed the hermetic worker gate for E2E-{run_id}."
+    )
+
+    # No step in the machine may require an off-pod tool.
+    state = (await control.get(f"/control/scenarios/{run_id}")).json()
+    assert state["worker_job_tool_steps"] == 10
+    assert state["remaining_required_responses"] == 0
+
+
+@pytest.mark.parametrize("retained", [False, True])
+@pytest.mark.parametrize("proof", ["valid", "wrong-run", "failed-command", "absent"])
+@pytest.mark.parametrize("sudo_version", [False, True])
+async def test_prepared_workspace_scenario_requires_successful_correlated_shell_proof(
+    control, inference, tmp_path, retained, proof, sudo_version
+):
+    run_id = (
+        "prepared-workspace-"
+        + ("job-sudo-" if sudo_version else "")
+        + ("reuse" if retained else "fresh")
+    )
+    await arm(control, run_id, scenario="prepared-workspace-job", required_responses=1)
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": name, "parameters": {"type": "object"}},
+        }
+        for name in (
+            "read_file",
+            "todo_complete",
+            "next_phase_todos",
+            "job_complete",
+            "run_command",
+        )
+    ]
+    for _ in range(7):
+        response = await inference.post(
+            "/v1/chat/completions", json=chat_request(run_id, extra={"tools": tools})
+        )
+        assert response.status_code == 200
+    function = response.json()["choices"][0]["message"]["tool_calls"][0]["function"]
+    assert function["name"] == "run_command"
+    arguments = json.loads(function["arguments"])
+    assert arguments["command"].startswith("sudo --version ") is sudo_version
+
+    tool = tmp_path / "srw-cache-check"
+    tool.write_text("#!/bin/sh\nprintf '%s\\n' srw-prepared-tool-v1\n")
+    tool.chmod(0o755)
+    if sudo_version:
+        sudo = tmp_path / "sudo"
+        sudo.write_text('#!/bin/sh\ntest "$#" -eq 1 && test "$1" = --version\n')
+        sudo.chmod(0o755)
+    (tmp_path / ".srw-initialize-count").write_text("initialized\n")
+    if retained:
+        (tmp_path / ".srw-execution-marker").write_text("previous-job\n")
+    result = subprocess.run(
+        ["sh", "-c", arguments["command"]],
+        cwd=tmp_path,
+        env={**os.environ, "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"]},
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert result.returncode == 0
+    assert (tmp_path / ".srw-execution-marker").read_text() == run_id + "\n"
+    output = "Exit code: 0\n--- stdout ---\n" + result.stdout
+    if proof == "wrong-run":
+        output = output.replace(run_id, run_id + "-different")
+    elif proof == "failed-command":
+        output = output.replace("Exit code: 0", "Exit code: 1")
+    elif proof == "absent":
+        output = "Exit code: 0\n--- stdout ---\n"
+    payload = chat_request(run_id, extra={"tools": tools})
+    payload["messages"].append(
+        {"role": "tool", "tool_call_id": "prepared-command", "content": output}
+    )
+    response = await inference.post("/v1/chat/completions", json=payload)
+    if proof == "valid":
+        assert response.status_code == 200
+        assert (
+            response.json()["choices"][0]["message"]["tool_calls"][0]["function"][
+                "name"
+            ]
+            == "todo_complete"
+        )
+    else:
+        assert response.status_code == 422
+        assert response.json()["error"]["type"] == "workspace_proof_missing"
+
+
+async def test_worker_job_scenario_fails_closed_without_a_required_tool(
+    control: httpx.AsyncClient,
+    inference: httpx.AsyncClient,
+) -> None:
+    run_id = "worker-job-gap-001"
+    await arm(control, run_id, scenario="worker-job")
+    response = await inference.post(
+        "/v1/chat/completions",
+        json=chat_request(
+            run_id,
+            extra={
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "todo_complete",
+                            "description": "test",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    }
+                ]
+            },
+        ),
+    )
+    assert response.status_code == 422
+    assert response.json()["error"]["type"] == "required_tool_missing"
 
 
 async def test_search_job_scenario_drives_search_completion_and_todos(
@@ -940,6 +1127,89 @@ async def test_unscoped_unknown_route_and_invalid_correlation_are_globally_visib
     assert overview["unscoped_unexpected_calls"] == 2
 
 
+async def test_each_unscoped_rejection_has_one_sanitized_diagnostic(
+    control: httpx.AsyncClient,
+    inference: httpx.AsyncClient,
+) -> None:
+    secret = "DO-NOT-RETAIN-UNSCOPED-CONTENT"
+
+    absent = await inference.post(
+        "/v1/embeddings",
+        json={"model": EMBEDDING_MODEL_ID, "input": secret},
+    )
+    assert absent.status_code == 409
+    assert absent.json()["error"]["type"] == "run_correlation_required"
+
+    await arm(control, "unscoped-a")
+    await arm(control, "unscoped-b")
+    ambiguous = await inference.post(
+        "/v1/embeddings",
+        json={"model": EMBEDDING_MODEL_ID, "input": secret},
+    )
+    assert ambiguous.status_code == 409
+    assert ambiguous.json()["error"]["type"] == "run_correlation_required"
+
+    unarmed = await inference.post(
+        "/v1/embeddings",
+        json={
+            "model": EMBEDDING_MODEL_ID,
+            "input": f"E2E-unscoped-missing {secret}",
+        },
+    )
+    assert unarmed.status_code == 409
+    assert unarmed.json()["error"]["type"] == "scenario_not_armed"
+
+    overview_text = (await control.get("/control/scenarios")).text
+    assert secret not in overview_text
+    overview = json.loads(overview_text)
+    assert overview["unscoped_unexpected_calls"] == 3
+    assert overview["unscoped_calls_truncated"] == 0
+    calls = overview["unscoped_calls"]
+    assert [call["sequence"] for call in calls] == [1, 2, 3]
+    assert [call["correlation_id"] for call in calls] == [
+        "unscoped:1",
+        "unscoped:2",
+        "unscoped:3",
+    ]
+    assert [call["outcome"] for call in calls] == [
+        "run_correlation_required_no_active_scenario",
+        "run_correlation_required_multiple_active_scenarios",
+        "scenario_not_armed",
+    ]
+    assert all(call["endpoint"] == "embeddings" for call in calls)
+    assert all(call["model"] == EMBEDDING_MODEL_ID for call in calls)
+    assert all(call["stream"] is False for call in calls)
+    assert calls[0]["correlation_run_ids"] == []
+    assert calls[0]["active_run_ids"] == []
+    assert calls[1]["correlation_run_ids"] == []
+    assert calls[1]["active_run_ids"] == ["unscoped-a", "unscoped-b"]
+    assert calls[2]["correlation_run_ids"] == ["unscoped-missing"]
+    assert calls[2]["active_run_ids"] == ["unscoped-a", "unscoped-b"]
+    assert all(call["observed_at"].endswith("Z") for call in calls)
+
+
+async def test_reset_while_a_stream_is_pending_is_globally_visible_once(
+    store: ScenarioStore,
+    control: httpx.AsyncClient,
+) -> None:
+    run_id = "reset-pending-001"
+    await arm(control, run_id, scenario="slow-stream", chunk_delay_ms=100)
+    decision = await store.begin_call(
+        run_id=run_id,
+        endpoint="chat.completions",
+        model=CHAT_MODEL_ID,
+        stream=True,
+        consume_required=True,
+    )
+    assert (await control.delete(f"/control/scenarios/{run_id}")).status_code == 200
+    await store.finish_call(decision, "success")
+
+    overview = (await control.get("/control/scenarios")).json()
+    assert overview["unscoped_unexpected_calls"] == 1
+    assert len(overview["unscoped_calls"]) == 1
+    assert overview["unscoped_calls"][0]["outcome"] == ("scenario_reset_before_finish")
+
+
 async def test_control_state_never_retains_prompts_tool_arguments_or_headers(
     control: httpx.AsyncClient,
     inference: httpx.AsyncClient,
@@ -980,3 +1250,86 @@ async def test_control_state_never_retains_prompts_tool_arguments_or_headers(
         "outcome",
         "duration_ms",
     }
+
+
+async def test_auxiliary_schemas_are_modelled_and_an_unknown_one_is_not(
+    control: httpx.AsyncClient,
+    inference: httpx.AsyncClient,
+) -> None:
+    """Every structured schema a real worker asks for is answered, and only those.
+
+    A worker job that runs long enough compacts its context
+    (``ConversationSummary``) and may curate or converge its knowledge
+    (``CurationResult`` / ``KnowledgeAssemblyResult``). Leaving those
+    unmodelled made each one a 422 that the agent retried and then degraded
+    around — a real behaviour change, and `unexpected_schema` noise that hides
+    a genuine unexpected call. The allowlist stays an allowlist: a schema
+    nobody modelled is still a rejection, never a fabricated answer.
+    """
+
+    run_id = "aux-schemas-001"
+    await arm(control, run_id)
+
+    def structured(name: str) -> dict:
+        return chat_request(
+            run_id,
+            extra={
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {"name": name, "schema": {"type": "object"}},
+                }
+            },
+        )
+
+    summary = await inference.post(
+        "/v1/chat/completions", json=structured("ConversationSummary")
+    )
+    assert summary.status_code == 200
+    payload = json.loads(summary.json()["choices"][0]["message"]["content"])
+    assert payload["summary"] == f"E2E-{run_id} deterministic conversation summary."
+    # Every field the compaction model declares must be present, or the agent
+    # falls back to trimming exactly as it did against a 422.
+    assert set(payload) == {
+        "summary",
+        "tasks_completed",
+        "tasks_in_progress",
+        "key_decisions",
+        "current_state",
+        "blockers",
+        "critical_facts",
+        "state_changes",
+        "pinned_instructions",
+        "identity_anchor",
+    }
+
+    curation = await inference.post(
+        "/v1/chat/completions", json=structured("CurationResult")
+    )
+    assert curation.status_code == 200
+    assert json.loads(curation.json()["choices"][0]["message"]["content"]) == {
+        "notes_created": 0,
+        "notes_updated": 0,
+        "summary": f"E2E-{run_id} deterministic no-op curation.",
+    }
+
+    convergence = await inference.post(
+        "/v1/chat/completions", json=structured("KnowledgeAssemblyResult")
+    )
+    assert convergence.status_code == 200
+    assert json.loads(convergence.json()["choices"][0]["message"]["content"]) == {
+        "notes_refreshed": 0,
+        "notes_superseded": 0,
+        "notes_merged": 0,
+        "notes_archived": 0,
+        "summary": f"E2E-{run_id} deterministic no-op convergence.",
+    }
+
+    unknown = await inference.post(
+        "/v1/chat/completions", json=structured("NotAModelledSchema")
+    )
+    assert unknown.status_code == 422
+    assert unknown.json()["error"]["type"] == "unsupported_schema"
+
+    state = (await control.get(f"/control/scenarios/{run_id}")).json()
+    assert state["unexpected_count"] == 1
+    assert state["pending_calls"] == 0

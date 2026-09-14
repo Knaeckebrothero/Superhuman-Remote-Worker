@@ -707,59 +707,6 @@ class TestSeedAdminMcpToken:
 
 
 # ============================================================================
-# Orchestrator API Endpoint Tests
-# ============================================================================
-
-
-class TestUserDictHelper:
-    """Tests for the _user_dict helper in main.py."""
-
-    def test_includes_is_admin_true(self):
-        """_user_dict should include is_admin field."""
-        # We can't easily import from main.py due to side effects,
-        # so we test the logic directly
-        user = _make_user(is_admin=True)
-
-        result = {
-            "id": str(user["id"]),
-            "display_name": user["display_name"],
-            "avatar_color": user["avatar_color"],
-            "email": user.get("email"),
-            "default_project_id": str(user["default_project_id"])
-            if user.get("default_project_id")
-            else None,
-            "is_admin": user.get("is_admin", False),
-            "created_at": user["created_at"],
-        }
-
-        assert result["is_admin"] is True
-
-    def test_includes_is_admin_false(self):
-        user = _make_user(is_admin=False)
-
-        result = {
-            "id": str(user["id"]),
-            "display_name": user["display_name"],
-            "avatar_color": user["avatar_color"],
-            "email": user.get("email"),
-            "default_project_id": str(user["default_project_id"])
-            if user.get("default_project_id")
-            else None,
-            "is_admin": user.get("is_admin", False),
-            "created_at": user["created_at"],
-        }
-
-        assert result["is_admin"] is False
-
-    def test_missing_is_admin_defaults_to_false(self):
-        user = _make_user()
-        del user["is_admin"]
-
-        result = {"is_admin": user.get("is_admin", False)}
-        assert result["is_admin"] is False
-
-
-# ============================================================================
 # Schema Tests
 # ============================================================================
 

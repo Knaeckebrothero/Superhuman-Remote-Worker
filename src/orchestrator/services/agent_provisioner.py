@@ -925,8 +925,9 @@ class AgentProvisioner:
         """Freshly attest one exact, ready pinned-session Pod before I/O.
 
         Provisioned session Pods carry the thread/generation labels from their
-        creation intent.  A warm-pool Pod deliberately retains its job labels;
-        its session authority instead comes from the exact bound protection
+        creation intent. A warm-pool Pod starts with job labels; route
+        publication may replace those with the exact thread/generation session
+        identity. Its authority in either shape comes from the bound protection
         receipt already selected by PostgreSQL plus the finalizer checked here.
         """
 
@@ -971,8 +972,8 @@ class AgentProvisioner:
             and labels.get("srw.io/runtime-generation") == generation
         )
         warm_identity = bool(
-            labels.get("srw/purpose") == "job"
-            and PINNED_AUTHORITY_FINALIZER in finalizers
+            PINNED_AUTHORITY_FINALIZER in finalizers
+            and (labels.get("srw/purpose") == "job" or provisioned_identity)
         )
         if (
             str(getattr(metadata, "name", "") or "") != name
@@ -1101,6 +1102,17 @@ class AgentProvisioner:
             "srw/purpose": "job",
         }
 
+    @staticmethod
+    def _routed_warm_binding_labels(authority: dict[str, Any]) -> dict[str, str]:
+        """Return the exact post-route identity of a protected warm Pod."""
+
+        return {
+            "srw/managed-by": "agent-provisioner",
+            "srw/purpose": "session",
+            "srw.io/thread-id": str(authority.get("thread_id") or ""),
+            "srw.io/runtime-generation": str(authority.get("runtime_generation") or ""),
+        }
+
     async def discover_pinned_warm_agent_authority(
         self, authority: dict[str, Any]
     ) -> dict[str, Any] | None:
@@ -1183,12 +1195,27 @@ class AgentProvisioner:
     ) -> dict[str, Any] | None:
         if not self._k8s_available or self._core_api is None:
             return None
-        return await release_planned_pinned_pod_authority(
+        released = await release_planned_pinned_pod_authority(
             self._core_api,
             namespace=str(authority.get("namespace") or ""),
             pod_name=str(authority.get("pod_name") or ""),
             expected_pod_uid=str(authority.get("pod_uid") or ""),
             expected_labels=self._warm_binding_labels(authority),
+        )
+        if released is not None:
+            return released
+        # Session route publication is UID/RV fenced and adds the exact thread
+        # and generation before changing purpose=job to purpose=session.  That
+        # is the only alternate label shape this captured warm authority owns.
+        routed_labels = self._routed_warm_binding_labels(authority)
+        if not all(routed_labels.values()):
+            return None
+        return await release_planned_pinned_pod_authority(
+            self._core_api,
+            namespace=str(authority.get("namespace") or ""),
+            pod_name=str(authority.get("pod_name") or ""),
+            expected_pod_uid=str(authority.get("pod_uid") or ""),
+            expected_labels=routed_labels,
         )
 
     async def fence_agent_pod_provision_intent(

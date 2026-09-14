@@ -718,3 +718,14 @@ class TestOriginVocabulary:
 
     def test_the_three_origins_are_distinct(self):
         assert len({ORIGIN_AGENT, ORIGIN_AGENT_PARTIAL, ORIGIN_PREDICTION}) == 3
+
+
+@pytest.mark.parametrize("measured", [None, {"shell": ["run_command"]}])
+def test_selected_backend_filters_predictions_but_never_agent_measurements(measured):
+    entry = compose_tool_view(
+        measured=measured,
+        configured={"shell": ["run_command"]},
+        backend_caps={"supports_shell": False},
+    )["shell"]
+    assert entry["state"] == (STATE_UNAVAILABLE if measured is None else STATE_ON)
+    assert entry["tools"] == ([] if measured is None else ["run_command"])

@@ -1264,12 +1264,12 @@ def _route_client(
     async def internal(request):
         assert request.headers.get("X-Internal-Key") == "test-key"
 
-    monkeypatch.setattr(canvases, "_get_db", lambda: db)
     monkeypatch.setattr(canvases, "_get_canvas_service", lambda received: service)
     monkeypatch.setattr(canvases, "_get_file_gateway", lambda received=None: gateway)
     monkeypatch.setattr(canvases, "require_thread_owner", owner)
     monkeypatch.setattr(canvases, "require_internal", internal)
     app = FastAPI()
+    app.state.store = db
     app.include_router(canvases.router)
     app.include_router(canvases.internal_router)
     return TestClient(app), service, gateway, db

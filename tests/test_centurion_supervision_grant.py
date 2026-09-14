@@ -21,6 +21,10 @@ Runtime enforcement is separate and unchanged: the officer lane appends
 even for names smuggled in by a thread override.
 """
 
+from shared.runtime.core.srw_manifest_config import (
+    srw_config_fragment as _srw_config_fragment,
+)
+
 from pathlib import Path
 
 import yaml
@@ -37,7 +41,9 @@ _CONFIG = (
 
 
 def _declared(group: str) -> list[str]:
-    tools = yaml.safe_load(_CONFIG.read_text(encoding="utf-8"))["tools"]
+    tools = _srw_config_fragment(yaml.safe_load(_CONFIG.read_text(encoding="utf-8")))[
+        "tools"
+    ]
     value = tools[group]
     assert isinstance(value, list), (
         f"tools.{group} must stay an explicit reviewed list (see module "

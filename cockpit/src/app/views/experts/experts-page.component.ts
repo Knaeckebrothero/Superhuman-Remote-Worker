@@ -1,16 +1,12 @@
 import {Component} from '@angular/core';
-import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
 import {ExpertsListComponent} from './experts-list.component';
 
 @Component({
   selector: 'app-experts-page',
   standalone: true,
-  imports: [SidebarToggleComponent, ExpertsListComponent],
+  imports: [ExpertsListComponent],
   template: `
     <div class="page">
-      <div class="page-toggle">
-        <app-sidebar-toggle />
-      </div>
       <main class="page-content">
         <app-experts-list />
       </main>
@@ -29,14 +25,6 @@ import {ExpertsListComponent} from './experts-list.component';
         height: 100%;
       }
 
-      .page-toggle {
-        padding: 8px 12px;
-        flex-shrink: 0;
-      }
-
-      .page-toggle:not(:has(.sidebar-toggle)) {
-        display: none;
-      }
 
       .page-content {
         flex: 1;

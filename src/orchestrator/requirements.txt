@@ -26,6 +26,7 @@ langchain-groq>=0.1.0
 tenacity>=8.0.0
 python-multipart>=0.0.18
 pyyaml>=6.0
+jsonschema>=4.18,<5
 nats-py>=2.9.0
 # The shared constraint selects a version that passes the installed SDK auth gate.
 kubernetes>=28.0.0

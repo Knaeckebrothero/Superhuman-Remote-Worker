@@ -7,6 +7,8 @@ gate, admission ordering, durable outcome handoff, and replay response matrix.
 
 from __future__ import annotations
 
+from tests import b08_completion_helpers as b08_helpers
+
 import builtins
 import copy
 import inspect
@@ -27,6 +29,7 @@ from orchestrator.services import job_completion_commands as commands
 from orchestrator.services import completion as completion_service
 from orchestrator.services.completion_effect_policy import COMPLETION_EFFECT_PLAN
 from orchestrator.services.completion_finalizer import CompletionDispositionSuperseded
+from orchestrator.services.container_provisioner import WorkspaceCleanupOutcome
 
 
 JOB_ID = "11111111-2222-3333-4444-555555555555"
@@ -343,7 +346,7 @@ def _journaled_entry(
 
 def _forbid_finalizer(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     getter = MagicMock(side_effect=AssertionError("finalizer must not be accessed"))
-    monkeypatch.setattr(orchestrator.main, "_get_completion_finalizer", getter)
+    monkeypatch.setattr(orchestrator.main._completion_runtime, "finalizer", getter)
     return getter
 
 
@@ -362,19 +365,27 @@ def _patch_normal_route_dependencies(
     )
     monkeypatch.setattr(orchestrator.main, "vector_db", None)
     monkeypatch.setattr(
-        orchestrator.main, "_archive_and_cleanup_workspace", workspace_cleanup
+        orchestrator.main.thread_retirement_operations.ThreadRetirementOperations,
+        "archive_and_cleanup_workspace",
+        workspace_cleanup,
     )
     monkeypatch.setattr(orchestrator.main, "maybe_wake_session", AsyncMock())
     monkeypatch.setattr(orchestrator.main, "_trigger_dispatch", MagicMock())
     monkeypatch.setattr(orchestrator.main, "_kick_session_wake_drain", MagicMock())
-    for helper in (
-        "_handle_critic_verdict_on_complete",
-        "_handle_scholar_completion",
-        "_handle_delegation_child_completion",
-        "_trigger_verification_on_complete",
-        "_advance_project_loop",
+    for owner, helper in (
+        (
+            orchestrator.main.verification_operations,
+            "handle_critic_verdict_on_complete",
+        ),
+        (orchestrator.main.subjob_completion_operations, "handle_scholar_completion"),
+        (
+            orchestrator.main.subjob_completion_operations,
+            "handle_delegation_child_completion",
+        ),
+        (orchestrator.main.verification_operations, "trigger_verification_on_complete"),
+        (orchestrator.main.project_loop_advance_service, "advance_project_loop"),
     ):
-        monkeypatch.setattr(orchestrator.main, helper, AsyncMock())
+        monkeypatch.setattr(owner, helper, AsyncMock())
 
     from orchestrator.services import completion as completion_service
 
@@ -400,14 +411,14 @@ async def test_effect_runner_replays_early_return_without_reentering_guard(
     runner = _RecordingRunner()
     monkeypatch.setattr(orchestrator.main, "postgres_db", database)
 
-    first = await orchestrator.main._complete_job_legacy(
+    first = await b08_helpers.complete_job_legacy(
         MagicMock(),
         JOB_ID,
         _body(),
         _authorized=True,
         _effect_runner=runner,
     )
-    replay = await orchestrator.main._complete_job_legacy(
+    replay = await b08_helpers.complete_job_legacy(
         MagicMock(),
         JOB_ID,
         _body(),
@@ -468,7 +479,7 @@ async def test_late_noop_runs_only_deferred_s36_handoff(
         workspace_cleanup=workspace_cleanup,
     )
 
-    result = await orchestrator.main._complete_job_legacy(
+    result = await b08_helpers.complete_job_legacy(
         MagicMock(),
         JOB_ID,
         _body(),
@@ -512,7 +523,7 @@ async def test_review_late_noop_without_handoff_does_not_run_s36(
         workspace_cleanup=workspace_cleanup,
     )
 
-    result = await orchestrator.main._complete_job_legacy(
+    result = await b08_helpers.complete_job_legacy(
         MagicMock(),
         JOB_ID,
         _body(),
@@ -543,7 +554,7 @@ async def test_intermediate_late_noop_defers_s36_to_still_higher_report(
         workspace_cleanup=workspace_cleanup,
     )
 
-    result = await orchestrator.main._complete_job_legacy(
+    result = await b08_helpers.complete_job_legacy(
         MagicMock(),
         JOB_ID,
         _body(),
@@ -583,19 +594,27 @@ async def test_effect_runner_reconstructs_normal_result_without_repeating_effect
     )
     monkeypatch.setattr(orchestrator.main, "vector_db", None)
     monkeypatch.setattr(
-        orchestrator.main, "_archive_and_cleanup_workspace", workspace_cleanup
+        orchestrator.main.thread_retirement_operations.ThreadRetirementOperations,
+        "archive_and_cleanup_workspace",
+        workspace_cleanup,
     )
     monkeypatch.setattr(orchestrator.main, "maybe_wake_session", wake)
     monkeypatch.setattr(orchestrator.main, "_trigger_dispatch", dispatch)
     monkeypatch.setattr(orchestrator.main, "_kick_session_wake_drain", wake_drain)
-    for helper in (
-        "_handle_critic_verdict_on_complete",
-        "_handle_scholar_completion",
-        "_handle_delegation_child_completion",
-        "_trigger_verification_on_complete",
-        "_advance_project_loop",
+    for owner, helper in (
+        (
+            orchestrator.main.verification_operations,
+            "handle_critic_verdict_on_complete",
+        ),
+        (orchestrator.main.subjob_completion_operations, "handle_scholar_completion"),
+        (
+            orchestrator.main.subjob_completion_operations,
+            "handle_delegation_child_completion",
+        ),
+        (orchestrator.main.verification_operations, "trigger_verification_on_complete"),
+        (orchestrator.main.project_loop_advance_service, "advance_project_loop"),
     ):
-        monkeypatch.setattr(orchestrator.main, helper, AsyncMock())
+        monkeypatch.setattr(owner, helper, AsyncMock())
 
     from orchestrator.services import completion as completion_service
 
@@ -613,14 +632,14 @@ async def test_effect_runner_reconstructs_normal_result_without_repeating_effect
     )
 
     body = orchestrator.main.JobCompleteRequest(should_stop=True, goal_achieved=True)
-    first = await orchestrator.main._complete_job_legacy(
+    first = await b08_helpers.complete_job_legacy(
         MagicMock(),
         JOB_ID,
         body,
         _authorized=True,
         _effect_runner=runner,
     )
-    replay = await orchestrator.main._complete_job_legacy(
+    replay = await b08_helpers.complete_job_legacy(
         MagicMock(),
         JOB_ID,
         body,
@@ -683,8 +702,8 @@ async def test_persisted_reorder_runs_class_b_and_product_delivery_before_s17(
         workspace_cleanup=workspace_cleanup,
     )
     monkeypatch.setattr(
-        orchestrator.main,
-        "_maybe_graft_completed_subjob",
+        orchestrator.main.subjob_output_operations,
+        "maybe_graft_completed_subjob",
         AsyncMock(
             return_value={
                 "status": "grafted",
@@ -693,7 +712,7 @@ async def test_persisted_reorder_runs_class_b_and_product_delivery_before_s17(
         ),
     )
 
-    result = await orchestrator.main._complete_job_legacy(
+    result = await b08_helpers.complete_job_legacy(
         MagicMock(),
         JOB_ID,
         _body(),
@@ -765,9 +784,13 @@ async def test_reordered_restart_after_s17_skips_pre_status_phase_and_resumes_ta
         workspace_cleanup=AsyncMock(return_value=[]),
     )
     graft = AsyncMock(side_effect=AssertionError("pre-status graft reran after S17"))
-    monkeypatch.setattr(orchestrator.main, "_maybe_graft_completed_subjob", graft)
+    monkeypatch.setattr(
+        orchestrator.main.subjob_output_operations,
+        "maybe_graft_completed_subjob",
+        graft,
+    )
 
-    result = await orchestrator.main._complete_job_legacy(
+    result = await b08_helpers.complete_job_legacy(
         MagicMock(),
         JOB_ID,
         _body(),
@@ -805,12 +828,12 @@ async def test_persisted_false_preserves_exact_status_first_order(
         workspace_cleanup=AsyncMock(return_value=[]),
     )
     monkeypatch.setattr(
-        orchestrator.main,
-        "_maybe_graft_completed_subjob",
+        orchestrator.main.subjob_output_operations,
+        "maybe_graft_completed_subjob",
         AsyncMock(return_value={"status": "skipped", "reason": "test"}),
     )
 
-    await orchestrator.main._complete_job_legacy(
+    await b08_helpers.complete_job_legacy(
         MagicMock(),
         JOB_ID,
         _body(),
@@ -847,12 +870,12 @@ async def test_persisted_true_nonterminal_path_preserves_status_first_order(
         workspace_cleanup=AsyncMock(return_value=[]),
     )
     monkeypatch.setattr(
-        orchestrator.main,
-        "_maybe_graft_completed_subjob",
+        orchestrator.main.subjob_output_operations,
+        "maybe_graft_completed_subjob",
         AsyncMock(return_value={"status": "skipped", "reason": "test"}),
     )
 
-    result = await orchestrator.main._complete_job_legacy(
+    result = await b08_helpers.complete_job_legacy(
         MagicMock(),
         JOB_ID,
         _body(),
@@ -888,12 +911,12 @@ async def test_reordered_pending_delivery_withholds_s17_and_all_tail_effects(
         workspace_cleanup=workspace_cleanup,
     )
     monkeypatch.setattr(
-        orchestrator.main,
-        "_maybe_graft_completed_subjob",
+        orchestrator.main.subjob_output_operations,
+        "maybe_graft_completed_subjob",
         AsyncMock(side_effect=RuntimeError("graft transport ambiguous")),
     )
 
-    result = await orchestrator.main._complete_job_legacy(
+    result = await b08_helpers.complete_job_legacy(
         MagicMock(),
         JOB_ID,
         _body(),
@@ -950,7 +973,7 @@ async def test_reordered_preexisting_s15_delivery_pending_withholds_s17(
         workspace_cleanup=AsyncMock(return_value=["must not run"]),
     )
 
-    result = await orchestrator.main._complete_job_legacy(
+    result = await b08_helpers.complete_job_legacy(
         MagicMock(),
         JOB_ID,
         _body(),
@@ -1003,17 +1026,17 @@ async def test_reordered_s15_runs_only_after_exact_delivery_marker(
     delivery = AsyncMock(side_effect=deliver)
     monkeypatch.setattr(job_cloud_baseline, "deliver_loop_diff_to_cloud", delivery)
     monkeypatch.setattr(
-        orchestrator.main,
-        "_prepare_atomic_project_loop_advance",
+        orchestrator.main.project_loop_advance_service,
+        "prepare_atomic_project_loop_advance",
         AsyncMock(return_value=None),
     )
     monkeypatch.setattr(
-        orchestrator.main,
-        "_materialize_prepared_project_loop_advance",
+        orchestrator.main.project_loop_advance_service,
+        "materialize_prepared_project_loop_advance",
         AsyncMock(return_value={"applicable": False, "won": False, "actions": []}),
     )
 
-    result = await orchestrator.main._complete_job_legacy(
+    result = await b08_helpers.complete_job_legacy(
         MagicMock(),
         JOB_ID,
         _body(),
@@ -1055,7 +1078,7 @@ async def test_reordered_entry_authority_loss_prevents_class_b_and_delivery(
     runner.delivery_control_hook = lose_entry_authority
 
     with pytest.raises(CompletionDispositionSuperseded):
-        await orchestrator.main._complete_job_legacy(
+        await b08_helpers.complete_job_legacy(
             MagicMock(),
             JOB_ID,
             _body(),
@@ -1095,13 +1118,13 @@ async def test_reordered_s27_uses_logical_terminal_job_but_followup_stays_tail(
         workspace_cleanup=AsyncMock(return_value=[]),
     )
     monkeypatch.setattr(
-        orchestrator.main,
-        "_maybe_graft_completed_subjob",
+        orchestrator.main.subjob_output_operations,
+        "maybe_graft_completed_subjob",
         AsyncMock(return_value={"status": "skipped", "reason": "critic"}),
     )
     observed_jobs: list[dict] = []
 
-    async def materialize(logical_job: dict) -> dict:
+    async def materialize(logical_job: dict, **_kwargs) -> dict:
         observed_jobs.append(copy.deepcopy(logical_job))
         assert database.job["status"] == "processing"
         return {
@@ -1116,13 +1139,17 @@ async def test_reordered_s27_uses_logical_terminal_job_but_followup_stays_tail(
 
     followup = AsyncMock(return_value={"actions": ["critic followup"]})
     monkeypatch.setattr(
-        orchestrator.main,
-        "_materialize_critic_verdict_transactional",
+        orchestrator.main.verification_operations,
+        "materialize_critic_verdict_transactional",
         AsyncMock(side_effect=materialize),
     )
-    monkeypatch.setattr(orchestrator.main, "_run_critic_verdict_followups", followup)
+    monkeypatch.setattr(
+        orchestrator.main.verification_operations,
+        "run_critic_verdict_followups",
+        followup,
+    )
 
-    result = await orchestrator.main._complete_job_legacy(
+    result = await b08_helpers.complete_job_legacy(
         MagicMock(),
         JOB_ID,
         _body(),
@@ -1158,7 +1185,7 @@ async def test_pre_m3_terminal_loop_effect_never_synthesizes_new_handoff(
         workspace_cleanup=AsyncMock(return_value=[]),
     )
 
-    result = await orchestrator.main._complete_job_legacy(
+    result = await b08_helpers.complete_job_legacy(
         MagicMock(),
         JOB_ID,
         _body(),
@@ -1195,7 +1222,7 @@ async def test_resume_rejects_same_status_without_this_commands_completed_marker
     )
 
     with pytest.raises(CompletionDispositionSuperseded) as raised:
-        await orchestrator.main._complete_job_legacy(
+        await b08_helpers.complete_job_legacy(
             MagicMock(),
             JOB_ID,
             _body(),
@@ -1233,7 +1260,7 @@ async def test_s17_cas_miss_raises_typed_whole_command_supersede(
     monkeypatch.setattr(database, "update_job_status", lose_s17)
 
     with pytest.raises(CompletionDispositionSuperseded) as raised:
-        await orchestrator.main._complete_job_legacy(
+        await b08_helpers.complete_job_legacy(
             MagicMock(),
             JOB_ID,
             _body(),
@@ -1276,7 +1303,7 @@ async def test_cancel_after_s17_is_fenced_before_any_class_c_effect(
     runner.disposition_authority_hook = cancel_at_class_c_boundary
 
     with pytest.raises(CompletionDispositionSuperseded) as raised:
-        await orchestrator.main._complete_job_legacy(
+        await b08_helpers.complete_job_legacy(
             MagicMock(),
             JOB_ID,
             _body(),
@@ -1333,7 +1360,11 @@ async def test_flag_on_s23_auto_deny_uses_exact_finalizer_owner(
         AsyncMock(return_value="sudo-request-1"),
     )
     resume = AsyncMock(return_value={"status": "denied_vm_upgrade"})
-    monkeypatch.setattr(orchestrator.main, "_resume_job_without_vm_internal", resume)
+    monkeypatch.setattr(
+        orchestrator.main.job_control_operations.JobControlOperations,
+        "resume_job_without_vm_internal",
+        resume,
+    )
     body = orchestrator.main.JobCompleteRequest(
         should_stop=True,
         goal_achieved=False,
@@ -1347,7 +1378,7 @@ async def test_flag_on_s23_auto_deny_uses_exact_finalizer_owner(
         client_report_id=REPORT_ID,
     )
 
-    result = await orchestrator.main._complete_job_legacy(
+    result = await b08_helpers.complete_job_legacy(
         MagicMock(),
         JOB_ID,
         body,
@@ -1405,7 +1436,7 @@ async def test_completed_pre_status_pause_replays_exact_early_outcome(
         error={"type": "infra_transient", "message": "database unavailable"},
     )
 
-    result = await orchestrator.main._complete_job_legacy(
+    result = await b08_helpers.complete_job_legacy(
         MagicMock(),
         JOB_ID,
         body,
@@ -1443,7 +1474,7 @@ async def test_infra_retry_ceiling_replay_uses_journaled_entry_attempt(
     runner.details["infra_transient_pause"] = copy.deepcopy(expected)
     monkeypatch.setattr(orchestrator.main, "postgres_db", database)
 
-    result = await orchestrator.main._complete_job_legacy(
+    result = await b08_helpers.complete_job_legacy(
         MagicMock(),
         JOB_ID,
         orchestrator.main.JobCompleteRequest(
@@ -1491,7 +1522,7 @@ async def test_memory_retry_ceiling_replay_uses_journaled_entry_counter(
         workspace_cleanup=workspace_cleanup,
     )
 
-    result = await orchestrator.main._complete_job_legacy(
+    result = await b08_helpers.complete_job_legacy(
         MagicMock(),
         JOB_ID,
         orchestrator.main.JobCompleteRequest(
@@ -1561,7 +1592,7 @@ async def test_llm_outage_attempt_ceiling_replay_uses_journaled_entry_counter(
         workspace_cleanup=workspace_cleanup,
     )
 
-    result = await orchestrator.main._complete_job_legacy(
+    result = await b08_helpers.complete_job_legacy(
         MagicMock(),
         JOB_ID,
         orchestrator.main.JobCompleteRequest(
@@ -1607,7 +1638,7 @@ async def test_main_status_effect_omits_large_freeze_payload(
     )
     large_value = "x" * 32_000
 
-    result = await orchestrator.main._complete_job_legacy(
+    result = await b08_helpers.complete_job_legacy(
         MagicMock(),
         JOB_ID,
         orchestrator.main.JobCompleteRequest(
@@ -1650,7 +1681,7 @@ async def test_durable_drain_stall_counter_requires_domain_write(
     )
 
     with pytest.raises(HTTPException) as raised:
-        await orchestrator.main._complete_job_legacy(
+        await b08_helpers.complete_job_legacy(
             MagicMock(),
             JOB_ID,
             orchestrator.main.JobCompleteRequest(
@@ -1686,7 +1717,7 @@ async def test_legacy_drain_stall_counter_keeps_best_effort_false_write(
         workspace_cleanup=AsyncMock(return_value=[]),
     )
 
-    result = await orchestrator.main._complete_job_legacy(
+    result = await b08_helpers.complete_job_legacy(
         MagicMock(),
         JOB_ID,
         orchestrator.main.JobCompleteRequest(
@@ -1737,7 +1768,7 @@ async def test_durable_recovery_delete_uses_exact_cleanup_intent(
     )
     prepare_cleanup = AsyncMock(return_value={"intent_generation": 7})
     reconcile_cleanup = AsyncMock(
-        return_value=orchestrator.main.WorkspaceCleanupOutcome(cleanup_state, 7)
+        return_value=WorkspaceCleanupOutcome(cleanup_state, 7)
     )
     monkeypatch.setattr(
         orchestrator.main.container_provisioner,
@@ -1762,7 +1793,7 @@ async def test_durable_recovery_delete_uses_exact_cleanup_intent(
 
     monkeypatch.setattr(completion_service, "handle_pod_workspace_recovery", recovery)
 
-    result = await orchestrator.main._complete_job_legacy(
+    result = await b08_helpers.complete_job_legacy(
         MagicMock(),
         JOB_ID,
         orchestrator.main.JobCompleteRequest(
@@ -1826,7 +1857,7 @@ async def test_recovery_delete_without_runtime_identity_fails_closed(
 
     monkeypatch.setattr(completion_service, "handle_pod_workspace_recovery", recovery)
 
-    result = await orchestrator.main._complete_job_legacy(
+    result = await b08_helpers.complete_job_legacy(
         MagicMock(),
         JOB_ID,
         orchestrator.main.JobCompleteRequest(
@@ -1923,7 +1954,7 @@ async def test_vm_recovery_retires_exact_runtime_before_context_reset(
     )
     database.merge_job_context.side_effect = merge
 
-    result = await orchestrator.main._complete_job_legacy(
+    result = await b08_helpers.complete_job_legacy(
         MagicMock(),
         JOB_ID,
         orchestrator.main.JobCompleteRequest(
@@ -1994,7 +2025,7 @@ async def test_terminal_delivery_failure_does_not_block_teardown_and_replays_onl
     )
     body = orchestrator.main.JobCompleteRequest(should_stop=True, goal_achieved=True)
 
-    first = await orchestrator.main._complete_job_legacy(
+    first = await b08_helpers.complete_job_legacy(
         MagicMock(),
         JOB_ID,
         body,
@@ -2019,7 +2050,7 @@ async def test_terminal_delivery_failure_does_not_block_teardown_and_replays_onl
     terminal_effects.assert_awaited_once()
     workspace_cleanup.assert_awaited_once_with(JOB_ID)
 
-    replay = await orchestrator.main._complete_job_legacy(
+    replay = await b08_helpers.complete_job_legacy(
         MagicMock(),
         JOB_ID,
         body,
@@ -2059,7 +2090,7 @@ async def test_session_wake_failure_does_not_block_independent_teardown(
     wake = AsyncMock(side_effect=RuntimeError("session wake store unavailable"))
     monkeypatch.setattr(orchestrator.main, "maybe_wake_session", wake)
 
-    result = await orchestrator.main._complete_job_legacy(
+    result = await b08_helpers.complete_job_legacy(
         MagicMock(),
         JOB_ID,
         orchestrator.main.JobCompleteRequest(should_stop=True, goal_achieved=True),
@@ -2106,7 +2137,7 @@ async def test_session_wake_retry_policy_is_dark_without_effect_runner(
     monkeypatch.setattr(orchestrator.main, "maybe_wake_session", wake)
 
     with pytest.raises(HTTPException) as caught:
-        await orchestrator.main._complete_job_legacy(
+        await b08_helpers.complete_job_legacy(
             MagicMock(),
             JOB_ID,
             orchestrator.main.JobCompleteRequest(should_stop=True, goal_achieved=True),
@@ -2139,7 +2170,7 @@ async def test_teardown_failure_stays_pending_and_replay_skips_done_delivery(
     )
     body = orchestrator.main.JobCompleteRequest(should_stop=True, goal_achieved=True)
 
-    first = await orchestrator.main._complete_job_legacy(
+    first = await b08_helpers.complete_job_legacy(
         MagicMock(),
         JOB_ID,
         body,
@@ -2163,7 +2194,7 @@ async def test_teardown_failure_stays_pending_and_replay_skips_done_delivery(
     terminal_effects.assert_awaited_once()
     workspace_cleanup.assert_awaited_once_with(JOB_ID)
 
-    replay = await orchestrator.main._complete_job_legacy(
+    replay = await b08_helpers.complete_job_legacy(
         MagicMock(),
         JOB_ID,
         body,
@@ -2202,11 +2233,13 @@ async def test_cancel_after_s17_supersedes_before_s36_without_settling_effect(
     workspace_cleanup = AsyncMock(return_value=["must not release"])
     monkeypatch.setattr(orchestrator.main, "postgres_db", database)
     monkeypatch.setattr(
-        orchestrator.main, "_archive_and_cleanup_workspace", workspace_cleanup
+        orchestrator.main.thread_retirement_operations.ThreadRetirementOperations,
+        "archive_and_cleanup_workspace",
+        workspace_cleanup,
     )
 
     with pytest.raises(CompletionDispositionSuperseded) as raised:
-        await orchestrator.main._run_completion_workspace_teardown(JOB_ID, runner)
+        await b08_helpers.run_completion_workspace_teardown(JOB_ID, runner)
 
     assert raised.value.observed_status == "cancelled"
     assert raised.value.expected_statuses == ("completed",)
@@ -2233,10 +2266,12 @@ async def test_active_s36_marker_status_drift_parks_without_clearing_effect(
     workspace_cleanup = AsyncMock(return_value=["must not release"])
     monkeypatch.setattr(orchestrator.main, "postgres_db", database)
     monkeypatch.setattr(
-        orchestrator.main, "_archive_and_cleanup_workspace", workspace_cleanup
+        orchestrator.main.thread_retirement_operations.ThreadRetirementOperations,
+        "archive_and_cleanup_workspace",
+        workspace_cleanup,
     )
 
-    output = await orchestrator.main._run_completion_workspace_teardown(JOB_ID, runner)
+    output = await b08_helpers.run_completion_workspace_teardown(JOB_ID, runner)
 
     assert output == {
         "actions": [],
@@ -2296,11 +2331,13 @@ async def test_flagged_vm_teardown_captures_replays_and_archives_exact_identity(
         orchestrator.main.vm_provisioner, "release_vm_captured", release
     )
     monkeypatch.setattr(
-        orchestrator.main, "_archive_and_cleanup_workspace", legacy_cleanup
+        orchestrator.main.thread_retirement_operations.ThreadRetirementOperations,
+        "archive_and_cleanup_workspace",
+        legacy_cleanup,
     )
 
-    first = await orchestrator.main._run_completion_workspace_teardown(JOB_ID, runner)
-    replay = await orchestrator.main._run_completion_workspace_teardown(JOB_ID, runner)
+    first = await b08_helpers.run_completion_workspace_teardown(JOB_ID, runner)
+    replay = await b08_helpers.run_completion_workspace_teardown(JOB_ID, runner)
 
     assert (
         first
@@ -2364,7 +2401,7 @@ async def test_vm_identity_mismatch_supersedes_only_s36_effect(
         AsyncMock(side_effect=AssertionError("must replay captured intent")),
     )
 
-    output = await orchestrator.main._run_completion_workspace_teardown(JOB_ID, runner)
+    output = await b08_helpers.run_completion_workspace_teardown(JOB_ID, runner)
 
     assert output["teardown_disposition"] == "identity_superseded"
     assert runner.superseded_names == {"workspace_archive_teardown"}
@@ -2400,7 +2437,9 @@ async def test_docker_vm_s36_keeps_durable_legacy_cleanup_without_identity_probe
     legacy_cleanup = AsyncMock(return_value=["docker vm released"])
     monkeypatch.setattr(orchestrator.main, "postgres_db", _RouteDB(job))
     monkeypatch.setattr(
-        orchestrator.main, "_archive_and_cleanup_workspace", legacy_cleanup
+        orchestrator.main.thread_retirement_operations.ThreadRetirementOperations,
+        "archive_and_cleanup_workspace",
+        legacy_cleanup,
     )
     monkeypatch.setattr(
         orchestrator.main.vm_provisioner,
@@ -2408,8 +2447,8 @@ async def test_docker_vm_s36_keeps_durable_legacy_cleanup_without_identity_probe
         AsyncMock(side_effect=AssertionError("Docker has no KubeVirt identity")),
     )
 
-    first = await orchestrator.main._run_completion_workspace_teardown(JOB_ID, runner)
-    replay = await orchestrator.main._run_completion_workspace_teardown(JOB_ID, runner)
+    first = await b08_helpers.run_completion_workspace_teardown(JOB_ID, runner)
+    replay = await b08_helpers.run_completion_workspace_teardown(JOB_ID, runner)
 
     assert (
         first
@@ -2495,11 +2534,13 @@ async def test_hybrid_vm_and_kubernetes_s36_captures_and_releases_both(
     )
     legacy_cleanup = AsyncMock(side_effect=AssertionError("must stay UID fenced"))
     monkeypatch.setattr(
-        orchestrator.main, "_archive_and_cleanup_workspace", legacy_cleanup
+        orchestrator.main.thread_retirement_operations.ThreadRetirementOperations,
+        "archive_and_cleanup_workspace",
+        legacy_cleanup,
     )
 
-    first = await orchestrator.main._run_completion_workspace_teardown(JOB_ID, runner)
-    replay = await orchestrator.main._run_completion_workspace_teardown(JOB_ID, runner)
+    first = await b08_helpers.run_completion_workspace_teardown(JOB_ID, runner)
+    replay = await b08_helpers.run_completion_workspace_teardown(JOB_ID, runner)
 
     assert (
         first
@@ -2609,10 +2650,12 @@ async def test_hybrid_s36_replacement_supersedes_and_preserves_other_names(
     )
     legacy_cleanup = AsyncMock(side_effect=AssertionError("must preserve successors"))
     monkeypatch.setattr(
-        orchestrator.main, "_archive_and_cleanup_workspace", legacy_cleanup
+        orchestrator.main.thread_retirement_operations.ThreadRetirementOperations,
+        "archive_and_cleanup_workspace",
+        legacy_cleanup,
     )
 
-    output = await orchestrator.main._run_completion_workspace_teardown(JOB_ID, runner)
+    output = await b08_helpers.run_completion_workspace_teardown(JOB_ID, runner)
 
     assert output["teardown_disposition"] == "identity_superseded"
     assert runner.superseded_names == {"workspace_archive_teardown"}
@@ -2675,7 +2718,7 @@ async def test_hybrid_s36_retry_precedes_replacement_supersede(
         AsyncMock(return_value="unknown"),
     )
 
-    output = await orchestrator.main._run_completion_workspace_teardown(JOB_ID, runner)
+    output = await b08_helpers.run_completion_workspace_teardown(JOB_ID, runner)
 
     assert output["teardown_disposition"] == "retry_pending"
     assert "captured Kubernetes teardown remains unknown" in output["error"]
@@ -2745,7 +2788,7 @@ async def test_flagged_kubernetes_teardown_captures_and_uses_exact_uids(
         release_mock,
     )
 
-    result = await orchestrator.main._complete_job_legacy(
+    result = await b08_helpers.complete_job_legacy(
         MagicMock(),
         JOB_ID,
         _body(),
@@ -2822,14 +2865,14 @@ async def test_kubernetes_teardown_resume_reuses_intent_after_pod_disappears(
         release_mock,
     )
 
-    first = await orchestrator.main._complete_job_legacy(
+    first = await b08_helpers.complete_job_legacy(
         MagicMock(),
         JOB_ID,
         _body(),
         _authorized=True,
         _effect_runner=runner,
     )
-    replay = await orchestrator.main._complete_job_legacy(
+    replay = await b08_helpers.complete_job_legacy(
         MagicMock(),
         JOB_ID,
         _body(),
@@ -2896,7 +2939,7 @@ async def test_kubernetes_uid_teardown_stays_off_for_default_off(
         release_mock,
     )
 
-    result = await orchestrator.main._complete_job_legacy(
+    result = await b08_helpers.complete_job_legacy(
         MagicMock(),
         JOB_ID,
         _body(),
@@ -2931,7 +2974,7 @@ async def test_default_off_bypasses_command_module_and_preserves_legacy_contract
 
     monkeypatch.setattr(orchestrator.main, "COMPLETION_COMMANDS_ENABLED", False)
     monkeypatch.setattr(orchestrator.main, "require_internal", auth)
-    monkeypatch.setattr(orchestrator.main, "_complete_job_legacy", legacy)
+    monkeypatch.setattr(orchestrator.main, "_run_legacy_completion", legacy)
     monkeypatch.setattr(commands, "accept_completion_command", accept)
 
     original_import = builtins.__import__
@@ -2946,7 +2989,7 @@ async def test_default_off_bypasses_command_module_and_preserves_legacy_contract
 
     monkeypatch.setattr(builtins, "__import__", reject_command_import)
 
-    handled = await orchestrator.main.complete_job(request, JOB_ID, body)
+    handled = await b08_helpers.complete_job(request, JOB_ID, body)
 
     assert handled is legacy_result
     auth.assert_awaited_once_with(request)
@@ -2975,7 +3018,7 @@ async def test_accepted_stateless_command_does_not_recheck_terminalized_worker_l
     # Command admission already checked token 17 and terminalized that queue
     # unit. Invoke the persisted workflow directly: the HTTP route now returns
     # 202 for this case and the background drain supplies the effect runner.
-    handled = await orchestrator.main._complete_job_legacy(
+    handled = await b08_helpers.complete_job_legacy(
         MagicMock(),
         JOB_ID,
         _body(),
@@ -2995,7 +3038,7 @@ async def test_accepted_stateless_command_does_not_recheck_terminalized_worker_l
     # stale token must still fail the historical thin entry check.
     monkeypatch.setattr(orchestrator.main, "COMPLETION_COMMANDS_ENABLED", False)
     with pytest.raises(HTTPException) as rejected:
-        await orchestrator.main.complete_job(MagicMock(), JOB_ID, _body())
+        await b08_helpers.complete_job(MagicMock(), JOB_ID, _body())
 
     assert rejected.value.status_code == 409
     assert rejected.value.detail == (
@@ -3031,10 +3074,10 @@ async def test_fresh_stateless_accept_returns_exact_background_handoff(
     )
     monkeypatch.setattr(orchestrator.main, "postgres_db", database)
     monkeypatch.setattr(orchestrator.main, "require_internal", AsyncMock())
-    monkeypatch.setattr(orchestrator.main, "_complete_job_legacy", legacy)
+    monkeypatch.setattr(orchestrator.main, "_run_legacy_completion", legacy)
     monkeypatch.setattr(commands, "accept_completion_command", accept)
 
-    response = await orchestrator.main.complete_job(request, JOB_ID, body)
+    response = await b08_helpers.complete_job(request, JOB_ID, body)
 
     assert isinstance(response, JSONResponse)
     assert response.status_code == 202
@@ -3124,13 +3167,13 @@ async def test_fresh_pinned_admission_preserves_exact_inline_response_and_calls(
     monkeypatch.setattr(
         orchestrator.main, "require_internal", AsyncMock(side_effect=auth)
     )
-    monkeypatch.setattr(orchestrator.main, "_complete_job_legacy", legacy_mock)
+    monkeypatch.setattr(orchestrator.main, "_run_legacy_completion", legacy_mock)
     monkeypatch.setattr(
-        orchestrator.main, "_get_completion_finalizer", finalizer_getter
+        orchestrator.main._completion_runtime, "finalizer", finalizer_getter
     )
     monkeypatch.setattr(commands, "accept_completion_command", accept_mock)
 
-    handled = await orchestrator.main.complete_job(request, JOB_ID, body)
+    handled = await b08_helpers.complete_job(request, JOB_ID, body)
 
     assert handled is legacy_result
     assert events == ["authenticate", "accept", "finalize", "legacy", "terminal"]
@@ -3194,14 +3237,14 @@ async def test_fresh_superseded_finalization_returns_terminal_outcome_not_202(
         AsyncMock(return_value=_accepted("fresh")),
     )
     monkeypatch.setattr(
-        orchestrator.main,
-        "_get_completion_finalizer",
+        orchestrator.main._completion_runtime,
+        "finalizer",
         MagicMock(return_value=SimpleNamespace(finalize_command=finalize)),
     )
     legacy = AsyncMock(side_effect=AssertionError("superseded workflow must not run"))
-    monkeypatch.setattr(orchestrator.main, "_complete_job_legacy", legacy)
+    monkeypatch.setattr(orchestrator.main, "_run_legacy_completion", legacy)
 
-    handled = await orchestrator.main.complete_job(MagicMock(), JOB_ID, _body())
+    handled = await b08_helpers.complete_job(MagicMock(), JOB_ID, _body())
 
     assert handled == outcome
     legacy.assert_not_awaited()
@@ -3243,7 +3286,7 @@ async def test_fresh_admission_exposes_local_force_delete_window(
     )
     monkeypatch.setattr(orchestrator.main, "require_internal", AsyncMock())
     monkeypatch.setattr(
-        orchestrator.main, "_complete_job_legacy", AsyncMock(side_effect=legacy)
+        orchestrator.main, "_run_legacy_completion", AsyncMock(side_effect=legacy)
     )
     monkeypatch.setattr(
         commands, "accept_completion_command", AsyncMock(side_effect=accept)
@@ -3252,8 +3295,8 @@ async def test_fresh_admission_exposes_local_force_delete_window(
         orchestrator.main.asyncio, "sleep", AsyncMock(side_effect=delay)
     )
     monkeypatch.setattr(
-        orchestrator.main,
-        "_get_completion_finalizer",
+        orchestrator.main._completion_runtime,
+        "finalizer",
         MagicMock(
             return_value=SimpleNamespace(
                 finalize_command=AsyncMock(side_effect=finalize)
@@ -3262,7 +3305,7 @@ async def test_fresh_admission_exposes_local_force_delete_window(
     )
 
     with caplog.at_level("INFO"):
-        handled = await orchestrator.main.complete_job(MagicMock(), JOB_ID, _body())
+        handled = await b08_helpers.complete_job(MagicMock(), JOB_ID, _body())
 
     assert handled == {"status": "success", "job_id": JOB_ID}
     assert events == ["accept", "finalize", "delay:15.0", "legacy"]
@@ -3313,19 +3356,19 @@ async def test_deterministic_http_guard_is_terminal_and_replays_exactly(
     finalize_mock = AsyncMock(side_effect=finalize)
     monkeypatch.setattr(orchestrator.main, "COMPLETION_COMMANDS_ENABLED", True)
     monkeypatch.setattr(orchestrator.main, "require_internal", AsyncMock())
-    monkeypatch.setattr(orchestrator.main, "_complete_job_legacy", legacy)
+    monkeypatch.setattr(orchestrator.main, "_run_legacy_completion", legacy)
     monkeypatch.setattr(
         commands, "accept_completion_command", AsyncMock(side_effect=accept)
     )
     monkeypatch.setattr(
-        orchestrator.main,
-        "_get_completion_finalizer",
+        orchestrator.main._completion_runtime,
+        "finalizer",
         MagicMock(return_value=SimpleNamespace(finalize_command=finalize_mock)),
     )
 
     for _attempt in range(2):
         with pytest.raises(HTTPException) as caught:
-            await orchestrator.main.complete_job(request, JOB_ID, body)
+            await b08_helpers.complete_job(request, JOB_ID, body)
         assert caught.value.status_code == 422
         assert caught.value.detail == {"reason": "deterministic completion guard"}
         assert caught.value.headers == {"X-Completion-Guard": "true"}
@@ -3369,10 +3412,10 @@ async def test_done_replay_returns_stored_outcome_with_idempotency_header(
     finalizer_getter = _forbid_finalizer(monkeypatch)
     monkeypatch.setattr(orchestrator.main, "COMPLETION_COMMANDS_ENABLED", True)
     monkeypatch.setattr(orchestrator.main, "require_internal", AsyncMock())
-    monkeypatch.setattr(orchestrator.main, "_complete_job_legacy", legacy)
+    monkeypatch.setattr(orchestrator.main, "_run_legacy_completion", legacy)
     monkeypatch.setattr(commands, "accept_completion_command", accept)
 
-    response = await orchestrator.main.complete_job(MagicMock(), JOB_ID, _body())
+    response = await b08_helpers.complete_job(MagicMock(), JOB_ID, _body())
 
     assert isinstance(response, JSONResponse)
     assert response.status_code == 200
@@ -3395,11 +3438,11 @@ async def test_pending_or_finalizing_replay_is_retryable_conflict(
     finalizer_getter = _forbid_finalizer(monkeypatch)
     monkeypatch.setattr(orchestrator.main, "COMPLETION_COMMANDS_ENABLED", True)
     monkeypatch.setattr(orchestrator.main, "require_internal", AsyncMock())
-    monkeypatch.setattr(orchestrator.main, "_complete_job_legacy", legacy)
+    monkeypatch.setattr(orchestrator.main, "_run_legacy_completion", legacy)
     monkeypatch.setattr(commands, "accept_completion_command", accept)
 
     with pytest.raises(HTTPException) as caught:
-        await orchestrator.main.complete_job(MagicMock(), JOB_ID, _body())
+        await b08_helpers.complete_job(MagicMock(), JOB_ID, _body())
 
     assert caught.value.status_code == 409
     assert caught.value.headers == {"Retry-After": "1"}
@@ -3421,11 +3464,11 @@ async def test_divergent_replay_is_unprocessable(
     finalizer_getter = _forbid_finalizer(monkeypatch)
     monkeypatch.setattr(orchestrator.main, "COMPLETION_COMMANDS_ENABLED", True)
     monkeypatch.setattr(orchestrator.main, "require_internal", AsyncMock())
-    monkeypatch.setattr(orchestrator.main, "_complete_job_legacy", legacy)
+    monkeypatch.setattr(orchestrator.main, "_run_legacy_completion", legacy)
     monkeypatch.setattr(commands, "accept_completion_command", accept)
 
     with pytest.raises(HTTPException) as caught:
-        await orchestrator.main.complete_job(MagicMock(), JOB_ID, _body())
+        await b08_helpers.complete_job(MagicMock(), JOB_ID, _body())
 
     assert caught.value.status_code == 422
     assert caught.value.headers is None
@@ -3444,11 +3487,11 @@ async def test_nonterminal_stateless_report_has_machine_coded_422(
     finalizer_getter = _forbid_finalizer(monkeypatch)
     monkeypatch.setattr(orchestrator.main, "COMPLETION_COMMANDS_ENABLED", True)
     monkeypatch.setattr(orchestrator.main, "require_internal", AsyncMock())
-    monkeypatch.setattr(orchestrator.main, "_complete_job_legacy", legacy)
+    monkeypatch.setattr(orchestrator.main, "_run_legacy_completion", legacy)
     monkeypatch.setattr(commands, "accept_completion_command", accept)
 
     with pytest.raises(HTTPException) as caught:
-        await orchestrator.main.complete_job(MagicMock(), JOB_ID, _body())
+        await b08_helpers.complete_job(MagicMock(), JOB_ID, _body())
 
     assert caught.value.status_code == 422
     assert caught.value.detail == {
@@ -3471,10 +3514,10 @@ async def test_parked_replay_is_accepted_without_retry_after(
     finalizer_getter = _forbid_finalizer(monkeypatch)
     monkeypatch.setattr(orchestrator.main, "COMPLETION_COMMANDS_ENABLED", True)
     monkeypatch.setattr(orchestrator.main, "require_internal", AsyncMock())
-    monkeypatch.setattr(orchestrator.main, "_complete_job_legacy", legacy)
+    monkeypatch.setattr(orchestrator.main, "_run_legacy_completion", legacy)
     monkeypatch.setattr(commands, "accept_completion_command", accept)
 
-    response = await orchestrator.main.complete_job(MagicMock(), JOB_ID, _body())
+    response = await b08_helpers.complete_job(MagicMock(), JOB_ID, _body())
 
     assert isinstance(response, JSONResponse)
     assert response.status_code == 202
@@ -3540,10 +3583,10 @@ async def test_operator_terminal_replays_return_their_durable_outcome(
     finalizer_getter = _forbid_finalizer(monkeypatch)
     monkeypatch.setattr(orchestrator.main, "COMPLETION_COMMANDS_ENABLED", True)
     monkeypatch.setattr(orchestrator.main, "require_internal", AsyncMock())
-    monkeypatch.setattr(orchestrator.main, "_complete_job_legacy", legacy)
+    monkeypatch.setattr(orchestrator.main, "_run_legacy_completion", legacy)
     monkeypatch.setattr(commands, "accept_completion_command", accept)
 
-    response = await orchestrator.main.complete_job(MagicMock(), JOB_ID, _body())
+    response = await b08_helpers.complete_job(MagicMock(), JOB_ID, _body())
 
     assert isinstance(response, JSONResponse)
     assert response.status_code == 200
@@ -3579,9 +3622,13 @@ async def test_curation_handoff_is_keyed_to_completion_command(
         "get_job",
         AsyncMock(return_value={"id": CURATOR_ID, "context": {}}),
     )
-    monkeypatch.setattr(orchestrator.main, "_internal_resume_job", queue)
+    monkeypatch.setattr(
+        orchestrator.main.job_control_operations.JobControlOperations,
+        "internal_resume_job",
+        queue,
+    )
 
-    await orchestrator.main._trigger_curation_final_pass(
+    await b08_helpers.trigger_curation_final_pass(
         JOB_ID,
         {"id": JOB_ID, "resolved_config": {}},
         completion_command_id=COMMAND_ID,
@@ -3623,10 +3670,14 @@ async def test_curation_handoff_reconciles_exact_command_without_requeue(
             }
         ),
     )
-    monkeypatch.setattr(orchestrator.main, "_internal_resume_job", queue)
+    monkeypatch.setattr(
+        orchestrator.main.job_control_operations.JobControlOperations,
+        "internal_resume_job",
+        queue,
+    )
     monkeypatch.setattr(orchestrator.main, "_trigger_dispatch", dispatch)
 
-    await orchestrator.main._trigger_curation_final_pass(
+    await b08_helpers.trigger_curation_final_pass(
         JOB_ID,
         {"id": JOB_ID, "resolved_config": {}},
         completion_command_id=COMMAND_ID,

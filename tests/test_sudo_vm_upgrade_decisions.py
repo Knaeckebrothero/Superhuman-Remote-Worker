@@ -20,6 +20,8 @@ module-level singletons mocked per-test; no TestClient / DB.
 
 from __future__ import annotations
 
+from tests import _b09_control_seams as control_seams
+
 import json
 import os
 from datetime import datetime, timedelta, timezone
@@ -74,25 +76,25 @@ def _frozen_job(*, status: str = "paused") -> dict:
 
 class TestJobFrozenPredicate:
     def test_dict_freeze(self):
-        assert orch_main._job_frozen_for_vm_upgrade(_frozen_job()) is True
+        assert control_seams.job_frozen_for_vm_upgrade(_frozen_job()) is True
 
     def test_str_freeze(self):
         job = _frozen_job()
         job["freeze_data"] = json.dumps(job["freeze_data"])
-        assert orch_main._job_frozen_for_vm_upgrade(job) is True
+        assert control_seams.job_frozen_for_vm_upgrade(job) is True
 
     def test_other_freeze_type(self):
         job = _frozen_job()
         job["freeze_data"] = {"freeze_type": "job_complete"}
-        assert orch_main._job_frozen_for_vm_upgrade(job) is False
+        assert control_seams.job_frozen_for_vm_upgrade(job) is False
 
     def test_no_freeze(self):
         job = _frozen_job()
         job["freeze_data"] = None
-        assert orch_main._job_frozen_for_vm_upgrade(job) is False
+        assert control_seams.job_frozen_for_vm_upgrade(job) is False
 
     def test_none_job(self):
-        assert orch_main._job_frozen_for_vm_upgrade(None) is False
+        assert control_seams.job_frozen_for_vm_upgrade(None) is False
 
 
 # =============================================================================
@@ -109,10 +111,10 @@ class TestApplyVmUpgradeDecision:
 
         with (
             patch.object(orch_main, "sudo_gate", gate),
-            patch.object(orch_main, "_guard_completion_control", blocked),
+            patch.object(orch_main._completion_control_boundary, "guard", blocked),
         ):
             with pytest.raises(HTTPException) as exc:
-                await orch_main._apply_vm_upgrade_decision(
+                await control_seams.apply_vm_upgrade_decision(
                     REQ_ID,
                     _vm_upgrade_row(),
                     approve=True,
@@ -135,9 +137,13 @@ class TestApplyVmUpgradeDecision:
         upgrade = AsyncMock(return_value={"status": "approved_vm_upgrade"})
         with (
             patch.object(orch_main, "sudo_gate", gate),
-            patch.object(orch_main, "_upgrade_job_to_vm_internal", upgrade),
+            patch.object(
+                orch_main.job_control_operations.JobControlOperations,
+                "_upgrade_job_to_vm_internal",
+                upgrade,
+            ),
         ):
-            result = await orch_main._apply_vm_upgrade_decision(
+            result = await control_seams.apply_vm_upgrade_decision(
                 REQ_ID, row, approve=True, upgrade=True, reason="ok", decided_by="op"
             )
         gate.approve_request.assert_awaited_once_with(
@@ -157,9 +163,13 @@ class TestApplyVmUpgradeDecision:
         no_vm = AsyncMock(return_value={"status": "denied_vm_upgrade"})
         with (
             patch.object(orch_main, "sudo_gate", gate),
-            patch.object(orch_main, "_resume_job_without_vm_internal", no_vm),
+            patch.object(
+                orch_main.job_control_operations.JobControlOperations,
+                "_resume_job_without_vm_internal",
+                no_vm,
+            ),
         ):
-            result = await orch_main._apply_vm_upgrade_decision(
+            result = await control_seams.apply_vm_upgrade_decision(
                 REQ_ID, row, approve=False, upgrade=False, reason="no", decided_by="op"
             )
         gate.deny_request.assert_awaited_once_with(REQ_ID, reason="no", decided_by="op")
@@ -179,7 +189,7 @@ class TestApplyVmUpgradeDecision:
             patch.object(orch_main, "sudo_gate", gate),
             pytest.raises(HTTPException) as exc,
         ):
-            await orch_main._apply_vm_upgrade_decision(
+            await control_seams.apply_vm_upgrade_decision(
                 REQ_ID, row, approve=True, upgrade=True, reason="", decided_by="op"
             )
         assert exc.value.status_code == 409
@@ -193,9 +203,13 @@ class TestApplyVmUpgradeDecision:
         upgrade = AsyncMock()
         with (
             patch.object(orch_main, "postgres_db", db),
-            patch.object(orch_main, "_upgrade_job_to_vm_internal", upgrade),
+            patch.object(
+                orch_main.job_control_operations.JobControlOperations,
+                "_upgrade_job_to_vm_internal",
+                upgrade,
+            ),
         ):
-            result = await orch_main._apply_vm_upgrade_decision(
+            result = await control_seams.apply_vm_upgrade_decision(
                 REQ_ID, row, approve=True, upgrade=True, reason="", decided_by="op"
             )
         upgrade.assert_not_called()
@@ -211,9 +225,13 @@ class TestApplyVmUpgradeDecision:
         upgrade = AsyncMock(return_value={"status": "approved_vm_upgrade"})
         with (
             patch.object(orch_main, "postgres_db", db),
-            patch.object(orch_main, "_upgrade_job_to_vm_internal", upgrade),
+            patch.object(
+                orch_main.job_control_operations.JobControlOperations,
+                "_upgrade_job_to_vm_internal",
+                upgrade,
+            ),
         ):
-            result = await orch_main._apply_vm_upgrade_decision(
+            result = await control_seams.apply_vm_upgrade_decision(
                 REQ_ID, row, approve=True, upgrade=True, reason="", decided_by="op"
             )
         upgrade.assert_awaited_once_with(JOB_ID)
@@ -224,7 +242,7 @@ class TestApplyVmUpgradeDecision:
         # First-decider-wins: a deny after an approve is a visible conflict.
         row = _vm_upgrade_row(status="approved")
         with pytest.raises(HTTPException) as exc:
-            await orch_main._apply_vm_upgrade_decision(
+            await control_seams.apply_vm_upgrade_decision(
                 REQ_ID, row, approve=False, upgrade=False, reason="", decided_by="op"
             )
         assert exc.value.status_code == 409
@@ -239,9 +257,13 @@ class TestApplyVmUpgradeDecision:
         no_vm = AsyncMock(return_value={"status": "denied_vm_upgrade"})
         with (
             patch.object(orch_main, "postgres_db", db),
-            patch.object(orch_main, "_resume_job_without_vm_internal", no_vm),
+            patch.object(
+                orch_main.job_control_operations.JobControlOperations,
+                "_resume_job_without_vm_internal",
+                no_vm,
+            ),
         ):
-            await orch_main._apply_vm_upgrade_decision(
+            await control_seams.apply_vm_upgrade_decision(
                 REQ_ID, row, approve=False, upgrade=False, reason="r", decided_by="op"
             )
         no_vm.assert_awaited_once()
@@ -257,7 +279,7 @@ class TestApplyVmUpgradeDecision:
             patch.object(orch_main, "sudo_gate", gate),
             pytest.raises(HTTPException) as exc,
         ):
-            await orch_main._apply_vm_upgrade_decision(
+            await control_seams.apply_vm_upgrade_decision(
                 REQ_ID, row, approve=True, upgrade=True, reason="", decided_by="op"
             )
         assert exc.value.status_code == 409
@@ -267,7 +289,7 @@ class TestApplyVmUpgradeDecision:
         row = _vm_upgrade_row()
         row["job_id"] = None
         with pytest.raises(HTTPException) as exc:
-            await orch_main._apply_vm_upgrade_decision(
+            await control_seams.apply_vm_upgrade_decision(
                 REQ_ID, row, approve=True, upgrade=True, reason="", decided_by="op"
             )
         assert exc.value.status_code == 400
@@ -308,7 +330,7 @@ class TestResumeWithoutVm:
             patch.object(orch_main, "_trigger_dispatch", MagicMock()) as trigger,
             pytest.raises(HTTPException) as exc,
         ):
-            await orch_main._resume_job_without_vm_internal(JOB_ID)
+            await control_seams.resume_job_without_vm_internal(JOB_ID)
 
         assert exc.value.status_code == 409
         conn.execute.assert_not_awaited()
@@ -325,7 +347,7 @@ class TestResumeWithoutVm:
             patch.object(orch_main, "workspace_service", ws),
             patch.object(orch_main, "_trigger_dispatch", trigger),
         ):
-            result = await orch_main._resume_job_without_vm_internal(
+            result = await control_seams.resume_job_without_vm_internal(
                 JOB_ID, decided_by="alice", reason="not needed", denied=True
             )
         sql, payload, job_id = conn.execute.await_args.args
@@ -352,7 +374,7 @@ class TestResumeWithoutVm:
             patch.object(orch_main, "workspace_service", ws),
             patch.object(orch_main, "_trigger_dispatch", MagicMock()),
         ):
-            result = await orch_main._resume_job_without_vm_internal(
+            result = await control_seams.resume_job_without_vm_internal(
                 JOB_ID, decided_by="alice", reason="", denied=False
             )
         merged = json.loads(conn.execute.await_args.args[1])
@@ -370,7 +392,7 @@ class TestResumeWithoutVm:
             patch.object(orch_main, "workspace_service", ws),
             pytest.raises(HTTPException) as exc,
         ):
-            await orch_main._resume_job_without_vm_internal(JOB_ID)
+            await control_seams.resume_job_without_vm_internal(JOB_ID)
         assert exc.value.status_code == 400
 
     @pytest.mark.asyncio
@@ -392,10 +414,10 @@ class TestResumeWithoutVm:
             patch.object(orch_main, "COMPLETION_COMMANDS_ENABLED", True),
             patch.object(orch_main, "postgres_db", db),
             patch.object(orch_main, "workspace_service", ws),
-            patch.object(orch_main, "_guard_completion_control", guard),
+            patch.object(orch_main._completion_control_boundary, "guard", guard),
             patch.object(orch_main, "_trigger_dispatch", MagicMock()),
         ):
-            result = await orch_main._resume_job_without_vm_internal(
+            result = await control_seams.resume_job_without_vm_internal(
                 JOB_ID,
                 decided_by="system",
                 reason="not allowed",
@@ -432,10 +454,10 @@ class TestResumeWithoutVm:
             patch.object(orch_main, "COMPLETION_COMMANDS_ENABLED", True),
             patch.object(orch_main, "postgres_db", db),
             patch.object(orch_main, "workspace_service", ws),
-            patch.object(orch_main, "_guard_completion_control", guard),
+            patch.object(orch_main._completion_control_boundary, "guard", guard),
             patch.object(orch_main, "_trigger_dispatch", MagicMock()),
         ):
-            await orch_main._resume_job_without_vm_internal(
+            await control_seams.resume_job_without_vm_internal(
                 JOB_ID,
                 completion_owner_command_id=REQ_ID,
                 completion_owner="finalizer-owner",
@@ -548,7 +570,7 @@ class TestFailExpiredVmUpgradeJobs:
         ctx.__aexit__ = AsyncMock(return_value=False)
         db.acquire = MagicMock(return_value=ctx)
         with patch.object(orch_main, "postgres_db", db):
-            count = await orch_main._fail_expired_vm_upgrade_jobs()
+            count = await control_seams.fail_expired_vm_upgrade_jobs()
         assert count == 1
         sql = conn.execute.await_args.args[0]
         assert "status = 'failed'" in sql
@@ -565,7 +587,7 @@ class TestFailExpiredVmUpgradeJobs:
         ctx.__aexit__ = AsyncMock(return_value=False)
         db.acquire = MagicMock(return_value=ctx)
         with patch.object(orch_main, "postgres_db", db):
-            assert await orch_main._fail_expired_vm_upgrade_jobs() == 0
+            assert await control_seams.fail_expired_vm_upgrade_jobs() == 0
         conn.execute.assert_not_called()
 
     @pytest.mark.asyncio
@@ -582,7 +604,7 @@ class TestFailExpiredVmUpgradeJobs:
             patch.object(orch_main, "postgres_db", db),
             patch.object(orch_main, "COMPLETION_COMMANDS_ENABLED", enabled),
         ):
-            assert await orch_main._fail_expired_vm_upgrade_jobs() == 1
+            assert await control_seams.fail_expired_vm_upgrade_jobs() == 1
 
         relation = "job_completion_sweep_exclusions"
         select_sql = conn.fetch.await_args.args[0]

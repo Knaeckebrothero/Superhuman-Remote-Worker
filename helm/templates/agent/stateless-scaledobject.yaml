@@ -1,0 +1,128 @@
+{{- if and .Values.agent.stateless.enabled .Values.agent.stateless.autoscaling.enabled }}
+{{- $as := .Values.agent.stateless.autoscaling }}
+# Queue-driven autoscaling for the stateless executor pool
+# (knowledge-base/knowledge/features/capacity_ux_and_queue_autoscaling.md §3;
+# stateless_agents.md §5.8).
+#
+# CPU and memory cannot size this fleet: an executor holds one unit at a time
+# and spends that unit blocked on LLM and WebDAV I/O at ~1% CPU, so the pool is
+# routinely slot-saturated while every resource gauge reads idle. Demand is the
+# run_queue itself — every unit an executor is working on is a `leased` row,
+# every unit waiting for one is a `queued` row — so the scaler asks Postgres
+# and skips the metrics pipeline entirely.
+#
+# KEDA is a CLUSTER-LEVEL dependency this chart does not install (like the
+# CloudNativePG operator): HomeLab deployments_managed/keda/ on dev,
+# scripts/local-dev-up.sh step 2b on k3d. With the flag on and no KEDA, the
+# ScaledObject is rejected at apply time (unknown kind) — fail-loud, by design.
+#
+# The query returns the DESIRED REPLICA COUNT itself:
+#
+#     busy      = leased rows whose lease is still live (an expired lease is
+#                 dead until the reaper re-queues it — then it counts as queued)
+#     runnable  = queued rows whose run_after has passed
+#     desired   = max(minReplicas, busy + runnable + reserve)
+#
+# `busy` and `runnable` are the claim's own predicates
+# (src/shared/run_queue/queries.py _CLAIM_SQL: state='queued' AND run_after <=
+# now(); lease liveness: leased_until > now()), so scaler and executor agree by
+# construction. src/orchestrator/services/stateless_capacity.py MIRRORS THIS
+# SQL for the admin capacity read — change both together.
+#
+# metricType is AverageValue (KEDA's default), deliberately: for an external
+# metric the HPA then computes desired = ceil(metric / target), independent of
+# the current replica count, so a query that already returns the replica count
+# with targetQueryValue 1 scales to exactly that number. `Value` would multiply
+# by the current replicas (desired = current * metric / target) and run away.
+#
+# Scale-down safety: `desired >= busy + reserve` means the HPA never asks for
+# fewer pods than are holding units; the orchestrator's pod-deletion-cost
+# reconciler makes the ReplicaSet remove IDLE pods first; and the stabilization
+# window below smooths a demand drop-then-rise. A busy-pod kill after such a
+# swing inside the window is still possible — the executor's SIGTERM drain
+# (agent.stateless.shutdownTimeoutSeconds) finishes or parks the unit.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ include "srw.fullname" . }}-agent-stateless
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "agent-stateless") | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "srw.fullname" . }}-agent-stateless
+  pollingInterval: {{ $as.pollingInterval | int }}
+  # Only consulted when scaling to ZERO (minReplicas: 0); 1..N scale-down is
+  # governed by the HPA behavior below.
+  cooldownPeriod: {{ $as.scaleDownStabilizationSeconds | int }}
+  minReplicaCount: {{ $as.minReplicas | int }}
+  maxReplicaCount: {{ $as.maxReplicas | int }}
+  advanced:
+    # Flag flipped back off → the ScaledObject goes away and the Deployment
+    # template re-emits its static replicas; this also restores the count the
+    # Deployment had before KEDA took it over, so the two agree.
+    restoreToOriginalReplicaCount: true
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          selectPolicy: Max
+          policies:
+            - type: Pods
+              value: 4
+              periodSeconds: 15
+            - type: Percent
+              value: 100
+              periodSeconds: 15
+        scaleDown:
+          stabilizationWindowSeconds: {{ $as.scaleDownStabilizationSeconds | int }}
+          selectPolicy: Max
+          policies:
+            - type: Pods
+              value: 1
+              periodSeconds: 60
+  triggers:
+    - type: postgresql
+      metricType: AverageValue
+      metadata:
+        # Fully qualified on purpose: the KEDA operator runs this query from
+        # ITS namespace, where a bare service name does not resolve
+        # ("lookup srw-postgres: no such host" — verified on k3d).
+        host: {{ printf "%s.%s.svc.cluster.local" (include "srw.postgresReadHost" .) .Release.Namespace | quote }}
+        port: {{ include "srw.postgresPort" . | quote }}
+        dbName: {{ include "srw.postgresDb" . | quote }}
+        sslmode: {{ .Values.databases.postgres.sslMode | default "prefer" | quote }}
+        targetQueryValue: "1"
+        query: >-
+          SELECT GREATEST({{ $as.minReplicas | int }},
+            (SELECT count(*) FROM run_queue WHERE state = 'leased' AND leased_until > now())
+            + (SELECT count(*) FROM run_queue WHERE state = 'queued' AND run_after <= now())
+            + {{ $as.reserve | int }})
+      authenticationRef:
+        name: {{ include "srw.fullname" . }}-agent-stateless-db
+---
+# Credentials for the scaler's read-only query. Same Secret and keys the
+# orchestrator itself uses (POSTGRES_USER / POSTGRES_PASSWORD in
+# srw.secretName), so all three secret modes work unchanged: chart-created,
+# operator-provided existingSecret, and ESO (external-secret.yaml renders that
+# exact Secret name from the Vault bundle). A dedicated read-only DB role is a
+# later hardening step (design note "Out of scope").
+#
+# A TriggerAuthentication is namespace-scoped and must live beside the
+# ScaledObject that references it.
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: {{ include "srw.fullname" . }}-agent-stateless-db
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "agent-stateless") | nindent 4 }}
+spec:
+  secretTargetRef:
+    - parameter: userName
+      name: {{ include "srw.secretName" . }}
+      key: POSTGRES_USER
+    - parameter: password
+      name: {{ include "srw.secretName" . }}
+      key: POSTGRES_PASSWORD
+{{- end }}

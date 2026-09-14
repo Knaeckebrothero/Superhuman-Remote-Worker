@@ -103,14 +103,17 @@ def _patched(db, *, inherited, defaults):
             "orchestrator.main._enforce_job_create_grants", AsyncMock(return_value=None)
         ),
         patch("orchestrator.services.job_provisioning.provision_job_repo", AsyncMock()),
-        patch("orchestrator.main._spawn_scholar_subjob", AsyncMock(return_value=None)),
+        patch(
+            "orchestrator.main.subjob_completion_operations.spawn_scholar_subjob",
+            AsyncMock(return_value=None),
+        ),
         patch("orchestrator.main._trigger_dispatch", MagicMock()),
     ]
 
 
 async def _create(db, fake_request, body, *, inherited, defaults):
     import orchestrator.security.access as access_module
-    from orchestrator.main import create_job
+    from tests._b09_control_seams import create_job
 
     with ExitStack() as stack:
         stack.enter_context(patch.object(access_module, "_INTERNAL_KEY", "secret"))

@@ -2686,6 +2686,8 @@ class OrchestratorClient:
         thread_id: str,
         config_override: dict[str, Any],
         datasource_ids: Optional[list[str]] = None,
+        *,
+        snapshot_generation: Optional[int] = None,
     ) -> Optional[dict[str, Any]]:
         """Persist runtime config changes for a thread.
 
@@ -2717,7 +2719,11 @@ class OrchestratorClient:
         if not self._client:
             return None
         url = f"{self.orchestrator_url}/api/agents/threads/{thread_id}/config"
-        payload: dict[str, Any] = {"config_override": config_override}
+        payload: dict[str, Any] = {
+            "config_override": config_override,
+            "snapshot_patch_protocol": 1,
+            "snapshot_generation": snapshot_generation,
+        }
         if datasource_ids is not None:
             payload["datasource_ids"] = [str(v) for v in datasource_ids]
         try:

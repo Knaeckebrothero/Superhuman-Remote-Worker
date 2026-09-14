@@ -605,3 +605,68 @@ describe('ToolsGroupComponent rendering', () => {
     });
   });
 });
+
+describe('ToolsGroupComponent delegation roster', () => {
+  beforeAll(async () => {
+    await ɵresolveComponentResources(() => Promise.resolve(''));
+  });
+
+  const delegationOn = () => ({
+    delegation: cat({state: 'on', tools: ['delegate_agent']}),
+  });
+
+  it('lists the roster the expert resolves, default flagged, next to the Delegation row', () => {
+    const fixture = mount({
+      mode: 'live',
+      resolved: response({
+        categories: delegationOn(),
+        subagents: {
+          default: 'explorer',
+          roster: [
+            {name: 'explorer', description: 'Read-only investigator.', ref: 'subagents/explorer'},
+            {name: 'reader', description: null, ref: 'subagents/reader'},
+          ],
+        },
+      }),
+    });
+    const entries = Array.from(
+      (fixture.nativeElement as HTMLElement).querySelectorAll('.roster-entry'),
+    ).map((el) => ({
+      name: el.querySelector('.roster-name')?.firstChild?.textContent?.trim(),
+      isDefault: el.querySelector('.roster-default') !== null,
+    }));
+    expect(entries).toEqual([
+      {name: 'explorer', isDefault: true},
+      {name: 'reader', isDefault: false},
+    ]);
+    expect(text(fixture)).toContain('(default)');
+    expect(text(fixture)).toContain('Read-only investigator.');
+    expect((fixture.nativeElement as HTMLElement).querySelector('.roster-empty')).toBeNull();
+  });
+
+  it('warns when the expert has NO roster — the tick would bind a tool that always errors', () => {
+    // The seeded assistant shipped without a roster: a ticked Delegation
+    // bound delegate_agent and every call returned "this expert has no
+    // roster". Off or on, the warning is what the user needs before ticking.
+    const fixture = mount({
+      mode: 'live',
+      resolved: response({
+        categories: {delegation: cat({state: 'off'})},
+        subagents: {default: null, roster: []},
+      }),
+    });
+    const warning = (fixture.nativeElement as HTMLElement).querySelector('.roster-empty');
+    expect(warning?.textContent).toContain('no subagent roster');
+    expect(warning?.textContent).not.toContain('agentSettings.');
+  });
+
+  it('claims nothing when the server made no claim (older orchestrator, failed resolve)', () => {
+    const fixture = mount({
+      mode: 'live',
+      resolved: response({categories: delegationOn()}),
+    });
+    const host = fixture.nativeElement as HTMLElement;
+    expect(host.querySelector('.roster-list')).toBeNull();
+    expect(host.querySelector('.roster-empty')).toBeNull();
+  });
+});

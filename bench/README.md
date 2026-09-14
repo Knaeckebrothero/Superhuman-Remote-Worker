@@ -79,6 +79,9 @@ stale the acceptance check.
 | D* | dev | developer | multi-phase spec/red/green flow, self-contained code katas |
 | R* | research | scholar | exploration sweeps + subjob spawning (noisy by design) |
 | A* | automation-shaped | worker_base | the recurring-digest shape, inputs inlined |
+| D3, D4 | dev, frontend | engineer | single-phase implement + verify with a check the task supplies (D3 inline module with three bugs and a duplicated helper; D4 a static page against an inline checker) |
+| D5 | dev-repo | engineer | clone a pinned public repository, extend it in its own conventions, run its suite (network; excluded as `infra` if the clone fails) |
+| O1 | ops | engineer | install a CLI into the sandbox, run it, report verbatim (network for `pip`) |
 
 All tasks are self-contained (inputs embedded in the description) so the
 task itself cannot drift between runs. Real-repo fix tasks are deliberately
@@ -136,11 +139,26 @@ absent from v1 — they change as the repo changes, which breaks pinning.
 
 ## Operating notes (from `p4-floor-trim-01` + `s4m2-rerun-01`, 2026-08-07)
 
-- **Two-arm runs:** `submit.py --server` builds a single arm only. For A/Bs,
-  build the spec yourself (tasks from `tasks.yaml`, `arms: [{name, model,
-  config_override, project_id}, ...]`) and POST `/api/bench/runs` directly.
-  Give each arm its own `project_id` when memory coupling could leak the
-  treatment; an arm without one inherits the run-level project. The sweeper
+- **Two-arm runs:** `submit.py --server --arms developer,engineer` builds one
+  arm per bundled config name (arm name = config name; the arm's config_name
+  overrides each task's), e.g. the developer-vs-engineer campaign
+  (`knowledge-base/knowledge/features/engineer_expert.md` §6):
+  `python bench/submit.py --server --run-id dev-vs-eng-01 --replicates 3 --model MiniMax-M3 --arms developer,engineer --only D1-wordfreq-kata,D2-inventory-bugfix,D3-ledger-refactor,D4-static-page,D5-clone-and-extend,O1-install-and-report`.
+  Add **`--isolate-arms`** whenever the variable under test could be carried by
+  project-scoped state: it creates one throwaway `bench-<run-id>-<arm>` project
+  per arm and stamps `project_id` on each, so Memory-Light recall and KB notes
+  cannot couple the treatments. Without it every arm inherits the run project and
+  the second arm to reach a task can recall the first's memories of it.
+  `bench/queries/first_command_latency.sql` reports attach → first shell command
+  and the audit rows before it, over the member job ids. **Read it only for ops
+  tasks:** on dev tasks it does not measure ceremony, because a strategic phase
+  that opens with `git log`/`git tag` reaches its "first command" within a minute
+  on any expert (dev-vs-eng-01: developer 1.0 min vs engineer 2.8 min, while the
+  developer took 3–7× the requests). Time-to-first-*edit* and request count are
+  the ceremony signals there.
+  For arms that need distinct `config_override`s, build the spec yourself (tasks
+  from `tasks.yaml`, `arms: [{name, model, config_override, project_id}, ...]`)
+  and POST `/api/bench/runs` directly. The sweeper
   schedules arms adjacent within each replicate's shuffled wave — that
   adjacency is what neutralizes time-varying confounds (pool growth,
   contention), so never split arms across runs or clusters.

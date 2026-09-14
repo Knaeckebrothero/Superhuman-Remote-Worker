@@ -1,0 +1,58 @@
+// Roman accents — what is left of the 2026-05 "shape pass" after the
+// 2026-09-10 visual refresh: the Cinzel brand face, the approval-card rule and
+// the two header inlays. Scoped under the two active body classes
+// (.theme-travertine / .theme-senate). No radii, no stamps, no uppercase.
+
+// =============================================================================
+// SHARED — applies to both Roman themes
+// =============================================================================
+.theme-travertine,
+.theme-senate {
+  // Cinzel is the BRAND face, not the UI face. Exactly four selectors read
+  // it: .sidebar-logo and .sidebar-label (rail brand block, sidebar.component.ts),
+  // .empty-title (chat hero, chat-empty-state.component.scss) and the SRW
+  // lettering of the inline vexillum (ui/vexillum). Everything
+  // else is Inter via --font-family-base; --font-primary is NOT rebound here,
+  // so type.display renders sentence-case Inter by its own fallbacks.
+  // Guarded by styles/visual-language.spec.ts.
+  --font-display: 'Cinzel', 'Cormorant Garamond', 'Times New Roman', serif;
+  --font-family-display: var(--font-display);
+
+  // Radii are NOT overridden here. The original Roman shape pass flattened
+  // the primitive scale; that was retired on 2026-09-10 (spec:
+  // knowledge-base/knowledge/features/cockpit_modern_visual_refresh.md).
+  // If a theme ever needs to rebind a primitive radius under .theme-*, it
+  // must re-declare the role tokens under the same class: the :root role
+  // declarations resolve their var() against <html>.
+
+  // Approval card — 3px accent-coloured left rule (porphyry red under the
+  // Porphyry accent, Tyrian purple by default). The one Roman accent kept
+  // beside the header inlays below; it is also the selected-row idiom for
+  // data tables (see _app-table.scss).
+  .approval-card,
+  .tool-approval {
+    border-left: 3px solid var(--accent-color);
+  }
+}
+
+// =============================================================================
+// TRAVERTINE — light-specific overrides
+// =============================================================================
+.theme-travertine {
+  // Topbar gold inlay — subtle warm rule under the panel header
+  .panel-header,
+  .session-topbar {
+    box-shadow: 0 1px 0 var(--warning); // gold ochre
+  }
+}
+
+// =============================================================================
+// SENATE — dark-specific overrides
+// =============================================================================
+.theme-senate {
+  // Subtle accent inlay under panel headers — mirrors travertine's gold
+  .panel-header,
+  .session-topbar {
+    box-shadow: 0 1px 0 color-mix(in srgb, var(--accent-color) 40%, transparent);
+  }
+}

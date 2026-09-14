@@ -21,6 +21,7 @@ import {AppInputComponent} from '../../../ui/input';
 import {AppSelectComponent} from '../../../ui/select';
 import {AppCheckboxComponent} from '../../../ui/checkbox';
 import {AppBadgeComponent} from '../../../ui/badge';
+import {HelmManagedBadgeComponent} from '../../../ui/helm-managed-badge/helm-managed-badge.component';
 import {AppFormFieldComponent} from '../../../ui/form-field';
 
 /** Providers the admin can seed/rotate — matches VALID_SYSTEM_API_KEY_PROVIDERS. */
@@ -53,6 +54,7 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
   imports: [
     RouterLink,
     TranslocoPipe,
+    HelmManagedBadgeComponent,
     AppButtonComponent,
     AppInputComponent,
     AppSelectComponent,
@@ -94,6 +96,7 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
                     } @else {
                       <span class="muted">{{ 'admin.providers.keys.manualBadge' | transloco }}</span>
                     }
+                    <app-helm-managed-badge [managed]="key.managed_by_helm" [drift]="key.helm_drift" />
                   </span>
                   <span class="col-updated">{{ formatDate(key.updated_at) }}</span>
                   <span class="col-action">
@@ -315,6 +318,7 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
                 <div class="endpoint-head">
                   <div class="endpoint-title">
                     <strong>{{ endpoint.label }}</strong>
+                    <app-helm-managed-badge [managed]="endpoint.managed_by_helm" [drift]="endpoint.helm_drift" />
                     @if (isCodexEndpoint(endpoint.label)) {
                       <app-badge tone="info" size="sm" [uppercase]="true" shape="pill">
                         codex subscription
@@ -348,7 +352,7 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
                     </app-button>
                     @if (!isCodexEndpoint(endpoint.label)) {
                       <app-button
-                        variant="ghost"
+                        variant="secondary"
                         size="sm"
                         [disabled]="editingEndpointId() === endpoint.id"
                         (clicked)="startEditEndpoint(endpoint)"
@@ -586,7 +590,7 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
       font-size: 12px;
       color: var(--text-muted);
       text-transform: uppercase;
-      letter-spacing: 0.5px;
+      letter-spacing: 0.06em;
     }
     .key-row {
       border-top: 1px solid var(--border-color);
@@ -722,7 +726,7 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
     .discovery-tier-title {
       font-size: 12px;
       text-transform: uppercase;
-      letter-spacing: 0.4px;
+      letter-spacing: 0.06em;
       color: var(--text-muted);
       margin: 8px 0 6px 0;
       display: flex;
@@ -739,7 +743,6 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
     }
     .discovery-family {
       font-size: 11px;
-      letter-spacing: 0.3px;
     }
     .discovery-caps {
       display: flex;
@@ -932,10 +935,21 @@ export class AdminProvidersComponent implements OnInit {
     if (value) this.keyProvider.set(value as SystemProviderValue);
   }
 
+  /**
+   * Rows declared with `reconcile: true` in the deployment's Helm values are
+   * re-applied on the next `helm upgrade`; make the admin acknowledge that an
+   * edit here is temporary before it goes through.
+   */
+  confirmHelmOverride(row: {managed_by_helm?: boolean} | undefined): boolean {
+    if (!row?.managed_by_helm) return true;
+    return confirm(this.transloco.translate('admin.helm.confirmOverride'));
+  }
+
   saveKey(): void {
     const value = this.keyValue().trim();
     if (!value) return;
     const provider = this.keyProvider();
+    if (!this.confirmHelmOverride(this.admin.systemApiKeys().find((k) => k.provider === provider))) return;
     this.savingKey.set(true);
     this.discoveryError.set('');
     this.keyFormError.set('');
@@ -1158,6 +1172,7 @@ export class AdminProvidersComponent implements OnInit {
 
   deleteKey(provider: string): void {
     if (!confirm(this.transloco.translate('admin.providers.keys.confirmDelete'))) return;
+    if (!this.confirmHelmOverride(this.admin.systemApiKeys().find((k) => k.provider === provider))) return;
     this.admin.deleteSystemApiKey(provider).subscribe();
   }
 
@@ -1207,6 +1222,7 @@ export class AdminProvidersComponent implements OnInit {
 
   deleteEndpoint(endpointId: string): void {
     if (!confirm(this.transloco.translate('admin.providers.endpoints.confirmDelete'))) return;
+    if (!this.confirmHelmOverride(this.admin.systemEndpoints().find((e) => e.id === endpointId))) return;
     this.admin.deleteSystemEndpoint(endpointId).subscribe();
   }
 
@@ -1248,6 +1264,7 @@ export class AdminProvidersComponent implements OnInit {
   saveEditEndpoint(): void {
     const endpointId = this.editingEndpointId();
     if (!endpointId) return;
+    if (!this.confirmHelmOverride(this.admin.systemEndpoints().find((e) => e.id === endpointId))) return;
     const label = this.editEndpointLabel().trim();
     const baseUrl = this.editEndpointBaseUrl().trim();
     if (!label || !baseUrl) return;

@@ -123,10 +123,12 @@ for ((i = 0; i < image_count; i++)); do
     img_var="TILT_IMAGE_${i}"
     repo_key_var="TILT_IMAGE_KEY_REPO_${i}"
     tag_key_var="TILT_IMAGE_KEY_TAG_${i}"
+    digest_key_var="TILT_IMAGE_KEY_DIGEST_${i}"
 
     img="${!img_var:-}"
     repo_key="${!repo_key_var:-}"
     tag_key="${!tag_key_var:-}"
+    digest_key="${!digest_key_var:-}"
 
     if [[ -z "$img" || -z "$repo_key" || -z "$tag_key" ]]; then
         echo "srw-preflight: image slot $i is incompletely wired (img='$img' repo_key='$repo_key' tag_key='$tag_key')" >&2
@@ -134,6 +136,15 @@ for ((i = 0; i < image_count; i++)); do
     fi
 
     flags+=(--set "${repo_key}=${img%:*}" --set "${tag_key}=${img##*:}")
+    # An overlay's old digest wins over a fresh tag in these chart helpers.
+    # Replace it with the exact image Tilt pushed. The controller cannot assume
+    # that k3d's node-side registry hostname also resolves inside a Pod.
+    if [[ -n "$digest_key" ]]; then
+        image_map_var="TILT_IMAGE_MAP_${i}"
+        image_map="${!image_map_var:?Tilt image map is required for a digest pin}"
+        digest="$(python3 "$(dirname -- "${BASH_SOURCE[0]}")/tilt-image-digest.py" "$image_map" "$img")"
+        flags+=(--set-string "${digest_key}=${digest}")
+    fi
 done
 
 # --- apply -------------------------------------------------------------------
@@ -141,7 +152,32 @@ install_cmd=(helm upgrade --install "${flags[@]}" "${ns_args[@]}" "$RELEASE" "$C
 echo "Running cmd: ${install_cmd[*]}" >&2
 "${install_cmd[@]}" >&2
 
-# Hand Tilt the object set the release owns so it can track pod status. `-n`
-# supplies the default namespace for manifest entries that omit one.
+# Hand Tilt the object set the release owns so it can track pod status. A
+# --namespace flag would also reject resources explicitly placed in the native
+# hosting namespace. Supply the release namespace as a temporary context default
+# instead: omitted namespaces resolve correctly and explicit namespaces survive.
+# The overlay contains context names only; credentials stay in the existing
+# kubeconfig files, which are never changed.
+read_release_resources() (
+    if [[ -z "$NS" ]]; then
+        helm get manifest "$RELEASE" | kubectl get -oyaml -f -
+        exit
+    fi
+    srw_read_context_file="$(mktemp "${TMPDIR:-/tmp}/srw-tilt-context.XXXXXX")"
+    trap 'rm -f -- "$srw_read_context_file"' EXIT
+    kubectl config view --minify -o json | python3 -c '
+import json, sys
+config = json.load(sys.stdin)
+name = config["current-context"]
+current = next(item["context"] for item in config["contexts"] if item["name"] == name)
+context = {key: current[key] for key in ("cluster", "user") if key in current}
+context["namespace"] = sys.argv[1]
+json.dump({"apiVersion": "v1", "kind": "Config", "current-context": name,
+           "contexts": [{"name": name, "context": context}]}, sys.stdout)
+' "$NS" > "$srw_read_context_file"
+    helm get manifest "$RELEASE" "${ns_args[@]}" |
+        KUBECONFIG="$srw_read_context_file:${KUBECONFIG:-$HOME/.kube/config}" \
+        kubectl get -oyaml -f -
+)
 echo "Running cmd: helm get manifest $RELEASE | kubectl get -f - -oyaml" >&2
-helm get manifest "$RELEASE" "${ns_args[@]}" | kubectl get "${ns_args[@]}" -oyaml -f -
+read_release_resources

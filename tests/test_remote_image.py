@@ -275,18 +275,21 @@ async def test_fetch_rejects_oversized_declared_body_without_reading_it():
 
 @pytest.mark.asyncio
 async def test_endpoint_authenticates_before_fetch(fake_request):
-    from orchestrator.main import RemoteImageRequest, load_remote_image
+    from orchestrator.main import _media_dependencies
+    from orchestrator.routers.media import load_remote_image
+    from orchestrator.schemas.media import RemoteImageRequest
 
     denied = HTTPException(status_code=401, detail="signed out")
     fetch = AsyncMock()
     with (
         patch("orchestrator.main.require_approved_user", AsyncMock(side_effect=denied)),
-        patch("orchestrator.main.fetch_remote_image", fetch),
+        patch("orchestrator.routers.media.fetch_remote_image", fetch),
     ):
         with pytest.raises(HTTPException) as exc:
             await load_remote_image(
                 fake_request,
                 RemoteImageRequest(url="https://images.example/a.png"),
+                dependencies=_media_dependencies(),
             )
     assert exc.value.status_code == 401
     fetch.assert_not_awaited()
@@ -294,7 +297,9 @@ async def test_endpoint_authenticates_before_fetch(fake_request):
 
 @pytest.mark.asyncio
 async def test_endpoint_returns_no_store_nosniff_image(fake_request, user_a):
-    from orchestrator.main import RemoteImageRequest, load_remote_image
+    from orchestrator.main import _media_dependencies
+    from orchestrator.routers.media import load_remote_image
+    from orchestrator.schemas.media import RemoteImageRequest
 
     image = subject.RemoteImage(
         content=_png(),
@@ -306,11 +311,15 @@ async def test_endpoint_returns_no_store_nosniff_image(fake_request, user_a):
         patch(
             "orchestrator.main.require_approved_user", AsyncMock(return_value=user_a)
         ),
-        patch("orchestrator.main.fetch_remote_image", AsyncMock(return_value=image)),
+        patch(
+            "orchestrator.routers.media.fetch_remote_image",
+            AsyncMock(return_value=image),
+        ),
     ):
         response = await load_remote_image(
             fake_request,
             RemoteImageRequest(url="https://images.example/a.png"),
+            dependencies=_media_dependencies(),
         )
 
     assert response.media_type == "image/png"

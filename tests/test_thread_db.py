@@ -309,6 +309,15 @@ class TestStatelessRetirementAcknowledgementSQL:
 class TestCreateThread:
     """Tests for create_thread method."""
 
+    @pytest.fixture(autouse=True)
+    def capture_boundary(self, monkeypatch):
+        # This class verifies INSERT shape; snapshot transactions and delivery
+        # have their own production-schema and capture tests.
+        monkeypatch.setattr(
+            "orchestrator.services.manifest_execution_snapshot.capture_execution",
+            AsyncMock(),
+        )
+
     @pytest.mark.asyncio
     async def test_returns_uuid_string(self):
         conn = _mock_conn()
@@ -1236,6 +1245,24 @@ class TestEndThread:
         assert "control_admission_agent_id = NULL" in sql
 
     @pytest.mark.asyncio
+    async def test_resume_refuses_ownerless_historical_thread(self):
+        conn = _mock_conn()
+        conn.fetchrow = AsyncMock(
+            return_value={
+                "status": "ended",
+                "user_id": None,
+                "execution_lane": "pinned",
+                "runtime_generation": None,
+                "runtime_retirement_token": None,
+                "metadata": {},
+            }
+        )
+        db = _make_db_with_conn(conn)
+
+        assert await db.resume_thread("tid-1") is False
+        conn.fetchval.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_stateless_retirement_marker_fences_resume_until_settled(self):
         pending_conn = _mock_conn()
         pending_conn.fetchrow = AsyncMock(
@@ -1375,6 +1402,11 @@ class TestEndThread:
         assert settled["terminal_token"] == 8
         assert settled["snapshot_restore_required"] is True
         assert "_stateless_workspace_retirement_pending" not in stored
+        # A resumable End keeps the PVC on purpose. Say so, rather than leaving
+        # a row whose only workspace statement is the cleanup projection's
+        # "deleted" — which is true of the pod and false of the volume.
+        assert settled["permanent"] is False
+        assert stored["workspace_container"]["volume_reclaimed"] is False
 
     @pytest.mark.asyncio
     async def test_finish_refuses_to_erase_in_progress_creation_authority(self):

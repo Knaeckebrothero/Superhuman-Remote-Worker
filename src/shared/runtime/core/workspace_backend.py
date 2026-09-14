@@ -304,6 +304,10 @@ class WorkspaceBackend(ABC):
         """
         raise NotImplementedError("resolve_home_path not supported by this backend")
 
+    def install_credential_environment(self, values: Dict[str, str]) -> None:
+        """Make connector ENV values available to this work item's commands."""
+        raise ValueError("Credential connectors require a sandbox or VM workspace")
+
     def execute_with_secret_stdin(
         self, command: str, secret: str | bytes, *, timeout: int = 30
     ) -> bool:
