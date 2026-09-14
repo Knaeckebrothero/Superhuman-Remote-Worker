@@ -40,8 +40,8 @@ _spec.loader.exec_module(smoke_module)
 cutover = smoke_module.cutover
 GateFailure, require = cutover.GateFailure, cutover.require
 DEFAULT_BASE = (
-    "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base"
-    "@sha256:db1015a32173c4553d1ad432bdb48760fdb8ba0782d25ae20349d4aaaf26c28f"
+    "ghcr.io/superhuman-remote-worker/srw-agent-vm-base"
+    "@sha256:38c04a4a291ebe6112fe786259941e1c9da22cee6da4184f583312249d0e9547"
 )
 
 

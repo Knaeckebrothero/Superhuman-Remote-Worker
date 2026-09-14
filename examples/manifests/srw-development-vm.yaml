@@ -12,8 +12,8 @@ spec:
     memory: 24Gi
     storage: 120Gi
   environment:
-    # Bootable SRW VM disk, published 2026-09-08. Each VM gets its own rootdisk.
-    image: ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base@sha256:db1015a32173c4553d1ad432bdb48760fdb8ba0782d25ae20349d4aaaf26c28f
+    # Bootable SRW VM disk, published 2026-09-14. Each VM gets its own rootdisk.
+    image: ghcr.io/superhuman-remote-worker/srw-agent-vm-base@sha256:38c04a4a291ebe6112fe786259941e1c9da22cee6da4184f583312249d0e9547
     pullPolicy: IfNotPresent
     cache: Reuse
   retention: Delete
