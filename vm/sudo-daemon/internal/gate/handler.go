@@ -12,7 +12,7 @@ import (
 
 	"golang.org/x/time/rate"
 
-	"github.com/knaeckebrothero/superhuman-remote-worker/sudo-gated/internal/peer"
+	"github.com/superhuman-remote-worker/srw/sudo-gated/internal/peer"
 )
 
 // ApprovalRequest is what the C plugin sends over the Unix socket.

@@ -1,6 +1,6 @@
 [Unit]
 Description=SRW code-server (live-VM Web IDE)
-Documentation=https://github.com/Knaeckebrothero/Superhuman-Remote-Worker
+Documentation=https://github.com/superhuman-remote-worker/srw
 After=network-online.target
 Wants=network-online.target
 

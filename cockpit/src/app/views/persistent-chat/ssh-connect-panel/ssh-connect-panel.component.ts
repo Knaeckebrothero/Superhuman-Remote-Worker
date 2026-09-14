@@ -12,7 +12,7 @@ const COPIED_RESET_MS = 2500;
  *  the prerequisites line below (I-1): the PAT and the helper are both
  *  documented there and nowhere else the product surfaces. */
 const SSH_DOCS_URL =
-    'https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/blob/main/ssh-access.md';
+    'https://github.com/superhuman-remote-worker/srw/blob/main/ssh-access.md';
 
 /**
  * Session view → "Connect over SSH". Renders the `~/.ssh/config` block for

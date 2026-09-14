@@ -127,7 +127,7 @@ class PersistentProvisioner:
         )
         self._agent_image: str = os.environ.get(
             "PERSISTENT_AGENT_IMAGE",
-            "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent:latest",
+            "ghcr.io/superhuman-remote-worker/srw-agent:latest",
         )
         self._agent_image_pull_policy: str = os.environ.get(
             "PERSISTENT_AGENT_IMAGE_PULL_POLICY", "Always"

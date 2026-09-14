@@ -1,6 +1,6 @@
 [Unit]
 Description=Sudo Approval Gate Daemon Socket
-Documentation=https://github.com/Knaeckebrothero/Superhuman-Remote-Worker
+Documentation=https://github.com/superhuman-remote-worker/srw
 
 [Socket]
 ListenStream=/run/sudo-gated/sudo-gated.sock

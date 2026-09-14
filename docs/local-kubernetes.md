@@ -67,8 +67,8 @@ mkcert -CAROOT
 ## 1. Clone and configure
 
 ```bash
-git clone https://github.com/Knaeckebrothero/Superhuman-Remote-Worker.git
-cd Superhuman-Remote-Worker
+git clone https://github.com/superhuman-remote-worker/srw.git
+cd srw
 
 cp deployment/values-local.yaml.example deployment/values-local.yaml
 $EDITOR deployment/values-local.yaml

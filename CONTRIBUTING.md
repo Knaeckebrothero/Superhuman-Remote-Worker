@@ -5,7 +5,7 @@ accessibility work, and well-scoped features are welcome.
 
 ## Before starting
 
-- Search the [issue tracker](https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/issues)
+- Search the [issue tracker](https://github.com/superhuman-remote-worker/srw/issues)
   for existing work.
 - Open an issue before a large feature, schema change, new dependency, or
   architectural refactor. Explain the problem and acceptance criteria before

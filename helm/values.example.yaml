@@ -6,7 +6,7 @@
 # field in this file MUST be reviewed before install.
 #
 # For all configurable options and defaults, see values.yaml or run:
-#   helm show values oci://ghcr.io/knaeckebrothero/charts/superhuman-remote-worker
+#   helm show values oci://ghcr.io/superhuman-remote-worker/charts/superhuman-remote-worker
 #
 # For evaluation with everything bundled in-cluster, see the README's
 # "Quick start" section instead — most of this file does not apply.

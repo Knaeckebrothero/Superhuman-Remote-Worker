@@ -24,8 +24,8 @@ import (
 
 	"github.com/nats-io/nats.go"
 
-	"github.com/knaeckebrothero/superhuman-remote-worker/sudo-gated/internal/config"
-	"github.com/knaeckebrothero/superhuman-remote-worker/sudo-gated/internal/gate"
+	"github.com/superhuman-remote-worker/srw/sudo-gated/internal/config"
+	"github.com/superhuman-remote-worker/srw/sudo-gated/internal/gate"
 )
 
 var version = "dev"

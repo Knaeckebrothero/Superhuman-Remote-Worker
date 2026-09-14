@@ -419,7 +419,7 @@ class ContainerProvisioner:
         )
         self._workspace_image: str = os.environ.get(
             "WORKSPACE_IMAGE",
-            "ghcr.io/knaeckebrothero/superhuman-remote-worker-workspace:latest",
+            "ghcr.io/superhuman-remote-worker/srw-workspace:latest",
         )
         self._ssh_secret_name: str = os.environ.get(
             "WORKSPACE_SSH_SECRET", "vm-ssh-key"

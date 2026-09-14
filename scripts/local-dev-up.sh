@@ -223,17 +223,17 @@ elif ! git -C "$REPO_ROOT" rev-parse --verify HEAD >/dev/null 2>&1; then
   skip "not a git checkout; cannot pin images to a commit — the chart's :latest tags apply"
 else
   log "pinning component images to this checkout's history"
-  GHCR_NS="ghcr.io/knaeckebrothero/superhuman-remote-worker"
+  GHCR_NS="ghcr.io/superhuman-remote-worker/srw"
   PIN_DEPTH="${SRW_IMAGE_PIN_DEPTH:-300}"
   ghcr_token() {
-    curl -fsS "https://ghcr.io/token?scope=repository:knaeckebrothero/superhuman-remote-worker-$1:pull" \
+    curl -fsS "https://ghcr.io/token?scope=repository:superhuman-remote-worker/srw-$1:pull" \
       | sed -n 's/.*"token":"\([^"]*\)".*/\1/p'
   }
   ghcr_has_tag() {  # token component tag
     local code
     code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $1" \
       -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json' \
-      "https://ghcr.io/v2/knaeckebrothero/superhuman-remote-worker-$2/manifests/$3")
+      "https://ghcr.io/v2/superhuman-remote-worker/srw-$2/manifests/$3")
     [ "$code" = "200" ]
   }
   resolve_tag() {  # component -> prints "sha-xxxxxxx depth" or nothing (one anonymous pull token per component)

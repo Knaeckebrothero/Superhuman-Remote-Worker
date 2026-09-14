@@ -148,7 +148,7 @@ class AgentProvisioner:
             "AGENT_IMAGE",
             os.environ.get(
                 "PERSISTENT_AGENT_IMAGE",
-                "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent:latest",
+                "ghcr.io/superhuman-remote-worker/srw-agent:latest",
             ),
         )
         self._configmap_name: str = os.environ.get("AGENT_CONFIGMAP", "srw-config")

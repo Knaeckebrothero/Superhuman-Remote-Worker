@@ -187,7 +187,7 @@ class VMProvisioner:
         self._vm_namespace: str = os.environ.get("VM_NAMESPACE", "agent-vms")
         self._default_vm_image: str = os.environ.get(
             "DEFAULT_VM_IMAGE",
-            "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:latest",
+            "ghcr.io/superhuman-remote-worker/srw-agent-vm-base:latest",
         )
         # HTTP controller transport (same-cluster, no NATS).
         self._controller_url: str = os.environ.get("VM_CONTROLLER_URL", "").rstrip("/")

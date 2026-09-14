@@ -7,7 +7,7 @@
 #   docker build -t srw-mcp-stdio -f src/mcp_server/Dockerfile .
 FROM python:3.12-slim
 
-LABEL org.opencontainers.image.source="https://github.com/Knaeckebrothero/Superhuman-Remote-Worker"
+LABEL org.opencontainers.image.source="https://github.com/superhuman-remote-worker/srw"
 LABEL org.opencontainers.image.description="Debug Cockpit MCP Server"
 
 ENV PYTHONSAFEPATH=1

@@ -271,7 +271,7 @@ class TestBackendClone:
         ws = make_workspace_manager()
         ds = token_ds(
             name="SRW Repository",
-            url="https://github.com/Knaeckebrothero/Superhuman-Remote-Worker",
+            url="https://github.com/superhuman-remote-worker/srw",
             config={"forge": "github"},
             default_branch="develop",
             read_only=False,
@@ -281,11 +281,11 @@ class TestBackendClone:
         ):
             clone_repository_datasources([ds], ws)
 
-        meta = ws.source_repo_meta["Superhuman-Remote-Worker"]
+        meta = ws.source_repo_meta["srw"]
         assert meta["forge"] == "github"
         assert meta["api_base"] == "https://api.github.com"
-        assert meta["owner"] == "Knaeckebrothero"
-        assert meta["repo"] == "Superhuman-Remote-Worker"
+        assert meta["owner"] == "superhuman-remote-worker"
+        assert meta["repo"] == "srw"
         assert meta["token"] == "tok123"
         assert meta["read_only"] is False
         assert meta["default_branch"] == "develop"
@@ -329,7 +329,7 @@ class TestRealAgentPayloadCarriesForgeMetadata:
         payload = agent_payload(
             token_ds(
                 name="SRW Repository",
-                url="https://github.com/Knaeckebrothero/Superhuman-Remote-Worker",
+                url="https://github.com/superhuman-remote-worker/srw",
                 config={"forge": "github"},
                 default_branch="develop",
                 project_read_only=False,
@@ -340,11 +340,11 @@ class TestRealAgentPayloadCarriesForgeMetadata:
         ):
             clone_repository_datasources(payload, ws)
 
-        meta = ws.source_repo_meta["Superhuman-Remote-Worker"]
+        meta = ws.source_repo_meta["srw"]
         assert meta["forge"] == "github"
         assert meta["api_base"] == "https://api.github.com"
-        assert meta["owner"] == "Knaeckebrothero"
-        assert meta["repo"] == "Superhuman-Remote-Worker"
+        assert meta["owner"] == "superhuman-remote-worker"
+        assert meta["repo"] == "srw"
         assert meta["token"] == "tok123"
         assert meta["read_only"] is False
 
@@ -505,7 +505,7 @@ class TestRealAgentPayloadCarriesForgeMetadata:
         payload = agent_payload(
             token_ds(
                 name="SRW Repository",
-                url="https://github.com/Knaeckebrothero/Superhuman-Remote-Worker",
+                url="https://github.com/superhuman-remote-worker/srw",
                 config={"forge": "github"},
                 default_branch="develop",
                 project_read_only=False,
@@ -516,7 +516,7 @@ class TestRealAgentPayloadCarriesForgeMetadata:
             "agent.managers.git_manager.GitManager.clone", return_value=MagicMock()
         ):
             clone_repository_datasources(payload, ws)
-        assert ws.source_repo_meta["Superhuman-Remote-Worker"]["forge"] == "github"
+        assert ws.source_repo_meta["srw"]["forge"] == "github"
 
         from orchestrator.main import _build_datasource_tool_override
 

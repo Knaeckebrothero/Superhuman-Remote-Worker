@@ -10,9 +10,9 @@ and supporting services can each be replaced with externally managed
 equivalents (managed Postgres, an external OIDC provider, an existing git
 server, etc.) — see [Production install](#production-install-bring-your-own).
 
-- **Chart:** `oci://ghcr.io/knaeckebrothero/charts/superhuman-remote-worker`
-- **Source:** <https://github.com/Knaeckebrothero/Superhuman-Remote-Worker>
-- **License:** see [LICENSE](https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/blob/main/LICENSE) — you must accept the terms to install (`license.acceptTerms: true`).
+- **Chart:** `oci://ghcr.io/superhuman-remote-worker/charts/superhuman-remote-worker`
+- **Source:** <https://github.com/superhuman-remote-worker/srw>
+- **License:** see [LICENSE](https://github.com/superhuman-remote-worker/srw/blob/main/LICENSE) — you must accept the terms to install (`license.acceptTerms: true`).
 
 ---
 
@@ -172,7 +172,7 @@ Install SRW normally, then wait for every enabled internal cluster:
 
 ```bash
 helm upgrade --install srw \
-  oci://ghcr.io/knaeckebrothero/charts/superhuman-remote-worker \
+  oci://ghcr.io/superhuman-remote-worker/charts/superhuman-remote-worker \
   --version <chart-version> \
   --namespace srw \
   --create-namespace \
@@ -245,7 +245,7 @@ For a self-contained evaluation install with everything in-cluster (Postgres,
 Neo4j, Keycloak, Gitea, OpenCloud all bundled):
 
 ```bash
-helm install srw oci://ghcr.io/knaeckebrothero/charts/superhuman-remote-worker \
+helm install srw oci://ghcr.io/superhuman-remote-worker/charts/superhuman-remote-worker \
   --version <chart-version> \
   --namespace srw --create-namespace \
   --set license.acceptTerms=true \
@@ -268,7 +268,7 @@ For pilot and customer deployments, you bring your own external services and
 manage your own secrets. Start by extracting the example values:
 
 ```bash
-helm pull oci://ghcr.io/knaeckebrothero/charts/superhuman-remote-worker \
+helm pull oci://ghcr.io/superhuman-remote-worker/charts/superhuman-remote-worker \
   --version <chart-version> --untar
 cp superhuman-remote-worker/values.example.yaml my-values.yaml
 $EDITOR my-values.yaml
@@ -326,7 +326,7 @@ kubectl -n srw create secret generic srw-secrets \
 Install:
 
 ```bash
-helm install srw oci://ghcr.io/knaeckebrothero/charts/superhuman-remote-worker \
+helm install srw oci://ghcr.io/superhuman-remote-worker/charts/superhuman-remote-worker \
   --version <chart-version> \
   --namespace srw \
   -f my-values.yaml
@@ -706,7 +706,7 @@ vm:
 vmController:
   image:
     tag: <release or sha tag>
-  defaultVmImage: ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:<tag>
+  defaultVmImage: ghcr.io/superhuman-remote-worker/srw-agent-vm-base:<tag>
   defaultCpu: 4
   defaultMemory: 8Gi
   maxConcurrentVms: 4
@@ -1025,7 +1025,7 @@ realm administrator credentials (when using internal Keycloak) are
 ## Upgrade
 
 ```bash
-helm upgrade srw oci://ghcr.io/knaeckebrothero/charts/superhuman-remote-worker \
+helm upgrade srw oci://ghcr.io/superhuman-remote-worker/charts/superhuman-remote-worker \
   --version <new-version> \
   -n srw -f my-values.yaml
 ```
@@ -1046,7 +1046,7 @@ provisioning/engage/stage/terminal work, and remove old warm-pool and dedicated
 agent pods. Then upgrade with:
 
 ```bash
-helm upgrade srw oci://ghcr.io/knaeckebrothero/charts/superhuman-remote-worker \
+helm upgrade srw oci://ghcr.io/superhuman-remote-worker/charts/superhuman-remote-worker \
   --version <new-version> \
   -n srw -f my-values.yaml \
   --set orchestrator.runtimeAuthorityMigrationMaintenanceAck=true
@@ -1080,7 +1080,7 @@ The full configurable surface is documented inline in `values.yaml`
 (every option has a `# --` comment):
 
 ```bash
-helm show values oci://ghcr.io/knaeckebrothero/charts/superhuman-remote-worker \
+helm show values oci://ghcr.io/superhuman-remote-worker/charts/superhuman-remote-worker \
   --version <chart-version>
 ```
 
@@ -1091,5 +1091,5 @@ chart tarball.
 
 ## Support
 
-- **Issues:** <https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/issues>
-- **License:** [LICENSE](https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/blob/main/LICENSE)
+- **Issues:** <https://github.com/superhuman-remote-worker/srw/issues>
+- **License:** [LICENSE](https://github.com/superhuman-remote-worker/srw/blob/main/LICENSE)

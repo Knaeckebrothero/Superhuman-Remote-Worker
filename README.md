@@ -2,8 +2,8 @@
 
 **Stop building agents. Start delegating work.**
 
-[![Main CI](https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/actions/workflows/main.yml/badge.svg)](https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/actions/workflows/main.yml)
-[![Latest tag](https://img.shields.io/github/v/tag/Knaeckebrothero/Superhuman-Remote-Worker?label=release)](https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/tags)
+[![Main CI](https://github.com/superhuman-remote-worker/srw/actions/workflows/main.yml/badge.svg)](https://github.com/superhuman-remote-worker/srw/actions/workflows/main.yml)
+[![Latest tag](https://img.shields.io/github/v/tag/superhuman-remote-worker/srw?label=release)](https://github.com/superhuman-remote-worker/srw/tags)
 [![License: FSL-1.1-ALv2](https://img.shields.io/badge/license-FSL--1.1--ALv2-9c2832)](LICENSE)
 
 [Website](https://superhuman-remote-worker.com/) ·
@@ -98,8 +98,8 @@ an API key for at least one configured LLM provider. See the
 starting.
 
 ```bash
-git clone https://github.com/Knaeckebrothero/Superhuman-Remote-Worker.git
-cd Superhuman-Remote-Worker
+git clone https://github.com/superhuman-remote-worker/srw.git
+cd srw
 
 # Add at least one OPENAI_API_KEY, ANTHROPIC_API_KEY, or GROQ_API_KEY.
 # Optionally declare providers, models and default pins under `llm.seed`
@@ -246,7 +246,7 @@ agent with `python -m agent` and the backend with
 
 Bug reports, focused fixes, documentation improvements, and design discussions
 are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md), and use the
-[issue tracker](https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/issues)
+[issue tracker](https://github.com/superhuman-remote-worker/srw/issues)
 for reproducible bugs and proposals. Do not open public issues for security
 reports.
 

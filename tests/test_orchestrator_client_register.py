@@ -162,7 +162,7 @@ async def test_register_payload_separates_full_declared_provenance_from_short_sh
     monkeypatch.setenv("SRW_SOURCE_REVISION", revision)
     monkeypatch.setenv(
         "SRW_SOURCE_URL",
-        "https://github.com/knaeckebrothero/Superhuman-Remote-Worker",
+        "https://github.com/superhuman-remote-worker/srw",
     )
     monkeypatch.setenv("SRW_RELEASE_VERSION", "v1.2.3")
     monkeypatch.setenv("BUILD_SHA", revision[:7])
@@ -190,7 +190,7 @@ async def test_register_payload_separates_full_declared_provenance_from_short_sh
     assert payload["build_sha"] == revision[:7]
     assert payload["product_provenance"] == {
         "source_revision": revision,
-        "source_url": ("https://github.com/knaeckebrothero/Superhuman-Remote-Worker"),
+        "source_url": ("https://github.com/superhuman-remote-worker/srw"),
         "artifact_digest": None,
         "content_digest": None,
         "release_version": "v1.2.3",
