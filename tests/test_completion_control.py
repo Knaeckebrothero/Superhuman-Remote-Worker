@@ -18,6 +18,23 @@ from unittest.mock import MagicMock, patch
 
 import orchestrator.main as main
 from orchestrator.routers import job_diff as job_diff_routes
+from orchestrator.services import agent_messaging
+
+
+def _send_agent_message(job_id, body):
+    """Drive the extracted send funnel with the application's own collaborators.
+
+    ``main._agent_messaging_dependencies()`` reads ``main.postgres_db``,
+    ``main.notification_service`` and ``main.COMPLETION_COMMANDS_ENABLED`` at
+    call time, so building it inside the patch scope is what keeps the patches
+    below steering the code under test.
+    """
+    return agent_messaging.send_agent_message(
+        MagicMock(),
+        job_id,
+        body,
+        dependencies=main._agent_messaging_dependencies(),
+    )
 
 
 def test_control_marker_expiry_and_malformed_fail_closed():
@@ -165,9 +182,9 @@ async def test_flag_off_guard_never_builds_completion_service():
     getter = MagicMock()
     with (
         patch.object(main, "COMPLETION_COMMANDS_ENABLED", False),
-        patch.object(main, "_get_completion_control", getter),
+        patch.object(main._completion_runtime, "control", getter),
     ):
-        await main._guard_completion_control(str(uuid4()), source="test")
+        await main._completion_control_boundary.guard(str(uuid4()), source="test")
     getter.assert_not_called()
 
 
@@ -193,7 +210,7 @@ async def test_public_control_endpoints_return_exact_409_before_mutation(
     db.queue_stateless_job_for_resume = AsyncMock()
     with (
         patch.object(main, auth_name, authorized),
-        patch.object(main, "_guard_completion_control", guard),
+        patch.object(main._completion_control_boundary, "guard", guard),
         patch.object(main, "postgres_db", db),
     ):
         with pytest.raises(HTTPException) as exc:
@@ -234,7 +251,7 @@ async def test_blocking_reply_internal_resume_guard_precedes_queue_mutation():
     guard = AsyncMock(side_effect=HTTPException(409, "completion finalizing"))
     with (
         patch.object(main, "postgres_db", db),
-        patch.object(main, "_guard_completion_control", guard),
+        patch.object(main._completion_control_boundary, "guard", guard),
     ):
         with pytest.raises(HTTPException) as exc:
             await main._internal_resume_job(job_id, "reply")
@@ -264,7 +281,7 @@ async def test_flag_on_pinned_resume_queues_without_agent_selection_or_post():
             "require_internal_or_job_access",
             AsyncMock(return_value=({}, job)),
         ),
-        patch.object(main, "_guard_completion_control", AsyncMock()),
+        patch.object(main._completion_control_boundary, "guard", AsyncMock()),
         patch.object(main, "_user_experts_enabled", AsyncMock(return_value=False)),
         patch.object(main, "_resume_missing_workspace", return_value=None),
         patch.object(main, "postgres_db", db),
@@ -404,12 +421,11 @@ async def test_blocking_message_loser_has_zero_notification_side_effects():
     )
     with (
         patch.object(main, "COMPLETION_COMMANDS_ENABLED", True),
-        patch.object(main, "require_internal", AsyncMock()),
         patch.object(main, "postgres_db", db),
         patch.object(main, "notification_service", notifier),
     ):
         with pytest.raises(HTTPException) as exc:
-            await main.send_agent_message(MagicMock(), job_id, body)
+            await _send_agent_message(job_id, body)
 
     assert exc.value.status_code == 409
     notifier.record_agent_message.assert_not_awaited()

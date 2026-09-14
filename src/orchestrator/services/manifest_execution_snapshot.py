@@ -87,6 +87,18 @@ def apply_srw_delivery_bindings(
     for key in ("workspace", "tools"):
         if isinstance((override or {}).get(key), dict):
             transient[key] = deepcopy(override[key])
+    # Workspace delivery selects the sudo gate too: VM commands reach the
+    # guest's gate, while a denied sandbox upgrade must remain blocked. Other
+    # private shell settings still come exclusively from the admitted snapshot.
+    shell = (override or {}).get("shell")
+    if isinstance(shell, dict):
+        sudo = {
+            key: deepcopy(shell[key])
+            for key in ("sudo_action", "sudo_block_message")
+            if key in shell
+        }
+        if sudo:
+            transient["shell"] = sudo
     result = deepcopy(blob)
     result["agent"] = deep_merge(result["agent"], transient)
     checked = deep_merge(deepcopy(policy), transient)
@@ -385,7 +397,10 @@ async def prepare_srw_snapshot(
             srw_workspace_config,
         )
 
-        expected = srw_workspace_config(workspace_selection["resolved"])
+        expected = srw_workspace_config(
+            workspace_selection["resolved"],
+            instance_recipe=workspace_selection.get("instance_recipe"),
+        )
         actual = policy.get("workspace") or {}
         if any(actual.get(key) != value for key, value in expected.items()):
             raise HTTPException(409, "Workspace assignment changed during admission.")
@@ -621,7 +636,7 @@ async def capture_execution(
                 conn=conn,
                 **prepared,
             )
-        return await store.freeze_execution(
+        snapshot = await store.freeze_execution(
             work_kind=work_kind,
             work_id=work_id,
             owner_id=owner_id,
@@ -629,3 +644,8 @@ async def capture_execution(
             conn=conn,
             **prepared,
         )
+
+        from orchestrator.services.retained_vm_workspaces import reserve
+
+        await reserve(db, snapshot)
+        return snapshot

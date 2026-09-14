@@ -41,6 +41,36 @@ def _patch_caller_and_db(user: dict, db):
     return stack
 
 
+def _patch_pending_actions_caller(user: dict, db, fake_request):
+    """``_patch_caller_and_db`` plus the two seams the extracted route needs.
+
+    ``orchestrator.routers.actions`` imports ``require_approved_user`` into its
+    own namespace, so the gate has to be patched there to steer the route; and
+    the route resolves its collaborators through
+    ``request.app.state.pending_actions_dependencies_factory``. The factory is
+    evaluated per call, so it picks up the patched ``main.postgres_db`` and
+    hands over ``main._pending_actions_cache`` itself.
+    """
+    stack = _patch_caller_and_db(user, db)
+    stack.enter_context(
+        patch(
+            "orchestrator.routers.actions.require_approved_user",
+            AsyncMock(return_value=user),
+        )
+    )
+    _point_at_pending_actions_factory(fake_request)
+    return stack
+
+
+def _point_at_pending_actions_factory(fake_request):
+    from orchestrator.main import _pending_actions_dependencies
+
+    fake_request.app.state.pending_actions_dependencies_factory = (
+        lambda: _pending_actions_dependencies()
+    )
+    return fake_request
+
+
 class TestExpertsGated:
     @pytest.mark.asyncio
     async def test_list_experts_runs_gate(self, user_a, fake_db, fake_request):
@@ -96,13 +126,14 @@ class TestPendingActions:
         self, user_admin, fake_db, fake_request
     ):
         """Admin path passes no owner filter — DB returns global counts."""
-        from orchestrator.main import _pending_actions_cache, get_pending_actions
+        from orchestrator.main import _pending_actions_cache
+        from orchestrator.routers.actions import get_pending_actions
 
         _pending_actions_cache.clear()
         fake_db.get_pending_action_counts = AsyncMock(
             return_value={"counts": {"total": 99}, "most_urgent": None}
         )
-        with _patch_caller_and_db(user_admin, fake_db):
+        with _patch_pending_actions_caller(user_admin, fake_db, fake_request):
             await get_pending_actions(fake_request)
 
         fake_db.get_pending_action_counts.assert_awaited_once_with()
@@ -113,13 +144,14 @@ class TestPendingActions:
     ):
         """Non-admin path resolves caller's project memberships and passes
         owner_user_id + visible_project_ids — narrowing the DB query."""
-        from orchestrator.main import _pending_actions_cache, get_pending_actions
+        from orchestrator.main import _pending_actions_cache
+        from orchestrator.routers.actions import get_pending_actions
 
         _pending_actions_cache.clear()
         fake_db.get_pending_action_counts = AsyncMock(
             return_value={"counts": {"total": 3}, "most_urgent": None}
         )
-        with _patch_caller_and_db(user_a, fake_db):
+        with _patch_pending_actions_caller(user_a, fake_db, fake_request):
             await get_pending_actions(fake_request)
 
         kwargs = fake_db.get_pending_action_counts.call_args.kwargs
@@ -134,30 +166,34 @@ class TestPendingActions:
         """Two callers with different visibility hit the DB twice (different
         cache keys). Without the fix, the admin's first response would have
         leaked into user_a's slot."""
-        from orchestrator.main import _pending_actions_cache, get_pending_actions
+        from orchestrator.main import _pending_actions_cache
+        from orchestrator.routers.actions import get_pending_actions
 
         _pending_actions_cache.clear()
         fake_db.get_pending_action_counts = AsyncMock(
             return_value={"counts": {"total": 0}, "most_urgent": None}
         )
-        with _patch_caller_and_db(user_admin, fake_db):
+        with _patch_pending_actions_caller(user_admin, fake_db, fake_request):
             await get_pending_actions(fake_request)
-        with _patch_caller_and_db(user_a, fake_db):
+        with _patch_pending_actions_caller(user_a, fake_db, fake_request):
             await get_pending_actions(fake_request)
 
         assert fake_db.get_pending_action_counts.await_count == 2
 
     @pytest.mark.asyncio
     async def test_runs_gate(self, fake_request):
-        from orchestrator.main import _pending_actions_cache, get_pending_actions
+        from orchestrator.main import _pending_actions_cache
+        from orchestrator.routers.actions import get_pending_actions
 
         _pending_actions_cache.clear()
+        _point_at_pending_actions_factory(fake_request)
 
         async def _denied(*_a, **_kw):
             raise HTTPException(status_code=403, detail="denied")
 
         with patch(
-            "orchestrator.main.require_approved_user", AsyncMock(side_effect=_denied)
+            "orchestrator.routers.actions.require_approved_user",
+            AsyncMock(side_effect=_denied),
         ):
             with pytest.raises(HTTPException) as exc:
                 await get_pending_actions(fake_request)

@@ -20,8 +20,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-import tests.conftest  # noqa: E402,F401 — applies license/crypto/env shims + sys.path
-import orchestrator.main as main  # noqa: E402
+from orchestrator.services.completion_recovery import (  # noqa: E402
+    CompletionRecoveryDependencies,
+    check_delegation_timeouts,
+)
 
 
 class _FakeConn:
@@ -86,24 +88,30 @@ def _child(status, *, wake_in_s=None):
 
 
 @pytest.fixture
-def wired(monkeypatch):
+def wired():
     """Wire the sweep against a fake parent row + children; return mocks."""
 
-    def _apply(parent_row, children):
-        db = main.postgres_db
-        monkeypatch.setattr(
-            db, "acquire", lambda: _FakeAcquire(_FakeConn([parent_row]))
-        )
-        monkeypatch.setattr(
-            db, "get_delegation_children", AsyncMock(return_value=children)
-        )
+    def _apply(parent_row, children, *, settle=None):
+        db = MagicMock()
+        db.acquire = lambda: _FakeAcquire(_FakeConn([parent_row]))
+        db.get_delegation_children = AsyncMock(return_value=children)
         cancel = AsyncMock()
         claim = AsyncMock(return_value=True)
-        monkeypatch.setattr(db, "cancel_job", cancel)
-        monkeypatch.setattr(db, "claim_delegation_resume", claim)
-        monkeypatch.setattr(db, "merge_job_context", AsyncMock())
-        monkeypatch.setattr(main, "_trigger_dispatch", MagicMock())
-        return cancel, claim
+        db.cancel_job = cancel
+        db.claim_delegation_resume = claim
+        db.merge_job_context = AsyncMock()
+        dependencies = CompletionRecoveryDependencies(
+            store=db,
+            completion_commands_enabled=lambda: True,
+            trigger_dispatch=MagicMock(),
+            completion_resume_guard_kwargs=lambda: {},
+            completion_dispatch_guard_kwargs=lambda: {},
+            wait_for_stateless_cancel_settle=settle or AsyncMock(return_value=True),
+            notify_operator_freeze=AsyncMock(),
+            handle_scholar_completion=AsyncMock(),
+            handle_delegation_child_completion=AsyncMock(),
+        )
+        return cancel, claim, dependencies
 
     return _apply
 
@@ -112,11 +120,11 @@ def wired(monkeypatch):
 async def test_paused_child_future_wake_parks_the_timer(wired):
     # Child paused for a 3h cooldown (wake +2h from now), naive elapsed 3h > 2h
     # timeout — the timer must NOT fire while the child legitimately waits.
-    cancel, claim = wired(
+    cancel, claim, dependencies = wired(
         _parent_row(started_ago_s=3 * 3600),
         [_child("paused", wake_in_s=2 * 3600)],
     )
-    assert await main._check_delegation_timeouts() == 0
+    assert await check_delegation_timeouts(dependencies=dependencies) == 0
     cancel.assert_not_awaited()
     claim.assert_not_awaited()
 
@@ -126,11 +134,11 @@ async def test_resumed_child_gets_full_window_from_wake(wired):
     # Fire-on-resume trap: the child woke 10min ago and is processing again;
     # naive elapsed (3h) exceeds the timeout, but active time since wake is
     # only 10min — the parent must keep waiting.
-    cancel, claim = wired(
+    cancel, claim, dependencies = wired(
         _parent_row(started_ago_s=3 * 3600),
         [_child("processing", wake_in_s=-600)],
     )
-    assert await main._check_delegation_timeouts() == 0
+    assert await check_delegation_timeouts(dependencies=dependencies) == 0
     cancel.assert_not_awaited()
     claim.assert_not_awaited()
 
@@ -139,11 +147,11 @@ async def test_resumed_child_gets_full_window_from_wake(wired):
 async def test_wake_window_exhausted_fires(wired):
     # The child woke 3h ago (full 2h window consumed) and the parent is still
     # waiting — the timeout fires normally.
-    cancel, claim = wired(
+    cancel, claim, dependencies = wired(
         _parent_row(started_ago_s=5 * 3600),
         [_child("processing", wake_in_s=-3 * 3600)],
     )
-    assert await main._check_delegation_timeouts() == 1
+    assert await check_delegation_timeouts(dependencies=dependencies) == 1
     cancel.assert_awaited_once_with("c1")
     claim.assert_awaited_once_with("par-1")
 
@@ -153,22 +161,22 @@ async def test_never_resuming_paused_child_terminates_at_wake_plus_timeout(wired
     # Overdue guard: a child stuck 'paused' long past its wake (outage sweeper
     # broken) must still be reaped — the derived anchor bounds it at
     # wake + timeout, never forever.
-    cancel, claim = wired(
+    cancel, claim, dependencies = wired(
         _parent_row(started_ago_s=6 * 3600),
         [_child("paused", wake_in_s=-3 * 3600)],
     )
-    assert await main._check_delegation_timeouts() == 1
+    assert await check_delegation_timeouts(dependencies=dependencies) == 1
     cancel.assert_awaited_once_with("c1")
     claim.assert_awaited_once_with("par-1")
 
 
 @pytest.mark.asyncio
 async def test_children_without_outage_state_fire_as_before(wired):
-    cancel, claim = wired(
+    cancel, claim, dependencies = wired(
         _parent_row(started_ago_s=3 * 3600),
         [_child("processing")],
     )
-    assert await main._check_delegation_timeouts() == 1
+    assert await check_delegation_timeouts(dependencies=dependencies) == 1
     cancel.assert_awaited_once_with("c1")
     claim.assert_awaited_once_with("par-1")
 
@@ -177,30 +185,30 @@ async def test_children_without_outage_state_fire_as_before(wired):
 async def test_wake_older_than_freeze_timestamp_is_ignored(wired):
     # A wake from a previous delegation round (re-suspend wrote a fresh freeze
     # timestamp after it) must not extend the current round's deadline.
-    cancel, claim = wired(
+    cancel, claim, dependencies = wired(
         _parent_row(started_ago_s=3 * 3600),
         [_child("processing", wake_in_s=-4 * 3600)],
     )
-    assert await main._check_delegation_timeouts() == 1
+    assert await check_delegation_timeouts(dependencies=dependencies) == 1
     cancel.assert_awaited_once_with("c1")
     claim.assert_awaited_once_with("par-1")
 
 
 @pytest.mark.asyncio
-async def test_under_timeout_never_touches_children(wired, monkeypatch):
+async def test_under_timeout_never_touches_children(wired):
     # Cheap path: while the naive timer hasn't expired, the sweep must not
     # fetch children at all (one query per waiting parent per tick suffices).
-    cancel, claim = wired(
+    cancel, claim, dependencies = wired(
         _parent_row(started_ago_s=600),
         [_child("paused", wake_in_s=2 * 3600)],
     )
-    assert await main._check_delegation_timeouts() == 0
-    main.postgres_db.get_delegation_children.assert_not_awaited()
+    assert await check_delegation_timeouts(dependencies=dependencies) == 0
+    dependencies.store.get_delegation_children.assert_not_awaited()
     cancel.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_stateless_timeout_reenqueues_without_dispatcher(wired, monkeypatch):
+async def test_stateless_timeout_reenqueues_without_dispatcher(wired):
     parent = _parent_row(started_ago_s=3 * 3600)
     parent.update(
         {
@@ -209,11 +217,11 @@ async def test_stateless_timeout_reenqueues_without_dispatcher(wired, monkeypatc
             "user_id": "44444444-4444-4444-4444-444444444444",
         }
     )
-    cancel, claim = wired(parent, [_child("processing")])
+    cancel, claim, dependencies = wired(parent, [_child("processing")])
     queue = AsyncMock(return_value=True)
-    monkeypatch.setattr(main.postgres_db, "queue_stateless_job_for_resume", queue)
+    dependencies.store.queue_stateless_job_for_resume = queue
 
-    assert await main._check_delegation_timeouts() == 1
+    assert await check_delegation_timeouts(dependencies=dependencies) == 1
 
     cancel.assert_awaited_once_with("c1")
     claim.assert_not_awaited()
@@ -225,12 +233,12 @@ async def test_stateless_timeout_reenqueues_without_dispatcher(wired, monkeypatc
         "fair_key": "44444444-4444-4444-4444-444444444444",
         "expected_status": "waiting",
     }
-    main._trigger_dispatch.assert_not_called()
+    dependencies.trigger_dispatch.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_stateless_timeout_finalizes_even_an_already_closed_queue(
-    wired, monkeypatch
+    wired,
 ):
     """Queue closure is not checkpoint/workspace cleanup completion.
 
@@ -240,17 +248,14 @@ async def test_stateless_timeout_finalizes_even_an_already_closed_queue(
     """
     child = _child("processing")
     child["execution_lane"] = "stateless"
-    _cancel, claim = wired(_parent_row(started_ago_s=3 * 3600), [child])
-    cancel_stateless = AsyncMock(return_value=(True, True))
     settle = AsyncMock(return_value=True)
-    monkeypatch.setattr(
-        main.postgres_db,
-        "cancel_stateless_job",
-        cancel_stateless,
+    _cancel, claim, dependencies = wired(
+        _parent_row(started_ago_s=3 * 3600), [child], settle=settle
     )
-    monkeypatch.setattr(main, "_wait_for_stateless_cancel_settle", settle)
+    cancel_stateless = AsyncMock(return_value=(True, True))
+    dependencies.store.cancel_stateless_job = cancel_stateless
 
-    assert await main._check_delegation_timeouts() == 1
+    assert await check_delegation_timeouts(dependencies=dependencies) == 1
 
     cancel_stateless.assert_awaited_once_with("c1")
     settle.assert_awaited_once_with("c1")
@@ -259,7 +264,7 @@ async def test_stateless_timeout_finalizes_even_an_already_closed_queue(
 
 @pytest.mark.asyncio
 async def test_stateless_timeout_retry_settles_already_cancelled_child(
-    wired, monkeypatch
+    wired,
 ):
     child = _child("cancelled")
     child.update(
@@ -268,17 +273,14 @@ async def test_stateless_timeout_retry_settles_already_cancelled_child(
             "context": {"_stateless_cancel_cleanup_pending": True},
         }
     )
-    _cancel, claim = wired(_parent_row(started_ago_s=3 * 3600), [child])
-    cancel_stateless = AsyncMock()
     settle = AsyncMock(return_value=True)
-    monkeypatch.setattr(
-        main.postgres_db,
-        "cancel_stateless_job",
-        cancel_stateless,
+    _cancel, claim, dependencies = wired(
+        _parent_row(started_ago_s=3 * 3600), [child], settle=settle
     )
-    monkeypatch.setattr(main, "_wait_for_stateless_cancel_settle", settle)
+    cancel_stateless = AsyncMock()
+    dependencies.store.cancel_stateless_job = cancel_stateless
 
-    assert await main._check_delegation_timeouts() == 1
+    assert await check_delegation_timeouts(dependencies=dependencies) == 1
 
     cancel_stateless.assert_not_awaited()
     settle.assert_awaited_once_with("c1")

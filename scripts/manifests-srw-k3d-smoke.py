@@ -726,6 +726,7 @@ def deployed_agents():
     paths = [
         "src/agent/api/persistent_app.py",
         "src/agent/agent.py",
+        "src/agent/core/workspace.py",
         "src/shared/runtime/core/session_config_patch.py",
         "src/shared/runtime/core/tool_report.py",
         "src/shared/runtime/core/srw_manifest_config.py",

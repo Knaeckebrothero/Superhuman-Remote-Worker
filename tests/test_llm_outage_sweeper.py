@@ -7,13 +7,17 @@ knowledge-base/knowledge/features/llm_outage_pause_and_backoff_redispatch.md.
 """
 
 from datetime import datetime, timedelta, timezone
+from dataclasses import replace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-import orchestrator.main as main  # noqa: E402
 from orchestrator.services.completion import (  # noqa: E402
     LLM_OUTAGE_CEILING_SECONDS,
+)
+from orchestrator.services.completion_recovery import (  # noqa: E402
+    CompletionRecoveryDependencies,
+    llm_outage_sweep_once,
 )
 
 
@@ -44,39 +48,47 @@ def _due_job(job_id, *, first_ago, last_ago=60, attempt=3):
 
 
 @pytest.fixture
-def wired(monkeypatch):
-    """Patch the module globals the sweeper reaches; return (db, trigger)."""
+def wired():
+    """Compose the sweep explicitly; return its store, dispatch and boundary."""
     db = MagicMock()
     db.list_due_llm_outage_jobs = AsyncMock(return_value=[])
     db.claim_llm_outage_redispatch = AsyncMock(return_value=True)
     db.fail_llm_outage_job = AsyncMock(return_value=True)
     trigger = MagicMock()
-    monkeypatch.setattr(main, "postgres_db", db)
-    monkeypatch.setattr(main, "_trigger_dispatch", trigger)
-    monkeypatch.setattr(main, "_notify_operator_freeze", AsyncMock())
-    return db, trigger
+    dependencies = CompletionRecoveryDependencies(
+        store=db,
+        completion_commands_enabled=lambda: True,
+        trigger_dispatch=trigger,
+        completion_resume_guard_kwargs=lambda: {},
+        completion_dispatch_guard_kwargs=lambda: {},
+        wait_for_stateless_cancel_settle=AsyncMock(return_value=True),
+        notify_operator_freeze=AsyncMock(),
+        handle_scholar_completion=AsyncMock(),
+        handle_delegation_child_completion=AsyncMock(),
+    )
+    return db, trigger, dependencies
 
 
 @pytest.mark.asyncio
 async def test_no_due_jobs_no_dispatch(wired):
-    db, trigger = wired
-    assert await main._llm_outage_sweep_once() == (0, 0)
+    db, trigger, dependencies = wired
+    assert await llm_outage_sweep_once(dependencies=dependencies) == (0, 0)
     db.list_due_llm_outage_jobs.assert_awaited_once_with(
         limit=50,
-        completion_commands_enabled=main.COMPLETION_COMMANDS_ENABLED,
+        completion_commands_enabled=True,
     )
     trigger.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_due_under_ceiling_redispatches(wired):
-    db, trigger = wired
+    db, trigger, dependencies = wired
     db.list_due_llm_outage_jobs = AsyncMock(
         return_value=[_due_job("j1", first_ago=3600)]
     )
-    assert await main._llm_outage_sweep_once() == (1, 0)
+    assert await llm_outage_sweep_once(dependencies=dependencies) == (1, 0)
     db.claim_llm_outage_redispatch.assert_awaited_once_with(
-        "j1", completion_commands_enabled=main.COMPLETION_COMMANDS_ENABLED
+        "j1", completion_commands_enabled=True
     )
     db.fail_llm_outage_job.assert_not_awaited()
     trigger.assert_called_once()
@@ -85,26 +97,26 @@ async def test_due_under_ceiling_redispatches(wired):
 @pytest.mark.asyncio
 async def test_cas_lost_not_counted(wired):
     # Another sweeper (transient dual-leader) already claimed it → CAS returns False.
-    db, trigger = wired
+    db, trigger, dependencies = wired
     db.list_due_llm_outage_jobs = AsyncMock(
         return_value=[_due_job("j1", first_ago=3600)]
     )
     db.claim_llm_outage_redispatch = AsyncMock(return_value=False)
-    assert await main._llm_outage_sweep_once() == (0, 0)
+    assert await llm_outage_sweep_once(dependencies=dependencies) == (0, 0)
     trigger.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_over_ceiling_fails_not_redispatched(wired):
-    db, trigger = wired
+    db, trigger, dependencies = wired
     db.list_due_llm_outage_jobs = AsyncMock(
         return_value=[_due_job("j1", first_ago=LLM_OUTAGE_CEILING_SECONDS + 3600)]
     )
-    assert await main._llm_outage_sweep_once() == (0, 1)
+    assert await llm_outage_sweep_once(dependencies=dependencies) == (0, 1)
     assert db.fail_llm_outage_job.await_args.args[0] == "j1"
     assert "past the give-up ceiling" in db.fail_llm_outage_job.await_args.args[1]
     assert db.fail_llm_outage_job.await_args.kwargs == {
-        "completion_commands_enabled": main.COMPLETION_COMMANDS_ENABLED
+        "completion_commands_enabled": True
     }
     db.claim_llm_outage_redispatch.assert_not_awaited()
     trigger.assert_not_called()
@@ -119,18 +131,16 @@ async def test_over_ceiling_fails_not_redispatched(wired):
 
 
 @pytest.mark.asyncio
-async def test_ceiling_failed_subjob_runs_parent_unblock_handlers(wired, monkeypatch):
-    db, trigger = wired
+async def test_ceiling_failed_subjob_runs_parent_unblock_handlers(wired):
+    db, trigger, dependencies = wired
     job = _due_job("sub-1", first_ago=LLM_OUTAGE_CEILING_SECONDS + 3600)
     job["parent_job_id"] = "par-1"
     job["creation_order"] = 0
     db.list_due_llm_outage_jobs = AsyncMock(return_value=[job])
-    scholar = AsyncMock()
-    delegation = AsyncMock()
-    monkeypatch.setattr(main, "_handle_scholar_completion", scholar)
-    monkeypatch.setattr(main, "_handle_delegation_child_completion", delegation)
+    scholar = dependencies.handle_scholar_completion
+    delegation = dependencies.handle_delegation_child_completion
 
-    assert await main._llm_outage_sweep_once() == (0, 1)
+    assert await llm_outage_sweep_once(dependencies=dependencies) == (0, 1)
     scholar.assert_awaited_once()
     delegation.assert_awaited_once()
     # Handlers must see the post-fail status, not the paused sweep row —
@@ -140,38 +150,35 @@ async def test_ceiling_failed_subjob_runs_parent_unblock_handlers(wired, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_ceiling_failed_toplevel_skips_subjob_handlers(wired, monkeypatch):
-    db, trigger = wired
+async def test_ceiling_failed_toplevel_skips_subjob_handlers(wired):
+    db, trigger, dependencies = wired
     db.list_due_llm_outage_jobs = AsyncMock(
         return_value=[_due_job("j1", first_ago=LLM_OUTAGE_CEILING_SECONDS + 3600)]
     )
-    scholar = AsyncMock()
-    delegation = AsyncMock()
-    monkeypatch.setattr(main, "_handle_scholar_completion", scholar)
-    monkeypatch.setattr(main, "_handle_delegation_child_completion", delegation)
+    scholar = dependencies.handle_scholar_completion
+    delegation = dependencies.handle_delegation_child_completion
 
-    assert await main._llm_outage_sweep_once() == (0, 1)
+    assert await llm_outage_sweep_once(dependencies=dependencies) == (0, 1)
     scholar.assert_not_awaited()
     delegation.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_unblock_handler_error_does_not_break_sweep(wired, monkeypatch):
+async def test_unblock_handler_error_does_not_break_sweep(wired):
     # A handler blow-up must not abort the tick — later due jobs still process.
-    db, trigger = wired
+    db, trigger, dependencies = wired
     sub = _due_job("sub-1", first_ago=LLM_OUTAGE_CEILING_SECONDS + 3600)
     sub["parent_job_id"] = "par-1"
     sub["creation_order"] = 0
     ok = _due_job("j2", first_ago=3600)
     db.list_due_llm_outage_jobs = AsyncMock(return_value=[sub, ok])
-    monkeypatch.setattr(
-        main,
-        "_handle_scholar_completion",
-        AsyncMock(side_effect=RuntimeError("boom")),
+    dependencies = replace(
+        dependencies,
+        handle_scholar_completion=AsyncMock(side_effect=RuntimeError("boom")),
+        handle_delegation_child_completion=AsyncMock(),
     )
-    monkeypatch.setattr(main, "_handle_delegation_child_completion", AsyncMock())
 
-    assert await main._llm_outage_sweep_once() == (1, 1)
+    assert await llm_outage_sweep_once(dependencies=dependencies) == (1, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -209,11 +216,11 @@ def _born_parked_job(job_id):
 
 @pytest.mark.asyncio
 async def test_born_parked_job_wakes_and_claims(wired):
-    db, trigger = wired
+    db, trigger, dependencies = wired
     db.list_due_llm_outage_jobs = AsyncMock(return_value=[_born_parked_job("j-park")])
-    assert await main._llm_outage_sweep_once() == (1, 0)
+    assert await llm_outage_sweep_once(dependencies=dependencies) == (1, 0)
     db.claim_llm_outage_redispatch.assert_awaited_once_with(
-        "j-park", completion_commands_enabled=main.COMPLETION_COMMANDS_ENABLED
+        "j-park", completion_commands_enabled=True
     )
     db.fail_llm_outage_job.assert_not_awaited()
     trigger.assert_called_once()

@@ -22,10 +22,29 @@ from agent.tools.context import ToolContext
 from agent.tools.core.officer import OFFICER_TOOLS_METADATA, create_officer_tools
 
 
+def _watchdog_deps(db, provisioner, recycler, *, reconciliation):
+    """What the watchdog task carries. The recycler is a callable because the
+    application assigns that global during startup and the tick re-reads it;
+    the rollout fence is a callable for the same reason a rebind on
+    ``orchestrator.main`` used to work."""
+    from orchestrator.services.officer_watchdog import OfficerWatchdogDependencies
+
+    return OfficerWatchdogDependencies(
+        store=db,
+        persistent_provisioner=provisioner,
+        persistent_thread_recycler=lambda: recycler,
+        kick_officer_event_drain=MagicMock(),
+        dispatch_officer_page=AsyncMock(return_value=None),
+        conclude_conference_if_any=AsyncMock(),
+        officer_runtime_verification_enabled=lambda: False,
+        persistent_agent_reconciliation_enabled=lambda: reconciliation,
+    )
+
+
 @pytest.mark.asyncio
 async def test_officer_missing_pod_delegates_to_lifecycle_owner(monkeypatch):
     """The watchdog observes; one shared recycler owns missing-pod repair."""
-    from orchestrator import main as orch_main
+    from orchestrator.services import officer_watchdog
 
     thread = {
         "id": "11111111-1111-4111-8111-111111111111",
@@ -52,17 +71,18 @@ async def test_officer_missing_pod_delegates_to_lifecycle_owner(monkeypatch):
             notification_due=False,
         )
     )
-    monkeypatch.setattr(orch_main, "postgres_db", db)
-    monkeypatch.setattr(orch_main, "persistent_provisioner", provisioner)
-    monkeypatch.setattr(orch_main, "_persistent_thread_recycler", recycler)
-    monkeypatch.setattr(orch_main, "PERSISTENT_AGENT_RECONCILIATION_ENABLED", True)
+    # The watchdog calls the liveness check as its own module-level name, so
+    # the stub goes there; everything else is a dependency field.
     monkeypatch.setattr(
-        orch_main, "_maintain_officer_runtime_authorization", maintenance
+        officer_watchdog, "maintain_officer_runtime_authorization", maintenance
+    )
+    dependencies = _watchdog_deps(db, provisioner, recycler, reconciliation=True)
+
+    await officer_watchdog.officer_watchdog_check_one(
+        thread, wake, dependencies=dependencies
     )
 
-    await orch_main._officer_watchdog_check_one(thread, wake)
-
-    maintenance.assert_awaited_once_with(thread)
+    maintenance.assert_awaited_once_with(thread, dependencies=dependencies)
     recycler.request_and_reconcile.assert_awaited_once_with(
         thread_id=thread["id"],
         reason="missing_pod",
@@ -74,7 +94,7 @@ async def test_officer_missing_pod_delegates_to_lifecycle_owner(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_officer_watchdog_probe_miss_does_not_recycle_existing_pod(monkeypatch):
-    from orchestrator import main as orch_main
+    from orchestrator.services import officer_watchdog
     from orchestrator.services.persistent_recycler import PersistentPodObservation
 
     thread = {
@@ -113,15 +133,16 @@ async def test_officer_watchdog_probe_miss_does_not_recycle_existing_pod(monkeyp
             notification_due=False,
         )
     )
-    monkeypatch.setattr(orch_main, "postgres_db", db)
-    monkeypatch.setattr(orch_main, "persistent_provisioner", provisioner)
-    monkeypatch.setattr(orch_main, "_persistent_thread_recycler", recycler)
-    monkeypatch.setattr(orch_main, "PERSISTENT_AGENT_RECONCILIATION_ENABLED", True)
+    # The watchdog calls the liveness check as its own module-level name, so
+    # the stub goes there; everything else is a dependency field.
     monkeypatch.setattr(
-        orch_main, "_maintain_officer_runtime_authorization", maintenance
+        officer_watchdog, "maintain_officer_runtime_authorization", maintenance
     )
+    dependencies = _watchdog_deps(db, provisioner, recycler, reconciliation=True)
 
-    await orch_main._officer_watchdog_check_one(thread, wake)
+    await officer_watchdog.officer_watchdog_check_one(
+        thread, wake, dependencies=dependencies
+    )
 
     recycler.observe.assert_awaited_once_with(thread["id"])
     recycler.request_and_reconcile.assert_not_awaited()
@@ -131,7 +152,7 @@ async def test_officer_watchdog_probe_miss_does_not_recycle_existing_pod(monkeyp
 async def test_officer_missing_pod_is_observation_only_while_rollout_fence_is_off(
     monkeypatch,
 ):
-    from orchestrator import main as orch_main
+    from orchestrator.services import officer_watchdog
 
     thread = {
         "id": "11111111-1111-4111-8111-111111111111",
@@ -156,15 +177,16 @@ async def test_officer_missing_pod_is_observation_only_while_rollout_fence_is_of
             notification_due=False,
         )
     )
-    monkeypatch.setattr(orch_main, "postgres_db", db)
-    monkeypatch.setattr(orch_main, "persistent_provisioner", provisioner)
-    monkeypatch.setattr(orch_main, "_persistent_thread_recycler", recycler)
-    monkeypatch.setattr(orch_main, "PERSISTENT_AGENT_RECONCILIATION_ENABLED", False)
+    # The watchdog calls the liveness check as its own module-level name, so
+    # the stub goes there; everything else is a dependency field.
     monkeypatch.setattr(
-        orch_main, "_maintain_officer_runtime_authorization", maintenance
+        officer_watchdog, "maintain_officer_runtime_authorization", maintenance
     )
+    dependencies = _watchdog_deps(db, provisioner, recycler, reconciliation=False)
 
-    await orch_main._officer_watchdog_check_one(thread, wake)
+    await officer_watchdog.officer_watchdog_check_one(
+        thread, wake, dependencies=dependencies
+    )
 
     recycler.observe.assert_not_awaited()
     recycler.request_and_reconcile.assert_not_awaited()

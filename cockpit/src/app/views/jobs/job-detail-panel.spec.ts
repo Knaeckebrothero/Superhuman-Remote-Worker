@@ -464,3 +464,90 @@ describe('subagent roster', () => {
     expect(subagentStatusTone('error')).toBe('danger');
   });
 });
+
+/**
+ * The prompt clamp.
+ *
+ * Whether the paragraph overflows is a layout question, and jsdom has no
+ * layout — `scrollHeight` is 0 for everything, so the ResizeObserver path
+ * cannot be exercised here (it is measured in the browser instead). What is
+ * worth pinning is the wiring the measurement drives: the cap is on by
+ * default, the toggle appears only when something is actually hidden, and
+ * pressing it lifts the cap rather than merely relabelling itself.
+ */
+describe('prompt clamp', () => {
+  beforeAll(async () => {
+    await ɵresolveComponentResources(() => Promise.resolve(''));
+  });
+  afterEach(() => TestBed.resetTestingModule());
+
+  function render(description: string) {
+    TestBed.configureTestingModule({
+      imports: [
+        JobDetailPanelComponent,
+        TranslocoTestingModule.forRoot({
+          langs: {en},
+          translocoConfig: {availableLangs: ['en'], defaultLang: 'en'},
+        }),
+      ],
+      providers: [provideRouter([])],
+    });
+    const transloco = TestBed.inject(TranslocoService);
+    transloco.setTranslation(en, 'en');
+    transloco.setActiveLang('en');
+    const fixture = TestBed.createComponent(JobDetailPanelComponent);
+    Object.defineProperty(fixture.componentInstance, 'job', {
+      value: signal({
+        id: 'job-1',
+        description,
+        status: 'processing',
+        created_at: '2026-08-23T09:00:00Z',
+      } as JobSummary),
+    });
+    Object.defineProperty(fixture.componentInstance, 'data', {value: signal(null)});
+    fixture.detectChanges();
+    return fixture;
+  }
+
+  it('caps the prompt and offers no toggle while nothing is hidden', () => {
+    const fixture = render('Short prompt.');
+    const root = fixture.nativeElement as HTMLElement;
+
+    expect(root.querySelector('.detail-description')?.textContent).toBe('Short prompt.');
+    expect(root.querySelector('.detail-description--capped')).not.toBeNull();
+    expect(root.querySelector('.desc-toggle')).toBeNull();
+    // The cap is harmless on text that never reaches it; the fade is not — a
+    // gradient taller than a one-line prompt would dim the prompt itself.
+    expect(root.querySelector('.detail-description--faded')).toBeNull();
+  });
+
+  it('lifts the cap when the toggle is pressed, and puts it back', () => {
+    const fixture = render('A prompt far taller than the panel.');
+    const component = fixture.componentInstance;
+    component.descOverflowed.set(true);
+    fixture.detectChanges();
+    const root = fixture.nativeElement as HTMLElement;
+
+    const toggle = root.querySelector('.desc-toggle') as HTMLButtonElement;
+    expect(toggle.textContent?.trim()).toBe('Show more');
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+
+    expect(root.querySelector('.detail-description--faded')).not.toBeNull();
+
+    toggle.click();
+    fixture.detectChanges();
+    expect(root.querySelector('.detail-description--capped')).toBeNull();
+    expect(root.querySelector('.detail-description--faded')).toBeNull();
+    expect(root.querySelector('.desc-toggle')?.textContent?.trim()).toBe('Show less');
+    expect(root.querySelector('.desc-toggle')?.getAttribute('aria-expanded')).toBe('true');
+
+    (root.querySelector('.desc-toggle') as HTMLButtonElement).click();
+    fixture.detectChanges();
+    expect(root.querySelector('.detail-description--capped')).not.toBeNull();
+  });
+
+  it('renders no description block at all when the job has no prompt', () => {
+    const root = render('').nativeElement as HTMLElement;
+    expect(root.querySelector('.description-block')).toBeNull();
+  });
+});

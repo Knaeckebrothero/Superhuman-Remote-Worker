@@ -596,14 +596,18 @@ class TestRoundLimitEnforcement:
     """
 
     def test_round_under_limit_spawns(self):
-        from orchestrator.main import _verification_gate_decision
+        from tests.b08_completion_helpers import (
+            verification_gate_decision as _verification_gate_decision,
+        )
 
         rounds = _rounds_with_open_blocking(1)
         action, _ = _verification_gate_decision(rounds, content_tree="h9", max_rounds=3)
         assert action == "spawn"
 
     def test_round_at_limit_escalates(self):
-        from orchestrator.main import _verification_gate_decision
+        from tests.b08_completion_helpers import (
+            verification_gate_decision as _verification_gate_decision,
+        )
 
         rounds = _rounds_with_open_blocking(3)
         action, reason = _verification_gate_decision(
@@ -613,7 +617,9 @@ class TestRoundLimitEnforcement:
         assert "round limit" in reason.lower()
 
     def test_round_over_limit_escalates(self):
-        from orchestrator.main import _verification_gate_decision
+        from tests.b08_completion_helpers import (
+            verification_gate_decision as _verification_gate_decision,
+        )
 
         rounds = _rounds_with_open_blocking(5)
         action, reason = _verification_gate_decision(
@@ -624,7 +630,9 @@ class TestRoundLimitEnforcement:
 
     def test_first_round_always_spawns(self):
         """Round zero (no prior rounds at all) is always under the cap."""
-        from orchestrator.main import _verification_gate_decision
+        from tests.b08_completion_helpers import (
+            verification_gate_decision as _verification_gate_decision,
+        )
 
         action, _ = _verification_gate_decision([], content_tree="h1", max_rounds=3)
         assert action == "spawn"
@@ -634,7 +642,9 @@ class TestRoundLimitEnforcement:
         the target at the cap. Confirm the decision function's outcome is
         always one of exactly two values, and approval is never one of
         them — however many rounds pile up."""
-        from orchestrator.main import _verification_gate_decision
+        from tests.b08_completion_helpers import (
+            verification_gate_decision as _verification_gate_decision,
+        )
 
         rounds = _rounds_with_open_blocking(10)
         action, _ = _verification_gate_decision(
@@ -650,7 +660,9 @@ class TestRoundLimitEnforcement:
         pure decision function): a project-loop job that hits the round cap
         must resolve 'completed', never 'pending_review'."""
         import orchestrator.main as main_module
-        from orchestrator.main import _trigger_verification_on_complete
+        from tests.b08_completion_helpers import (
+            trigger_verification_on_complete as _trigger_verification_on_complete,
+        )
 
         update_mock = AsyncMock()
         monkeypatch.setattr(main_module.postgres_db, "update_job_status", update_mock)

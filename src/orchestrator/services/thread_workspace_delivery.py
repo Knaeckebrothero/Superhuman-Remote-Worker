@@ -44,6 +44,7 @@ from typing import Any, Optional  # noqa: F401  (used by the moved bodies)
 from uuid import UUID
 
 from fastapi import HTTPException
+from orchestrator.services.session_workspace_policy import preparation_wait_budget
 
 from orchestrator.security.access import externalize_gitea_url
 from orchestrator.security.access import require_internal as _require_internal
@@ -1142,7 +1143,11 @@ async def agent_get_thread_workspace_locked(
         # SSH key path (set by Docker provisioner in dev mode)
         "ssh_key_path": os.environ.get("SSH_KEY_PATH"),
         # VM fields (take precedence when present)
-        "vm_status": vm.get("status"),
+        "vm_status": (final_metadata.get("workspace_preparation") or vm).get("status"),
+        "vm_preparation": (final_metadata.get("workspace_preparation") or vm).get(
+            "preparation"
+        ),
+        "vm_preparation_timeout_s": preparation_wait_budget(co, vm),
         "vm_ssh_host": vm.get("ssh_host"),
         "vm_ssh_port": vm.get("ssh_port"),
         "vm_name": vm.get("vm_name"),

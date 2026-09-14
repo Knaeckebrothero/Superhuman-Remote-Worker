@@ -274,3 +274,17 @@ async def admin_set_provider_default(
     return await dependencies.service.set_provider_default(
         kind=kind, body=body, admin=admin
     )
+
+
+@router.get("/api/admin/helm-managed")
+async def admin_helm_managed(
+    request: Request,
+    *,
+    dependencies: ProviderCatalogDependencies = Depends(
+        get_provider_catalog_dependencies
+    ),
+) -> dict[str, Any]:
+    """Which provider rows Helm reconciles on every upgrade, and which of
+    them an admin has overridden since (``helm_drift``)."""
+    await dependencies.require_admin(request)
+    return await dependencies.service.helm_managed_overview()

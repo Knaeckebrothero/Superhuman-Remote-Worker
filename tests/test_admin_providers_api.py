@@ -44,6 +44,7 @@ ADMIN_ROUTES = {
     ("GET", "/api/admin/providers/codex/availability"),
     ("GET", "/api/admin/providers/defaults"),
     ("PUT", "/api/admin/providers/defaults/{kind}"),
+    ("GET", "/api/admin/helm-managed"),
 }
 
 

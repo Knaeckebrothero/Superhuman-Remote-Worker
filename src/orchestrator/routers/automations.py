@@ -1,12 +1,17 @@
 """``/api/automations`` — CRUD + run-now / pause / resume / runs.
 
-First ``APIRouter`` in the project. Pattern: handlers reach for
-``postgres_db`` via late import (``from main import postgres_db``)
-inside each handler body to dodge circular import at module load time —
-same pattern ``src/orchestrator/auth/bff.py`` established. ``_trigger_dispatch``
-is similarly late-imported by the few handlers that create jobs (run-now)
-so the new job is picked up by the auto-assign loop without waiting for
-its 30s tick.
+First ``APIRouter`` in the project. R1.B07 closed its eleven late
+``from orchestrator.main import ...`` sites: the store, the forge/cloud clients
+and the dispatch nudge now arrive on :class:`AutomationsDependencies`, resolved
+from the application handling the request, so two applications in one process
+cannot share one store no matter which of them answered. The tool-override
+validator is imported from its owning service instead of being reached through
+the application module — it is a pure helper, and going through ``main`` bought
+a second hop and nothing else.
+
+``trigger_dispatch`` is the nudge the handlers that create jobs (run-now) fire
+so the new job is picked up by the auto-assign loop without waiting for its 30s
+tick.
 
 Spec: knowledge-base/knowledge/features/automations_v0.md §Endpoints.
 """
@@ -14,9 +19,10 @@ Spec: knowledge-base/knowledge/features/automations_v0.md §Endpoints.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Callable
 
-from fastapi import APIRouter, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 
 from orchestrator.security.access import PROJECT_ARCHIVED_DETAIL, require_project_member
@@ -31,11 +37,32 @@ from orchestrator.services.cron_dispatcher import (
     validate_timezone,
 )
 from orchestrator.services.default_experts import ExpertSelectionError
+from orchestrator.services.session_tool_policy import with_validated_tool_overrides
 from shared.runtime.core.loader import canonical_config_name
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/automations", tags=["Automations"])
+
+
+@dataclass
+class AutomationsDependencies:
+    """Collaborators for one automation request, resolved per invocation.
+
+    ``trigger_dispatch`` is the auto-assign nudge (B11 owns the scheduler);
+    ``gitea_client`` and ``main_cloud_router`` are the application's forge and
+    cloud singletons, used only by run-now's best-effort repo provisioning.
+    """
+
+    store: Any
+    gitea_client: Any
+    main_cloud_router: Any
+    trigger_dispatch: Callable[[], None]
+
+
+def get_automations_dependencies(request: Request) -> AutomationsDependencies:
+    """Resolve collaborators only from the application handling this request."""
+    return request.app.state.automations_dependencies_factory()
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +166,12 @@ async def _resolve_automation_or_404(
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
-async def create_automation(request: Request, body: AutomationCreate) -> dict[str, Any]:
+async def create_automation(
+    request: Request,
+    body: AutomationCreate,
+    *,
+    dependencies: AutomationsDependencies = Depends(get_automations_dependencies),
+) -> dict[str, Any]:
     """Create a new automation (cron-only in v0).
 
     The caller becomes ``owner_id``. If ``project_id`` is set the caller
@@ -147,9 +179,7 @@ async def create_automation(request: Request, body: AutomationCreate) -> dict[st
     here from the cron expression so the first dispatcher tick after
     create can fire it without an extra round-trip.
     """
-    from orchestrator.main import postgres_db  # late import: avoid circular
-
-    caller = await require_approved_user(request, postgres_db)
+    caller = await require_approved_user(request, dependencies.store)
 
     # Boundary validation — surface bad cron / tz as 400s rather than 500s
     try:
@@ -163,11 +193,7 @@ async def create_automation(request: Request, body: AutomationCreate) -> dict[st
     # POST /api/jobs, so the validator there does not see it, and every cron
     # fire re-plants whatever is stored. Validate it at the only boundary it
     # does cross: this one.
-    from orchestrator.main import (
-        _with_validated_tool_overrides,
-    )  # late import: avoid circular
-
-    validated_override = _with_validated_tool_overrides(body.config_override)
+    validated_override = with_validated_tool_overrides(body.config_override)
 
     if body.project_id:
         # Editor or higher needed to scope an automation to a project —
@@ -176,7 +202,7 @@ async def create_automation(request: Request, body: AutomationCreate) -> dict[st
         # to create future work, which is exactly what archiving withdraws.
         await require_project_member(
             request,
-            postgres_db,
+            dependencies.store,
             body.project_id,
             min_role="editor",
             allow_archived=False,
@@ -184,7 +210,7 @@ async def create_automation(request: Request, body: AutomationCreate) -> dict[st
 
     try:
         expert = await validate_automation_expert_selection(
-            postgres_db,
+            dependencies.store,
             owner_id=str(caller["id"]),
             project_id=body.project_id,
             expert=body.expert,
@@ -199,7 +225,7 @@ async def create_automation(request: Request, body: AutomationCreate) -> dict[st
         else None
     )
 
-    row = await postgres_db.create_automation(
+    row = await dependencies.store.create_automation(
         owner_id=str(caller["id"]),
         project_id=body.project_id,
         name=body.name,
@@ -226,6 +252,8 @@ async def create_automation(request: Request, body: AutomationCreate) -> dict[st
 async def list_automations(
     request: Request,
     project_id: str | None = Query(None, description="Filter by project"),
+    *,
+    dependencies: AutomationsDependencies = Depends(get_automations_dependencies),
 ) -> list[dict[str, Any]]:
     """List automations visible to the caller.
 
@@ -235,41 +263,46 @@ async def list_automations(
     all automations on that project (across owners) provided the caller
     is a project member; otherwise 403.
     """
-    from orchestrator.main import postgres_db  # late import: avoid circular
-
-    caller = await require_approved_user(request, postgres_db)
+    caller = await require_approved_user(request, dependencies.store)
 
     if project_id is not None:
         # Membership check enforces visibility for cross-owner project view.
         await require_project_member(
-            request, postgres_db, project_id, min_role="viewer"
+            request, dependencies.store, project_id, min_role="viewer"
         )
-        return await postgres_db.list_automations(project_id=project_id)
+        return await dependencies.store.list_automations(project_id=project_id)
 
-    return await postgres_db.list_automations(owner_id=str(caller["id"]))
+    return await dependencies.store.list_automations(owner_id=str(caller["id"]))
 
 
 @router.get("/{automation_id}")
-async def get_automation(request: Request, automation_id: str) -> dict[str, Any]:
+async def get_automation(
+    request: Request,
+    automation_id: str,
+    *,
+    dependencies: AutomationsDependencies = Depends(get_automations_dependencies),
+) -> dict[str, Any]:
     """Fetch a single automation. 404 if not visible to the caller."""
-    from orchestrator.main import postgres_db  # late import: avoid circular
-
-    caller = await require_approved_user(request, postgres_db)
-    return await _resolve_automation_or_404(postgres_db, automation_id, caller, request)
+    caller = await require_approved_user(request, dependencies.store)
+    return await _resolve_automation_or_404(
+        dependencies.store, automation_id, caller, request
+    )
 
 
 @router.patch("/{automation_id}")
 async def update_automation(
-    request: Request, automation_id: str, body: AutomationUpdate
+    request: Request,
+    automation_id: str,
+    body: AutomationUpdate,
+    *,
+    dependencies: AutomationsDependencies = Depends(get_automations_dependencies),
 ) -> dict[str, Any]:
     """Partial update. Recomputes ``next_run_at`` when cron / tz / enabled
     changes; pause (enabled=false) clears it.
     """
-    from orchestrator.main import postgres_db  # late import: avoid circular
-
-    caller = await require_approved_user(request, postgres_db)
+    caller = await require_approved_user(request, dependencies.store)
     row = await _resolve_automation_or_404(
-        postgres_db, automation_id, caller, request, min_project_role="editor"
+        dependencies.store, automation_id, caller, request, min_project_role="editor"
     )
 
     fields = body.model_dump(exclude_unset=True)
@@ -279,11 +312,7 @@ async def update_automation(
     # Same reason as create: this override is replayed into db.create_job on
     # every fire, bypassing the POST /api/jobs validator entirely.
     if "config_override" in fields:
-        from orchestrator.main import (
-            _with_validated_tool_overrides,
-        )  # late import: circular
-
-        fields["config_override"] = _with_validated_tool_overrides(
+        fields["config_override"] = with_validated_tool_overrides(
             fields["config_override"]
         )
 
@@ -311,7 +340,7 @@ async def update_automation(
         effective_expert_id = fields.get("expert_id", row.get("expert_id"))
         try:
             fields["expert"] = await validate_automation_expert_selection(
-                postgres_db,
+                dependencies.store,
                 owner_id=str(row["owner_id"]),
                 project_id=str(row["project_id"]) if row.get("project_id") else None,
                 expert=effective_expert,
@@ -332,24 +361,27 @@ async def update_automation(
         else:
             fields["next_run_at"] = None
 
-    updated = await postgres_db.update_automation(automation_id, **fields)
+    updated = await dependencies.store.update_automation(automation_id, **fields)
     return updated or row
 
 
 @router.delete(
     "/{automation_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None
 )
-async def delete_automation(request: Request, automation_id: str) -> None:
+async def delete_automation(
+    request: Request,
+    automation_id: str,
+    *,
+    dependencies: AutomationsDependencies = Depends(get_automations_dependencies),
+) -> None:
     """Hard-delete. Past spawned jobs survive — the back-link in
     ``jobs.context['automation_id']`` becomes orphaned, intentional.
     """
-    from orchestrator.main import postgres_db  # late import: avoid circular
-
-    caller = await require_approved_user(request, postgres_db)
+    caller = await require_approved_user(request, dependencies.store)
     await _resolve_automation_or_404(
-        postgres_db, automation_id, caller, request, min_project_role="editor"
+        dependencies.store, automation_id, caller, request, min_project_role="editor"
     )
-    await postgres_db.delete_automation(automation_id)
+    await dependencies.store.delete_automation(automation_id)
 
 
 # ---------------------------------------------------------------------------
@@ -358,27 +390,28 @@ async def delete_automation(request: Request, automation_id: str) -> None:
 
 
 @router.post("/{automation_id}/run-now")
-async def run_now(request: Request, automation_id: str) -> dict[str, Any]:
+async def run_now(
+    request: Request,
+    automation_id: str,
+    *,
+    dependencies: AutomationsDependencies = Depends(get_automations_dependencies),
+) -> dict[str, Any]:
     """Fire the automation immediately, regardless of schedule.
 
     Does NOT touch ``next_run_at`` — the next scheduled fire still happens
     on time. Useful for "test this thing I just edited" and for the
     cockpit's Run-now button.
     """
-    from orchestrator.main import (  # late import: avoid circular
-        _trigger_dispatch,
-        gitea_client,
-        main_cloud_router,
-        postgres_db,
-    )
     from orchestrator.services.job_provisioning import provision_job_repo
 
-    caller = await require_approved_user(request, postgres_db)
+    caller = await require_approved_user(request, dependencies.store)
     row = await _resolve_automation_or_404(
-        postgres_db, automation_id, caller, request, min_project_role="editor"
+        dependencies.store, automation_id, caller, request, min_project_role="editor"
     )
 
-    job = await create_job_from_automation(postgres_db, row, trigger_kind="manual")
+    job = await create_job_from_automation(
+        dependencies.store, row, trigger_kind="manual"
+    )
     if job is None:
         # The service skips-and-logs rather than raising, because its other
         # caller is a cron tick with nobody to answer. Run-now DOES have a
@@ -392,9 +425,9 @@ async def run_now(request: Request, automation_id: str) -> dict[str, Any]:
     try:
         await provision_job_repo(
             job_row=job,
-            gitea_client=gitea_client,
-            postgres_db=postgres_db,
-            main_cloud_router=main_cloud_router,
+            gitea_client=dependencies.gitea_client,
+            postgres_db=dependencies.store,
+            main_cloud_router=dependencies.main_cloud_router,
         )
     except Exception:
         logger.exception(
@@ -405,25 +438,28 @@ async def run_now(request: Request, automation_id: str) -> dict[str, Any]:
     # Best-effort nudge to the auto-assign dispatcher so the new job
     # doesn't sit idle for up to 30s waiting on the scheduled tick.
     try:
-        _trigger_dispatch()
+        dependencies.trigger_dispatch()
     except Exception:
-        logger.exception("run-now: _trigger_dispatch raised (non-fatal)")
+        logger.exception("run-now: trigger_dispatch raised (non-fatal)")
 
     return {"automation_id": automation_id, "job": job}
 
 
 @router.post("/{automation_id}/pause")
-async def pause_automation(request: Request, automation_id: str) -> dict[str, Any]:
+async def pause_automation(
+    request: Request,
+    automation_id: str,
+    *,
+    dependencies: AutomationsDependencies = Depends(get_automations_dependencies),
+) -> dict[str, Any]:
     """Set ``enabled=false`` and clear ``next_run_at`` so the dispatcher
     stops considering this automation. Reversible via ``resume``.
     """
-    from orchestrator.main import postgres_db  # late import: avoid circular
-
-    caller = await require_approved_user(request, postgres_db)
+    caller = await require_approved_user(request, dependencies.store)
     await _resolve_automation_or_404(
-        postgres_db, automation_id, caller, request, min_project_role="editor"
+        dependencies.store, automation_id, caller, request, min_project_role="editor"
     )
-    return await postgres_db.update_automation(
+    return await dependencies.store.update_automation(
         automation_id,
         enabled=False,
         next_run_at=None,
@@ -431,16 +467,19 @@ async def pause_automation(request: Request, automation_id: str) -> dict[str, An
 
 
 @router.post("/{automation_id}/resume")
-async def resume_automation(request: Request, automation_id: str) -> dict[str, Any]:
+async def resume_automation(
+    request: Request,
+    automation_id: str,
+    *,
+    dependencies: AutomationsDependencies = Depends(get_automations_dependencies),
+) -> dict[str, Any]:
     """Set ``enabled=true`` and recompute ``next_run_at`` from now."""
-    from orchestrator.main import postgres_db  # late import: avoid circular
-
-    caller = await require_approved_user(request, postgres_db)
+    caller = await require_approved_user(request, dependencies.store)
     row = await _resolve_automation_or_404(
-        postgres_db, automation_id, caller, request, min_project_role="editor"
+        dependencies.store, automation_id, caller, request, min_project_role="editor"
     )
     next_run = compute_initial_next_run(row["cron_expr"], row["timezone"])
-    return await postgres_db.update_automation(
+    return await dependencies.store.update_automation(
         automation_id,
         enabled=True,
         next_run_at=next_run,
@@ -452,14 +491,14 @@ async def list_runs(
     request: Request,
     automation_id: str,
     limit: int = Query(50, ge=1, le=500),
+    *,
+    dependencies: AutomationsDependencies = Depends(get_automations_dependencies),
 ) -> list[dict[str, Any]]:
     """List jobs spawned by this automation, newest first.
 
     Joins on ``jobs.context->>'automation_id'`` which the dispatcher
     writes at fire time (``services/automations.py``).
     """
-    from orchestrator.main import postgres_db  # late import: avoid circular
-
-    caller = await require_approved_user(request, postgres_db)
-    await _resolve_automation_or_404(postgres_db, automation_id, caller, request)
-    return await postgres_db.list_automation_runs(automation_id, limit=limit)
+    caller = await require_approved_user(request, dependencies.store)
+    await _resolve_automation_or_404(dependencies.store, automation_id, caller, request)
+    return await dependencies.store.list_automation_runs(automation_id, limit=limit)

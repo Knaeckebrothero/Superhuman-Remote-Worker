@@ -50,6 +50,8 @@ from orchestrator.services.pinned_k8s_effect import (
 from orchestrator.services.persistent_recycler import (
     PersistentPodObservation,
     PersistentThreadRecycler,
+    persistent_recycle_view,
+    read_recycle_record,
 )
 from agent.database.postgres_db import PostgresDB as AgentPostgresDB
 from shared.persistent_input_delivery import (
@@ -1326,7 +1328,9 @@ async def _recycle_state(db: PostgresDB, thread_id: str):
     metadata = row["metadata"]
     if isinstance(metadata, str):
         metadata = json.loads(metadata)
-    return metadata["agent_pod"]["recycle"], metadata
+    # Resolved, not reached into: the record's durable home is a sibling of
+    # `agent_pod`, which a retired endpoint no longer leaves behind.
+    return read_recycle_record(metadata), metadata
 
 
 async def _runtime_identity(db: PostgresDB, thread_id: str) -> tuple[str, str]:
@@ -7277,6 +7281,202 @@ async def test_recycler_legacy_thread_recovers_through_registration_route(db, ca
     assert live_grants == 1
 
 
+async def _retire_runtime_to_suspended(db: PostgresDB, ids: dict) -> None:
+    """Drive the REAL non-permanent retirement that parks a pinned runtime.
+
+    This is the transition a lost Pod actually produces: ``_cleanup_pinned_thread_retirement``
+    runs, and because the retirement is not permanent the orchestrator settles
+    through :meth:`settle_pinned_thread_retirement`, whose UPDATE ends with
+    ``metadata = COALESCE(metadata,'{}'::jsonb) - 'agent_pod'``. The thread
+    survives in ``suspended``; its physical endpoint authority does not.
+
+    Deliberately NOT a hand-written row: an impossible fixture would prove
+    nothing about the state the watchdog actually meets.
+    """
+
+    authority = await db.begin_pinned_thread_retirement(
+        ids["thread"], permanent=False, settle_status="suspended"
+    )
+    await _authorize_and_ack(db, ids, authority, settle_status="suspended")
+    assert await db.settle_pinned_thread_retirement(
+        ids["thread"],
+        token=authority["token"],
+        generation=authority["generation"],
+        final_status="suspended",
+    )
+    parked = await db.get_thread(ids["thread"])
+    # The precondition the watchdog meets, asserted rather than assumed.
+    assert parked["status"] == "suspended"
+    assert parked["agent_id"] is None
+    assert (_json(parked["metadata"]) or {}).get("agent_pod") in (None, {})
+
+
+@pytest.mark.asyncio
+async def test_missing_pod_after_retirement_records_one_blocked_generation(db):
+    """A runtime lost AFTER its endpoint was retired is still recordable.
+
+    The Officer watchdog's third duty submits ``reason="missing_pod"`` with no
+    observation. Before this correction the recycler rebuilt a partial
+    ``agent_pod`` to carry its record and migration 0185's
+    ``threads_agent_pod_authority_shape`` trigger rejected the write, so the
+    tick raised every 60s and nothing durable was ever written.
+    """
+
+    ids = await _seed(db, protected_agent_pod=True, workspace_claim=False)
+    await _retire_runtime_to_suspended(db, ids)
+
+    provisioner = FakeProvisioner()
+    recycler = PersistentThreadRecycler(db=db, provisioner=provisioner)
+    result = await recycler.request_and_reconcile(
+        thread_id=ids["thread"],
+        reason="missing_pod",
+        expected_build_sha="new-build",
+        expected_project_id=ids["project"],
+    )
+
+    # One durable generation, an explicit outcome, and no forged recovery.
+    assert result.generation
+    assert result.state == "blocked"
+    state, _ = await _recycle_state(db, ids["thread"])
+    assert state["generation"] == result.generation
+    assert state["reason"] == "missing_pod"
+    assert state["phase"] == "blocked"
+    assert state["last_failure"]["class"] == "pinned_pod_protection_unresolved"
+    assert provisioner.create_calls == 0
+
+    # The authority invariant is untouched: no partial Pod marker was invented.
+    thread = await db.get_thread(ids["thread"])
+    assert (_json(thread["metadata"]) or {}).get("agent_pod") in (None, {})
+    assert thread["agent_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_missing_pod_after_retirement_is_durable_and_single_generation(db):
+    """Concurrency, repetition and a cold reader all see the same one record."""
+
+    ids = await _seed(db, protected_agent_pod=True, workspace_claim=False)
+    await _retire_runtime_to_suspended(db, ids)
+
+    provisioner = FakeProvisioner()
+    recycler = PersistentThreadRecycler(db=db, provisioner=provisioner)
+    results = await asyncio.gather(
+        *(
+            recycler.request_and_reconcile(
+                thread_id=ids["thread"],
+                reason="missing_pod",
+                expected_build_sha="new-build",
+                expected_project_id=ids["project"],
+            )
+            for _ in range(4)
+        )
+    )
+    # A later tick is the watchdog's real cadence, not a second incident.
+    later = await recycler.request_and_reconcile(
+        thread_id=ids["thread"],
+        reason="missing_pod",
+        expected_build_sha="new-build",
+        expected_project_id=ids["project"],
+    )
+
+    generations = {r.generation for r in [*results, later] if r.generation}
+    assert len(generations) == 1
+    assert provisioner.create_calls == 0
+
+    # Durable through a process that never saw the write.
+    cold = PersistentThreadRecycler(db=db, provisioner=FakeProvisioner())
+    reread = await cold._read_recycle(ids["thread"])
+    assert reread["generation"] == generations.pop()
+    assert reread["reason"] == "missing_pod"
+    assert reread["phase"] == "blocked"
+
+    # And it is observable through the same projection the Post card reads.
+    thread = await db.get_thread(ids["thread"])
+    view = persistent_recycle_view(thread["metadata"])
+    assert view["recycle_phase"] == "blocked"
+    assert view["last_failure"] == "pinned_pod_protection_unresolved"
+
+
+@pytest.mark.asyncio
+async def test_malformed_nonempty_pod_authority_is_still_rejected(db):
+    """The invariant the correction routes around, not through.
+
+    Moving the record out of ``agent_pod`` must not make a partial marker
+    acceptable: a non-empty ``agent_pod`` still owes both a name and a UID.
+    """
+
+    ids = await _seed(db, protected_agent_pod=True, workspace_claim=False)
+    await _retire_runtime_to_suspended(db, ids)
+
+    async with db.acquire() as conn:
+        for marker in (
+            {"recycle": {"generation": "g", "phase": "blocked"}},
+            {"pod_name": f"persistent-{ids['thread'][:12]}"},
+            {"pod_uid": "some-uid"},
+            {"observed_build_sha": "x", "expected_build_sha": "y"},
+        ):
+            with pytest.raises(asyncpg.CheckViolationError) as refused:
+                await conn.execute(
+                    "UPDATE threads SET metadata=jsonb_set("
+                    "COALESCE(metadata,'{}'::jsonb),'{agent_pod}',$2::jsonb,true) "
+                    "WHERE id=$1::uuid",
+                    UUID(ids["thread"]),
+                    json.dumps(marker),
+                )
+            assert (
+                refused.value.constraint_name == "threads_agent_pod_authority_shape"
+            ), marker
+
+    # And the shape the correction actually writes is accepted, because it
+    # never touches `agent_pod` at all.
+    recycler = PersistentThreadRecycler(db=db, provisioner=FakeProvisioner())
+    result = await recycler.request_and_reconcile(
+        thread_id=ids["thread"],
+        reason="missing_pod",
+        expected_build_sha="new-build",
+        expected_project_id=ids["project"],
+    )
+    assert result.generation
+    thread = await db.get_thread(ids["thread"])
+    assert (_json(thread["metadata"]) or {}).get("agent_pod") in (None, {})
+
+
+@pytest.mark.asyncio
+async def test_recycle_record_survives_a_retirement_that_clears_agent_pod(db):
+    """Ordering the other way round: request first, retirement second.
+
+    The record must outlive the physical endpoint it was once nested in, or a
+    retirement racing an in-flight recycle silently erases the generation.
+    """
+
+    ids = await _seed(db, protected_agent_pod=True, workspace_claim=False)
+    provisioner = FakeProvisioner()
+    recycler = PersistentThreadRecycler(db=db, provisioner=provisioner)
+    observation = PersistentPodObservation(
+        thread_id=ids["thread"],
+        pod_name=f"persistent-{ids['thread'][:12]}",
+        pod_uid="old-pod",
+        build_sha="old-build",
+        phase="Running",
+        ready=True,
+        terminating=False,
+        labels={},
+    )
+    first = await recycler.request_and_reconcile(
+        thread_id=ids["thread"],
+        reason="image_drift",
+        expected_build_sha="new-build",
+        observation=observation,
+        expected_project_id=ids["project"],
+    )
+    assert first.generation
+
+    await _retire_runtime_to_suspended(db, ids)
+
+    surviving = await recycler._read_recycle(ids["thread"])
+    assert surviving["generation"] == first.generation
+    assert surviving["reason"] == "image_drift"
+
+
 @pytest.mark.asyncio
 async def test_concurrent_missing_pod_does_not_forge_process_zero(db):
     ids = await _seed(db, protected_agent_pod=True)
@@ -8378,7 +8578,7 @@ async def test_retryable_failure_keeps_hold_and_pages_once_before_convergence(db
             UPDATE threads
                SET metadata = jsonb_set(
                    metadata,
-                   '{agent_pod,recycle,next_retry_at}',
+                   '{persistent_recycle,next_retry_at}',
                    to_jsonb((now() - interval '1 minute')::text))
              WHERE id=$1
             """,
@@ -8424,7 +8624,7 @@ async def test_unsettled_old_runtime_times_out_without_forced_deletion(db):
             UPDATE threads
                SET metadata = jsonb_set(
                    metadata,
-                   '{agent_pod,recycle,drain_wait_started_at}',
+                   '{persistent_recycle,drain_wait_started_at}',
                    to_jsonb((now() - interval '6 minutes')::text))
              WHERE id=$1
             """,
@@ -8627,7 +8827,7 @@ async def test_notification_claim_crash_reclaims_once_and_success_is_terminal(db
             UPDATE threads
                SET metadata = jsonb_set(
                    metadata,
-                   '{agent_pod,recycle,notification,claim_expires_at}',
+                   '{persistent_recycle,notification,claim_expires_at}',
                    to_jsonb((now() - interval '1 minute')::text))
              WHERE id=$1
             """,
@@ -8740,7 +8940,7 @@ async def test_failed_notification_retries_after_bounded_backoff(db):
             UPDATE threads
                SET metadata = jsonb_set(
                    metadata,
-                   '{agent_pod,recycle,notification,next_retry_at}',
+                   '{persistent_recycle,notification,next_retry_at}',
                    to_jsonb((now() - interval '1 minute')::text))
              WHERE id=$1
             """,
@@ -8928,3 +9128,79 @@ async def test_two_desired_image_changes_chain_without_releasing_hold(db):
         "example.test/agent:sha-build-two",
         "example.test/agent:sha-build-three",
     ]
+
+
+@pytest.mark.asyncio
+async def test_preparation_stage_preserves_deadline_and_allows_session_end(db):
+    from orchestrator.services.vm_provisioner import VMProvisioner
+    from shared.workspace_preparation import preparation_request
+
+    ids = await _seed(db, bind_agent=False, publish_agent_pod=False)
+    before = await db.get_thread(ids["thread"])
+    runtime = str(before["runtime_generation"])
+    preparation = preparation_request(
+        {"image": "registry.example/base:v1", "prepare": []},
+        scope_kind="Account",
+        scope_uid=str(before["user_id"]),
+        allocation_id=ids["thread"],
+        owner_kind="session",
+        runtime_generation=runtime,
+    )
+    context = VMProvisioner._fresh_provision_ctx()
+    context.update(
+        status="provisioning",
+        preparation_request=preparation,
+        preparation_wait_started_at=123.0,
+    )
+    kwargs = dict(
+        expected_runtime_generation=runtime,
+        expected_agent_id=None,
+        expected_attach_token=None,
+    )
+    stage = await db.begin_pinned_thread_vm_provisioning(
+        ids["thread"],
+        expected_vm_context=None,
+        provision_context=context,
+        preparation_only=True,
+        **kwargs,
+    )
+    assert stage["preparation_only"] is True
+    metadata = _json((await db.get_thread(ids["thread"]))["metadata"])
+    assert not metadata.get("vm")
+    assert any(
+        r["entity_id"] == ids["thread"]
+        for r in await db.list_thread_vm_readiness_candidates()
+    )
+    assert (
+        await db.begin_pinned_thread_vm_provisioning(
+            ids["thread"],
+            expected_vm_context=None,
+            provision_context=context,
+            preparation_only=True,
+            **kwargs,
+        )
+        == stage
+    )
+    assert stage["preparation_wait_started_at"] == 123.0
+    assert await db.merge_thread_preparation_if_current(
+        ids["thread"], runtime, stage, {"preparation": {"phase": "Building"}}
+    )
+    retired = await db.begin_pinned_thread_retirement(ids["thread"], permanent=True)
+    assert retired["state"] == "pending"
+    assert not await db.begin_pinned_thread_vm_provisioning(
+        ids["thread"],
+        expected_vm_context=None,
+        provision_context=context,
+        preparation_only=True,
+        **kwargs,
+    )
+    assert not await db.merge_thread_preparation_if_current(
+        ids["thread"], runtime, stage, {"status": "ready"}
+    )
+    cancellations = await db.list_vm_preparation_cancellations()
+    assert any(r["entity_id"] == ids["thread"] for r in cancellations)
+    await db.acknowledge_vm_preparation_cancelled("thread", ids["thread"], preparation)
+    assert not any(
+        r["entity_id"] == ids["thread"]
+        for r in await db.list_vm_preparation_cancellations()
+    )

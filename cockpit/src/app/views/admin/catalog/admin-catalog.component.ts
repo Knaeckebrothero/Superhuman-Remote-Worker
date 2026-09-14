@@ -1,5 +1,6 @@
 import {ChangeDetectionStrategy, Component, computed, DestroyRef, effect, ElementRef, inject, OnInit, signal, viewChild} from '@angular/core';
 import {takeUntilDestroyed} from '@angular/core/rxjs-interop';
+import {TranslocoService} from '@jsverse/transloco';
 import {AdminModelsService} from '../../../core/services/admin-models.service';
 import {AdminProvidersService} from '../../../core/services/admin-providers.service';
 import {AdminModelsCoordinatorService} from '../models/admin-models-coordinator.service';
@@ -23,6 +24,7 @@ import {AppSelectComponent} from '../../../ui/select';
 import {AppCheckboxComponent} from '../../../ui/checkbox';
 import {AppFormFieldComponent} from '../../../ui/form-field';
 import {AppBadgeComponent} from '../../../ui/badge';
+import {HelmManagedBadgeComponent} from '../../../ui/helm-managed-badge/helm-managed-badge.component';
 import {AppDialogComponent} from '../../../ui/dialog';
 import {formatTokens, parseTokens} from '../../../core/util/format-tokens';
 
@@ -196,6 +198,7 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [
+    HelmManagedBadgeComponent,
     AppButtonComponent,
     AppInputComponent,
     AppSelectComponent,
@@ -240,7 +243,10 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
                   </div>
                   @for (m of group.rows; track m.id) {
                     <div class="model-row">
-                      <span class="col-display">{{ m.display_label }}</span>
+                      <span class="col-display">
+                        {{ m.display_label }}
+                        <app-helm-managed-badge [managed]="m.managed_by_helm" [drift]="m.helm_drift" />
+                      </span>
                       <span class="col-id mono">{{ m.model_id }}</span>
                       <span class="col-capability">
                         <span class="cap-badges">
@@ -1134,6 +1140,7 @@ export class AdminCatalogComponent implements OnInit {
   readonly providers = inject(AdminProvidersService);
   private readonly coordinator = inject(AdminModelsCoordinatorService);
   private readonly destroyRef = inject(DestroyRef);
+  private readonly transloco = inject(TranslocoService);
 
   private readonly discoverPaneRef = viewChild<ElementRef<HTMLElement>>('discoverPane');
 
@@ -1552,7 +1559,18 @@ export class AdminCatalogComponent implements OnInit {
       });
   }
 
+  /**
+   * Rows declared with `reconcile: true` in the deployment's Helm values are
+   * re-applied on the next `helm upgrade`; an edit here is temporary and the
+   * admin should say so knowingly.
+   */
+  confirmHelmOverride(model: CatalogModel | null | undefined): boolean {
+    if (!model?.managed_by_helm) return true;
+    return confirm(this.transloco.translate('admin.helm.confirmOverride'));
+  }
+
   toggleEnabled(model: CatalogModel, checked: boolean): void {
+    if (!this.confirmHelmOverride(model)) return;
     this.models.updateModel(model.id, {enabled: checked}).subscribe();
   }
 
@@ -1591,6 +1609,7 @@ export class AdminCatalogComponent implements OnInit {
   savePricing(): void {
     const row = this.pricingRow();
     if (!row) return;
+    if (!this.confirmHelmOverride(row)) return;
     const mode = this.pricingMode();
     const id = this.pricingDraft().trim();
     if (mode === 'map' && !id) {
@@ -1616,6 +1635,7 @@ export class AdminCatalogComponent implements OnInit {
 
   deleteRow(model: CatalogModel): void {
     if (!confirm(`Delete "${model.display_label}" from the catalog?`)) return;
+    if (!this.confirmHelmOverride(model)) return;
     this.models.deleteModel(model.id).subscribe((res) => {
       if (res.warning) alert(res.warning);
     });

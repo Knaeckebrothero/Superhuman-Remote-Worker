@@ -14,6 +14,13 @@ from typing import Any, Protocol, TYPE_CHECKING
 
 from fastapi import HTTPException
 
+from shared.helm_provenance import (
+    RECONCILE_MANIFEST_KEY,
+    SOURCE_UI,
+    annotate,
+    model_identity,
+)
+
 from orchestrator.schemas.provider_catalog import (
     AdminDefaultModelSet,
     ApiKeySet,
@@ -44,6 +51,9 @@ class ProviderCatalogStore(Protocol):
         key_prefix: str,
         label: str | None = None,
         seeded_from: str | None = None,
+        *,
+        source: str | None = None,
+        helm_value_hash: str | None = None,
     ) -> dict[str, Any]: ...
     async def delete_system_api_key(self, provider: str) -> bool: ...
     async def get_system_api_key_discovery_cache(
@@ -167,14 +177,17 @@ def _validate_llm_endpoint_url(base_url: str, allow_insecure: bool) -> str:
     return parsed.geturl()
 
 
-def _serialize_endpoint(row: dict[str, Any]) -> dict[str, Any]:
+def _serialize_endpoint(
+    row: dict[str, Any], *, manifest: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """Shape an endpoint row for the API response (key_prefix only, no full key).
 
     The ``models`` key is kept on the response shape for Cockpit
     compatibility but is always empty after the catalog flip — model
-    offerings live in the admin-curated ``models`` table now.
+    offerings live in the admin-curated ``models`` table now. ``manifest``
+    (the ``helm.reconcile`` row) drives the Helm-managed annotation.
     """
-    return {
+    out = {
         "id": str(row["id"]),
         "label": row["label"],
         "base_url": row["base_url"],
@@ -185,12 +198,18 @@ def _serialize_endpoint(row: dict[str, Any]) -> dict[str, Any]:
         "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
         "updated_at": row["updated_at"].isoformat() if row.get("updated_at") else None,
         "models": [],
+        "source": row.get("source"),
     }
+    return annotate(
+        out, manifest=manifest, section="systemEndpoints", identity=row["label"]
+    )
 
 
-def _serialize_system_api_key(row: dict[str, Any]) -> dict[str, Any]:
+def _serialize_system_api_key(
+    row: dict[str, Any], *, manifest: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """Shape a system_api_keys row for API responses (prefix only)."""
-    return {
+    out = {
         "id": str(row["id"]),
         "provider": row["provider"],
         "key_prefix": row.get("key_prefix"),
@@ -198,7 +217,19 @@ def _serialize_system_api_key(row: dict[str, Any]) -> dict[str, Any]:
         "seeded_from": row.get("seeded_from"),
         "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
         "updated_at": row["updated_at"].isoformat() if row.get("updated_at") else None,
+        "source": row.get("source"),
     }
+    return annotate(
+        out, manifest=manifest, section="systemApiKeys", identity=row["provider"]
+    )
+
+
+def _manifest_value(row: Any) -> dict[str, Any] | None:
+    """The ``helm.reconcile`` manifest as a dict, or None when never written."""
+    if not isinstance(row, dict):
+        return None
+    value = row.get("value")
+    return value if isinstance(value, dict) else None
 
 
 def _endpoint_is_subscription_proxy(endpoint: Mapping[str, Any]) -> bool:
@@ -217,10 +248,16 @@ class ProviderCatalogService:
     probe: EndpointProbe
     subscriptions: SubscriptionDiscovery
 
+    async def _reconcile_manifest(self) -> dict[str, Any] | None:
+        return _manifest_value(
+            await self.store.get_system_setting(RECONCILE_MANIFEST_KEY)
+        )
+
     async def list_provider_keys(self) -> list[dict[str, Any]]:
         """List system-scoped provider API keys (prefix only, no full keys)."""
+        manifest = await self._reconcile_manifest()
         rows = await self.store.list_system_api_keys()
-        return [_serialize_system_api_key(r) for r in rows]
+        return [_serialize_system_api_key(r, manifest=manifest) for r in rows]
 
     async def set_provider_key(self, provider: str, body: ApiKeySet) -> dict[str, Any]:
         """Set or rotate the system-level API key for a provider.
@@ -244,9 +281,10 @@ class ProviderCatalogService:
             api_key=body.api_key,
             key_prefix=body.api_key[:8],
             label=body.label,
+            source=SOURCE_UI,
         )
         await self._maybe_schedule_discovery(provider, body.api_key)
-        return _serialize_system_api_key(row)
+        return _serialize_system_api_key(row, manifest=await self._reconcile_manifest())
 
     async def delete_provider_key(self, provider: str) -> dict[str, str]:
         """Remove the system-level key for a provider."""
@@ -375,8 +413,9 @@ class ProviderCatalogService:
 
     async def list_provider_endpoints(self) -> list[dict[str, Any]]:
         """List system-scoped LLM endpoints with their models."""
+        manifest = await self._reconcile_manifest()
         rows = await self.store.list_system_llm_endpoints()
-        return [_serialize_endpoint(r) for r in rows]
+        return [_serialize_endpoint(r, manifest=manifest) for r in rows]
 
     async def create_provider_endpoint(self, body: LlmEndpointCreate) -> dict[str, Any]:
         """Create a new system-scoped LLM endpoint (visible to every user)."""
@@ -388,6 +427,7 @@ class ProviderCatalogService:
                 base_url=base_url,
                 api_key=body.api_key,
                 key_prefix=key_prefix,
+                source=SOURCE_UI,
             )
         except Exception as e:
             if "uq_llm_endpoint_label_system" in str(e):
@@ -397,7 +437,7 @@ class ProviderCatalogService:
                 )
             raise
         row["models"] = []
-        return _serialize_endpoint(row)
+        return _serialize_endpoint(row, manifest=await self._reconcile_manifest())
 
     async def update_provider_endpoint(
         self, endpoint_id: str, body: LlmEndpointUpdate
@@ -414,11 +454,12 @@ class ProviderCatalogService:
             api_key=body.api_key,
             key_prefix=key_prefix,
             clear_api_key=body.clear_api_key and body.api_key is None,
+            source=SOURCE_UI,
         )
         if row is None:
             raise HTTPException(status_code=404, detail="System endpoint not found")
         row["models"] = []
-        return _serialize_endpoint(row)
+        return _serialize_endpoint(row, manifest=await self._reconcile_manifest())
 
     async def delete_provider_endpoint(self, endpoint_id: str) -> dict[str, str]:
         deleted = await self.store.delete_system_llm_endpoint(endpoint_id)
@@ -550,6 +591,72 @@ class ProviderCatalogService:
                 ),
             )
         await self.store.set_default_llm_model(
-            kind, body.model or None, updated_by=str(admin.get("id"))
+            kind, body.model or None, updated_by=str(admin.get("id")), source=SOURCE_UI
         )
         return {"kind": kind, "model": await self.store.get_default_llm_model(kind)}
+
+    async def helm_managed_overview(self) -> dict[str, Any]:
+        """Everything Admin → Models needs to badge Helm-managed rows.
+
+        Returns the ``helm.reconcile`` manifest the seed Job last wrote plus
+        per-row provenance for keys, endpoints, catalog rows and default pins
+        (``source``, ``managed_by_helm``, ``helm_drift``). Rows are the same
+        shapes the list endpoints return, so the cockpit can merge by id.
+        """
+        manifest = await self._reconcile_manifest()
+        keys = [
+            _serialize_system_api_key(r, manifest=manifest)
+            for r in await self.store.list_system_api_keys()
+        ]
+        endpoint_rows = await self.store.list_system_llm_endpoints()
+        endpoints = [_serialize_endpoint(r, manifest=manifest) for r in endpoint_rows]
+        label_by_id = {str(r["id"]): r["label"] for r in endpoint_rows}
+        models = []
+        for row in await self.store.list_models():
+            anchor = (
+                label_by_id.get(str(row["provider_ref"]), str(row["provider_ref"]))
+                if row.get("provider_kind") == "endpoint"
+                else str(row["provider_ref"])
+            )
+            models.append(
+                annotate(
+                    {
+                        "id": str(row["id"]),
+                        "provider_kind": row.get("provider_kind"),
+                        "provider_ref": str(row.get("provider_ref")),
+                        "model_id": row.get("model_id"),
+                        "source": row.get("source"),
+                    },
+                    manifest=manifest,
+                    section="models",
+                    identity=model_identity(
+                        row.get("provider_kind") or "system", anchor, row["model_id"]
+                    ),
+                )
+            )
+        defaults: dict[str, Any] = {}
+        for kind in sorted(VALID_DEFAULT_MODEL_KINDS):
+            setting = await self.store.get_system_setting(f"llm.default_{kind}_model")
+            model = None
+            if setting and isinstance(setting.get("value"), dict):
+                model = setting["value"].get("model") or None
+            defaults[kind] = annotate(
+                {"model": model, "source": (setting or {}).get("source")},
+                manifest=manifest,
+                section="defaults",
+                identity=kind,
+            )
+        return {
+            "manifest": manifest
+            or {
+                "systemApiKeys": [],
+                "systemEndpoints": [],
+                "models": [],
+                "defaults": [],
+            },
+            "applied_at": (manifest or {}).get("applied_at"),
+            "keys": keys,
+            "endpoints": endpoints,
+            "models": models,
+            "defaults": defaults,
+        }

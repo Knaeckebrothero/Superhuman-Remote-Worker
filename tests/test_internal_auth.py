@@ -1062,14 +1062,21 @@ class TestPureInternalEndpoints:
 
     @pytest.mark.asyncio
     async def test_complete_job_without_key_401(self, fake_request, job_a):
-        from orchestrator.main import JobCompleteRequest, complete_job
+        import orchestrator.main as orch_main
+        from orchestrator.routers.job_completion import complete_job
+        from orchestrator.schemas.job_runtime import JobCompleteRequest
 
         body = JobCompleteRequest(
             should_stop=True, goal_achieved=False, error=None, freeze_data=None
         )
         with patch.object(access_module, "_INTERNAL_KEY", "secret"):
             with pytest.raises(HTTPException) as exc:
-                await complete_job(fake_request, str(job_a["id"]), body)
+                await complete_job(
+                    fake_request,
+                    str(job_a["id"]),
+                    body,
+                    dependencies=orch_main._job_completion_dependencies(),
+                )
         assert exc.value.status_code == 401
 
     @pytest.mark.asyncio

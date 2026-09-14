@@ -18,13 +18,20 @@ from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
-import orchestrator.main as orch_main
-from orchestrator.main import list_officers
+from orchestrator.routers import officers as officers_router
+from orchestrator.services import officer_post_views
+from orchestrator.services.officer_post_views import (
+    OfficerPostViewDependencies,
+    list_officers as list_officers_service,
+)
 
 PROJECT_A = str(uuid4())
 PROJECT_B = str(uuid4())
 THREAD_A = str(uuid4())
+USER = {"id": "u1"}
 
 
 def _row(**over) -> dict:
@@ -55,30 +62,71 @@ def _row(**over) -> dict:
     return row
 
 
+def _deps(store, *, auto_pull_release_enabled=False) -> OfficerPostViewDependencies:
+    """The roster's own collaborators. The release fence is a callable on the
+    dependency object now, so a suite steers it here rather than by rebinding
+    ``OFFICER_AUTO_PULL_RELEASE_ENABLED`` on ``orchestrator.main``."""
+    return OfficerPostViewDependencies(
+        store=store,
+        vector_store=MagicMock(name="vector_db"),
+        usage_ledger=MagicMock(name="usage_ledger"),
+        persistent_provisioner=MagicMock(name="persistent_provisioner"),
+        auto_pull_release_enabled=lambda: auto_pull_release_enabled,
+        persistent_agent_reconciliation_enabled=lambda: False,
+        find_open_conference_thread=AsyncMock(return_value=None),
+    )
+
+
+async def list_officers(request, store, *, auto_pull_release_enabled=False):
+    """Drive the roster read through its owner with an explicit principal —
+    the router resolves both from the application and the gate."""
+    return await list_officers_service(
+        request,
+        dependencies=_deps(store, auto_pull_release_enabled=auto_pull_release_enabled),
+        user=USER,
+    )
+
+
 @pytest.fixture
-def db(monkeypatch):
-    db = SimpleNamespace(
+def db():
+    return SimpleNamespace(
         list_project_officer_posts=AsyncMock(return_value=[_row()]),
         get_or_create_project_officer=AsyncMock(),
     )
-    monkeypatch.setattr(orch_main, "postgres_db", db)
-    return db
 
 
 @pytest.fixture
-def as_user(monkeypatch):
+def visible(monkeypatch):
+    """Point the scope read at the module that actually performs it."""
+
+    def _set(value):
+        monkeypatch.setattr(
+            officer_post_views,
+            "user_visible_project_ids",
+            AsyncMock(return_value=value),
+        )
+
+    return _set
+
+
+def _client(store, monkeypatch, *, auto_pull_release_enabled=False) -> TestClient:
+    """The real route on a bare application, so the wiring stays covered: the
+    router resolves its dependencies from ``app.state`` and runs the gate."""
     monkeypatch.setattr(
-        orch_main, "require_approved_user", AsyncMock(return_value={"id": "u1"})
+        officers_router, "require_approved_user", AsyncMock(return_value=USER)
     )
-
-
-@pytest.mark.asyncio
-async def test_the_roster_reports_the_post_at_a_glance(db, as_user, monkeypatch):
-    monkeypatch.setattr(
-        orch_main, "user_visible_project_ids", AsyncMock(return_value={PROJECT_A})
+    app = FastAPI()
+    app.state.officer_post_view_dependencies_factory = lambda: _deps(
+        store, auto_pull_release_enabled=auto_pull_release_enabled
     )
+    app.include_router(officers_router.router)
+    return TestClient(app, raise_server_exceptions=False)
 
-    result = await list_officers(MagicMock())
+
+def test_the_roster_reports_the_post_at_a_glance(db, visible, monkeypatch):
+    visible({PROJECT_A})
+
+    result = _client(db, monkeypatch).get("/api/officers").json()
 
     officer = result["officers"][0]
     assert officer["project_name"] == "Better Resavio"
@@ -98,55 +146,44 @@ async def test_the_roster_reports_the_post_at_a_glance(db, as_user, monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_a_vacant_post_is_listed_as_vacant(db, as_user, monkeypatch):
-    monkeypatch.setattr(
-        orch_main, "user_visible_project_ids", AsyncMock(return_value={PROJECT_A})
-    )
+async def test_a_vacant_post_is_listed_as_vacant(db, visible):
+    visible({PROJECT_A})
     db.list_project_officer_posts = AsyncMock(
         return_value=[_row(thread_id=None, thread_status=None, metadata=None)]
     )
 
-    officer = (await list_officers(MagicMock()))["officers"][0]
+    officer = (await list_officers(MagicMock(), db))["officers"][0]
 
     assert officer["commissioned"] is False
     assert officer["thread_id"] is None
 
 
 @pytest.mark.asyncio
-async def test_a_held_officer_says_so(db, as_user, monkeypatch):
-    monkeypatch.setattr(
-        orch_main, "user_visible_project_ids", AsyncMock(return_value={PROJECT_A})
-    )
+async def test_a_held_officer_says_so(db, visible):
+    visible({PROJECT_A})
     metadata = _row()["metadata"]
     metadata["config_override"]["officer"]["hold"] = {"kind": "conference"}
     db.list_project_officer_posts = AsyncMock(return_value=[_row(metadata=metadata)])
 
-    officer = (await list_officers(MagicMock()))["officers"][0]
+    officer = (await list_officers(MagicMock(), db))["officers"][0]
 
     assert officer["held"] == {"kind": "conference"}
 
 
 @pytest.mark.asyncio
-async def test_the_roster_is_scoped_to_visible_projects(db, as_user, monkeypatch):
-    monkeypatch.setattr(
-        orch_main, "user_visible_project_ids", AsyncMock(return_value={PROJECT_B})
-    )
+async def test_the_roster_is_scoped_to_visible_projects(db, visible):
+    visible({PROJECT_B})
 
-    await list_officers(MagicMock())
+    await list_officers(MagicMock(), db)
 
     assert db.list_project_officer_posts.await_args.args[0] == [PROJECT_B]
 
 
 @pytest.mark.asyncio
-async def test_an_admin_sees_every_post_without_materializing_ids(
-    db, as_user, monkeypatch
-):
-    monkeypatch.setattr(
-        orch_main, "user_visible_project_ids", AsyncMock(return_value="all")
-    )
+async def test_an_admin_sees_every_post_without_materializing_ids(db, visible):
+    visible("all")
 
-    monkeypatch.setattr(orch_main, "OFFICER_AUTO_PULL_RELEASE_ENABLED", False)
-    result = await list_officers(MagicMock())
+    result = await list_officers(MagicMock(), db, auto_pull_release_enabled=False)
 
     assert db.list_project_officer_posts.await_args.args[0] is None
     assert result["auto_pull_downgrade"] == {
@@ -162,15 +199,12 @@ async def test_an_admin_sees_every_post_without_materializing_ids(
 
 
 @pytest.mark.asyncio
-async def test_admin_downgrade_readiness_requires_the_release_fence_closed(
-    db, as_user, monkeypatch
-):
-    monkeypatch.setattr(
-        orch_main, "user_visible_project_ids", AsyncMock(return_value="all")
-    )
-    monkeypatch.setattr(orch_main, "OFFICER_AUTO_PULL_RELEASE_ENABLED", True)
+async def test_admin_downgrade_readiness_requires_the_release_fence_closed(db, visible):
+    visible("all")
 
-    readiness = (await list_officers(MagicMock()))["auto_pull_downgrade"]
+    readiness = (await list_officers(MagicMock(), db, auto_pull_release_enabled=True))[
+        "auto_pull_downgrade"
+    ]
 
     assert readiness["safe"] is False
     assert readiness["release_fence_closed"] is False
@@ -178,15 +212,12 @@ async def test_admin_downgrade_readiness_requires_the_release_fence_closed(
 
 
 @pytest.mark.asyncio
-async def test_visible_project_readiness_is_never_global_downgrade_proof(
-    db, as_user, monkeypatch
-):
-    monkeypatch.setattr(
-        orch_main, "user_visible_project_ids", AsyncMock(return_value={PROJECT_A})
-    )
-    monkeypatch.setattr(orch_main, "OFFICER_AUTO_PULL_RELEASE_ENABLED", False)
+async def test_visible_project_readiness_is_never_global_downgrade_proof(db, visible):
+    visible({PROJECT_A})
 
-    readiness = (await list_officers(MagicMock()))["auto_pull_downgrade"]
+    readiness = (await list_officers(MagicMock(), db, auto_pull_release_enabled=False))[
+        "auto_pull_downgrade"
+    ]
 
     assert readiness["scope"] == "visible_projects"
     assert readiness["safe"] is False
@@ -194,16 +225,11 @@ async def test_visible_project_readiness_is_never_global_downgrade_proof(
 
 
 @pytest.mark.asyncio
-async def test_malformed_commissioned_mirror_fails_downgrade_readiness(
-    db, as_user, monkeypatch
-):
-    monkeypatch.setattr(
-        orch_main, "user_visible_project_ids", AsyncMock(return_value="all")
-    )
-    monkeypatch.setattr(orch_main, "OFFICER_AUTO_PULL_RELEASE_ENABLED", False)
+async def test_malformed_commissioned_mirror_fails_downgrade_readiness(db, visible):
+    visible("all")
     db.list_project_officer_posts = AsyncMock(return_value=[_row(metadata=None)])
 
-    result = await list_officers(MagicMock())
+    result = await list_officers(MagicMock(), db, auto_pull_release_enabled=False)
 
     assert result["officers"][0]["auto_pull_runtime_valid"] is False
     assert result["auto_pull_downgrade"]["safe"] is False
@@ -214,15 +240,12 @@ async def test_malformed_commissioned_mirror_fails_downgrade_readiness(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("metadata", [[], "[]", '"legacy-scalar"', 7])
 async def test_non_object_legacy_metadata_is_invalid_not_a_roster_500(
-    db, as_user, monkeypatch, metadata
+    db, visible, metadata
 ):
-    monkeypatch.setattr(
-        orch_main, "user_visible_project_ids", AsyncMock(return_value="all")
-    )
-    monkeypatch.setattr(orch_main, "OFFICER_AUTO_PULL_RELEASE_ENABLED", False)
+    visible("all")
     db.list_project_officer_posts = AsyncMock(return_value=[_row(metadata=metadata)])
 
-    result = await list_officers(MagicMock())
+    result = await list_officers(MagicMock(), db, auto_pull_release_enabled=False)
 
     officer = result["officers"][0]
     assert officer["auto_pull_runtime_valid"] is False
@@ -236,12 +259,9 @@ async def test_non_object_legacy_metadata_is_invalid_not_a_roster_500(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("post_config", [[], 0, False, "", None])
 async def test_falsey_malformed_durable_post_blocks_downgrade_readiness(
-    db, as_user, monkeypatch, post_config
+    db, visible, post_config
 ):
-    monkeypatch.setattr(
-        orch_main, "user_visible_project_ids", AsyncMock(return_value="all")
-    )
-    monkeypatch.setattr(orch_main, "OFFICER_AUTO_PULL_RELEASE_ENABLED", False)
+    visible("all")
     db.list_project_officer_posts = AsyncMock(
         return_value=[
             _row(
@@ -254,7 +274,7 @@ async def test_falsey_malformed_durable_post_blocks_downgrade_readiness(
         ]
     )
 
-    result = await list_officers(MagicMock())
+    result = await list_officers(MagicMock(), db, auto_pull_release_enabled=False)
 
     officer = result["officers"][0]
     assert officer["auto_pull_durable_valid"] is False
@@ -267,12 +287,9 @@ async def test_falsey_malformed_durable_post_blocks_downgrade_readiness(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("officer_config", [[], 0, False, "", None])
 async def test_falsey_malformed_durable_officer_blocks_downgrade_readiness(
-    db, as_user, monkeypatch, officer_config
+    db, visible, officer_config
 ):
-    monkeypatch.setattr(
-        orch_main, "user_visible_project_ids", AsyncMock(return_value="all")
-    )
-    monkeypatch.setattr(orch_main, "OFFICER_AUTO_PULL_RELEASE_ENABLED", False)
+    visible("all")
     db.list_project_officer_posts = AsyncMock(
         return_value=[
             _row(
@@ -285,7 +302,7 @@ async def test_falsey_malformed_durable_officer_blocks_downgrade_readiness(
         ]
     )
 
-    result = await list_officers(MagicMock())
+    result = await list_officers(MagicMock(), db, auto_pull_release_enabled=False)
 
     officer = result["officers"][0]
     assert officer["auto_pull_durable_valid"] is False
@@ -297,13 +314,8 @@ async def test_falsey_malformed_durable_officer_blocks_downgrade_readiness(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("post_config", [{}, {"officer": {}}])
-async def test_absent_durable_officer_is_a_safe_false_default(
-    db, as_user, monkeypatch, post_config
-):
-    monkeypatch.setattr(
-        orch_main, "user_visible_project_ids", AsyncMock(return_value="all")
-    )
-    monkeypatch.setattr(orch_main, "OFFICER_AUTO_PULL_RELEASE_ENABLED", False)
+async def test_absent_durable_officer_is_a_safe_false_default(db, visible, post_config):
+    visible("all")
     db.list_project_officer_posts = AsyncMock(
         return_value=[
             _row(
@@ -316,7 +328,7 @@ async def test_absent_durable_officer_is_a_safe_false_default(
         ]
     )
 
-    result = await list_officers(MagicMock())
+    result = await list_officers(MagicMock(), db, auto_pull_release_enabled=False)
 
     officer = result["officers"][0]
     assert officer["auto_pull_durable"] is False
@@ -326,13 +338,8 @@ async def test_absent_durable_officer_is_a_safe_false_default(
 
 
 @pytest.mark.asyncio
-async def test_malformed_auxiliary_submaps_do_not_obscure_valid_authority(
-    db, as_user, monkeypatch
-):
-    monkeypatch.setattr(
-        orch_main, "user_visible_project_ids", AsyncMock(return_value="all")
-    )
-    monkeypatch.setattr(orch_main, "OFFICER_AUTO_PULL_RELEASE_ENABLED", False)
+async def test_malformed_auxiliary_submaps_do_not_obscure_valid_authority(db, visible):
+    visible("all")
     db.list_project_officer_posts = AsyncMock(
         return_value=[
             _row(
@@ -347,7 +354,7 @@ async def test_malformed_auxiliary_submaps_do_not_obscure_valid_authority(
         ]
     )
 
-    result = await list_officers(MagicMock())
+    result = await list_officers(MagicMock(), db, auto_pull_release_enabled=False)
 
     officer = result["officers"][0]
     assert officer["auto_pull_runtime_valid"] is True
@@ -358,11 +365,8 @@ async def test_malformed_auxiliary_submaps_do_not_obscure_valid_authority(
 
 
 @pytest.mark.asyncio
-async def test_ended_but_linked_true_mirror_blocks_downgrade(db, as_user, monkeypatch):
-    monkeypatch.setattr(
-        orch_main, "user_visible_project_ids", AsyncMock(return_value="all")
-    )
-    monkeypatch.setattr(orch_main, "OFFICER_AUTO_PULL_RELEASE_ENABLED", False)
+async def test_ended_but_linked_true_mirror_blocks_downgrade(db, visible):
+    visible("all")
     metadata = _row()["metadata"]
     metadata["config_override"]["officer"]["auto_pull"] = True
     db.list_project_officer_posts = AsyncMock(
@@ -375,7 +379,7 @@ async def test_ended_but_linked_true_mirror_blocks_downgrade(db, as_user, monkey
         ]
     )
 
-    result = await list_officers(MagicMock())
+    result = await list_officers(MagicMock(), db, auto_pull_release_enabled=False)
 
     assert result["officers"][0]["commissioned"] is False
     assert result["officers"][0]["auto_pull_runtime"] is True
@@ -385,23 +389,17 @@ async def test_ended_but_linked_true_mirror_blocks_downgrade(db, as_user, monkey
 
 
 @pytest.mark.asyncio
-async def test_a_user_with_no_visible_projects_gets_an_empty_roster(
-    db, as_user, monkeypatch
-):
-    monkeypatch.setattr(
-        orch_main, "user_visible_project_ids", AsyncMock(return_value=set())
-    )
+async def test_a_user_with_no_visible_projects_gets_an_empty_roster(db, visible):
+    visible(set())
 
-    assert (await list_officers(MagicMock()))["officers"] == []
+    assert (await list_officers(MagicMock(), db))["officers"] == []
     db.list_project_officer_posts.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_the_roster_never_creates_a_post(db, as_user, monkeypatch):
-    monkeypatch.setattr(
-        orch_main, "user_visible_project_ids", AsyncMock(return_value={PROJECT_A})
-    )
+async def test_the_roster_never_creates_a_post(db, visible):
+    visible({PROJECT_A})
 
-    await list_officers(MagicMock())
+    await list_officers(MagicMock(), db)
 
     db.get_or_create_project_officer.assert_not_awaited()

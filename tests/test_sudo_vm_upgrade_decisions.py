@@ -109,7 +109,7 @@ class TestApplyVmUpgradeDecision:
 
         with (
             patch.object(orch_main, "sudo_gate", gate),
-            patch.object(orch_main, "_guard_completion_control", blocked),
+            patch.object(orch_main._completion_control_boundary, "guard", blocked),
         ):
             with pytest.raises(HTTPException) as exc:
                 await orch_main._apply_vm_upgrade_decision(
@@ -392,7 +392,7 @@ class TestResumeWithoutVm:
             patch.object(orch_main, "COMPLETION_COMMANDS_ENABLED", True),
             patch.object(orch_main, "postgres_db", db),
             patch.object(orch_main, "workspace_service", ws),
-            patch.object(orch_main, "_guard_completion_control", guard),
+            patch.object(orch_main._completion_control_boundary, "guard", guard),
             patch.object(orch_main, "_trigger_dispatch", MagicMock()),
         ):
             result = await orch_main._resume_job_without_vm_internal(
@@ -432,7 +432,7 @@ class TestResumeWithoutVm:
             patch.object(orch_main, "COMPLETION_COMMANDS_ENABLED", True),
             patch.object(orch_main, "postgres_db", db),
             patch.object(orch_main, "workspace_service", ws),
-            patch.object(orch_main, "_guard_completion_control", guard),
+            patch.object(orch_main._completion_control_boundary, "guard", guard),
             patch.object(orch_main, "_trigger_dispatch", MagicMock()),
         ):
             await orch_main._resume_job_without_vm_internal(

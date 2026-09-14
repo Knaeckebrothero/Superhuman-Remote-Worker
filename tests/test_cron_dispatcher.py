@@ -227,27 +227,6 @@ def _make_row(
     }
 
 
-@pytest.fixture(autouse=True)
-def _stub_post_commit_provisioning(monkeypatch):
-    """Keep every cron unit test hermetic against the new post-commit
-    provisioning hook. ``_process_one_due_automation`` late-imports
-    ``provision_job_repo`` and pulls ``gitea_client`` / ``main_cloud_router``
-    from ``main``; stub both so the tests never import the full orchestrator
-    app or hit Gitea. Tests that assert on provisioning re-patch with their
-    own handle (last setattr wins).
-    """
-    import sys
-    import types
-
-    monkeypatch.setattr(
-        "orchestrator.services.job_provisioning.provision_job_repo", AsyncMock()
-    )
-    fake_main = types.ModuleType("orchestrator.main")
-    fake_main.gitea_client = MagicMock()
-    fake_main.main_cloud_router = MagicMock()
-    monkeypatch.setitem(sys.modules, "orchestrator.main", fake_main)
-
-
 class TestProcessOneDueAutomation:
     @pytest.mark.asyncio
     async def test_no_due_returns_false_without_side_effects(self) -> None:
@@ -495,50 +474,47 @@ class TestAutoDisableNotification:
 # ---------------------------------------------------------------------------
 
 
-def _patch_provisioning(monkeypatch, *, side_effect=None) -> AsyncMock:
-    """Re-patch the autouse provisioning stub with an assertable handle."""
-    provision_mock = AsyncMock(side_effect=side_effect)
-    monkeypatch.setattr(
-        "orchestrator.services.job_provisioning.provision_job_repo", provision_mock
-    )
-    return provision_mock
+def _provision_adapter(*, side_effect=None) -> AsyncMock:
+    """The ``(job_row, db)`` provisioning adapter the application injects.
+
+    R1.B07 turned this into an explicit constructor argument: the loop
+    outlives every request, so it carries the Gitea/cloud adapter rather than
+    late-importing ``orchestrator.main``. Handing the mock in is what steers
+    the code now — monkey-patching ``provision_job_repo`` would be inert,
+    because the dispatcher never names it.
+    """
+    return AsyncMock(side_effect=side_effect)
 
 
 class TestPostCommitProvisioning:
     @pytest.mark.asyncio
-    async def test_fire_provisions_created_job(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        provision = _patch_provisioning(monkeypatch)
+    async def test_fire_provisions_created_job(self) -> None:
+        provision = _provision_adapter()
         row = _make_row(next_run_at=datetime.now(timezone.utc))
         db = _make_mock_db(due_row=row)
 
-        out = await _process_one_due_automation(db)
+        out = await _process_one_due_automation(db, provision_repo=provision)
 
         assert out is True
         provision.assert_awaited_once()
-        kwargs = provision.await_args.kwargs
-        assert kwargs["job_row"] == {"id": "11111111-1111-1111-1111-111111111111"}
-        assert kwargs["postgres_db"] is db
+        job_row, postgres_db = provision.await_args.args
+        assert job_row == {"id": "11111111-1111-1111-1111-111111111111"}
+        assert postgres_db is db
 
     @pytest.mark.asyncio
-    async def test_catchup_skip_does_not_provision(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        provision = _patch_provisioning(monkeypatch)
+    async def test_catchup_skip_does_not_provision(self) -> None:
+        provision = _provision_adapter()
         long_ago = datetime(2025, 1, 1, 0, 0, tzinfo=timezone.utc)
         row = _make_row(next_run_at=long_ago, catchup_window_seconds=3600)
         db = _make_mock_db(due_row=row)
 
-        await _process_one_due_automation(db)
+        await _process_one_due_automation(db, provision_repo=provision)
 
         provision.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_max_fires_disable_does_not_provision(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        provision = _patch_provisioning(monkeypatch)
+    async def test_max_fires_disable_does_not_provision(self) -> None:
+        provision = _provision_adapter()
         now = datetime.now(timezone.utc)
         row = _make_row(
             next_run_at=now,
@@ -548,23 +524,19 @@ class TestPostCommitProvisioning:
         )
         db = _make_mock_db(due_row=row)
 
-        await _process_one_due_automation(db)
+        await _process_one_due_automation(db, provision_repo=provision)
 
         provision.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_provisioning_failure_does_not_break_tick(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_provisioning_failure_does_not_break_tick(self) -> None:
         """A Gitea outage during provisioning must not crash the tick or
         undo the committed fire."""
-        provision = _patch_provisioning(
-            monkeypatch, side_effect=RuntimeError("gitea down")
-        )
+        provision = _provision_adapter(side_effect=RuntimeError("gitea down"))
         row = _make_row(next_run_at=datetime.now(timezone.utc))
         db = _make_mock_db(due_row=row)
 
-        out = await _process_one_due_automation(db)
+        out = await _process_one_due_automation(db, provision_repo=provision)
 
         assert out is True
         provision.assert_awaited_once()

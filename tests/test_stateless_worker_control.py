@@ -1369,7 +1369,11 @@ async def test_cancel_retries_pinned_verb_after_vm_lane_repair(monkeypatch):
         "_cascade_cancel_to_children",
         AsyncMock(return_value=True),
     )
-    monkeypatch.setattr(main, "_handle_scholar_completion", AsyncMock())
+    monkeypatch.setattr(
+        main.subjob_completion_operations,
+        "handle_scholar_completion",
+        AsyncMock(),
+    )
     monkeypatch.setattr(main, "maybe_wake_session", AsyncMock())
     monkeypatch.setattr(main, "_kick_session_wake_drain", MagicMock())
     monkeypatch.setattr(main, "_trigger_dispatch", MagicMock())
@@ -1456,7 +1460,11 @@ async def test_pinned_cancel_linearizes_before_agent_post_and_prunes_after(
     monkeypatch.setattr(
         main, "_cascade_cancel_to_children", AsyncMock(return_value=True)
     )
-    monkeypatch.setattr(main, "_handle_scholar_completion", AsyncMock())
+    monkeypatch.setattr(
+        main.subjob_completion_operations,
+        "handle_scholar_completion",
+        AsyncMock(),
+    )
     monkeypatch.setattr(main, "maybe_wake_session", AsyncMock())
     monkeypatch.setattr(main, "_kick_session_wake_drain", MagicMock())
     monkeypatch.setattr(main, "_trigger_dispatch", MagicMock())
@@ -1653,7 +1661,11 @@ async def test_cancel_endpoint_closes_queued_stateless_unit_without_agent_post(
         "_cascade_cancel_to_children",
         AsyncMock(return_value=True),
     )
-    monkeypatch.setattr(main, "_handle_scholar_completion", AsyncMock())
+    monkeypatch.setattr(
+        main.subjob_completion_operations,
+        "handle_scholar_completion",
+        AsyncMock(),
+    )
     monkeypatch.setattr(main, "maybe_wake_session", AsyncMock())
     monkeypatch.setattr(main, "_kick_session_wake_drain", MagicMock())
     monkeypatch.setattr(main, "_trigger_dispatch", MagicMock())
@@ -1673,6 +1685,7 @@ async def test_blocking_message_status_is_exact_worker_fenced(
     status_cas_wins,
 ):
     from orchestrator import main
+    from orchestrator.services import agent_messaging
 
     # OC-01: the stateless fence used to be inline SQL in send_agent_message.
     # It now lives inside create_routed_blocking_freeze, which commits the
@@ -1693,7 +1706,6 @@ async def test_blocking_message_status_is_exact_worker_fenced(
     async def acquire():
         yield MagicMock()
 
-    monkeypatch.setattr(main, "require_internal", AsyncMock())
     monkeypatch.setattr(
         main.postgres_db,
         "get_job",
@@ -1768,12 +1780,24 @@ async def test_blocking_message_status_is_exact_worker_fenced(
         lease_token=9,
     )
 
+    # The send funnel moved to ``services.agent_messaging``; its collaborators
+    # come from ``main._agent_messaging_dependencies()``, which binds
+    # ``main.postgres_db`` and ``main.notification_service`` — the very objects
+    # monkeypatched above — so those patches still steer the code under test.
+    def _send():
+        return agent_messaging.send_agent_message(
+            MagicMock(),
+            JOB_ID,
+            body,
+            dependencies=main._agent_messaging_dependencies(),
+        )
+
     if status_cas_wins:
-        result = await main.send_agent_message(MagicMock(), JOB_ID, body)
+        result = await _send()
         assert result["status"] == "sent"
     else:
         with pytest.raises(HTTPException) as lost:
-            await main.send_agent_message(MagicMock(), JOB_ID, body)
+            await _send()
         assert lost.value.status_code == 409
         assert lost.value.detail == "Job changed before blocking message was committed"
 
@@ -1814,7 +1838,11 @@ async def test_cancel_endpoint_waits_for_leased_owner_before_workspace_cleanup(
         "_cascade_cancel_to_children",
         AsyncMock(return_value=True),
     )
-    monkeypatch.setattr(main, "_handle_scholar_completion", AsyncMock())
+    monkeypatch.setattr(
+        main.subjob_completion_operations,
+        "handle_scholar_completion",
+        AsyncMock(),
+    )
     monkeypatch.setattr(main, "maybe_wake_session", AsyncMock())
     monkeypatch.setattr(main, "_kick_session_wake_drain", MagicMock())
     monkeypatch.setattr(main, "_trigger_dispatch", MagicMock())
@@ -1856,7 +1884,11 @@ async def test_cancel_keeps_root_workspace_when_stateless_child_did_not_settle(
     )
     cleanup = AsyncMock()
     monkeypatch.setattr(main, "_archive_and_cleanup_workspace", cleanup)
-    monkeypatch.setattr(main, "_handle_scholar_completion", AsyncMock())
+    monkeypatch.setattr(
+        main.subjob_completion_operations,
+        "handle_scholar_completion",
+        AsyncMock(),
+    )
     monkeypatch.setattr(main, "maybe_wake_session", AsyncMock())
     monkeypatch.setattr(main, "_kick_session_wake_drain", MagicMock())
     monkeypatch.setattr(main, "_trigger_dispatch", MagicMock())
@@ -2175,7 +2207,11 @@ async def test_phase_approval_reenqueues_stateless_job(monkeypatch, tmp_path):
         "require_internal_or_job_access",
         AsyncMock(return_value=(None, job)),
     )
-    monkeypatch.setattr(main, "resolve_job_repo", AsyncMock(return_value=(None, None)))
+    monkeypatch.setattr(
+        main.subjob_output_operations,
+        "resolve_job_repo",
+        AsyncMock(return_value=(None, None)),
+    )
     monkeypatch.setattr(main, "gitea_client", SimpleNamespace(is_initialized=False))
     monkeypatch.setattr(main, "workspace_service", SimpleNamespace(base_path=tmp_path))
     queued = AsyncMock(return_value=True)

@@ -90,7 +90,9 @@ Helm will run a one-shot seed Job (`{{ include "srw.fullname" . }}-llm-seed`)
 post-install and post-upgrade. It inserts provider keys, endpoints and
 catalog rows, and pins default models (llm.seed.defaults), only where they
 are absent — existing rows and pins, whether previously seeded or set via
-Admin → Models, are never overwritten.
+Admin → Models, are never overwritten. Entries declared with
+`reconcile: true` are the exception: those are re-applied on every upgrade
+and shown with a "Helm" badge in Admin → Models.
 
 Inspect the run:
 

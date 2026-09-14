@@ -34,6 +34,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional
 from uuid import UUID
@@ -103,33 +104,54 @@ def _parse_iso(value: Any) -> Optional[datetime]:
         return None
 
 
-def _resolve_handles() -> tuple[Any, Any]:
-    """Late-bind the audit reader and usage ledger off the main module.
+@dataclass(frozen=True)
+class ReportingHandles:
+    """The three read-only handles the sitrep's optional sections need.
 
-    Both are module globals constructed during orchestrator startup; importing
-    ``main`` at call time (never at import time) avoids the circular import
-    and simply yields ``(None, None)`` in test processes that never built
-    them — which is exactly the degraded path the sections already handle.
+    None of them is required: a missing audit reader, usage ledger or vector
+    pool costs its own section and never the wake. That is why the default is
+    an all-``None`` instance rather than an error — it is exactly the degraded
+    path the sections already handle, and the shape a test process gets for
+    free.
     """
-    try:
-        import orchestrator.main as orchestrator_main
 
-        return (
-            getattr(orchestrator_main, "audit_reader", None),
-            getattr(orchestrator_main, "usage_ledger", None),
-        )
-    except Exception:
-        return None, None
+    audit_reader: Any = None
+    usage_ledger: Any = None
+    vector_db: Any = None
+
+
+_HANDLES = ReportingHandles()
+
+
+def bind_reporting_handles(handles: ReportingHandles) -> None:
+    """Hand this module the application's long-lived reporting handles.
+
+    R1.B07 closed this module's two late ``import orchestrator.main`` lookups.
+    The sitrep is rendered inside the officer wake drain, which is reached
+    through ``kick_event_drain(db)`` from a dozen call sites that hold nothing
+    but the store — so threading three more parameters through every one of
+    them would move the coupling rather than remove it. The application binds
+    them once at startup instead, the same shape
+    ``notification_service.connect()`` already uses, and every entry point
+    still accepts explicit overrides that win over whatever is bound.
+    """
+    global _HANDLES
+    _HANDLES = handles
+
+
+def reporting_handles() -> ReportingHandles:
+    """What is currently bound (an all-``None`` instance before startup)."""
+    return _HANDLES
+
+
+def _resolve_handles() -> tuple[Any, Any]:
+    """The bound audit reader and usage ledger."""
+    return _HANDLES.audit_reader, _HANDLES.usage_ledger
 
 
 def _resolve_vector_db() -> Any:
-    """Late-bind the vector DB pool (KB index home) off the main module."""
-    try:
-        import orchestrator.main as orchestrator_main
-
-        return getattr(orchestrator_main, "vector_db", None)
-    except Exception:
-        return None
+    """The bound vector DB pool (KB index home)."""
+    return _HANDLES.vector_db
 
 
 def prior_state(thread: dict[str, Any]) -> dict[str, Any]:

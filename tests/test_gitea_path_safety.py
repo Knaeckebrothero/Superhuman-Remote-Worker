@@ -323,7 +323,9 @@ class TestProxyRoutes:
         with (
             patch.object(orch_main, "gitea_client", gc),
             patch.object(
-                orch_main, "resolve_job_repo", AsyncMock(return_value=(REPO, None))
+                orch_main.subjob_output_operations,
+                "resolve_job_repo",
+                AsyncMock(return_value=(REPO, None)),
             ),
         ):
             # ``require_job_access`` is a field default on the route

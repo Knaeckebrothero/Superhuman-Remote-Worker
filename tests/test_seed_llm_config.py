@@ -8,7 +8,7 @@ no-ops) without standing up Postgres.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
 import yaml
@@ -20,6 +20,7 @@ from orchestrator.seed.llm_config import (
     load_payload,
     seed,
 )
+from shared.helm_provenance import RECONCILE_MANIFEST_KEY, value_hash
 from shared.subscription_routing import SUBSCRIPTION_PROXY_TRANSPORT
 
 
@@ -30,6 +31,7 @@ def _fake_db(
     existing_catalog_keys: set[tuple[str, str]] | None = None,
     catalog_rows: list[dict] | None = None,
     existing_defaults: dict[str, str] | None = None,
+    existing_default_provenance: dict[str, tuple[str, str | None]] | None = None,
 ):
     """Build a ``PostgresDB``-shaped mock that tracks mutations.
 
@@ -38,20 +40,34 @@ def _fake_db(
     None for those (matching the ``ON CONFLICT DO NOTHING`` path).
 
     ``catalog_rows`` are pre-existing rows as ``list_models`` returns them
-    (``model_id`` + ``capabilities`` + ``enabled``); rows ``create_model``
-    inserts during the run are appended, so the defaults section sees what
-    the same payload just seeded. ``existing_defaults`` pre-populates the
-    ``llm.default_<kind>_model`` pins.
+    (``model_id`` + ``capabilities`` + ``enabled``, optionally ``id``,
+    ``provider_kind``/``provider_ref``, ``source``, ``helm_value_hash``);
+    rows ``create_model`` inserts during the run are appended, so the
+    defaults section sees what the same payload just seeded.
+    ``existing_defaults`` pre-populates the ``llm.default_<kind>_model``
+    pins; ``existing_default_provenance`` maps kind -> (source, hash) for
+    them (default ``('ui', None)``).
     """
     db = MagicMock()
-    db.list_system_api_keys = AsyncMock(return_value=list(existing_api_keys or []))
+    db.list_system_api_keys = AsyncMock(
+        return_value=[dict(k) for k in (existing_api_keys or [])]
+    )
     db.list_system_llm_endpoints = AsyncMock(
         return_value=[dict(e) for e in (existing_endpoints or [])]
     )
     db.upsert_system_api_key = AsyncMock()
+    db.update_system_llm_endpoint = AsyncMock(return_value={})
 
     async def _create_endpoint(
-        *, label, base_url, api_key, key_prefix, transport_kind=None
+        *,
+        label,
+        base_url,
+        api_key,
+        key_prefix,
+        transport_kind=None,
+        source=None,
+        helm_value_hash=None,
+        seeded_from=None,
     ):
         new_id = f"endpoint-{label}"
         return {
@@ -60,10 +76,11 @@ def _fake_db(
             "base_url": base_url,
             "key_prefix": key_prefix,
             "transport_kind": transport_kind,
+            "source": source,
+            "helm_value_hash": helm_value_hash,
         }
 
     catalog_keys = set(existing_catalog_keys or set())
-
     rows = [dict(r) for r in (catalog_rows or [])]
 
     async def _create_model(**kwargs):
@@ -73,10 +90,13 @@ def _fake_db(
         catalog_keys.add(key)
         row = {
             "id": f"catalog-{kwargs['model_id']}",
+            "provider_kind": kwargs.get("provider_kind"),
             "provider_ref": kwargs["provider_ref"],
             "model_id": kwargs["model_id"],
             "capabilities": list(kwargs.get("capabilities") or []),
             "enabled": kwargs.get("enabled", True),
+            "source": kwargs.get("source"),
+            "helm_value_hash": kwargs.get("helm_value_hash"),
         }
         rows.append(row)
         return row
@@ -90,26 +110,64 @@ def _fake_db(
                 continue
             if enabled_only and not row.get("enabled", True):
                 continue
+            if provider_kind is not None and row.get("provider_kind") != provider_kind:
+                continue
+            if provider_ref is not None and row.get("provider_ref") != provider_ref:
+                continue
             out.append(dict(row))
         return out
 
+    async def _update_model(catalog_id, **fields):
+        for row in rows:
+            if row.get("id") == catalog_id:
+                row.update(fields)
+                return dict(row)
+        return None
+
     pins = dict(existing_defaults or {})
+    pin_prov = dict(existing_default_provenance or {})
+    settings: dict[str, dict] = {}
 
     async def _get_default(kind):
         return pins.get(kind)
 
-    async def _set_default(kind, model, *, updated_by=None):
+    async def _set_default(kind, model, *, updated_by=None, **prov):
         if model:
             pins[kind] = model
+            pin_prov[kind] = (prov.get("source", "ui"), prov.get("helm_value_hash"))
         else:
             pins.pop(kind, None)
+
+    async def _get_setting(key):
+        prefix, suffix = "llm.default_", "_model"
+        if key.startswith(prefix) and key.endswith(suffix):
+            kind = key[len(prefix) : -len(suffix)]
+            if kind not in pins:
+                return None
+            source, h = pin_prov.get(kind, ("ui", None))
+            return {
+                "key": key,
+                "value": {"model": pins[kind]},
+                "source": source,
+                "helm_value_hash": h,
+            }
+        return settings.get(key)
+
+    async def _upsert_setting(key, value, **kw):
+        settings[key] = {"key": key, "value": value, **kw}
+        return settings[key]
 
     db.create_system_llm_endpoint = AsyncMock(side_effect=_create_endpoint)
     db.create_model = AsyncMock(side_effect=_create_model)
     db.list_models = AsyncMock(side_effect=_list_models)
+    db.update_model = AsyncMock(side_effect=_update_model)
     db.get_default_llm_model = AsyncMock(side_effect=_get_default)
     db.set_default_llm_model = AsyncMock(side_effect=_set_default)
+    db.get_system_setting = AsyncMock(side_effect=_get_setting)
+    db.upsert_system_setting = AsyncMock(side_effect=_upsert_setting)
     db._pins = pins
+    db._settings = settings
+    db._rows = rows
     return db
 
 
@@ -263,6 +321,8 @@ class TestSeedEndpoints:
             api_key=None,
             key_prefix=None,
             transport_kind=None,
+            source="helm",
+            helm_value_hash=ANY,
         )
         # Model entries become catalog rows now (provider_kind='endpoint').
         # The seed pipeline always emits the array spelling — passing the
@@ -312,6 +372,8 @@ class TestSeedEndpoints:
             api_key=None,
             key_prefix=None,
             transport_kind=SUBSCRIPTION_PROXY_TRANSPORT,
+            source="helm",
+            helm_value_hash=ANY,
         )
         db.update_system_llm_endpoint.assert_not_called()
         assert report.endpoints_seeded == ["Primary"]
@@ -649,7 +711,11 @@ class TestSeedDefaults:
         report = await seed(db, {"defaults": {"chat": "gpt-5-mini"}})
 
         db.set_default_llm_model.assert_awaited_once_with(
-            "chat", "gpt-5-mini", updated_by=SEEDED_FROM_TAG
+            "chat",
+            "gpt-5-mini",
+            updated_by=SEEDED_FROM_TAG,
+            source="helm",
+            helm_value_hash=value_hash("gpt-5-mini"),
         )
         assert report.defaults_seeded == [("chat", "gpt-5-mini")]
         assert report.defaults_skipped == []
@@ -780,3 +846,521 @@ class TestSeedDefaults:
         db = _fake_db()
         with pytest.raises(ValueError):
             await seed(db, {"defaults": ["chat"]})
+
+
+# ---------------------------------------------------------------------------
+# seed — per-row params (models.params_json)
+# ---------------------------------------------------------------------------
+
+
+class TestSeedParams:
+    @pytest.mark.asyncio
+    async def test_system_model_params_land_in_params_json(self):
+        db = _fake_db(existing_api_keys=[{"provider": "openai"}])
+        payload = {
+            "systemModels": [
+                {
+                    "provider": "openai",
+                    "id": "gpt-5-mini",
+                    "capability": "chat",
+                    "family": "gpt-5",
+                    "params": {"reasoning_effort": "low", "temperature": 0},
+                }
+            ]
+        }
+        await seed(db, payload)
+
+        kwargs = db.create_model.await_args.kwargs
+        assert kwargs["params_json"] == {"reasoning_effort": "low", "temperature": 0}
+
+    @pytest.mark.asyncio
+    async def test_endpoint_model_params_land_in_params_json(self):
+        db = _fake_db()
+        payload = {
+            "systemEndpoints": [
+                {
+                    "label": "MiniMax",
+                    "baseUrl": "https://api.minimax.io/v1",
+                    "models": [
+                        {
+                            "id": "MiniMax-M3",
+                            "capabilities": ["chat", "auxiliary"],
+                            "params": {"pricing_id": "minimax/minimax-m3"},
+                        }
+                    ],
+                }
+            ]
+        }
+        await seed(db, payload)
+
+        kwargs = db.create_model.await_args.kwargs
+        assert kwargs["provider_kind"] == "endpoint"
+        assert kwargs["params_json"] == {"pricing_id": "minimax/minimax-m3"}
+
+    @pytest.mark.asyncio
+    async def test_absent_params_is_none(self):
+        db = _fake_db(existing_api_keys=[{"provider": "openai"}])
+        await seed(
+            db,
+            {"systemModels": [{"provider": "openai", "id": "gpt-5-mini"}]},
+        )
+        assert db.create_model.await_args.kwargs["params_json"] is None
+
+    @pytest.mark.asyncio
+    async def test_non_mapping_params_is_ignored_with_warning(self, caplog):
+        db = _fake_db(existing_api_keys=[{"provider": "openai"}])
+        with caplog.at_level("WARNING", logger="orchestrator.seed.llm_config"):
+            await seed(
+                db,
+                {
+                    "systemModels": [
+                        {"provider": "openai", "id": "gpt-5-mini", "params": "low"}
+                    ]
+                },
+            )
+        assert db.create_model.await_args.kwargs["params_json"] is None
+        assert "params must be a mapping" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# reconcile: true — Helm re-applies the entry on every run
+# ---------------------------------------------------------------------------
+
+
+def _model_fields(**overrides):
+    base = {
+        "display_label": "gpt-5-mini",
+        "capabilities": ["chat", "auxiliary"],
+        "family": "gpt-5",
+        "context_window": None,
+        "reasoning_level": None,
+        "params_json": None,
+        "enabled": True,
+    }
+    base.update(overrides)
+    return base
+
+
+class TestReconcileKeys:
+    @pytest.mark.asyncio
+    async def test_flag_absent_keeps_insert_only(self):
+        db = _fake_db(existing_api_keys=[{"provider": "openai", "source": "ui"}])
+        report = await seed(
+            db, {"systemApiKeys": [{"provider": "openai", "apiKey": "sk-new"}]}
+        )
+        db.upsert_system_api_key.assert_not_awaited()
+        assert report.api_keys_skipped == ["openai"]
+        assert report.reconciled == []
+        assert report.manifest["systemApiKeys"] == []
+
+    @pytest.mark.asyncio
+    async def test_reconciled_key_overwrites_admin_row_and_reports_revert(self, caplog):
+        db = _fake_db(
+            existing_api_keys=[
+                {"provider": "openai", "source": "ui", "helm_value_hash": "old"}
+            ]
+        )
+        with caplog.at_level("WARNING", logger="orchestrator.seed.llm_config"):
+            report = await seed(
+                db,
+                {
+                    "systemApiKeys": [
+                        {"provider": "openai", "apiKey": "sk-new", "reconcile": True}
+                    ]
+                },
+            )
+        kwargs = db.upsert_system_api_key.await_args.kwargs
+        assert kwargs["api_key"] == "sk-new"
+        assert kwargs["source"] == "helm"
+        assert kwargs["helm_value_hash"] == value_hash(
+            {"api_key": "sk-new", "label": None}
+        )
+        assert report.reconciled == [("systemApiKeys", "openai")]
+        assert report.reverted == [("systemApiKeys", "openai")]
+        assert report.manifest["systemApiKeys"] == ["openai"]
+        assert "admin edit reverted" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_reconciled_key_unchanged_is_a_noop(self):
+        h = value_hash({"api_key": "sk-same", "label": "Main"})
+        db = _fake_db(
+            existing_api_keys=[
+                {"provider": "openai", "source": "helm", "helm_value_hash": h}
+            ]
+        )
+        report = await seed(
+            db,
+            {
+                "systemApiKeys": [
+                    {
+                        "provider": "openai",
+                        "apiKey": "sk-same",
+                        "label": "Main",
+                        "reconcile": True,
+                    }
+                ]
+            },
+        )
+        db.upsert_system_api_key.assert_not_awaited()
+        assert report.api_keys_skipped == ["openai"]
+        assert report.reconciled == []
+        # Still declared as managed, even though nothing had to change.
+        assert report.manifest["systemApiKeys"] == ["openai"]
+
+    @pytest.mark.asyncio
+    async def test_fresh_insert_carries_helm_provenance(self):
+        db = _fake_db()
+        await seed(db, {"systemApiKeys": [{"provider": "openai", "apiKey": "sk-x"}]})
+        kwargs = db.upsert_system_api_key.await_args.kwargs
+        assert kwargs["source"] == "helm"
+        assert kwargs["helm_value_hash"] == value_hash(
+            {"api_key": "sk-x", "label": None}
+        )
+
+
+class TestReconcileEndpoints:
+    _existing = {
+        "id": "ep-1",
+        "label": "MiniMax",
+        "base_url": "https://old",
+        "transport_kind": None,
+        "source": "ui",
+        "helm_value_hash": None,
+    }
+
+    @pytest.mark.asyncio
+    async def test_reconciled_endpoint_reapplies_url_and_key(self):
+        db = _fake_db(existing_endpoints=[self._existing])
+        report = await seed(
+            db,
+            {
+                "systemEndpoints": [
+                    {
+                        "label": "MiniMax",
+                        "baseUrl": "https://new/v1",
+                        "apiKey": "sk-cp-new",
+                        "reconcile": True,
+                        "models": [],
+                    }
+                ]
+            },
+        )
+        kwargs = db.update_system_llm_endpoint.await_args.kwargs
+        assert kwargs["endpoint_id"] == "ep-1"
+        assert kwargs["base_url"] == "https://new/v1"
+        assert kwargs["api_key"] == "sk-cp-new"
+        assert kwargs["clear_api_key"] is False
+        assert kwargs["source"] == "helm"
+        assert report.reverted == [("systemEndpoints", "MiniMax")]
+        assert report.manifest["systemEndpoints"] == ["MiniMax"]
+
+    @pytest.mark.asyncio
+    async def test_unresolved_credential_keeps_stored_key(self, caplog, monkeypatch):
+        monkeypatch.delenv("SEED_ENDPOINT_0_API_KEY", raising=False)
+        db = _fake_db(existing_endpoints=[self._existing])
+        with caplog.at_level("WARNING", logger="orchestrator.seed.llm_config"):
+            await seed(
+                db,
+                {
+                    "systemEndpoints": [
+                        {
+                            "label": "MiniMax",
+                            "baseUrl": "https://new/v1",
+                            "apiKeyEnv": "SEED_ENDPOINT_0_API_KEY",
+                            "reconcile": True,
+                            "models": [],
+                        }
+                    ]
+                },
+            )
+        kwargs = db.update_system_llm_endpoint.await_args.kwargs
+        assert kwargs["api_key"] is None
+        assert kwargs["clear_api_key"] is False
+        assert "stored key left untouched" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_keyless_declaration_clears_a_stored_key(self):
+        db = _fake_db(existing_endpoints=[self._existing])
+        await seed(
+            db,
+            {
+                "systemEndpoints": [
+                    {
+                        "label": "MiniMax",
+                        "baseUrl": "https://new/v1",
+                        "reconcile": True,
+                        "models": [],
+                    }
+                ]
+            },
+        )
+        assert db.update_system_llm_endpoint.await_args.kwargs["clear_api_key"] is True
+
+    @pytest.mark.asyncio
+    async def test_unchanged_reconciled_endpoint_is_a_noop(self):
+        h = value_hash(
+            {"base_url": "https://old", "api_key": "k", "transport_kind": None}
+        )
+        db = _fake_db(
+            existing_endpoints=[
+                {**self._existing, "source": "helm", "helm_value_hash": h}
+            ]
+        )
+        report = await seed(
+            db,
+            {
+                "systemEndpoints": [
+                    {
+                        "label": "MiniMax",
+                        "baseUrl": "https://old",
+                        "apiKey": "k",
+                        "reconcile": True,
+                        "models": [],
+                    }
+                ]
+            },
+        )
+        db.update_system_llm_endpoint.assert_not_awaited()
+        assert report.endpoints_skipped == ["MiniMax"]
+
+    @pytest.mark.asyncio
+    async def test_flag_absent_never_updates(self):
+        db = _fake_db(existing_endpoints=[self._existing])
+        await seed(
+            db,
+            {
+                "systemEndpoints": [
+                    {"label": "MiniMax", "baseUrl": "https://new/v1", "models": []}
+                ]
+            },
+        )
+        db.update_system_llm_endpoint.assert_not_awaited()
+
+
+class TestReconcileModels:
+    _row = {
+        "id": "catalog-1",
+        "provider_kind": "system",
+        "provider_ref": "openai",
+        "model_id": "gpt-5-mini",
+        "capabilities": ["chat", "auxiliary"],
+        "enabled": True,
+        "source": "ui",
+        "helm_value_hash": None,
+    }
+    _entry = {
+        "provider": "openai",
+        "id": "gpt-5-mini",
+        "capabilities": ["chat", "auxiliary"],
+        "family": "gpt-5",
+        "reconcile": True,
+    }
+
+    @pytest.mark.asyncio
+    async def test_reconciled_model_rewrites_a_differing_row(self):
+        db = _fake_db(
+            existing_api_keys=[{"provider": "openai"}],
+            existing_catalog_keys={("openai", "gpt-5-mini")},
+            catalog_rows=[self._row],
+        )
+        report = await seed(
+            db, {"systemModels": [{**self._entry, "contextWindow": 400000}]}
+        )
+        args, kwargs = db.update_model.await_args
+        assert args == ("catalog-1",)
+        assert kwargs["context_window"] == 400000
+        assert kwargs["source"] == "helm"
+        assert kwargs["helm_value_hash"] == value_hash(
+            _model_fields(context_window=400000)
+        )
+        assert report.reconciled == [("models", "openai/gpt-5-mini")]
+        assert report.reverted == [("models", "openai/gpt-5-mini")]
+        assert report.manifest["models"] == ["openai/gpt-5-mini"]
+
+    @pytest.mark.asyncio
+    async def test_unchanged_reconciled_model_is_a_noop(self):
+        db = _fake_db(
+            existing_api_keys=[{"provider": "openai"}],
+            existing_catalog_keys={("openai", "gpt-5-mini")},
+            catalog_rows=[
+                {
+                    **self._row,
+                    "source": "helm",
+                    "helm_value_hash": value_hash(_model_fields()),
+                }
+            ],
+        )
+        report = await seed(db, {"systemModels": [self._entry]})
+        db.update_model.assert_not_awaited()
+        assert report.models_skipped == [("openai", "gpt-5-mini")]
+        assert report.manifest["models"] == ["openai/gpt-5-mini"]
+
+    @pytest.mark.asyncio
+    async def test_flag_absent_keeps_on_conflict_do_nothing(self):
+        db = _fake_db(
+            existing_api_keys=[{"provider": "openai"}],
+            existing_catalog_keys={("openai", "gpt-5-mini")},
+            catalog_rows=[self._row],
+        )
+        entry = {k: v for k, v in self._entry.items() if k != "reconcile"}
+        report = await seed(db, {"systemModels": [{**entry, "contextWindow": 1}]})
+        db.update_model.assert_not_awaited()
+        assert report.models_skipped == [("openai", "gpt-5-mini")]
+
+    @pytest.mark.asyncio
+    async def test_endpoint_model_identity_uses_the_label(self):
+        db = _fake_db(
+            existing_endpoints=[
+                {
+                    "id": "ep-1",
+                    "label": "MiniMax",
+                    "base_url": "https://m",
+                    "source": "helm",
+                }
+            ],
+            existing_catalog_keys={("ep-1", "MiniMax-M3")},
+            catalog_rows=[
+                {
+                    "id": "catalog-m3",
+                    "provider_kind": "endpoint",
+                    "provider_ref": "ep-1",
+                    "model_id": "MiniMax-M3",
+                    "capabilities": ["chat"],
+                    "source": "ui",
+                }
+            ],
+        )
+        report = await seed(
+            db,
+            {
+                "systemEndpoints": [
+                    {
+                        "label": "MiniMax",
+                        "baseUrl": "https://m",
+                        "models": [
+                            {
+                                "id": "MiniMax-M3",
+                                "capabilities": ["chat"],
+                                "reconcile": True,
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+        assert db.update_model.await_args.args == ("catalog-m3",)
+        assert report.manifest["models"] == ["endpoint:MiniMax/MiniMax-M3"]
+        assert report.manifest["systemEndpoints"] == []
+
+    @pytest.mark.asyncio
+    async def test_fresh_insert_carries_hash(self):
+        db = _fake_db(existing_api_keys=[{"provider": "openai"}])
+        await seed(db, {"systemModels": [self._entry]})
+        kwargs = db.create_model.await_args.kwargs
+        assert kwargs["source"] == "helm"
+        assert kwargs["helm_value_hash"] == value_hash(_model_fields())
+
+
+class TestReconcileDefaults:
+    @pytest.mark.asyncio
+    async def test_reconciled_pin_replaces_an_admin_pin(self):
+        db = _fake_db(
+            catalog_rows=[_chat_row("gpt-5-mini"), _chat_row("MiniMax-M3")],
+            existing_defaults={"chat": "MiniMax-M3"},
+        )
+        report = await seed(
+            db, {"defaults": {"chat": {"model": "gpt-5-mini", "reconcile": True}}}
+        )
+        db.set_default_llm_model.assert_awaited_once_with(
+            "chat",
+            "gpt-5-mini",
+            updated_by=SEEDED_FROM_TAG,
+            source="helm",
+            helm_value_hash=value_hash("gpt-5-mini"),
+        )
+        assert report.reconciled == [("defaults", "chat")]
+        assert report.reverted == [("defaults", "chat")]
+        assert report.manifest["defaults"] == ["chat"]
+        assert db._pins == {"chat": "gpt-5-mini"}
+
+    @pytest.mark.asyncio
+    async def test_unchanged_reconciled_pin_is_a_noop(self):
+        db = _fake_db(
+            catalog_rows=[_chat_row("gpt-5-mini")],
+            existing_defaults={"chat": "gpt-5-mini"},
+            existing_default_provenance={"chat": ("helm", value_hash("gpt-5-mini"))},
+        )
+        report = await seed(
+            db, {"defaults": {"chat": {"model": "gpt-5-mini", "reconcile": True}}}
+        )
+        db.set_default_llm_model.assert_not_awaited()
+        assert report.defaults_skipped == [("chat", "gpt-5-mini")]
+        assert report.manifest["defaults"] == ["chat"]
+
+    @pytest.mark.asyncio
+    async def test_reconciled_pin_still_refuses_a_missing_model(self):
+        db = _fake_db(
+            catalog_rows=[_chat_row("MiniMax-M3")],
+            existing_defaults={"chat": "MiniMax-M3"},
+        )
+        report = await seed(
+            db, {"defaults": {"chat": {"model": "nope", "reconcile": True}}}
+        )
+        db.set_default_llm_model.assert_not_awaited()
+        assert report.defaults_skipped == [("chat", "nope")]
+        assert db._pins == {"chat": "MiniMax-M3"}
+
+    @pytest.mark.asyncio
+    async def test_scalar_form_never_reconciles(self):
+        db = _fake_db(
+            catalog_rows=[_chat_row("gpt-5-mini"), _chat_row("MiniMax-M3")],
+            existing_defaults={"chat": "MiniMax-M3"},
+        )
+        report = await seed(db, {"defaults": {"chat": "gpt-5-mini"}})
+        db.set_default_llm_model.assert_not_awaited()
+        assert report.manifest["defaults"] == []
+
+
+class TestReconcileManifest:
+    @pytest.mark.asyncio
+    async def test_manifest_is_written_only_for_the_job(self):
+        db = _fake_db(existing_api_keys=[{"provider": "openai"}])
+        payload = {
+            "systemApiKeys": [{"provider": "openai", "apiKey": "k", "reconcile": True}],
+            "systemModels": [
+                {
+                    "provider": "openai",
+                    "id": "gpt-5-mini",
+                    "family": "gpt-5",
+                    "reconcile": True,
+                }
+            ],
+            "defaults": {"chat": {"model": "gpt-5-mini", "reconcile": True}},
+        }
+        report = await seed(db, payload)
+        db.upsert_system_setting.assert_not_awaited()
+        assert report.manifest_written is False
+
+        report = await seed(db, payload, record_manifest=True)
+        assert report.manifest_written is True
+        args, kwargs = db.upsert_system_setting.await_args
+        assert args[0] == RECONCILE_MANIFEST_KEY
+        manifest = args[1]
+        assert manifest["systemApiKeys"] == ["openai"]
+        assert manifest["models"] == ["openai/gpt-5-mini"]
+        assert manifest["defaults"] == ["chat"]
+        assert manifest["systemEndpoints"] == []
+        assert "applied_at" in manifest
+        assert kwargs["source"] == "helm"
+        assert kwargs["updated_by"] == SEEDED_FROM_TAG
+
+    @pytest.mark.asyncio
+    async def test_empty_manifest_still_written(self):
+        db = _fake_db()
+        report = await seed(db, {"systemApiKeys": []}, record_manifest=True)
+        assert report.manifest_written is True
+        manifest = db.upsert_system_setting.await_args.args[1]
+        assert all(
+            manifest[s] == []
+            for s in ("systemApiKeys", "systemEndpoints", "models", "defaults")
+        )

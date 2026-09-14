@@ -855,6 +855,27 @@ class AsyncCockpitClient:
         response.raise_for_status()
         return response.json()
 
+    @_create_retry_decorator()
+    async def list_workspace_cache(self, *, scope_kind="Account", scope_name="me"):
+        response = await self._client.get(
+            "/api/workspace-cache",
+            params={"scope_kind": scope_kind, "scope_name": scope_name},
+        )
+        response.raise_for_status()
+        return response.json()
+
+    async def delete_workspace_cache(
+        self, artifact_id, *, scope_kind="Account", scope_name="me"
+    ):
+        identity = str(UUID(str(artifact_id)))
+        response = await self._mutation_request(
+            "DELETE",
+            f"/api/workspace-cache/{identity}",
+            params={"scope_kind": scope_kind, "scope_name": scope_name},
+        )
+        response.raise_for_status()
+        return response.json()
+
     async def export_manifest_resource(
         self, resource_id: str, *, output_format: str = "yaml"
     ) -> dict[str, Any]:

@@ -37,6 +37,7 @@ from typing import (
 )
 from uuid import UUID, uuid4
 
+from shared.helm_provenance import provenance_from_breadcrumb
 from shared.credential_connectors import CredentialConnectorAttachedError
 
 try:
@@ -3714,6 +3715,7 @@ class PostgresDB:
                 SELECT j.id, j.status, j.completion_outcome_kind,
                        j.config_name, j.expert_id, j.config_override,
                        execution.harness_adapter AS execution_harness_adapter,
+                       workspace_binding.instance_id AS workspace_instance_id,
                        COALESCE(
                            CASE WHEN execution.harness_adapter = 'srw/v1' THEN
                                execution.resolved #> '{spec,execution,expert,inline,runtime,config,resolved}'
@@ -3736,6 +3738,8 @@ class PostgresDB:
                 LEFT JOIN projects p ON p.id = j.project_id
                 LEFT JOIN srw_execution_specs execution
                     ON execution.work_kind='Job' AND execution.work_id=j.id
+                LEFT JOIN srw_execution_workspace_bindings workspace_binding
+                    ON workspace_binding.execution_id=execution.id
                 WHERE j.id = $1
                 """,
                 uuid_val,
@@ -9732,7 +9736,11 @@ class PostgresDB:
         return result == "UPDATE 1"
 
     async def merge_ide_session_context(
-        self, job_id: str, session_updates: Dict[str, Any]
+        self,
+        job_id: str,
+        session_updates: Dict[str, Any],
+        *,
+        expected_vm_generation: str | None = None,
     ) -> bool:
         """Atomically merge updates into context.ide_session without touching other keys.
 
@@ -9742,6 +9750,8 @@ class PostgresDB:
         Args:
             job_id: Job UUID as string
             session_updates: Dictionary of keys to merge into context.ide_session
+            expected_vm_generation: Restrict heartbeat activity to an existing
+                live VM IDE on this generation.
 
         Returns:
             True if updated, False if not found
@@ -9763,17 +9773,31 @@ class PostgresDB:
             "    updated_at = CURRENT_TIMESTAMP "
             "WHERE id = $2"
         )
-        async with self.acquire() as conn:
-            result = await conn.execute(
-                query, json_module.dumps(session_updates), uuid_val
+        arguments = [json_module.dumps(session_updates), uuid_val]
+        if expected_vm_generation is not None:
+            # Heartbeats update an explicitly hosted VM IDE. They never create
+            # a runtime projection or relabel another/unknown backend. Check
+            # the current generation atomically with this write.
+            query += (
+                " AND context->'vm'->>'provision_generation' = $3"
+                " AND context->'vm'->>'status' = 'ready'"
+                " AND context->'ide_session'->>'restore_type' = 'vm'"
+                " AND context->'ide_session'->>'status' IN ('active','idle')"
             )
+            arguments.append(expected_vm_generation)
+        async with self.acquire() as conn:
+            result = await conn.execute(query, *arguments)
 
         return result == "UPDATE 1"
 
     async def merge_thread_ide_session_context(
-        self, thread_id: str, session_updates: Dict[str, Any]
+        self,
+        thread_id: str,
+        session_updates: Dict[str, Any],
+        *,
+        expected_vm_generation: str | None = None,
     ) -> bool:
-        """Atomically merge updates into threads.metadata.ide_session."""
+        """Merge IDE activity, optionally restricted to the current live VM."""
         import json as json_module
 
         try:
@@ -9790,10 +9814,17 @@ class PostgresDB:
             ") "
             "WHERE id = $2"
         )
-        async with self.acquire() as conn:
-            result = await conn.execute(
-                query, json_module.dumps(session_updates), uuid_val
+        arguments = [json_module.dumps(session_updates), uuid_val]
+        if expected_vm_generation is not None:
+            query += (
+                " AND metadata->'vm'->>'provision_generation' = $3"
+                " AND metadata->'vm'->>'status' = 'ready'"
+                " AND metadata->'ide_session'->>'restore_type' = 'vm'"
+                " AND metadata->'ide_session'->>'status' IN ('active','idle')"
             )
+            arguments.append(expected_vm_generation)
+        async with self.acquire() as conn:
+            result = await conn.execute(query, *arguments)
 
         return result == "UPDATE 1"
 
@@ -13013,7 +13044,9 @@ class PostgresDB:
         Kubernetes/VM deletion acknowledgements are control-plane facts, not
         proof that a partitioned node or guest stopped using a delivered
         deploy key. The provisioner records this receipt only after an exact
-        endpoint retirement plus an independent zero scan. A later ambiguous
+        endpoint retirement plus an independent zero scan, or authenticated
+        cancellation evidence that preparation never issued a workspace source
+        together with exact runtime absence. A later ambiguous
         delete response may replay only when the receipt still matches the
         server-owned runtime generation in the same owner row.
         """
@@ -19591,7 +19624,10 @@ class PostgresDB:
         expected_attach_token: str | None,
         expected_vm_context: Mapping[str, Any] | None,
         provision_context: Mapping[str, Any],
-    ) -> bool:
+        poll: bool = False,
+        preparation_only: bool = False,
+        expected_preparation_context: Mapping[str, Any] | None = None,
+    ) -> bool | dict:
         """Install one VM provision generation before any controller effect.
 
         The caller's earlier route/read snapshot is advisory.  This method is
@@ -19600,6 +19636,11 @@ class PostgresDB:
         the caller observed, then publishes the new provision generation and
         ``provisioning`` status in the same update.  A stale upgrade therefore
         cannot dispatch after End, Resume, rebind, or another VM attempt.
+
+        ``preparation_only`` instead returns a separate durable cache stage;
+        it installs no physical VM authority and preserves an existing stage's
+        deadline. VM admission then compares ``expected_preparation_context``
+        before consuming that stage in the same transaction.
 
         ``None`` means the ``vm`` member was absent/JSON-null.  Present scalar
         or array values fail closed instead of being truthiness-coerced to an
@@ -19648,6 +19689,19 @@ class PostgresDB:
         ):
             return False
         proposed["provision_generation"] = provision_generation
+        if preparation_only:
+            from shared.workspace_preparation import validate_request
+
+            try:
+                preparation = validate_request(proposed["preparation_request"])
+            except (ValueError, TypeError, KeyError):
+                return False
+            if (
+                preparation["allocationId"] != str(parsed_thread)
+                or preparation["ownerKind"] != "session"
+                or preparation["runtimeGeneration"] != str(parsed_runtime_generation)
+            ):
+                return False
         expected_vm = (
             dict(expected_vm_context) if expected_vm_context is not None else None
         )
@@ -19679,7 +19733,24 @@ class PostgresDB:
                 if current_vm != expected_vm:
                     return False
                 current_vm_status = str((current_vm or {}).get("status") or "")
-                if current_vm_status in {
+                if poll:
+                    if (
+                        current_vm_status
+                        not in {
+                            "waiting_golden",
+                            "waiting_capacity",
+                            "waiting_headscale",
+                            "waiting_preparation",
+                            "provisioning",
+                        }
+                        or (current_vm or {}).get("provision_generation")
+                        != provision_generation
+                        or (current_vm or {}).get("identity_authenticated") is not False
+                        or current_vm_status == "provisioning"
+                        and not (current_vm or {}).get("preparation_request")
+                    ):
+                        return False
+                elif current_vm_status in {
                     "provisioning",
                     "created",
                     "starting",
@@ -19688,6 +19759,7 @@ class PostgresDB:
                     "waiting_golden",
                     "waiting_capacity",
                     "waiting_headscale",
+                    "waiting_preparation",
                 }:
                     return False
                 if not (
@@ -19711,6 +19783,32 @@ class PostgresDB:
                     len(inverse_agents) != 1 or inverse_agents[0]["id"] != parsed_agent
                 ):
                     return False
+
+                # Cache construction has no physical VM identity. Keep it out
+                # of metadata.vm so End can retire this runtime without
+                # inventing VM/PVC UIDs or relaxing physical fencing.
+                stage = metadata.get("workspace_preparation")
+                if stage is not None and not isinstance(stage, dict):
+                    return False
+                if preparation_only:
+                    if stage and stage.get("preparation_request") == preparation:
+                        return dict(stage) if stage.get("status") != "failed" else False
+                    if stage and stage.get("preparation_cancelled_revision") != (
+                        stage.get("preparation_request") or {}
+                    ).get("revision"):
+                        return False
+                    proposed.update(status="waiting_preparation", preparation_only=True)
+                    metadata["workspace_preparation"] = proposed
+                    await conn.execute(
+                        "UPDATE threads SET metadata=$2::jsonb WHERE id=$1::uuid",
+                        parsed_thread,
+                        json.dumps(metadata),
+                    )
+                    return proposed
+                if expected_preparation_context is not None:
+                    if stage != dict(expected_preparation_context):
+                        return False
+                    metadata.pop("workspace_preparation", None)
 
                 # Installing a VM generation is also the exact workspace-tier
                 # transition boundary.  Session upgrades historically left
@@ -19767,6 +19865,26 @@ class PostgresDB:
                     parsed_runtime_generation,
                 )
                 return result == "UPDATE 1"
+
+    async def merge_thread_preparation_if_current(
+        self, thread_id, runtime_generation, expected, updates
+    ) -> bool:
+        """CAS cache progress without installing physical VM authority."""
+        async with self.acquire() as conn:
+            return (
+                await conn.execute(
+                    "UPDATE threads SET metadata=jsonb_set(metadata,'{workspace_preparation}',"
+                    "(metadata->'workspace_preparation') || $4::jsonb) "
+                    "WHERE id=$1::uuid AND runtime_generation=$2::uuid "
+                    "AND runtime_retirement_token IS NULL AND status<>'ended' "
+                    "AND metadata->'workspace_preparation'=$3::jsonb",
+                    UUID(str(thread_id)),
+                    UUID(str(runtime_generation)),
+                    json.dumps(expected),
+                    json.dumps(updates),
+                )
+                == "UPDATE 1"
+            )
 
     async def merge_thread_vm_context(
         self, thread_id: str, vm_updates: Dict[str, Any]
@@ -19892,17 +20010,76 @@ class PostgresDB:
                     "starting",
                     "restoring",
                     "ssh_pending",
+                    "waiting_preparation",
+                    "waiting_golden",
+                    "waiting_capacity",
+                    "waiting_headscale",
                 )
             )
         )
         query = (
             "SELECT id::text AS entity_id, user_id::text AS user_id, "
-            "metadata->'vm' AS vm FROM threads WHERE ("
+            "COALESCE(metadata->'workspace_preparation',metadata->'vm') AS vm FROM threads WHERE ("
             + status_clause
+            + (
+                ""
+                if ready
+                else " OR metadata->'workspace_preparation'->>'status'='waiting_preparation'"
+            )
             + ") AND threads.status <> 'ended' AND threads.ended_at IS NULL"
+            + " AND runtime_retirement_token IS NULL"
         )
         async with self.acquire() as conn:
             return [dict(row) for row in await conn.fetch(query)]
+
+    async def list_vm_preparation_cancellations(self) -> list:
+        """Terminal executions still holding a preparation allocation."""
+        query = """
+            SELECT id::text AS entity_id,'job' AS entity_type,context->'vm' AS vm
+            FROM jobs
+            WHERE (status IN ('completed','failed','cancelled') OR context->'vm'->>'status'='failed')
+              AND jsonb_typeof(context->'vm'->'preparation_request')='object'
+              AND context->'vm'->>'preparation_cancelled_revision' IS DISTINCT FROM
+                  context->'vm'->'preparation_request'->>'revision'
+            UNION ALL
+            SELECT id::text,'thread',metadata->'vm'
+            FROM threads
+            WHERE (status='ended' OR runtime_retirement_token IS NOT NULL OR metadata->'vm'->>'status'='failed')
+              AND jsonb_typeof(metadata->'vm'->'preparation_request')='object'
+              AND metadata->'vm'->>'preparation_cancelled_revision' IS DISTINCT FROM
+                  metadata->'vm'->'preparation_request'->>'revision'
+            UNION ALL
+            SELECT id::text,'thread',metadata->'workspace_preparation'
+            FROM threads
+            WHERE (status='ended' OR runtime_retirement_token IS NOT NULL OR metadata->'workspace_preparation'->>'status'='failed')
+              AND jsonb_typeof(metadata->'workspace_preparation'->'preparation_request')='object'
+              AND metadata->'workspace_preparation'->>'preparation_cancelled_revision' IS DISTINCT FROM
+                  metadata->'workspace_preparation'->'preparation_request'->>'revision'
+            LIMIT 50
+        """
+        async with self.acquire() as conn:
+            return [dict(row) for row in await conn.fetch(query)]
+
+    async def acknowledge_vm_preparation_cancelled(
+        self, entity_type, entity_id, request
+    ):
+        if entity_type not in {"job", "thread"}:
+            raise ValueError("Invalid preparation owner")
+        table, column = (
+            ("jobs", "context") if entity_type == "job" else ("threads", "metadata")
+        )
+        async with self.acquire() as conn:
+            for field in (
+                ("vm",) if entity_type == "job" else ("vm", "workspace_preparation")
+            ):
+                await conn.execute(
+                    f"UPDATE {table} SET {column}=jsonb_set({column},'{{{field}}}',"
+                    f"({column}->'{field}') || jsonb_build_object('preparation_cancelled_revision',$3::text)) "
+                    f"WHERE id=$1::uuid AND {column}->'{field}'->'preparation_request'=$2::jsonb",
+                    UUID(entity_id),
+                    json.dumps(request),
+                    request["revision"],
+                )
 
     async def merge_thread_snapshot_context(
         self, thread_id: str, snapshot_updates: Dict[str, Any]
@@ -32765,6 +32942,13 @@ class PostgresDB:
                 marker["recycle"] = recycle
                 metadata = dict(metadata)
                 metadata["agent_pod"] = marker
+                # The record lives in a sibling of `agent_pod` so it can outlive
+                # a retired endpoint; the copy inside the marker is what the
+                # successor-publication CAS below matches on. Both homes are
+                # written here for the same reason the service writer keeps
+                # them in step -- a stale sibling would be republished over
+                # this one and drop `successor_attempt`.
+                metadata["persistent_recycle"] = recycle
                 await conn.execute(
                     "UPDATE threads SET metadata=$2::jsonb WHERE id=$1::uuid",
                     parsed_thread,
@@ -44629,6 +44813,7 @@ class PostgresDB:
             rows = await conn.fetch(
                 """
                 SELECT id, provider, key_prefix, label, seeded_from,
+                       source, helm_value_hash, source_updated_at,
                        created_at, updated_at
                 FROM system_api_keys
                 ORDER BY provider
@@ -44652,25 +44837,40 @@ class PostgresDB:
         key_prefix: str,
         label: str | None = None,
         seeded_from: str | None = None,
+        *,
+        source: str | None = None,
+        helm_value_hash: str | None = None,
     ) -> Dict[str, Any]:
         """Create or replace the system-level API key for a provider.
 
         ``seeded_from`` is a breadcrumb set by the helm seed job; admin-UI
         edits pass ``None`` so subsequent re-seeds skip overwriting.
+
+        ``source`` records who is writing (see ``shared.helm_provenance``);
+        when omitted it is derived from ``seeded_from``. ``helm_value_hash``
+        is only ever set by the seed Job and survives admin rotations, so a
+        later reconcile can still tell "what Helm last applied".
         """
+        source = source or provenance_from_breadcrumb(seeded_from)
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
                 INSERT INTO system_api_keys
-                    (provider, api_key, key_prefix, label, seeded_from)
-                VALUES ($1, $2, $3, $4, $5)
+                    (provider, api_key, key_prefix, label, seeded_from,
+                     source, helm_value_hash, source_updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP)
                 ON CONFLICT (provider) DO UPDATE
                 SET api_key = EXCLUDED.api_key,
                     key_prefix = EXCLUDED.key_prefix,
                     label = EXCLUDED.label,
                     seeded_from = EXCLUDED.seeded_from,
+                    source = EXCLUDED.source,
+                    helm_value_hash = COALESCE(EXCLUDED.helm_value_hash,
+                                               system_api_keys.helm_value_hash),
+                    source_updated_at = CURRENT_TIMESTAMP,
                     updated_at = CURRENT_TIMESTAMP
                 RETURNING id, provider, key_prefix, label, seeded_from,
+                          source, helm_value_hash, source_updated_at,
                           created_at, updated_at
                 """,
                 provider,
@@ -44678,6 +44878,8 @@ class PostgresDB:
                 key_prefix,
                 label,
                 seeded_from,
+                source,
+                helm_value_hash,
             )
             return dict(row)
 
@@ -45925,6 +46127,7 @@ class PostgresDB:
             endpoint_rows = await conn.fetch(
                 """
                 SELECT id, label, base_url, key_prefix, transport_kind,
+                       source, helm_value_hash, source_updated_at,
                        created_at, updated_at
                 FROM llm_endpoints
                 WHERE user_id IS NULL
@@ -45942,7 +46145,8 @@ class PostgresDB:
             row = await conn.fetchrow(
                 """
                 SELECT id, label, base_url, api_key, key_prefix,
-                       transport_kind, created_at, updated_at
+                       transport_kind, source, helm_value_hash,
+                       source_updated_at, created_at, updated_at
                 FROM llm_endpoints
                 WHERE id = $1 AND user_id IS NULL
                 """,
@@ -45964,20 +46168,29 @@ class PostgresDB:
         api_key: str | None,
         key_prefix: str | None,
         transport_kind: str | None = None,
+        *,
+        source: str | None = None,
+        helm_value_hash: str | None = None,
+        seeded_from: str | None = None,
     ) -> Dict[str, Any]:
         """Create a new system-scoped LLM endpoint. Label must be globally unique.
 
         ``transport_kind`` is the stable routing marker (see
         ``shared.subscription_routing``); NULL for an ordinary
-        OpenAI-compatible endpoint.
+        OpenAI-compatible endpoint. ``source`` (see ``shared.helm_provenance``)
+        defaults to a derivation from ``seeded_from``, which this table does
+        not store — the breadcrumb only informs provenance here.
         """
+        source = source or provenance_from_breadcrumb(seeded_from)
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
                 INSERT INTO llm_endpoints
-                    (user_id, label, base_url, api_key, key_prefix, transport_kind)
-                VALUES (NULL, $1, $2, $3, $4, $5)
+                    (user_id, label, base_url, api_key, key_prefix, transport_kind,
+                     source, helm_value_hash, source_updated_at)
+                VALUES (NULL, $1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP)
                 RETURNING id, label, base_url, key_prefix, transport_kind,
+                          source, helm_value_hash, source_updated_at,
                           created_at, updated_at
                 """,
                 label,
@@ -45985,6 +46198,8 @@ class PostgresDB:
                 _encrypt_optional(api_key),
                 key_prefix,
                 transport_kind,
+                source,
+                helm_value_hash,
             )
             return dict(row)
 
@@ -45997,14 +46212,28 @@ class PostgresDB:
         key_prefix: str | None = None,
         clear_api_key: bool = False,
         transport_kind: str | None = None,
+        source: str | None = None,
+        helm_value_hash: str | None = None,
     ) -> Dict[str, Any] | None:
         """Patch a system endpoint. Only non-None fields are updated.
 
-        Returns None if no row matches (endpoint missing or user-scoped).
+        ``source`` stamps who is writing (``shared.helm_provenance``) and
+        bumps ``source_updated_at``; ``helm_value_hash`` is set by the seed
+        Job only. Returns None if no row matches (endpoint missing or
+        user-scoped).
         """
         sets: List[str] = []
         args: List[Any] = [UUID(endpoint_id)]
         param_idx = 2
+        if source is not None:
+            sets.append(f"source = ${param_idx}")
+            sets.append("source_updated_at = CURRENT_TIMESTAMP")
+            args.append(source)
+            param_idx += 1
+        if helm_value_hash is not None:
+            sets.append(f"helm_value_hash = ${param_idx}")
+            args.append(helm_value_hash)
+            param_idx += 1
         if label is not None:
             sets.append(f"label = ${param_idx}")
             args.append(label)
@@ -46035,6 +46264,7 @@ class PostgresDB:
                 row = await conn.fetchrow(
                     """
                     SELECT id, label, base_url, key_prefix, transport_kind,
+                           source, helm_value_hash, source_updated_at,
                            created_at, updated_at
                     FROM llm_endpoints
                     WHERE id = $1 AND user_id IS NULL
@@ -46049,6 +46279,7 @@ class PostgresDB:
             SET {", ".join(sets)}
             WHERE id = $1 AND user_id IS NULL
             RETURNING id, label, base_url, key_prefix, transport_kind,
+                      source, helm_value_hash, source_updated_at,
                       created_at, updated_at
         """
         async with self.acquire() as conn:
@@ -46084,7 +46315,8 @@ class PostgresDB:
     _MODEL_FIELDS = (
         "id, provider_kind, provider_ref, model_id, display_label, "
         "capabilities, family, context_window, reasoning_level, "
-        "params_json, enabled, seeded_from, notes, created_at, updated_at"
+        "params_json, enabled, seeded_from, notes, "
+        "source, helm_value_hash, source_updated_at, created_at, updated_at"
     )
 
     @staticmethod
@@ -46211,8 +46443,13 @@ class PostgresDB:
         seeded_from: str | None = None,
         notes: str | None = None,
         on_conflict_do_nothing: bool = False,
+        source: str | None = None,
+        helm_value_hash: str | None = None,
     ) -> Dict[str, Any] | None:
         """Insert a catalog row.
+
+        ``source`` (``shared.helm_provenance``) defaults to a derivation from
+        ``seeded_from``; ``helm_value_hash`` is set by the seed Job only.
 
         ``context_window=0`` and ``params_json={"temperature": 0}`` round-trip
         as themselves — only literal ``None`` is treated as "use default".
@@ -46229,6 +46466,7 @@ class PostgresDB:
         canonical = self._canonicalize_capabilities(
             capability=capability, capabilities=capabilities
         )
+        source = source or provenance_from_breadcrumb(seeded_from)
         on_conflict = (
             "ON CONFLICT (provider_kind, provider_ref, model_id) DO NOTHING"
             if on_conflict_do_nothing
@@ -46240,8 +46478,10 @@ class PostgresDB:
                 INSERT INTO models
                     (provider_kind, provider_ref, model_id, display_label,
                      capabilities, family, context_window,
-                     reasoning_level, params_json, enabled, seeded_from, notes)
-                VALUES ($1, $2, $3, $4, $5::TEXT[], $6, $7, $8, $9, $10, $11, $12)
+                     reasoning_level, params_json, enabled, seeded_from, notes,
+                     source, helm_value_hash, source_updated_at)
+                VALUES ($1, $2, $3, $4, $5::TEXT[], $6, $7, $8, $9, $10, $11, $12,
+                        $13, $14, CURRENT_TIMESTAMP)
                 {on_conflict}
                 RETURNING {self._MODEL_FIELDS}
                 """,
@@ -46257,6 +46497,8 @@ class PostgresDB:
                 enabled,
                 seeded_from,
                 notes,
+                source,
+                helm_value_hash,
             )
         return self._row_to_model(row) if row else None
 
@@ -46284,6 +46526,11 @@ class PostgresDB:
             "params_json",
             "enabled",
             "notes",
+            # Provenance (shared.helm_provenance): ``source`` stamps who is
+            # writing and bumps source_updated_at; ``helm_value_hash`` is set
+            # by the seed Job only.
+            "source",
+            "helm_value_hash",
         }
         # Capability changes are coupled — canonicalize singular/array
         # spellings into the array form before writing.
@@ -46310,6 +46557,8 @@ class PostgresDB:
             idx += 1
         if not sets:
             return await self.get_model(model_id)
+        if "source" in fields:
+            sets.append("source_updated_at = CURRENT_TIMESTAMP")
         sets.append("updated_at = CURRENT_TIMESTAMP")
         async with self.acquire() as conn:
             row = await conn.fetchrow(
@@ -46519,13 +46768,28 @@ class PostgresDB:
         model: str | None,
         *,
         updated_by: str | None = None,
+        source: str | None = None,
+        helm_value_hash: str | None = None,
     ) -> None:
-        """Set or clear the default model ID for ``kind``."""
+        """Set or clear the default model ID for ``kind``.
+
+        ``source`` / ``helm_value_hash`` are the provenance columns
+        (``shared.helm_provenance``), forwarded to the settings upsert.
+        """
         key = self._default_llm_model_key(kind)
         if model is None or model == "":
             await self.delete_system_setting(key)
             return
-        await self.upsert_system_setting(key, {"model": model}, updated_by=updated_by)
+        # Forward provenance only when given so callers (and their mocks)
+        # that never set it keep the original call shape.
+        extra: Dict[str, Any] = {}
+        if source is not None:
+            extra["source"] = source
+        if helm_value_hash is not None:
+            extra["helm_value_hash"] = helm_value_hash
+        await self.upsert_system_setting(
+            key, {"model": model}, updated_by=updated_by, **extra
+        )
 
     # Catalog capabilities that support a "first-enabled-alphabetical" fallback
     # when the admin pin is missing or dangling. Whisper/tts gained catalog
@@ -53997,7 +54261,8 @@ class PostgresDB:
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT key, value, credentials_ref, updated_at, updated_by
+                SELECT key, value, credentials_ref, updated_at, updated_by,
+                       source, helm_value_hash, source_updated_at
                 FROM system_settings WHERE key = $1
                 """,
                 key,
@@ -54020,32 +54285,51 @@ class PostgresDB:
         *,
         credentials_ref: Optional[str] = None,
         updated_by: Optional[str] = None,
+        source: Optional[str] = None,
+        helm_value_hash: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Create or replace a system_settings row.
 
-        Returns the post-write row (after the DB-side updated_at is set).
+        ``source`` (``shared.helm_provenance``) records who is writing; when
+        omitted it is derived from ``updated_by`` — a ``helm:`` actor is the
+        seed Job, anything else (an admin id, or no actor) counts as the
+        application/UI. Boot-time seeders pass ``source='default'``
+        explicitly. ``helm_value_hash`` is set by the seed Job only and
+        survives later writes. Returns the post-write row (after the DB-side
+        updated_at is set).
         """
         # ``updated_by`` is a TEXT column; coerce non-str actor ids (e.g. a
         # UUID) so callers passing a raw uuid don't trip asyncpg's type check.
         if updated_by is not None:
             updated_by = str(updated_by)
+        if source is None:
+            source = "helm" if (updated_by or "").startswith("helm:") else "ui"
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
                 INSERT INTO system_settings
-                    (key, value, credentials_ref, updated_at, updated_by)
-                VALUES ($1, $2::jsonb, $3, CURRENT_TIMESTAMP, $4)
+                    (key, value, credentials_ref, updated_at, updated_by,
+                     source, helm_value_hash, source_updated_at)
+                VALUES ($1, $2::jsonb, $3, CURRENT_TIMESTAMP, $4,
+                        $5, $6, CURRENT_TIMESTAMP)
                 ON CONFLICT (key) DO UPDATE SET
                     value = EXCLUDED.value,
                     credentials_ref = EXCLUDED.credentials_ref,
                     updated_at = CURRENT_TIMESTAMP,
-                    updated_by = EXCLUDED.updated_by
-                RETURNING key, value, credentials_ref, updated_at, updated_by
+                    updated_by = EXCLUDED.updated_by,
+                    source = EXCLUDED.source,
+                    helm_value_hash = COALESCE(EXCLUDED.helm_value_hash,
+                                               system_settings.helm_value_hash),
+                    source_updated_at = CURRENT_TIMESTAMP
+                RETURNING key, value, credentials_ref, updated_at, updated_by,
+                          source, helm_value_hash, source_updated_at
                 """,
                 key,
                 json.dumps(value),
                 credentials_ref,
                 updated_by,
+                source,
+                helm_value_hash,
             )
         d = self._row_to_dict(row) or {}
         raw_value = d.get("value")

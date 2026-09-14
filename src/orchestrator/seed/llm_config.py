@@ -31,6 +31,16 @@ a fresh stack. On each run:
   warning, so a typo in values.yaml cannot pin a model the resolver has no
   transport for.
 
+* Any entry may carry ``reconcile: true``. Such an entry is **re-applied on
+  every run**: the row is rewritten to the declared value whenever it differs
+  from what Helm last applied (``helm_value_hash``) or was last written by
+  someone else (``source``), and an admin override is logged as reverted.
+  The set of reconciled identities is recorded in the ``system_settings``
+  row ``helm.reconcile`` (the manifest) so Admin → Models can badge the rows
+  Helm owns. Entries without the flag keep the insert-only contract above.
+  See shared/helm_provenance.py and
+  knowledge-base/knowledge/features/helm_managed_settings.md.
+
 The Job is re-run on every upgrade, so the seeder's success path must be
 idempotent. Non-zero exits are reserved for genuine DB errors — a re-run
 against an already-seeded stack reports "skipped" for everything and exits 0.
@@ -55,6 +65,8 @@ Payload shape::
             contextWindow: 128000
             reasoningLevel: null
             capability: chat             # optional; defaults to 'chat'
+            params:                      # optional; lands in models.params_json
+              temperature: 0.2
           - id: "qwen3-embedding-8b"
             displayName: "Qwen3 Embedding 8B"
             capability: embedding        # routes to Admin → Defaults → Embedding
@@ -96,12 +108,22 @@ import logging
 import os
 import sys
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
 import yaml
 
 from orchestrator.database.postgres import PostgresDB
+from shared.helm_provenance import (
+    RECONCILE_MANIFEST_KEY,
+    SOURCE_DEFAULT,
+    SOURCE_HELM,
+    SOURCE_UI,
+    empty_manifest,
+    model_identity,
+    value_hash,
+)
 from shared.subscription_routing import (
     LEGACY_CODEX_PROXY_ENDPOINT_LABEL,
     SUBSCRIPTION_PROXY_TRANSPORT,
@@ -292,6 +314,28 @@ def _resolve_capabilities_from_entry(
     return out
 
 
+def _params_from_entry(entry: dict[str, Any], *, context: str) -> dict[str, Any] | None:
+    """Free-form per-row parameters (``models.params_json``).
+
+    Accepts ``params`` (helm spelling) or ``params_json``. Anything that is
+    not a mapping is ignored with a warning rather than failing the run —
+    the row is still worth seeding without its tuning.
+    """
+    raw = entry.get("params")
+    if raw is None:
+        raw = entry.get("params_json")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        logger.warning(
+            "%s: params must be a mapping, got %s — ignored",
+            context,
+            type(raw).__name__,
+        )
+        return None
+    return dict(raw)
+
+
 @dataclass
 class SeedReport:
     """Outcome summary for a single seed run."""
@@ -304,12 +348,19 @@ class SeedReport:
     models_skipped: list[tuple[str, str]] = field(default_factory=list)
     defaults_seeded: list[tuple[str, str]] = field(default_factory=list)
     defaults_skipped: list[tuple[str, str]] = field(default_factory=list)
+    # (section, identity) rows rewritten by a ``reconcile: true`` entry, and
+    # the subset whose previous writer was an admin (override reverted).
+    reconciled: list[tuple[str, str]] = field(default_factory=list)
+    reverted: list[tuple[str, str]] = field(default_factory=list)
+    manifest: dict[str, list[str]] = field(default_factory=empty_manifest)
+    manifest_written: bool = False
 
     def log(self) -> None:
         logger.info(
             "seed summary — keys seeded=%d skipped=%d, endpoints seeded=%d "
             "skipped=%d, models seeded=%d skipped=%d, defaults seeded=%d "
-            "skipped=%d",
+            "skipped=%d, reconciled=%d (admin overrides reverted=%d), "
+            "manifest written=%s",
             len(self.api_keys_seeded),
             len(self.api_keys_skipped),
             len(self.endpoints_seeded),
@@ -318,6 +369,27 @@ class SeedReport:
             len(self.models_skipped),
             len(self.defaults_seeded),
             len(self.defaults_skipped),
+            len(self.reconciled),
+            len(self.reverted),
+            self.manifest_written,
+        )
+
+
+def _wants_reconcile(entry: dict[str, Any]) -> bool:
+    return bool(entry.get("reconcile"))
+
+
+def _record_reconcile(
+    report: SeedReport, section: str, identity: str, previous_source: str | None
+) -> None:
+    report.reconciled.append((section, identity))
+    if previous_source == SOURCE_UI:
+        report.reverted.append((section, identity))
+        logger.warning(
+            "%s[%s]: admin edit reverted — the entry is declared with "
+            "reconcile: true, so Helm's value wins on every upgrade",
+            section,
+            identity,
         )
 
 
@@ -342,7 +414,7 @@ def load_payload(path: Path) -> dict[str, Any]:
 async def _seed_api_keys(
     db: PostgresDB, entries: Iterable[dict[str, Any]], report: SeedReport
 ) -> None:
-    existing = {row["provider"] for row in await db.list_system_api_keys()}
+    existing = {row["provider"]: row for row in await db.list_system_api_keys()}
     for entry in entries:
         provider = entry.get("provider")
         if not provider:
@@ -358,21 +430,42 @@ async def _seed_api_keys(
                 provider,
             )
             continue
-        if provider in existing:
-            report.api_keys_skipped.append(provider)
-            logger.info("api key for %s already present — skipped", provider)
-            continue
-
         label = entry.get("label")
+        declared_hash = value_hash({"api_key": api_key, "label": label})
+        reconcile = _wants_reconcile(entry)
+        if reconcile:
+            report.manifest["systemApiKeys"].append(provider)
+        current = existing.get(provider)
+        if current is not None:
+            if not reconcile:
+                report.api_keys_skipped.append(provider)
+                logger.info("api key for %s already present — skipped", provider)
+                continue
+            if (
+                current.get("source") == SOURCE_HELM
+                and current.get("helm_value_hash") == declared_hash
+            ):
+                report.api_keys_skipped.append(provider)
+                logger.info(
+                    "api key for %s matches the declared value — skipped", provider
+                )
+                continue
+
         await db.upsert_system_api_key(
             provider=provider,
             api_key=api_key,
             key_prefix=api_key[:8],
             label=label,
             seeded_from=SEEDED_FROM_TAG,
+            source=SOURCE_HELM,
+            helm_value_hash=declared_hash,
         )
-        report.api_keys_seeded.append(provider)
-        logger.info("seeded system api key for %s", provider)
+        if current is None:
+            report.api_keys_seeded.append(provider)
+            logger.info("seeded system api key for %s", provider)
+        else:
+            _record_reconcile(report, "systemApiKeys", provider, current.get("source"))
+            logger.info("reconciled system api key for %s", provider)
 
 
 async def _seed_endpoints(
@@ -419,20 +512,65 @@ async def _seed_endpoints(
         existing = by_label.get(label)
         if existing is None and transport_kind == SUBSCRIPTION_PROXY_TRANSPORT:
             existing = subscription_row
+        api_key = _resolve_secret_value(entry, context=f"systemEndpoints[{label}]")
+        # A declared-but-unresolved credential (empty Secret key, unset env)
+        # must never be mistaken for "keyless": reconcile then leaves the
+        # stored key alone and only re-applies the URL.
+        declares_key = any(
+            entry.get(k) for k in ("apiKey", "api_key", "apiKeyEnv", "api_key_env")
+        )
+        declared_hash = value_hash(
+            {
+                "base_url": base_url,
+                "api_key": api_key if (api_key or not declares_key) else "<unresolved>",
+                "transport_kind": transport_kind,
+            }
+        )
+        reconcile = _wants_reconcile(entry)
+        if reconcile:
+            report.manifest["systemEndpoints"].append(label)
+        # ``_source`` is an internal key (never rendered by the chart): runtime
+        # callers that reuse this path — the subscription-proxy wiring on an
+        # OAuth callback — record image-shipped provenance, not Helm's.
+        write_source = entry.get("_source") or SOURCE_HELM
         if existing is None:
-            api_key = _resolve_secret_value(entry, context=f"systemEndpoints[{label}]")
             created = await db.create_system_llm_endpoint(
                 label=label,
                 base_url=base_url,
                 api_key=api_key,
                 key_prefix=(api_key[:8] if api_key else None),
                 transport_kind=transport_kind,
+                source=write_source,
+                helm_value_hash=declared_hash if write_source == SOURCE_HELM else None,
             )
             endpoint_id = str(created["id"])
             if transport_kind == SUBSCRIPTION_PROXY_TRANSPORT:
                 subscription_row = created
             report.endpoints_seeded.append(label)
             logger.info("seeded system endpoint %s (%s)", label, base_url)
+        elif reconcile and not (
+            existing.get("source") == SOURCE_HELM
+            and existing.get("helm_value_hash") == declared_hash
+        ):
+            endpoint_id = str(existing["id"])
+            if declares_key and not api_key:
+                logger.warning(
+                    "systemEndpoints[%s]: credential declared but unresolved — "
+                    "re-applying the URL only, stored key left untouched",
+                    label,
+                )
+            await db.update_system_llm_endpoint(
+                endpoint_id=endpoint_id,
+                base_url=base_url,
+                api_key=api_key,
+                key_prefix=(api_key[:8] if api_key else None),
+                clear_api_key=(not declares_key and not api_key),
+                transport_kind=transport_kind,
+                source=SOURCE_HELM,
+                helm_value_hash=declared_hash,
+            )
+            _record_reconcile(report, "systemEndpoints", label, existing.get("source"))
+            logger.info("reconciled system endpoint %s (%s)", label, base_url)
         else:
             endpoint_id = str(existing["id"])
             # Self-heal a pre-migration row (or one an operator created by hand
@@ -483,43 +621,35 @@ async def _seed_endpoints(
                 endpoint_aggregated[model_id] = {
                     "model": model,
                     "capabilities": list(capabilities),
+                    "reconcile": _wants_reconcile(model),
                 }
             else:
                 existing_caps = existing["capabilities"]
                 for c in capabilities:
                     if c not in existing_caps:
                         existing_caps.append(c)
+                existing["reconcile"] = existing["reconcile"] or _wants_reconcile(model)
 
         for model_id, agg in endpoint_aggregated.items():
             model = agg["model"]
-            capabilities = agg["capabilities"]
-            display_label = (
-                model.get("displayName") or model.get("display_name") or model_id
+            fields = _declared_model_fields(
+                model,
+                model_id=model_id,
+                capabilities=agg["capabilities"],
+                family_of=family_of,
+                context=f"systemEndpoints[{label}].models[{model_id}]",
             )
-            inserted = await db.create_model(
+            await _apply_model_row(
+                db,
+                report,
                 provider_kind="endpoint",
                 provider_ref=endpoint_id,
                 model_id=model_id,
-                display_label=display_label,
-                capabilities=capabilities,
-                family=model.get("family") or family_of(model_id),
-                context_window=model.get("contextWindow")
-                or model.get("context_window"),
-                reasoning_level=model.get("reasoningLevel")
-                or model.get("reasoning_level"),
-                enabled=model.get("enabled", True),
-                seeded_from="helm:llm.seed",
-                on_conflict_do_nothing=True,
-            )
-            if inserted is None:
-                report.models_skipped.append((label, model_id))
-                continue
-            report.models_seeded.append((label, model_id))
-            logger.info(
-                "seeded catalog row %s (capabilities=%s) under endpoint %s",
-                model_id,
-                capabilities,
-                label,
+                fields=fields,
+                reconcile=agg["reconcile"],
+                identity=model_identity("endpoint", label, model_id),
+                report_key=label,
+                anchor_desc=f"endpoint {label}",
             )
 
 
@@ -577,6 +707,7 @@ async def _seed_system_models(
             aggregated[key] = {
                 "entry": entry,
                 "capabilities": list(capabilities),
+                "reconcile": _wants_reconcile(entry),
             }
         else:
             # Union the capabilities (preserve order, dedupe). Other metadata
@@ -587,36 +718,123 @@ async def _seed_system_models(
             for c in capabilities:
                 if c not in existing_caps:
                     existing_caps.append(c)
+            existing["reconcile"] = existing["reconcile"] or _wants_reconcile(entry)
 
     for (provider, model_id), agg in aggregated.items():
         entry = agg["entry"]
-        capabilities = agg["capabilities"]
-        display_label = (
-            entry.get("displayName") or entry.get("display_name") or model_id
+        fields = _declared_model_fields(
+            entry,
+            model_id=model_id,
+            capabilities=agg["capabilities"],
+            family_of=family_of,
+            context=f"systemModels[{provider}/{model_id}]",
         )
-        inserted = await db.create_model(
+        await _apply_model_row(
+            db,
+            report,
             provider_kind="system",
             provider_ref=provider,
             model_id=model_id,
-            display_label=display_label,
-            capabilities=capabilities,
-            family=entry.get("family") or family_of(model_id),
-            context_window=entry.get("contextWindow") or entry.get("context_window"),
-            reasoning_level=entry.get("reasoningLevel") or entry.get("reasoning_level"),
-            enabled=entry.get("enabled", True),
-            seeded_from=SEEDED_FROM_TAG,
-            on_conflict_do_nothing=True,
+            fields=fields,
+            reconcile=agg["reconcile"],
+            identity=model_identity("system", provider, model_id),
+            report_key=provider,
+            anchor_desc=f"system provider {provider}",
         )
-        if inserted is None:
-            report.models_skipped.append((provider, model_id))
-            continue
-        report.models_seeded.append((provider, model_id))
+
+
+def _declared_model_fields(
+    entry: dict[str, Any],
+    *,
+    model_id: str,
+    capabilities: list[str],
+    family_of: Any,
+    context: str,
+) -> dict[str, Any]:
+    """The catalog columns a helm entry declares, in ``create_model`` spelling.
+
+    The same dict is hashed for reconcile, so two renders of the same values
+    produce the same ``helm_value_hash``.
+    """
+    return {
+        "display_label": (
+            entry.get("displayName") or entry.get("display_name") or model_id
+        ),
+        "capabilities": list(capabilities),
+        "family": entry.get("family") or family_of(model_id),
+        "context_window": entry.get("contextWindow") or entry.get("context_window"),
+        "reasoning_level": entry.get("reasoningLevel") or entry.get("reasoning_level"),
+        "params_json": _params_from_entry(entry, context=context),
+        "enabled": entry.get("enabled", True),
+    }
+
+
+async def _apply_model_row(
+    db: PostgresDB,
+    report: SeedReport,
+    *,
+    provider_kind: str,
+    provider_ref: str,
+    model_id: str,
+    fields: dict[str, Any],
+    reconcile: bool,
+    identity: str,
+    report_key: str,
+    anchor_desc: str,
+) -> None:
+    """Insert a catalog row, or re-apply it when declared with ``reconcile``.
+
+    Insert stays ``ON CONFLICT DO NOTHING`` (admin edits survive) unless the
+    entry is reconciled, in which case a differing row is rewritten to the
+    declared fields and stamped ``source='helm'``.
+    """
+    declared_hash = value_hash(fields)
+    if reconcile:
+        report.manifest["models"].append(identity)
+    inserted = await db.create_model(
+        provider_kind=provider_kind,
+        provider_ref=provider_ref,
+        model_id=model_id,
+        seeded_from=SEEDED_FROM_TAG,
+        on_conflict_do_nothing=True,
+        source=SOURCE_HELM,
+        helm_value_hash=declared_hash,
+        **fields,
+    )
+    if inserted is not None:
+        report.models_seeded.append((report_key, model_id))
         logger.info(
-            "seeded catalog row %s (capabilities=%s) under system provider %s",
+            "seeded catalog row %s (capabilities=%s) under %s",
             model_id,
-            capabilities,
-            provider,
+            fields["capabilities"],
+            anchor_desc,
         )
+        return
+    if not reconcile:
+        report.models_skipped.append((report_key, model_id))
+        return
+    rows = await db.list_models(provider_kind=provider_kind, provider_ref=provider_ref)
+    current = next((r for r in rows if r.get("model_id") == model_id), None)
+    if current is None:
+        # Conflict said "exists", the listing disagrees — a concurrent delete;
+        # nothing sensible to reconcile against this run.
+        report.models_skipped.append((report_key, model_id))
+        return
+    if (
+        current.get("source") == SOURCE_HELM
+        and current.get("helm_value_hash") == declared_hash
+    ):
+        report.models_skipped.append((report_key, model_id))
+        logger.info("catalog row %s matches the declared value — skipped", model_id)
+        return
+    await db.update_model(
+        str(current["id"]),
+        source=SOURCE_HELM,
+        helm_value_hash=declared_hash,
+        **fields,
+    )
+    _record_reconcile(report, "models", identity, current.get("source"))
+    logger.info("reconciled catalog row %s under %s", model_id, anchor_desc)
 
 
 def _default_model_from_entry(value: Any) -> str | None:
@@ -644,7 +862,8 @@ async def _seed_defaults(
     """
     catalog_by_capability: dict[str, set[str]] = {}
     for kind in sorted(entries):
-        model = _default_model_from_entry(entries[kind])
+        declared = entries[kind]
+        model = _default_model_from_entry(declared)
         capability = DEFAULT_PIN_CAPABILITY_BY_KIND.get(kind)
         if capability is None:
             report.defaults_skipped.append((kind, model or ""))
@@ -657,13 +876,31 @@ async def _seed_defaults(
         if model is None:
             logger.info("defaults[%s]: no model declared — skipped", kind)
             continue
+        reconcile = isinstance(declared, dict) and _wants_reconcile(declared)
+        if reconcile:
+            report.manifest["defaults"].append(kind)
+        declared_hash = value_hash(model)
         existing = await db.get_default_llm_model(kind)
+        previous_source: str | None = None
         if existing:
-            report.defaults_skipped.append((kind, existing))
-            logger.info(
-                "default %s already pinned to %s — leaving untouched", kind, existing
-            )
-            continue
+            if not reconcile:
+                report.defaults_skipped.append((kind, existing))
+                logger.info(
+                    "default %s already pinned to %s — leaving untouched",
+                    kind,
+                    existing,
+                )
+                continue
+            row = await db.get_system_setting(f"llm.default_{kind}_model") or {}
+            previous_source = row.get("source")
+            if (
+                previous_source == SOURCE_HELM
+                and row.get("helm_value_hash") == declared_hash
+                and existing == model
+            ):
+                report.defaults_skipped.append((kind, existing))
+                logger.info("default %s matches the declared pin — skipped", kind)
+                continue
         if capability not in catalog_by_capability:
             rows = await db.list_models(capabilities=[capability], enabled_only=True)
             catalog_by_capability[capability] = {row["model_id"] for row in rows}
@@ -678,13 +915,55 @@ async def _seed_defaults(
                 capability,
             )
             continue
-        await db.set_default_llm_model(kind, model, updated_by=SEEDED_FROM_TAG)
-        report.defaults_seeded.append((kind, model))
-        logger.info("pinned default %s model to %s", kind, model)
+        await db.set_default_llm_model(
+            kind,
+            model,
+            updated_by=SEEDED_FROM_TAG,
+            source=SOURCE_HELM,
+            helm_value_hash=declared_hash,
+        )
+        if existing:
+            _record_reconcile(report, "defaults", kind, previous_source)
+            logger.info("reconciled default %s model to %s", kind, model)
+        else:
+            report.defaults_seeded.append((kind, model))
+            logger.info("pinned default %s model to %s", kind, model)
 
 
-async def seed(db: PostgresDB, payload: dict[str, Any]) -> SeedReport:
-    """Apply the seed payload against an already-connected ``PostgresDB``."""
+async def _write_manifest(db: PostgresDB, report: SeedReport) -> None:
+    """Record which identities Helm reconciles, for the admin API's badges.
+
+    Rewritten on every Job run, so dropping ``reconcile: true`` from values
+    and upgrading is how a row is released back to the UI.
+    """
+    manifest: dict[str, Any] = {
+        section: sorted(set(ids)) for section, ids in report.manifest.items()
+    }
+    manifest["applied_at"] = datetime.now(timezone.utc).isoformat()
+    await db.upsert_system_setting(
+        RECONCILE_MANIFEST_KEY,
+        manifest,
+        updated_by=SEEDED_FROM_TAG,
+        source=SOURCE_HELM,
+        helm_value_hash=value_hash(
+            {k: v for k, v in manifest.items() if k != "applied_at"}
+        ),
+    )
+    report.manifest_written = True
+    logger.info(
+        "reconcile manifest recorded: %s",
+        {k: len(v) for k, v in manifest.items() if isinstance(v, list)},
+    )
+
+
+async def seed(
+    db: PostgresDB, payload: dict[str, Any], *, record_manifest: bool = False
+) -> SeedReport:
+    """Apply the seed payload against an already-connected ``PostgresDB``.
+
+    ``record_manifest`` (the Helm Job) rewrites the ``helm.reconcile``
+    manifest afterwards; the bare-metal init path leaves it alone.
+    """
     report = SeedReport()
     api_keys = payload.get("systemApiKeys") or []
     endpoints = payload.get("systemEndpoints") or []
@@ -711,6 +990,8 @@ async def seed(db: PostgresDB, payload: dict[str, Any]) -> SeedReport:
     # Last on purpose: catalog rows seeded above are visible to the pin check.
     if defaults:
         await _seed_defaults(db, defaults, report)
+    if record_manifest:
+        await _write_manifest(db, report)
     return report
 
 
@@ -780,6 +1061,7 @@ async def ensure_subscription_proxy_endpoint(
                 "apiKeyEnv": subscription_proxy_inference_key_env(),
                 "transportKind": SUBSCRIPTION_PROXY_TRANSPORT,
                 "models": [],
+                "_source": SOURCE_DEFAULT,
             }
         ]
     }
@@ -825,6 +1107,7 @@ async def ensure_elevenlabs_tts_endpoint(db: PostgresDB) -> bool:
                 break
         if endpoint_id is None:
             created = await db.create_system_llm_endpoint(
+                source=SOURCE_DEFAULT,
                 label=ELEVENLABS_ENDPOINT_LABEL,
                 base_url=_ELEVENLABS_BASE_URL,
                 api_key=None,  # env is the source of truth; adapter reads it
@@ -882,6 +1165,7 @@ async def ensure_tavily_search_endpoint(db: PostgresDB) -> bool:
                 return False
 
         endpoint = await db.create_system_llm_endpoint(
+            source=SOURCE_DEFAULT,
             label=TAVILY_ENDPOINT_LABEL,
             base_url=_TAVILY_BASE_URL,
             api_key=api_key,
@@ -907,7 +1191,9 @@ async def ensure_tavily_search_endpoint(db: PostgresDB) -> bool:
 
         for capability in ("search", "fetch"):
             if not await db.get_default_llm_model(capability):
-                await db.set_default_llm_model(capability, TAVILY_MODEL_ID)
+                await db.set_default_llm_model(
+                    capability, TAVILY_MODEL_ID, source=SOURCE_DEFAULT
+                )
         logger.info(
             "ensure_tavily_search_endpoint: registered Tavily search/fetch provider"
         )
@@ -943,6 +1229,7 @@ async def ensure_searxng_search_endpoint(
                 return False
 
         endpoint = await db.create_system_llm_endpoint(
+            source=SOURCE_DEFAULT,
             label=SEARXNG_ENDPOINT_LABEL,
             base_url=url,
             api_key=None,
@@ -965,11 +1252,15 @@ async def ensure_searxng_search_endpoint(
 
         primary = await db.get_default_llm_model("search")
         if not primary:
-            await db.set_default_llm_model("search", SEARXNG_MODEL_ID)
+            await db.set_default_llm_model(
+                "search", SEARXNG_MODEL_ID, source=SOURCE_DEFAULT
+            )
         elif primary != SEARXNG_MODEL_ID and not await db.get_default_llm_model(
             "search_fallback"
         ):
-            await db.set_default_llm_model("search_fallback", SEARXNG_MODEL_ID)
+            await db.set_default_llm_model(
+                "search_fallback", SEARXNG_MODEL_ID, source=SOURCE_DEFAULT
+            )
         logger.info(
             "ensure_searxng_search_endpoint: registered bundled SearXNG provider"
         )
@@ -990,7 +1281,7 @@ async def run(payload_path: Path) -> SeedReport:
     db = PostgresDB()
     await db.connect()
     try:
-        report = await seed(db, payload)
+        report = await seed(db, payload, record_manifest=True)
     finally:
         await db.close()
     report.log()
@@ -1032,6 +1323,7 @@ async def ensure_crawl4ai_fetch_endpoint(
                 return False
 
         endpoint = await db.create_system_llm_endpoint(
+            source=SOURCE_DEFAULT,
             label=CRAWL4AI_ENDPOINT_LABEL,
             base_url=url,
             api_key=token,
@@ -1053,7 +1345,9 @@ async def ensure_crawl4ai_fetch_endpoint(
             return False
 
         if not await db.get_default_llm_model("fetch"):
-            await db.set_default_llm_model("fetch", CRAWL4AI_MODEL_ID)
+            await db.set_default_llm_model(
+                "fetch", CRAWL4AI_MODEL_ID, source=SOURCE_DEFAULT
+            )
         logger.info(
             "ensure_crawl4ai_fetch_endpoint: registered bundled Crawl4AI provider"
         )

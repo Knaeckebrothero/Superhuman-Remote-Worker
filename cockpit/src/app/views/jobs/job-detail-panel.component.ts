@@ -1,10 +1,13 @@
 import {
   ChangeDetectionStrategy,
   Component,
+  ElementRef,
   computed,
+  effect,
   input,
   output,
   signal,
+  viewChild,
 } from '@angular/core';
 import {RouterLink} from '@angular/router';
 import {TranslocoModule} from '@jsverse/transloco';
@@ -240,7 +243,27 @@ export function subjobBlockedKey(
   template: `
     <div class="detail-panel">
       @if (job().description) {
-        <p class="detail-description">{{ job().description }}</p>
+        <div class="description-block">
+          <!-- Kept on one line on purpose: the paragraph is pre-wrap, so any
+               template indentation around the interpolation renders as a real
+               leading space. -->
+          <p
+            #descBody
+            class="detail-description"
+            [class.detail-description--capped]="!descExpanded()"
+            [class.detail-description--faded]="descOverflowed() && !descExpanded()"
+          >{{ job().description }}</p>
+          @if (descOverflowed()) {
+            <button
+              type="button"
+              class="desc-toggle"
+              [attr.aria-expanded]="descExpanded()"
+              (click)="descExpanded.set(!descExpanded())"
+            >
+              {{ (descExpanded() ? 'jobs.detail.showLess' : 'jobs.detail.showMore') | transloco }}
+            </button>
+          }
+        </div>
       }
 
       <div class="detail-grid">
@@ -492,6 +515,13 @@ export function subjobBlockedKey(
         background: var(--surface-1);
         border-radius: var(--radius-control);
       }
+      .description-block {
+        display: flex;
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 6px;
+        min-width: 0;
+      }
       .detail-description {
         margin: 0;
         color: var(--text-primary);
@@ -499,6 +529,47 @@ export function subjobBlockedKey(
         line-height: 1.55;
         white-space: pre-wrap;
         overflow-wrap: anywhere;
+      }
+      /* A job prompt is routinely hundreds of lines; left unclamped it pushes
+         the facts, usage and roster below it off the screen entirely — the
+         panel then reads as "a wall of text" rather than as a job summary. */
+      .detail-description--capped {
+        position: relative;
+        /* 10 lines: em is this element's own 13px, so the cap tracks the font
+           size and the 1.55 line-height rather than a hard-coded pixel guess. */
+        max-height: 15.5em;
+        overflow: hidden;
+      }
+      /* Only once something is genuinely hidden: an unfaded short prompt must
+         not be dimmed by a gradient taller than the text it sits over. */
+      .detail-description--faded::after {
+        content: '';
+        position: absolute;
+        inset-inline: 0;
+        bottom: 0;
+        height: 3em;
+        /* Fades to the panel's own background — a gradient to anything else
+           reads as a smudge in whichever theme it does not match. */
+        background: linear-gradient(to bottom, transparent, var(--surface-1));
+        pointer-events: none;
+      }
+      /* Reads as a chip, not as prose: in both themes --border-color equals
+         the panel background, so a bordered-but-transparent button is
+         invisible at rest. A surface-0 fill on the surface-1 panel is the same
+         contrast pair the scope switch below already uses. */
+      .desc-toggle {
+        padding: 3px 8px;
+        border: none;
+        border-radius: var(--radius-control);
+        background: var(--surface-0);
+        color: var(--text-secondary);
+        font-family: inherit;
+        font-size: 11px;
+        cursor: pointer;
+      }
+      .desc-toggle:hover {
+        background: var(--surface-2);
+        color: var(--text-primary);
       }
       .detail-grid {
         display: grid;
@@ -794,6 +865,34 @@ export class JobDetailPanelComponent {
 
   /** Which figure is on screen. Resets with the panel, which is cheap and honest. */
   readonly scope = signal<UsageScope>('job');
+
+  /** Whether the prompt is shown whole. Resets with the panel, like `scope`. */
+  readonly descExpanded = signal(false);
+  /** True once the clamped prompt is genuinely taller than its cap. */
+  readonly descOverflowed = signal(false);
+  private readonly descBody = viewChild<ElementRef<HTMLElement>>('descBody');
+
+  constructor() {
+    // "Show more" may only appear when text is actually hidden, and a
+    // length heuristic lies in both directions — a hard-wrapped prompt
+    // overflows where the same character count of flowing prose does not.
+    // So measure the laid-out paragraph, as the tool card does.
+    effect((onCleanup) => {
+      const el = this.descBody()?.nativeElement;
+      if (!el || typeof ResizeObserver === 'undefined') {
+        this.descOverflowed.set(false);
+        return;
+      }
+      const observer = new ResizeObserver(() => {
+        // Expanding lifts the cap, so the element then measures as "fits" —
+        // which would remove the very button needed to collapse it again.
+        if (this.descExpanded()) return;
+        this.descOverflowed.set(el.scrollHeight > el.clientHeight + 1);
+      });
+      observer.observe(el);
+      onCleanup(() => observer.disconnect());
+    });
+  }
 
   protected readonly formatCount = formatCount;
   protected readonly formatUsd = formatUsd;

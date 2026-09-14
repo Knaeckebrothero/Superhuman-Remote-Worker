@@ -1,0 +1,612 @@
+{
+  "gate": "manifest-srw-adapter-smoke",
+  "context": "k3d-srw",
+  "gateIdentity": "cutover-63cf521673b1-",
+  "startedAt": "2026-09-14T01:15:26.237968+00:00",
+  "status": "passed",
+  "scope": "Real SRW Jobs on sandbox/virtual and stateless Sessions on sandbox/virtual/none over HTTP, SSE and referenced workspace snapshots",
+  "deployment": {
+    "pod": "srw-orchestrator-85dc8977d4-rn66l",
+    "imageID": "srw-registry:5000/srw-orchestrator@sha256:79e9c514b32c7d80e1cb1aa5557f33e9372452b8543e92e4b32fa8cd2c928c9e",
+    "sourceFilesMatched": 76,
+    "sourceDigest": "821689b77bcfc90a5de47f85082527c469752d309480e92a49ff6271d5937dec",
+    "nativeHostingEnabled": false,
+    "nativeNamespace": "srw-native"
+  },
+  "agents": [
+    {
+      "pod": "srw-agent-stateless-fc64f6654-8v4jq",
+      "uid": "992f52d0-be75-41c4-ae69-4cea62e5394f",
+      "image": "srw-registry:5000/srw-agent:tilt-45d59d3ba5a7f50b",
+      "sourceFilesMatched": 6
+    },
+    {
+      "pod": "srw-agent-stateless-fc64f6654-bmmnh",
+      "uid": "39a0f367-d66e-4299-ae5d-3353fa264bbb",
+      "image": "srw-registry:5000/srw-agent:tilt-45d59d3ba5a7f50b",
+      "sourceFilesMatched": 6
+    }
+  ],
+  "fixtureImage": "srw-registry:5000/srw-manifest-fixture@sha256:3d0ec14ee4e90a8a794f2937c5aea2e77b03caaf70c5870db480325ca824d5f1",
+  "temporaryAdmin": {
+    "username": "srw-manifest-admin-0b6fe11947f6",
+    "oauthClientID": "adc864dd-aa22-4c33-a352-e3a9a1ba0d21",
+    "keycloakID": "079d25a6-4a45-4dfc-8b16-8edb9466fef2",
+    "applicationID": "a6e7ce9f-e02a-4641-81a1-f193149bdf9c",
+    "identityRevoked": true,
+    "identityDeleted": true,
+    "applicationUserDeleted": true,
+    "oauthClientDeleted": true,
+    "defaultProjectRemoved": true,
+    "externalProfileResidue": "Normal JIT cloud/Gitea profiles may outlive the application user; no external account deletion API is assumed."
+  },
+  "checks": [
+    "Role-authenticated owned provider/model registration preserves configured and effective defaults",
+    "Native SRW manifest Job on sandbox completes through the same Expert and reapply preserves its execution identity",
+    "Native SRW manifest Job on virtual completes through the same Expert and reapply preserves its execution identity",
+    "Existing Job API selects a referenced virtual workspace independently of its Expert",
+    "Stateless Session first attach, frozen source edit, next-turn PATCH and End/Resume preserve the admitted contract",
+    "The same immutable Session Expert replies on sandbox, virtual and explicit none; previews respect the selected tier"
+  ],
+  "cleanup": {
+    "complete": true,
+    "stage": "complete",
+    "workloads": [
+      {
+        "kind": "Session",
+        "workID": "9c74e2d5-e922-404f-b647-48a2b9676269",
+        "statuses": [
+          {
+            "method": "GET",
+            "status": 200
+          },
+          {
+            "method": "DELETE",
+            "status": 503
+          },
+          {
+            "method": "GET",
+            "status": 200
+          },
+          {
+            "method": "DELETE",
+            "status": 200
+          },
+          {
+            "method": "GET",
+            "status": 404
+          }
+        ],
+        "absent": true
+      },
+      {
+        "kind": "Session",
+        "workID": "45a02ed4-57f6-4ebd-8cd8-837fcfc8c448",
+        "statuses": [
+          {
+            "method": "GET",
+            "status": 200
+          },
+          {
+            "method": "DELETE",
+            "status": 503
+          },
+          {
+            "method": "GET",
+            "status": 200
+          },
+          {
+            "method": "DELETE",
+            "status": 200
+          },
+          {
+            "method": "GET",
+            "status": 404
+          }
+        ],
+        "absent": true
+      },
+      {
+        "kind": "Session",
+        "workID": "c17b8147-d2b6-4aee-b0c6-ccfc6404830b",
+        "statuses": [
+          {
+            "method": "GET",
+            "status": 200
+          },
+          {
+            "method": "DELETE",
+            "status": 200
+          },
+          {
+            "method": "GET",
+            "status": 404
+          }
+        ],
+        "absent": true
+      },
+      {
+        "kind": "Session",
+        "workID": "89b4955e-fc3c-4668-8695-fa15c31bfd0b",
+        "statuses": [
+          {
+            "method": "GET",
+            "status": 200
+          },
+          {
+            "method": "DELETE",
+            "status": 200
+          },
+          {
+            "method": "GET",
+            "status": 404
+          }
+        ],
+        "absent": true
+      },
+      {
+        "kind": "Job",
+        "workID": "1c039b97-c861-4eb3-b3fd-172d5763fb9f",
+        "statuses": [
+          {
+            "method": "GET",
+            "status": 200
+          },
+          {
+            "method": "DELETE",
+            "status": 200
+          },
+          {
+            "method": "GET",
+            "status": 404
+          }
+        ],
+        "absent": true
+      },
+      {
+        "kind": "Job",
+        "workID": "6620fd38-3c64-4df9-b777-9062a40c5290",
+        "statuses": [
+          {
+            "method": "GET",
+            "status": 200
+          },
+          {
+            "method": "DELETE",
+            "status": 200
+          },
+          {
+            "method": "GET",
+            "status": 404
+          }
+        ],
+        "absent": true
+      },
+      {
+        "kind": "Job",
+        "workID": "61f16609-5c81-4dbb-8565-9d17a4a1e47c",
+        "statuses": [
+          {
+            "method": "GET",
+            "status": 200
+          },
+          {
+            "method": "DELETE",
+            "status": 200
+          },
+          {
+            "method": "GET",
+            "status": 404
+          }
+        ],
+        "absent": true
+      }
+    ],
+    "workloadsAndCatalogRemoved": true
+  },
+  "workspaceJobs": [
+    {
+      "workID": "6620fd38-3c64-4df9-b777-9062a40c5290",
+      "snapshot": {
+        "id": "dbc4b425-b079-4cd9-bfe7-d062c43eda9e",
+        "generation": 1,
+        "revision": "sha256:2fdb43193156d3df5c25c2e745ac781a7e760e37c8db3aea404248e4cd80d2c4",
+        "adapter": "srw/v1",
+        "image": "srw-registry:5000/srw-agent:tilt-45d59d3ba5a7f50b",
+        "model": "zz-srw-manifest-63cf521673b1",
+        "temperature": 0.17,
+        "workspaceBackend": "sandbox",
+        "workspace": {
+          "template": {
+            "ref": {
+              "name": "cutover-63cf521673b1-sandbox"
+            }
+          }
+        },
+        "resolvedWorkspace": {
+          "template": {
+            "inline": {
+              "backend": "sandbox",
+              "retention": "Delete"
+            }
+          }
+        },
+        "sourceDigest": "23a9b2ccda3764c3d4eda349ef012dcc33318d6bf5295553c0c2853c7ca6f756",
+        "job": {
+          "execution_lane": "pinned",
+          "status": "completed",
+          "has_workspace_container": true
+        }
+      },
+      "provider": {
+        "consumed_required_responses": 0,
+        "worker_job_tool_steps": 12,
+        "unexpected_count": 0,
+        "pending_calls": 0
+      },
+      "ingress": "manifest-api"
+    },
+    {
+      "workID": "61f16609-5c81-4dbb-8565-9d17a4a1e47c",
+      "snapshot": {
+        "id": "0e0eb10b-06e7-4884-955b-7cd963634ab8",
+        "generation": 1,
+        "revision": "sha256:3ea83b9bb67a8bbc653b5d957fde6bfe54c93a48a3efe72a5f6b95be02a7f3e0",
+        "adapter": "srw/v1",
+        "image": "srw-registry:5000/srw-agent:tilt-45d59d3ba5a7f50b",
+        "model": "zz-srw-manifest-63cf521673b1",
+        "temperature": 0.17,
+        "workspaceBackend": "virtual",
+        "workspace": {
+          "template": {
+            "ref": {
+              "name": "cutover-63cf521673b1-virtual"
+            }
+          }
+        },
+        "resolvedWorkspace": {
+          "template": {
+            "inline": {
+              "backend": "virtual",
+              "retention": "Delete"
+            }
+          }
+        },
+        "sourceDigest": "23a9b2ccda3764c3d4eda349ef012dcc33318d6bf5295553c0c2853c7ca6f756",
+        "job": {
+          "execution_lane": "pinned",
+          "status": "completed",
+          "has_workspace_container": false
+        }
+      },
+      "provider": {
+        "consumed_required_responses": 0,
+        "worker_job_tool_steps": 12,
+        "unexpected_count": 0,
+        "pending_calls": 0
+      },
+      "ingress": "manifest-api"
+    },
+    {
+      "workID": "1c039b97-c861-4eb3-b3fd-172d5763fb9f",
+      "snapshot": {
+        "id": "b8560734-52e0-47fd-9f85-b08da0f9d687",
+        "generation": 1,
+        "revision": "sha256:53f649ec1b06e972b75f264cf39b363fb42d374ecfd0082c1a49c68e869a4ddd",
+        "adapter": "srw/v1",
+        "image": "srw-registry:5000/srw-agent:tilt-45d59d3ba5a7f50b",
+        "model": "zz-srw-manifest-63cf521673b1",
+        "temperature": 0.17,
+        "workspaceBackend": "virtual",
+        "workspace": {
+          "template": {
+            "ref": {
+              "name": "cutover-63cf521673b1-virtual",
+              "scope": {
+                "kind": "Account",
+                "name": "996a2e0d-1ead-48d1-a56f-21a0ab1524db"
+              }
+            }
+          }
+        },
+        "resolvedWorkspace": {
+          "template": {
+            "inline": {
+              "backend": "virtual",
+              "retention": "Delete"
+            }
+          }
+        },
+        "sourceDigest": "23a9b2ccda3764c3d4eda349ef012dcc33318d6bf5295553c0c2853c7ca6f756",
+        "job": {
+          "execution_lane": "pinned",
+          "status": "completed",
+          "has_workspace_container": false
+        }
+      },
+      "provider": {
+        "consumed_required_responses": 0,
+        "worker_job_tool_steps": 12,
+        "unexpected_count": 0,
+        "pending_calls": 0
+      },
+      "ingress": "job-api"
+    }
+  ],
+  "job": {
+    "workID": "6620fd38-3c64-4df9-b777-9062a40c5290",
+    "snapshot": {
+      "id": "dbc4b425-b079-4cd9-bfe7-d062c43eda9e",
+      "generation": 1,
+      "revision": "sha256:2fdb43193156d3df5c25c2e745ac781a7e760e37c8db3aea404248e4cd80d2c4",
+      "adapter": "srw/v1",
+      "image": "srw-registry:5000/srw-agent:tilt-45d59d3ba5a7f50b",
+      "model": "zz-srw-manifest-63cf521673b1",
+      "temperature": 0.17,
+      "workspaceBackend": "sandbox",
+      "workspace": {
+        "template": {
+          "ref": {
+            "name": "cutover-63cf521673b1-sandbox"
+          }
+        }
+      },
+      "resolvedWorkspace": {
+        "template": {
+          "inline": {
+            "backend": "sandbox",
+            "retention": "Delete"
+          }
+        }
+      },
+      "sourceDigest": "23a9b2ccda3764c3d4eda349ef012dcc33318d6bf5295553c0c2853c7ca6f756",
+      "job": {
+        "execution_lane": "pinned",
+        "status": "completed",
+        "has_workspace_container": true
+      }
+    },
+    "provider": {
+      "consumed_required_responses": 0,
+      "worker_job_tool_steps": 12,
+      "unexpected_count": 0,
+      "pending_calls": 0
+    },
+    "ingress": "manifest-api"
+  },
+  "session": {
+    "workID": "9c74e2d5-e922-404f-b647-48a2b9676269",
+    "original": {
+      "id": "9bc0544e-9be8-4c09-816b-86c0b815cbec",
+      "generation": 1,
+      "revision": "sha256:ef6092a9cfc1bfbc2756ef6502c8eb6184351e023182fb60186564a119638579",
+      "adapter": "srw/v1",
+      "image": "srw-registry:5000/srw-agent:tilt-45d59d3ba5a7f50b",
+      "model": "zz-srw-manifest-63cf521673b1",
+      "temperature": 0.17,
+      "workspaceBackend": "sandbox",
+      "workspace": {
+        "template": {
+          "ref": {
+            "name": "cutover-63cf521673b1-sandbox"
+          }
+        }
+      },
+      "resolvedWorkspace": {
+        "template": {
+          "inline": {
+            "backend": "sandbox",
+            "retention": "Delete"
+          }
+        }
+      },
+      "sourceDigest": "742f50f0dae87705fc1acd27302b3b5f5f7163a16539455a92fe5ba716010067",
+      "thread": {
+        "execution_lane": "stateless",
+        "status": "active",
+        "generation": "c2c02ad4-e7ed-4135-a8e0-cac77b876f52",
+        "total_turns": 1
+      }
+    },
+    "patched": {
+      "id": "9bc0544e-9be8-4c09-816b-86c0b815cbec",
+      "generation": 2,
+      "revision": "sha256:1a2230a590bb07bfec92125f62d494d9e305b84fd101c7828cdf0a266d2f0076",
+      "adapter": "srw/v1",
+      "image": "srw-registry:5000/srw-agent:tilt-45d59d3ba5a7f50b",
+      "model": "zz-srw-manifest-63cf521673b1",
+      "temperature": 0.42,
+      "workspaceBackend": "sandbox",
+      "workspace": {
+        "template": {
+          "ref": {
+            "name": "cutover-63cf521673b1-sandbox"
+          }
+        }
+      },
+      "resolvedWorkspace": {
+        "template": {
+          "inline": {
+            "backend": "sandbox",
+            "retention": "Delete"
+          }
+        }
+      },
+      "sourceDigest": "742f50f0dae87705fc1acd27302b3b5f5f7163a16539455a92fe5ba716010067",
+      "thread": {
+        "execution_lane": "stateless",
+        "status": "active",
+        "generation": "c2c02ad4-e7ed-4135-a8e0-cac77b876f52",
+        "total_turns": 1
+      }
+    },
+    "resumed": {
+      "id": "9bc0544e-9be8-4c09-816b-86c0b815cbec",
+      "generation": 2,
+      "revision": "sha256:1a2230a590bb07bfec92125f62d494d9e305b84fd101c7828cdf0a266d2f0076",
+      "adapter": "srw/v1",
+      "image": "srw-registry:5000/srw-agent:tilt-45d59d3ba5a7f50b",
+      "model": "zz-srw-manifest-63cf521673b1",
+      "temperature": 0.42,
+      "workspaceBackend": "sandbox",
+      "workspace": {
+        "template": {
+          "ref": {
+            "name": "cutover-63cf521673b1-sandbox"
+          }
+        }
+      },
+      "resolvedWorkspace": {
+        "template": {
+          "inline": {
+            "backend": "sandbox",
+            "retention": "Delete"
+          }
+        }
+      },
+      "sourceDigest": "742f50f0dae87705fc1acd27302b3b5f5f7163a16539455a92fe5ba716010067",
+      "thread": {
+        "execution_lane": "stateless",
+        "status": "active",
+        "generation": "dd11f631-b3bb-4514-8fa3-ad859a6ea670",
+        "total_turns": 3
+      }
+    },
+    "provider": {
+      "consumed_required_responses": 3,
+      "worker_job_tool_steps": 0,
+      "unexpected_count": 0,
+      "pending_calls": 0
+    }
+  },
+  "workspaceSessions": [
+    {
+      "backend": "sandbox",
+      "workID": "45a02ed4-57f6-4ebd-8cd8-837fcfc8c448",
+      "snapshot": {
+        "id": "27670bb1-411f-470f-b3d8-99862f8f8280",
+        "generation": 1,
+        "revision": "sha256:3aee664e5a0c5370c7c2eddbca3e3a6edcc8f174732b9b0d184d821f605f6a8e",
+        "adapter": "srw/v1",
+        "image": "srw-registry:5000/srw-agent:tilt-45d59d3ba5a7f50b",
+        "model": "zz-srw-manifest-63cf521673b1",
+        "temperature": 0.17,
+        "workspaceBackend": "sandbox",
+        "workspace": {
+          "template": {
+            "ref": {
+              "name": "cutover-63cf521673b1-sandbox"
+            }
+          }
+        },
+        "resolvedWorkspace": {
+          "template": {
+            "inline": {
+              "backend": "sandbox",
+              "retention": "Delete"
+            }
+          }
+        },
+        "sourceDigest": "742f50f0dae87705fc1acd27302b3b5f5f7163a16539455a92fe5ba716010067",
+        "thread": {
+          "execution_lane": "stateless",
+          "status": "active",
+          "generation": "4a700523-b45d-4e37-9085-087ecea85d15",
+          "total_turns": 1
+        }
+      },
+      "toolReportOrigin": "prediction",
+      "provider": {
+        "consumed_required_responses": 1,
+        "worker_job_tool_steps": 0,
+        "unexpected_count": 0,
+        "pending_calls": 0
+      },
+      "shellPreview": "on"
+    },
+    {
+      "backend": "virtual",
+      "workID": "c17b8147-d2b6-4aee-b0c6-ccfc6404830b",
+      "snapshot": {
+        "id": "6ef57535-e74f-4963-9182-27a2e538b8f9",
+        "generation": 1,
+        "revision": "sha256:609cfc493d661c65993396bf3bebb992d039eb6e76c49152cb430aa931ce33ad",
+        "adapter": "srw/v1",
+        "image": "srw-registry:5000/srw-agent:tilt-45d59d3ba5a7f50b",
+        "model": "zz-srw-manifest-63cf521673b1",
+        "temperature": 0.17,
+        "workspaceBackend": "virtual",
+        "workspace": {
+          "template": {
+            "ref": {
+              "name": "cutover-63cf521673b1-virtual"
+            }
+          }
+        },
+        "resolvedWorkspace": {
+          "template": {
+            "inline": {
+              "backend": "virtual",
+              "retention": "Delete"
+            }
+          }
+        },
+        "sourceDigest": "742f50f0dae87705fc1acd27302b3b5f5f7163a16539455a92fe5ba716010067",
+        "thread": {
+          "execution_lane": "stateless",
+          "status": "active",
+          "generation": "cded6f12-4e2a-4066-bec1-9a22683fc16c",
+          "total_turns": 1
+        }
+      },
+      "toolReportOrigin": "prediction",
+      "provider": {
+        "consumed_required_responses": 1,
+        "worker_job_tool_steps": 0,
+        "unexpected_count": 0,
+        "pending_calls": 0
+      },
+      "shellPreview": "unavailable"
+    },
+    {
+      "backend": "none",
+      "workID": "89b4955e-fc3c-4668-8695-fa15c31bfd0b",
+      "snapshot": {
+        "id": "4bd824b4-db2a-4b8d-ab12-f188f418e527",
+        "generation": 1,
+        "revision": "sha256:59d9a602212d9e918b55c61089cdb64cd2265ba18c25aa8680f2edc9172a9265",
+        "adapter": "srw/v1",
+        "image": "srw-registry:5000/srw-agent:tilt-45d59d3ba5a7f50b",
+        "model": "zz-srw-manifest-63cf521673b1",
+        "temperature": 0.17,
+        "workspaceBackend": "none",
+        "workspace": null,
+        "resolvedWorkspace": null,
+        "sourceDigest": "742f50f0dae87705fc1acd27302b3b5f5f7163a16539455a92fe5ba716010067",
+        "thread": {
+          "execution_lane": "stateless",
+          "status": "active",
+          "generation": "0853eac7-242f-47de-a6b0-e612393052a5",
+          "total_turns": 1
+        }
+      },
+      "toolReportOrigin": "prediction",
+      "provider": {
+        "consumed_required_responses": 1,
+        "worker_job_tool_steps": 0,
+        "unexpected_count": 0,
+        "pending_calls": 0
+      },
+      "shellPreview": "unavailable"
+    }
+  ],
+  "ownedWorkIDs": {
+    "job": "1c039b97-c861-4eb3-b3fd-172d5763fb9f",
+    "session": "89b4955e-fc3c-4668-8695-fa15c31bfd0b"
+  },
+  "fixtureNamespace": {
+    "name": "srw-adapter-gate-1f72a6c6ec27",
+    "uid": "816128ff-9278-4e85-863e-4aeefdb50b9b"
+  },
+  "finishedAt": "2026-09-14T01:21:08.160402+00:00"
+}

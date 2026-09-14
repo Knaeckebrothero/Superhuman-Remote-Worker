@@ -1,0 +1,27 @@
+# Profile overlay for R1.B07's final acceptance gate — the Officer watchdog's
+# three duties, exercised live. Layered ON TOP of values-e2e.yaml,
+# values-stateless-sandbox.yaml and values-forge-sandbox.yaml, never instead of
+# them.
+#
+# One flag, and it is the one the third duty needs. A missing runtime is not
+# repaired by the watchdog itself: it is submitted to the shared durable
+# lifecycle owner (`PersistentAgentInstanceManager`), and that owner refuses
+# every automatic submission while `PERSISTENT_AGENT_RECONCILIATION_ENABLED`
+# is false — the chart default, and deliberately so, because automatic
+# persistent reconciliation is an operator decision on a real deployment.
+# With the flag off the duty reaches `recycler`/`is_available`, logs
+# "automatic persistent reconciliation disabled" and returns, so the duty
+# cannot be observed at all.
+#
+# This is not a gate being weakened. The authority, leader, hold and
+# retirement gates are untouched; the recycler still carries its own durable
+# generation and claim fencing, and `signal_drain_pending` still refuses any
+# submission it does not own. The flag only decides whether the *automatic*
+# caller is allowed to submit at all, which is precisely the behaviour under
+# test.
+#
+# The shared baseline stays as it is for the same reason the forge and the
+# cloud live in overlays: a dependency or a behavioural flag added to
+# values-e2e.yaml changes every other profile's run.
+orchestrator:
+  persistentAgentReconciliationEnabled: true

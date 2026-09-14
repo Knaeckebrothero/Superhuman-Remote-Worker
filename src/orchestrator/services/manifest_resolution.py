@@ -333,19 +333,21 @@ class LiveManifestResolver:
             )
             if (
                 old
-                and old["document"] == doc
+                and old["document"]["spec"] == doc["spec"]
                 and await self.store.db.fetchval(
                     "SELECT EXISTS(SELECT 1 FROM srw_execution_specs WHERE resource_id=$1)",
                     old["id"],
                 )
             ):
-                # Reapply acknowledges the existing finite assignment. It must
-                # neither resolve a newer dependency generation nor replay work.
+                # Reapply and classification edits acknowledge the existing
+                # finite assignment. They cannot refresh its dependency generation.
                 await self.authorize_dependencies(old["dependencies"])
                 result = {
                     key: deepcopy(old[key])
                     for key in ("document", "resolved", "revision", "dependencies")
                 }
+                result["document"] = deepcopy(doc)
+                result["resolved"]["metadata"] = deepcopy(doc["metadata"])
                 result["project_id"] = None
                 self.prepared[key] = result
                 return result
