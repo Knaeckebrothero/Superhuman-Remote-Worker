@@ -225,6 +225,26 @@ python -m shared.manifests preview examples/manifests/*.yaml
 python -m shared.manifests export examples/manifests/*.yaml --output-format json
 ```
 
+### Reading from stdin
+
+Pass `-` once to read UTF-8 YAML or JSON from stdin. It accepts YAML document
+streams and flow mappings, plus JSON objects and exported JSON arrays. Mix `-`
+with file paths to preserve their argument order; file-only commands ignore stdin.
+Repeated `-` operands are rejected before reading any input.
+
+The existing 1 MiB source limit, document/depth limits and duplicate-key checks
+still apply. Oversized stdin is rejected after reading the limit plus one byte.
+For shorter streams, the producer must close its pipe when finished. Invalid
+UTF-8 and parse failures return a nonzero exit without echoing input values.
+
+Export the examples and validate the result through stdin:
+
+```bash
+python -m shared.manifests export examples/manifests/resources.yaml \
+  --scope-kind Account --scope-name personal --output-format json \
+  | python -m shared.manifests validate -
+```
+
 For resources without explicit metadata scope, provide both `--scope-kind Account`
 and `--scope-name personal` (or the intended Project/Catalog scope). Validation
 permits omitted scope; preview/export must resolve it. A Project itself requires
