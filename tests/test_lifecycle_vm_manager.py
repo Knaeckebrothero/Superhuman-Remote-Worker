@@ -96,7 +96,10 @@ def _make_manager(
 
     async def _fetchrow(sql, *args):
         identity = str(args[0]) if args else ""
-        if "job_completion_sweep_exclusions" in sql:
+        if (
+            "SELECT command_id, route" in sql
+            and "FROM job_completion_sweep_exclusions" in sql
+        ):
             return (
                 {
                     "command_id": "44444444-4444-4444-8444-444444444444",
@@ -1054,6 +1057,49 @@ class TestDelete:
 
 
 class TestCompletionControlLifecycleOwnership:
+    @pytest.mark.asyncio
+    @pytest.mark.xfail(
+        strict=True,
+        reason="accepted VM deletion retry retains the completion control claim",
+    )
+    async def test_retry_pending_delete_releases_claim_for_next_attempt(self):
+        """A known incomplete delete is retryable, not ambiguous ownership."""
+
+        job = {
+            "id": "job-1",
+            "status": "completed",
+            "execution_lane": "pinned",
+            "context": {},
+        }
+        mgr, provisioner, _, _, db = _make_manager(
+            job_rows=[job], completion_commands_enabled=True
+        )
+        provisioner.release_vm_captured.return_value = VMTeardownResult(
+            "retry_pending", False
+        )
+        inst = Instance(
+            kind="vm",
+            id="agent-vm-job-1",
+            bound_to="job-1",
+            metadata={
+                "scope": "job",
+                "job_status": "completed",
+                "execution_lane": "pinned",
+                "provision_generation": "00000000-0000-4000-8000-000000000001",
+                "vm_uid": "vm-uid-1",
+                "rootdisk_pvc_uid": "rootdisk-uid-1",
+            },
+        )
+
+        await mgr.delete(inst, grace_s=0)
+
+        provisioner.release_vm_captured.assert_awaited_once()
+        conn = db.acquire.return_value.__aenter__.return_value
+        assert any(
+            "- '_completion_control_claim'" in str(call.args[0])
+            for call in conn.fetchrow.await_args_list
+        )
+
     @pytest.mark.asyncio
     async def test_action_time_recheck_blocks_snapshot_delete_and_give_up(self):
         mgr, provisioner, _, snapshot, db = _make_manager(
