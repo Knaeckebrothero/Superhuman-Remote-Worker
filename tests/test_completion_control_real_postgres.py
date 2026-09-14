@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID, uuid4
 
 import asyncpg
@@ -18,10 +19,13 @@ from orchestrator.services.completion_control import (
     CompletionControl,
     CompletionControlClaimConflict,
 )
+from orchestrator.services.completion_lifecycle import CompletionLifecycleOwnership
 from orchestrator.services.job_completion_commands import (
     CompletionControlInProgress,
     accept_completion_command,
 )
+from orchestrator.services.lifecycle import Instance, VMInstanceManager
+from orchestrator.services.vm_provisioner import VMTeardownIdentity, VMTeardownResult
 from shared.worker_queue import claim_worker_batch
 from tests._previous_release_seed import seed_previous_release_row
 
@@ -149,6 +153,269 @@ async def _accept_pinned(pg, job_id: UUID, agent_id: UUID, report_id: UUID):
         client_report_id=str(report_id),
         requested_by="control-real-pg",
     )
+
+
+def _context(value) -> dict:
+    if isinstance(value, str):
+        value = json.loads(value)
+    return dict(value or {})
+
+
+async def _claim_clock_snapshot(pg, job_id: UUID) -> tuple[dict, float]:
+    async with pg.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT context, extract(epoch FROM clock_timestamp())::float8 "
+            "AS db_now_epoch FROM jobs WHERE id=$1",
+            job_id,
+        )
+    assert row is not None
+    marker = _context(row["context"])[COMPLETION_CONTROL_CLAIM_KEY]
+    return marker, float(row["db_now_epoch"])
+
+
+async def _wait_for_db_claim_expiry(pg, job_id: UUID, *, timeout: float = 3) -> dict:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        marker, db_now = await _claim_clock_snapshot(pg, job_id)
+        if db_now >= float(marker["expires_epoch"]):
+            return marker
+        if asyncio.get_running_loop().time() >= deadline:
+            pytest.fail("lifecycle claim did not expire on the database clock")
+        await asyncio.sleep(0.025)
+
+
+@pytest.mark.asyncio
+async def test_preexisting_lifecycle_claim_survives_restart_then_control_recovers(pg):
+    """A pre-correction retry marker recovers without rewriting its expiry."""
+
+    async with pg.acquire() as conn:
+        agent_id = await _agent(conn)
+        job_id = await _pinned_job(conn, status="pending_review", agent_id=agent_id)
+
+    db = _PoolDB(pg)
+    router = AsyncMock()
+    original_owner = CompletionLifecycleOwnership(
+        db, router, lease_seconds=0.5, heartbeat_seconds=0.1
+    )
+    async with original_owner.action(
+        str(job_id),
+        source="lifecycle_vm_reap",
+        resource_kind="vm",
+        resource_identity="vm-uid-original",
+        expected_status="pending_review",
+        expected_lane="pinned",
+    ) as original_permit:
+        assert original_permit.local
+        assert original_permit.claim is not None
+        original_claim_id = original_permit.claim.claim_id
+        # Model the old retry_pending path: the external attempt was known to be
+        # incomplete, but the pre-correction process exited without settling its
+        # permit. The fixed-shape marker therefore survives process exit.
+
+    marker, db_now = await _claim_clock_snapshot(pg, job_id)
+    assert marker["claim_id"] == original_claim_id
+    assert marker["source"] == "lifecycle_vm_reap"
+    assert marker["fence_kind"] == "vm"
+    assert marker["fence_value"] == "vm-uid-original"
+    assert float(marker["expires_epoch"]) > db_now
+
+    restarted_owner = CompletionLifecycleOwnership(
+        db, AsyncMock(), lease_seconds=0.5, heartbeat_seconds=0.1
+    )
+    refused = await restarted_owner.classify(str(job_id), source="restart_probe")
+    assert refused.disposition == "stand_down"
+    assert refused.reason == "active_control_claim"
+    control = CompletionControl(db, AsyncMock())
+    with pytest.raises(
+        CompletionControlClaimConflict, match="job control is already in progress"
+    ):
+        await control.claim_job(
+            job_id,
+            source="cancel_job",
+            expected_status="pending_review",
+            expected_lane="pinned",
+        )
+
+    expired_marker = await _wait_for_db_claim_expiry(pg, job_id)
+    assert expired_marker["claim_id"] == original_claim_id
+    assert not await original_owner.refresh(original_permit)
+
+    recovered = await control.claim_job(
+        job_id,
+        source="cancel_job",
+        expected_status="pending_review",
+        expected_lane="pinned",
+    )
+    assert recovered.claim_id != original_claim_id
+    assert recovered.fence_kind == "assigned_agent"
+    assert recovered.fence_value == str(agent_id)
+    assert not await original_owner.refresh(original_permit)
+    async with control.finish_claim(recovered) as (conn, _job):
+        await conn.execute("UPDATE jobs SET status='cancelled' WHERE id=$1", job_id)
+
+    async with pg.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT status::text AS status, assigned_agent_id, context "
+            "FROM jobs WHERE id=$1",
+            job_id,
+        )
+    assert row["status"] == "cancelled"
+    assert row["assigned_agent_id"] is None
+    assert COMPLETION_CONTROL_CLAIM_KEY not in _context(row["context"])
+
+
+@pytest.mark.asyncio
+async def test_expired_lifecycle_owner_defers_to_completion_command_route(pg):
+    """Command routing wins before any successor VM lifecycle claim."""
+
+    async with pg.acquire() as conn:
+        agent_id = await _agent(conn)
+        job_id = await _pinned_job(conn, status="pending_review", agent_id=agent_id)
+
+    db = _PoolDB(pg)
+    old_owner = CompletionLifecycleOwnership(
+        db, AsyncMock(), lease_seconds=0.5, heartbeat_seconds=0.1
+    )
+    async with old_owner.action(
+        str(job_id),
+        source="lifecycle_vm_reap",
+        resource_kind="vm",
+        resource_identity="shared-vm-name#uid-old",
+        expected_status="pending_review",
+        expected_lane="pinned",
+    ) as old_permit:
+        assert old_permit.local
+        old_claim_id = old_permit.claim.claim_id
+
+    await _wait_for_db_claim_expiry(pg, job_id)
+    accepted = await _accept_pinned(pg, job_id, agent_id, uuid4())
+
+    router = AsyncMock()
+    restarted_owner = CompletionLifecycleOwnership(
+        db, router, lease_seconds=0.5, heartbeat_seconds=0.1
+    )
+    async with restarted_owner.action(
+        str(job_id),
+        source="lifecycle_vm_reap",
+        resource_kind="vm",
+        resource_identity="shared-vm-name#uid-successor",
+        expected_status="pending_review",
+        expected_lane="pinned",
+    ) as successor_permit:
+        assert not successor_permit.local
+        assert successor_permit.decision.command_id == str(accepted.command_id)
+        assert successor_permit.decision.disposition in {"routed", "stand_down"}
+
+    assert not await old_owner.refresh(old_permit)
+    async with pg.acquire() as conn:
+        marker = _context(
+            await conn.fetchval("SELECT context FROM jobs WHERE id=$1", job_id)
+        )[COMPLETION_CONTROL_CLAIM_KEY]
+    assert marker["claim_id"] == old_claim_id
+    assert marker["fence_value"] == "shared-vm-name#uid-old"
+    if successor_permit.decision.disposition == "routed":
+        router.enqueue_job.assert_awaited_once()
+    else:
+        router.enqueue_job.assert_not_awaited()
+
+
+def _real_pg_vm_manager(pg, *, identity: VMTeardownIdentity, outcome: VMTeardownResult):
+    provisioner = MagicMock()
+    provisioner.lifecycle_available = True
+    provisioner.capture_vm_teardown_identity = AsyncMock(return_value=identity)
+    provisioner.release_vm_captured = AsyncMock(return_value=outcome)
+    manager = VMInstanceManager(
+        provisioner,
+        MagicMock(),
+        MagicMock(),
+        _PoolDB(pg),
+        completion_commands_enabled=True,
+        completion_router=AsyncMock(),
+    )
+    manager._completion_lifecycle = CompletionLifecycleOwnership(
+        _PoolDB(pg), AsyncMock(), lease_seconds=5, heartbeat_seconds=0.5
+    )
+    return manager, provisioner
+
+
+@pytest.mark.asyncio
+async def test_vm_lifecycle_refuses_same_name_successor_with_real_claim(pg):
+    async with pg.acquire() as conn:
+        job_id = await _pinned_job(conn, status="completed", agent_id=None)
+
+    successor = VMTeardownIdentity(
+        provision_generation="00000000-0000-4000-8000-000000000002",
+        vm_uid="vm-uid-successor",
+        rootdisk_pvc_uid="rootdisk-uid-successor",
+    )
+    manager, provisioner = _real_pg_vm_manager(
+        pg, identity=successor, outcome=VMTeardownResult("completed", True)
+    )
+    listed = Instance(
+        kind="vm",
+        id="shared-vm-name",
+        bound_to=str(job_id),
+        metadata={
+            "scope": "job",
+            "job_status": "completed",
+            "execution_lane": "pinned",
+            "provision_generation": "00000000-0000-4000-8000-000000000001",
+            "vm_uid": "vm-uid-original",
+            "rootdisk_pvc_uid": "rootdisk-uid-original",
+        },
+    )
+
+    await manager.delete(listed, grace_s=0)
+
+    provisioner.release_vm_captured.assert_not_awaited()
+    async with pg.acquire() as conn:
+        context = _context(
+            await conn.fetchval("SELECT context FROM jobs WHERE id=$1", job_id)
+        )
+    assert COMPLETION_CONTROL_CLAIM_KEY not in context
+
+
+@pytest.mark.asyncio
+async def test_vm_lifecycle_retains_real_claim_for_ambiguous_teardown(pg):
+    async with pg.acquire() as conn:
+        job_id = await _pinned_job(conn, status="completed", agent_id=None)
+
+    identity = VMTeardownIdentity(
+        provision_generation="00000000-0000-4000-8000-000000000001",
+        vm_uid="vm-uid-original",
+        rootdisk_pvc_uid="rootdisk-uid-original",
+    )
+    manager, provisioner = _real_pg_vm_manager(
+        pg, identity=identity, outcome=VMTeardownResult("identity_unknown", False)
+    )
+    listed = Instance(
+        kind="vm",
+        id="agent-vm-original",
+        bound_to=str(job_id),
+        metadata={
+            "scope": "job",
+            "job_status": "completed",
+            "execution_lane": "pinned",
+            "provision_generation": identity.provision_generation,
+            "vm_uid": identity.vm_uid,
+            "rootdisk_pvc_uid": identity.rootdisk_pvc_uid,
+        },
+    )
+
+    await manager.delete(listed, grace_s=0)
+
+    provisioner.release_vm_captured.assert_awaited_once_with(
+        str(job_id),
+        identity,
+        purge_disk=True,
+        entity_type="job",
+        capture_snapshot=False,
+    )
+    marker, db_now = await _claim_clock_snapshot(pg, job_id)
+    assert marker["source"] == "lifecycle_vm_delete"
+    assert marker["fence_kind"] == "vm"
+    assert marker["fence_value"] == identity.vm_uid
+    assert float(marker["expires_epoch"]) > db_now
 
 
 @pytest.mark.asyncio
