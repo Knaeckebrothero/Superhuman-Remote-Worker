@@ -2,17 +2,18 @@
   "recordVersion": 1,
   "milestone": "alpha manifest compatibility and preparation network isolation",
   "authoredAPI": "srw/v1alpha1",
-  "runtimeSource": "23bb1fc74b0ddbbc040a095ad114dd92476af596",
+  "runtimeSource": "a000c8d3936f25e3d99aa89e5968eea9dcfaabd6",
   "baselineSource": "5809c97f549f45f226984da300ddda9850cb2174",
   "python": {
-    "files": 2572,
+    "commit": "a000c8d3936f25e3d99aa89e5968eea9dcfaabd6",
+    "files": 2609,
     "unchanged": true,
     "changed": [],
     "result": {
-      "passed": 31017,
+      "passed": 31047,
       "skipped": 179,
-      "warnings": 180,
-      "durationSeconds": 1051.51
+      "warnings": 179,
+      "durationSeconds": 1185.38
     }
   },
   "upgrade": {
@@ -112,7 +113,10 @@
   "mainRollout": {
     "deployed": false,
     "onlineEnabled": false,
-    "reason": "PR #127 requires an approving review; PR #128 remains a candidate. Repository auto-merge is disabled."
+    "currentChart": "0.0.999",
+    "currentRevision": 971,
+    "memoryOnlyGitOpsCommit": "4e79f6e",
+    "reason": "The candidate requires an approving review under the develop branch rule; no bypass used. Main only received the separate VM-controller memory increase."
   },
   "protectedResources": {
     "main": {
@@ -120,10 +124,10 @@
       "allPreserved": true,
       "missingOrReplaced": [],
       "currentCounts": {
-        "VirtualMachine": 3,
-        "VirtualMachineInstance": 3,
-        "PersistentVolumeClaim": 234,
-        "DataVolume": 8
+        "VirtualMachine": 4,
+        "VirtualMachineInstance": 4,
+        "PersistentVolumeClaim": 236,
+        "DataVolume": 10
       }
     },
     "k3d-srw": {
@@ -135,13 +139,14 @@
         "DataVolume": 2
       }
     },
-    "observedAt": "2026-09-13T22:50:35.608769+00:00"
+    "observedAt": "2026-09-14T00:56:05.583846+00:00"
   },
   "limitations": [
-    "The authored API remains srw/v1alpha1, not a stable srw/v1 declaration.",
-    "Passing preparation network probes do not certify generic image hosting.",
-    "The real development Job is still running; its full-stack deployment and reviewable patch have not been accepted.",
-    "Main has not deployed this candidate and still uses offline preparation."
+    "Authored API remains srw/v1alpha1; this is not a stable srw/v1 declaration.",
+    "Preparation network probes do not certify generic image hosting.",
+    "Full real-provider development acceptance is incomplete; preserve failed/paused attempts and retained recovery handles.",
+    "Main has not deployed the candidate and keeps offline preparation.",
+    "The VM remote-operation protocol remains disabled on main; no forward-only activation was performed for recovery."
   ],
   "mainNamespaceAdmission": {
     "namespace": "superhuman-remote-worker",
@@ -167,7 +172,7 @@
       }
     ]
   },
-  "recordedAt": "2026-09-13T22:50:35.608920+00:00",
+  "recordedAt": "2026-09-14T01:10:30.207578+00:00",
   "developmentToolSource": "36e6262ea6ef5789e54d749ebd79b5261a9f09f3",
   "developmentToolTests": {
     "passed": 104,
@@ -175,9 +180,9 @@
     "durationSeconds": 19.61
   },
   "candidateCI": {
-    "head": "36e6262ea6ef5789e54d749ebd79b5261a9f09f3",
+    "head": "a000c8d3936f25e3d99aa89e5968eea9dcfaabd6",
     "status": "passed",
-    "url": "https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/actions/runs/34785999985"
+    "url": "https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/actions/runs/34793926807"
   },
   "preparationHarness": {
     "offline": {
@@ -215,20 +220,79 @@
         "result": "failed with complete cleanup",
         "reason": "Clearing the digest required a registry hostname that the controller could not resolve. Tilt now supplies its verified pushed digest."
       }
-    ]
+    ],
+    "onlineSudoRetainedStatus": {
+      "record": "k3d-online-sudo-retained-srw-2026-09-14.json",
+      "sha256": "ff2726be7062af3e4f1e7c2edc3e3249e4ead37b5e1ab2532004bdcc41649f36",
+      "runtimeSource": "18f73043606767efe3168aa775bedb8c43d25b69",
+      "status": "passed",
+      "cleanup": true,
+      "startedAt": "2026-09-14T00:14:00.118476+00:00",
+      "finishedAt": "2026-09-14T00:34:55.429905+00:00",
+      "cases": 6,
+      "realGuestShellProofs": 4,
+      "readonlySudoVersionQueries": 4,
+      "package": "hello",
+      "scope": "The sudo query executes no privileged command. Known initialization success is preserved across retained attachments."
+    }
   },
   "developmentAssignment": {
-    "jobID": "c7d46b72-57f5-4dbd-af5a-255f8f981654",
     "provider": "MiniMax-M3",
-    "status": "processing",
-    "scope": "Manifest CLI stdin support plus full nested SRW k3d/Tilt acceptance. Separate real-provider workflow, not claimed complete.",
-    "createdAt": "2026-09-13T20:12:36.128586Z",
-    "readyAt": "2026-09-13T22:19:41Z",
-    "claim": "Premature legacy reaper claim expired naturally; no database claim deletion or frozen deadline extension."
+    "status": "not accepted",
+    "scope": "Agent-authored manifest CLI stdin support plus a complete nested SRW k3d/Tilt stack. Real-provider evidence is separate from deterministic fixture gates.",
+    "attempts": [
+      {
+        "jobID": "c7d46b72-57f5-4dbd-af5a-255f8f981654",
+        "status": "failed",
+        "result": "False VM-upgrade freeze; supported parked-completion force-resolution after quiescence. Original patch and interrupted Tilt log retained."
+      },
+      {
+        "jobID": "2477b731-567e-4ad3-88a7-8aad83ee07d1",
+        "status": "failed",
+        "result": "Controller OOM/transport failure before VM publication stranded a retained reservation. Guarded recovery refused without process-zero authority."
+      },
+      {
+        "jobID": "2bfe0152-232f-4f2d-ba32-0c3d18bd7bcc",
+        "status": "paused",
+        "result": "Raw keys to a closed tab triggered workspace recovery. A replacement VM preserves the disk, but the Job remains paused; nested Tilt did not finish."
+      },
+      {
+        "jobID": "7e83006c-85f6-4435-b0ee-6493369b42fb",
+        "status": "processing",
+        "readyAt": "2026-09-14T00:53:28.198793+00:00",
+        "result": "Fresh prepared VM and explicit stateless shell mode; agent handling remaining code review and full stack."
+      }
+    ],
+    "recoveredAgentSource": {
+      "commit": "bc6ccecef3a871fc8a3ae073477843d6bcba68df",
+      "files": 3,
+      "focusedTests": 48,
+      "ruff": "passed",
+      "method": "Exact-identity read-only SFTP of actual source files; original exported patch was stale. Files preserved verbatim without a supervisor replacement implementation.",
+      "acceptance": "Remaining review corrections and complete nested-stack proof required."
+    },
+    "protectedRecoveryInstances": [
+      "5d9fcf4e-fa1a-4964-8a38-b9b4c6ca6f3a",
+      "99b73d9f-9ddc-487d-8ace-f37d62a71599"
+    ]
   },
   "mainHealth": {
     "deployments": 15,
     "allCurrentAndReady": true,
-    "observedAt": "2026-09-13T22:50:35.608769+00:00"
+    "scope": "After memory-only Helm revision 971; not a runtime candidate rollout.",
+    "afterHelmRevision": 971
+  },
+  "shellCorrection": {
+    "source": "a000c8d3936f25e3d99aa89e5968eea9dcfaabd6",
+    "focusedTests": 336,
+    "fullSuite": "passed",
+    "realSSHTmuxGate": {
+      "status": "passed",
+      "record": "k3d-shell-pane-loss-2026-09-14.json",
+      "baselineReproduced": true,
+      "cleanup": true,
+      "scope": "Real SSH/tmux and production workspace adapter; not a RunQueue or VM recovery gate."
+    },
+    "purpose": "Classify a proven absent pane during raw-key send without losing the surviving shell; keep ownership/session failures fatal."
   }
 }

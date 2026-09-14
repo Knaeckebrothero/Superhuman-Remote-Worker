@@ -25,16 +25,20 @@ drivers before SRW Job admission, and checks reap eligibility before acquiring
 cleanup authority for a preparing workspace. Its optional preparation Pod
 firewall closes the observed K3s startup gap without changing node networking.
 Tilt also supplies verified fresh MCP/preparer image digests, so a saved local
-pin cannot silently select an older builder.
+pin cannot silently select an older builder. Workspace delivery now preserves its
+SRW sudo policy, and a later failed attachment cannot erase an existing retained
+disk's successful initialization status.
 
 The [release verification record](verification/release-contract-2026-09-14.json)
 captures these candidate checks:
 
-- Full Python regression: **31,017 passed, 179 skipped**, with
+- Full Python regression at `a000c8d39`: **31,047 passed, 179 skipped**, with
   `PYTHONSAFEPATH=1`, eight bounded file workers and no fail-fast flag. Captured
-  runtime inputs stayed unchanged. Subsequent development-tool and gate changes
-  passed 104 focused tests. Ruff, import contracts, both inventories, both Helm
-  lint profiles and the candidate CI pipeline passed.
+  runtime inputs stayed unchanged. Ruff, import contracts, both inventories, both
+  Helm lint profiles and that candidate's CI pipeline passed. The subsequent
+  raw-key shell correction also has 336 focused passing tests. The [real SSH/tmux gate](verification/k3d-shell-pane-loss-2026-09-14.json)
+  passed: closed-tab isolation, whole-session failure and stale-token refusal,
+  followed by exact cleanup. This is not a VM-recovery or RunQueue admission gate.
 - Local upgrade, rollback and candidate restore preserved six stored resources,
   versions, resolved contents, identical reapply and JSON/YAML exports. This is
   a same-schema rollback result with no pending firewall-enabled preparations,
@@ -49,6 +53,9 @@ captures these candidate checks:
   Job required real guest SSH output. Online proof also required execution of
   the package downloaded during preparation. Owned workloads, retained disks,
   artifacts and credentials retired; scope-local base imports follow cache TTL.
+  The final [online sudo/retention rerun](verification/k3d-online-sudo-retained-srw-2026-09-14.json)
+  passed all six cases at `18f730436`; every successful Job also ran a top-level
+  `sudo --version` query, which executes no privileged command.
 - The production firewall Pod construction passed 17 local k3d cases and 85
   cases across all five main-cluster nodes, including positive controls,
   private-destination denial from startup, IPv6 denial and failed-init
@@ -56,12 +63,18 @@ captures these candidate checks:
   read-only disk inspection passed. These checks do not certify generic hosting.
 
 These are candidate results, not a main-dev rollout. Main dev still runs chart
-`0.0.999`, revision 970, with offline preparation. PRs
+`0.0.999`, revision 971, with offline preparation. That revision only increased
+the VM-controller memory limit after an observed OOM. PRs
 [#127](https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/pull/127) and
 [#128](https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/pull/128) require
 the normal review and release process before the new profile can be enabled
-there. A real-provider development Job is separately exercising a full nested
-k3d/Tilt stack; its completion is not part of the deterministic gates above.
+there. Real-provider self-development remains unaccepted: earlier attempts
+exposed a false sudo freeze, a stranded retained reservation after controller
+transport loss, and raw keys to a closed tab triggering workspace recovery.
+The retained disks and failure evidence are preserved. Actual agent-authored
+revisions were recovered verbatim and pass 48 focused tests; a fresh Job is
+addressing the remaining review and full nested k3d/Tilt acceptance. Those
+results are separate from the deterministic gates above.
 
 ## Integrated implementation — previous baseline
 
