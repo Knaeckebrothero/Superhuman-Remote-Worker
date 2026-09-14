@@ -107,15 +107,15 @@ def _parse_connection_string(connection_string: str) -> dict:
     }
 
 
-def _safe_connection_parts(connection_string: Optional[str]) -> dict:
-    """Host/port/database only — never the password. Log from this.
-
-    ``_parse_connection_string`` above deliberately returns the password for
-    ``PGPASSWORD``, so nothing read out of it may reach a log record.
-    """
-    from shared.db_url import describe_postgres_dsn  # local import: src/*
-
-    return describe_postgres_dsn(connection_string)
+def _database_log_label(*, vector: bool = False) -> str:
+    """Read diagnostic identity independently of a credential-bearing DSN."""
+    if vector:
+        if os.getenv("VECTOR_POSTGRES_USER") and os.getenv("VECTOR_POSTGRES_PASSWORD"):
+            return os.getenv("VECTOR_POSTGRES_DB") or "vector database"
+        return "vector database configured via VECTOR_DB_URL"
+    if os.getenv("POSTGRES_USER") and os.getenv("POSTGRES_PASSWORD"):
+        return os.getenv("POSTGRES_DB") or "srw"
+    return "application database configured via DATABASE_URL"
 
 
 async def init_postgres(force_reset: bool = False) -> bool:
@@ -140,7 +140,7 @@ async def init_postgres(force_reset: bool = False) -> bool:
         return False
 
     connection_string = get_postgres_connection_string()
-    db_name = _safe_connection_parts(connection_string)["database"]
+    db_name = _database_log_label()
     logger.info("  Database: %s", db_name)
 
     db = PostgresDB(connection_string)
@@ -316,7 +316,7 @@ async def init_vector_db(force_reset: bool = False) -> bool:
         logger.error(f"  Could not import PostgresDB: {e}")
         return False
 
-    db_name = _safe_connection_parts(vector_url)["database"]
+    db_name = _database_log_label(vector=True)
     logger.info("  Database: %s", db_name)
 
     db = PostgresDB(vector_url, migrations_dir=MIGRATIONS_VECTOR_DIR)
@@ -450,7 +450,7 @@ def backup_vector_db(backup_file: Path) -> bool:
 
     logger.info(
         "  Running pg_dump for vector database: %s",
-        _safe_connection_parts(vector_url)["database"],
+        _database_log_label(vector=True),
     )
 
     try:
@@ -505,7 +505,7 @@ def restore_vector_db(backup_file: Path) -> bool:
 
     logger.info(
         "  Running pg_restore for vector database: %s",
-        _safe_connection_parts(vector_url)["database"],
+        _database_log_label(vector=True),
     )
 
     try:
@@ -581,7 +581,7 @@ def backup_postgres(backup_file: Path) -> bool:
 
     logger.info(
         "  Running pg_dump for database: %s",
-        _safe_connection_parts(connection_string)["database"],
+        _database_log_label(),
     )
 
     try:
@@ -618,7 +618,7 @@ def restore_postgres(backup_file: Path) -> bool:
     # Clear database first
     logger.info(
         "  Clearing database: %s",
-        _safe_connection_parts(connection_string)["database"],
+        _database_log_label(),
     )
     try:
         asyncio.run(_reset_postgres_schema())
@@ -642,7 +642,7 @@ def restore_postgres(backup_file: Path) -> bool:
 
     logger.info(
         "  Running pg_restore for database: %s",
-        _safe_connection_parts(connection_string)["database"],
+        _database_log_label(),
     )
 
     try:

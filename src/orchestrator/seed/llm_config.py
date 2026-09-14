@@ -200,7 +200,22 @@ def _entry_field_names(entry: Any) -> str:
     """
     if not isinstance(entry, dict):
         return type(entry).__name__
-    return ", ".join(sorted(str(key) for key in entry)) or "none"
+    known_fields = (
+        "provider",
+        "apiKey",
+        "apiKeyEnv",
+        "label",
+        "baseUrl",
+        "base_url",
+        "models",
+        "transportKind",
+        "transport_kind",
+        "reconcile",
+    )
+    names = [name for name in known_fields if name in entry]
+    if any(key not in known_fields for key in entry):
+        names.append("other fields")
+    return ", ".join(names) or "none"
 
 
 def _resolve_secret_value(entry: dict[str, Any], *, context: str) -> str | None:

@@ -440,6 +440,26 @@ def missing_secret_envs(
     return missing
 
 
+def missing_secret_diagnostics(missing: list[dict]) -> list[str]:
+    """Describe absent credentials using schema-owned identities only.
+
+    A custom credentials_ref is operator-controlled, so report its field and
+    configuration location instead of copying the reference into a log.
+    """
+    labels: list[str] = []
+    for required in _REQUIRED_SECRET_ENVS.values():
+        for field, fallbacks in required.items():
+            entries = [entry for entry in missing if entry.get("field") == field]
+            if not entries:
+                continue
+            for env_name in fallbacks:
+                if any(entry.get("env_var") == env_name for entry in entries):
+                    labels.append(env_name)
+            if any(entry.get("env_var") not in fallbacks for entry in entries):
+                labels.append(field + " via credentials_ref")
+    return labels
+
+
 def main_cloud_routing_snapshot(settings: MainCloudConfig) -> dict:
     """Return the complete non-secret routing snapshot for DB adoption."""
 

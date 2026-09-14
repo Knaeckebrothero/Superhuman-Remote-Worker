@@ -3,12 +3,11 @@
 Covers the sites CodeQL flags under ``py/clear-text-logging-sensitive-data``.
 Each test asserts two things at once: the secret literal is ABSENT from every
 emitted record, and the useful context (host, database name, provider name,
-key count, masked prefix, VM name, job id) is still PRESENT. A fix that simply
+key count, slot, VM name, job id) is still PRESENT. A fix that simply
 deletes the message would fail these as surely as one that leaks.
 
-``describe_postgres_dsn`` is the shared sanitiser: it returns only the parts of
-a DSN that are safe to log, so the tainted connection string never reaches a
-log expression.
+DSN parsing is tested separately from diagnostics. Logs identify databases
+through independent configuration, and never copy a credential-bearing DSN.
 """
 
 from __future__ import annotations
@@ -239,7 +238,7 @@ class TestPostgresDbLogging:
         assert created is True
         emitted = _messages(caplog)
         assert SECRET_PASSWORD not in emitted
-        assert "srwdb" in emitted
+        assert "configured database" in emitted
 
     @pytest.mark.asyncio
     async def test_unquoted_fallback_dsn_never_leaks_a_password_fragment(self, caplog):
@@ -357,3 +356,130 @@ class TestVmControllerLogging:
         assert auth_key not in emitted
         assert name == controller_mod._rootdisk_name(job_id)
         assert job_id in emitted
+
+
+@pytest.mark.parametrize(
+    "dsn, expected",
+    [
+        ("postgresql://user@localhost/srwdb?password=p@ss/LEAKEDSECRET", "srwdb"),
+        (
+            "postgresql://user:pw@localhost/srwdb?application_name=admin@example.com",
+            "srwdb",
+        ),
+        ("postgresql://user:pw@localhost/srw@prod", "srw@prod"),
+        ("postgresql://user:pw@localhost/srw%20db", "srw db"),
+        ("postgresql://user:pw@localhost?dbname=query_db", "query_db"),
+        ("postgresql://user:pw@localhost?database=query_db", "query_db"),
+        ("postgresql://user:pw@localhost?dbname=first&database=second", "first"),
+    ],
+)
+def test_dsn_metadata_respects_component_boundaries(dsn, expected):
+    from shared.db_url import describe_postgres_dsn
+
+    parts = describe_postgres_dsn(dsn)
+    assert parts["database"] == expected
+    assert parts["host"] == "localhost"
+    assert "LEAKEDSECRET" not in repr(parts)
+
+
+def test_malformed_ipv6_description_is_empty():
+    from shared.db_url import describe_postgres_dsn
+
+    assert describe_postgres_dsn("postgresql://user:pw@[bad/db") == {
+        "host": "",
+        "port": "",
+        "database": "",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "dsn, expected",
+    [
+        ("postgresql://user@localhost/srwdb?password=p@ss/LEAKEDSECRET", "srwdb"),
+        ("postgresql://user:pw@localhost/srw@prod", "srw@prod"),
+        ("postgresql://user:pw@localhost/srw%22db?sslmode=require", 'srw"db'),
+        ("postgresql://user:pw@localhost?dbname=query_db", "query_db"),
+    ],
+)
+async def test_database_creation_uses_driver_database_not_log_label(
+    dsn, expected, caplog
+):
+    from orchestrator.database import postgres as pg_mod
+
+    db = pg_mod.PostgresDB(dsn)
+    conn = MagicMock()
+    conn.fetchval = AsyncMock(return_value=None)
+    conn.execute = AsyncMock()
+    conn.close = AsyncMock()
+    with caplog.at_level(logging.INFO, logger=pg_mod.logger.name):
+        with patch.object(
+            pg_mod.asyncpg, "connect", AsyncMock(return_value=conn)
+        ) as connect:
+            assert await db.create_database_if_not_exists()
+    conn.fetchval.assert_awaited_once_with(
+        "SELECT 1 FROM pg_database WHERE datname = $1", expected
+    )
+    conn.execute.assert_awaited_once_with(
+        'CREATE DATABASE "' + expected.replace('"', '""') + '"'
+    )
+    assert connect.call_args.kwargs["database"] == "postgres"
+    assert "LEAKEDSECRET" not in _messages(caplog)
+    assert "database" in _messages(caplog).lower()
+
+
+def test_key_ring_logs_slots_without_any_key_prefix(caplog):
+    from shared.runtime.llm.key_ring import KeyRing
+
+    with caplog.at_level(logging.DEBUG):
+        ring = KeyRing(["PRIVATEA-key-one", "PRIVATEB-key-two"], provider="openai")
+        assert ring.rotate() == "PRIVATEB-key-two"
+    text = _messages(caplog)
+    assert "PRIVATEA" not in text and "PRIVATEB" not in text
+    assert "openai" in text and "slot" in text
+
+
+@pytest.mark.asyncio
+async def test_malformed_seed_field_names_cannot_leak_secrets(caplog):
+    from orchestrator.seed.llm_config import _seed_api_keys, SeedReport
+
+    db = MagicMock()
+    db.list_system_api_keys = AsyncMock(return_value=[])
+    await _seed_api_keys(
+        db, [{"apiKey": "SECRET-VALUE", "SECRET-FIELD": True}], SeedReport()
+    )
+    assert "SECRET" not in _messages(caplog)
+    assert "apiKey" in _messages(caplog)
+
+
+def test_cloud_missing_secret_diagnostics_use_known_names_only():
+    from orchestrator.services.cloud.config import missing_secret_diagnostics
+
+    assert missing_secret_diagnostics(
+        [
+            {"field": "admin_password", "env_var": "NEXTCLOUD_ADMIN_PASSWORD"},
+            {"field": "agent_password", "env_var": "SECRET-AS-MALFORMED-REF"},
+        ]
+    ) == ["NEXTCLOUD_ADMIN_PASSWORD", "agent_password via credentials_ref"]
+
+
+@pytest.mark.asyncio
+async def test_init_fallback_logs_configuration_source_not_query_password(
+    monkeypatch, caplog
+):
+    from orchestrator import init as init_mod
+
+    monkeypatch.delenv("POSTGRES_USER", raising=False)
+    monkeypatch.delenv("POSTGRES_PASSWORD", raising=False)
+    monkeypatch.setenv(
+        "DATABASE_URL", "postgresql://user@localhost/srwdb?password=p@ss/LEAKEDSECRET"
+    )
+    db = MagicMock()
+    db.create_database_if_not_exists = AsyncMock(return_value=True)
+    db.connect = AsyncMock(side_effect=RuntimeError("stop"))
+    db.close = AsyncMock()
+    with caplog.at_level(logging.INFO):
+        with patch("orchestrator.database.postgres.PostgresDB", return_value=db):
+            await init_mod.init_postgres()
+    assert "LEAKEDSECRET" not in _messages(caplog)
+    assert "DATABASE_URL" in _messages(caplog)

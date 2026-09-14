@@ -9043,21 +9043,15 @@ async def lifespan(app: FastAPI):
     # longer silent. The PUT/test endpoints refuse this at swap time; this
     # catches a Helm-misconfigured deployment that booted straight into it.
     try:
-        from orchestrator.services.cloud.config import missing_secret_envs
+        from orchestrator.services.cloud.config import (
+            missing_secret_diagnostics,
+            missing_secret_envs,
+        )
 
         _active_id = main_cloud_router.active.backend_id
         _missing_secrets = missing_secret_envs(_active_id, _persisted_overlay)
         if _missing_secrets:
-            # Name only variables confirmed absent from the environment: a
-            # variable with no value cannot disclose one, which is exactly
-            # what this warning reports.
-            _unset_names = sorted(
-                {
-                    str(_m["env_var"])
-                    for _m in _missing_secrets
-                    if not os.getenv(str(_m["env_var"]))
-                }
-            )
+            _unset_names = missing_secret_diagnostics(_missing_secrets)
             logger.warning(
                 "Main cloud backend %r is active but required secret env var(s) "
                 "are unset: %s — it is running on built-in DEV credentials and "

@@ -68,7 +68,7 @@ from orchestrator.security.crypto import (
     is_encrypted,
 )
 
-from shared.db_url import build_postgres_url, describe_postgres_dsn
+from shared.db_url import build_postgres_url, postgres_database_name
 from shared.job_freeze_types import AUTO_REDISPATCH_FREEZE_TYPES
 from shared.job_steering import context_delivery_key, queued_reply_key
 from shared.pinned_session_identity import PinnedSessionBinding
@@ -51743,24 +51743,30 @@ class PostgresDB:
         # Parse the database name out of the DSN rather than slicing it: a
         # fallback DATABASE_URL is not URL-quoted, so a "/" in the password
         # makes rsplit land inside the credentials.
-        db_name = describe_postgres_dsn(self._connection_string)["database"]
+        try:
+            db_name = postgres_database_name(self._connection_string)
+        except ValueError:
+            raise RuntimeError(
+                "Could not extract database name from connection string"
+            ) from None
         if not db_name:
             raise RuntimeError("Could not extract database name from connection string")
 
         # Connect to postgres database to create the target database
-        base_conn_str = self._connection_string.rsplit("/", 1)[0] + "/postgres"
-
-        conn = await asyncpg.connect(base_conn_str)
+        # The explicit database argument overrides both path and query targets
+        # while preserving credentials, SSL options and all other DSN settings.
+        conn = await asyncpg.connect(self._connection_string, database="postgres")
         try:
             exists = await conn.fetchval(
                 "SELECT 1 FROM pg_database WHERE datname = $1", db_name
             )
             if not exists:
                 # Use quoted identifier to handle special characters
-                await conn.execute(f'CREATE DATABASE "{db_name}"')
-                logger.info(f"Created database: {db_name}")
+                quoted_name = db_name.replace('"', '""')
+                await conn.execute(f'CREATE DATABASE "{quoted_name}"')
+                logger.info("Created configured database")
                 return True
-            logger.debug(f"Database already exists: {db_name}")
+            logger.debug("Configured database already exists")
             return False
         finally:
             await conn.close()
