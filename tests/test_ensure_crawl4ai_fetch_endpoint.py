@@ -44,6 +44,7 @@ async def test_fresh_install_creates_fetch_row_and_claims_the_empty_slot(monkeyp
         "base_url": "http://srw-crawl4ai:11235",
         "api_key": "0123456789abcdef0123456789abcdef",
         "key_prefix": "01234567",
+        "source": "default",
     }
     model = db.create_model.await_args.kwargs
     assert model["model_id"] == CRAWL4AI_MODEL_ID
@@ -55,7 +56,7 @@ async def test_fresh_install_creates_fetch_row_and_claims_the_empty_slot(monkeyp
         "ops": ["extract", "crawl"],
     }
     assert db.set_default_llm_model.await_args_list == [
-        call("fetch", CRAWL4AI_MODEL_ID)
+        call("fetch", CRAWL4AI_MODEL_ID, source="default")
     ]
 
 

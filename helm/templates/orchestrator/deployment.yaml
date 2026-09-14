@@ -43,6 +43,7 @@ spec:
         # replace the process even when the optional Reloader is disabled.
         checksum/manifest-hosting: {{ toJson .Values.manifestHosting | sha256sum | quote }}
         checksum/workspace-cleanup-reconciliation: {{ dict "enabled" $workspaceCleanupProtocol | toJson | sha256sum | quote }}
+        checksum/workspace-preparation: {{ include "srw.vmPreparationEnvironment" . | sha256sum | quote }}
         checksum/workspace-lifecycle-protocol-cutover: {{ dict "enabled" $workspaceLifecycleCutover | toJson | sha256sum | quote }}
         checksum/workspace-lifecycle-service-account: {{ .Values.orchestrator.workspaceLifecycleServiceAccountGeneration | default "0197" | toString | sha256sum | quote }}
         checksum/vm-remote-operation-protocol: {{ dict "enabled" $vmRemoteProtocol | toJson | sha256sum | quote }}
@@ -1323,6 +1324,14 @@ spec:
                   name: {{ include "srw.configMapName" . }}
                   key: VM_PERSISTENT_ROOTDISK
                   optional: true
+            # Admission must see the same capabilities as the VM controller.
+            {{- range $key, $_ := (include "srw.vmPreparationEnvironment" . | fromYaml) }}
+            - name: {{ $key }}
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" $ }}
+                  key: {{ $key }}
+            {{- end }}
             # Workspace containers
             - name: WORKSPACE_IMAGE
               valueFrom:

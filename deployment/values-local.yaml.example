@@ -467,15 +467,34 @@ keycloak:
 llm:
   seed:
     researchProviderWaitSeconds: 900
-    # Pin default models here too, so a rebuilt cluster comes up with the same
-    # Admin → Models → Defaults you would otherwise click through again.
-    # Insert-only: a kind that is already pinned is left alone. Each model
-    # must be an enabled catalog row for that kind (seeded via systemModels /
-    # systemEndpoints, or added in the Cockpit); an unknown model is skipped
-    # with a warning in the srw-llm-seed Job log, an unknown kind fails the
-    # render. Full kind list in helm/values.yaml under llm.seed.defaults.
+    # Everything Admin → Models can do, declared once, so a rebuilt cluster
+    # comes up configured. Dev mode (secrets.create: true above) lets the
+    # keys sit inline — they are rendered into a dedicated Secret only the
+    # seed Job reads, then encrypted into Postgres. Insert-only: rows and
+    # pins an admin changed in the Cockpit are never overwritten. Full
+    # reference in helm/values.yaml under llm.seed.
+    # enabled: true
+    # systemApiKeys:
+    #   openai:
+    #     value: "sk-..."
+    # systemModels:
+    #   - provider: openai
+    #     id: "gpt-5-mini"
+    #     capabilities: [chat, auxiliary]
+    #     family: gpt-5
+    #     reasoningLevel: low
+    # systemEndpoints:
+    #   - label: "OpenRouter embedding"
+    #     baseUrl: "https://openrouter.ai/api/v1"
+    #     apiKey: "sk-or-..."
+    #     models:
+    #       - id: "qwen/qwen3-embedding-8b"
+    #         capability: embedding
+    #       - id: "qwen/qwen3-reranker-8b"
+    #         capability: rerank
     # defaults:
     #   chat: "gpt-5-mini"
     #   auxiliary: "gpt-5-mini"
     #   embedding: "qwen/qwen3-embedding-8b"
+    #   rerank: "qwen/qwen3-reranker-8b"
     #   rerank: "qwen/qwen3-reranker-8b"

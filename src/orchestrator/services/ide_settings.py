@@ -1547,12 +1547,18 @@ async def seed_ide_profile(
     push = _push_fn or _ssh_untar_from_file
     pointers = profile_pointers or {}
     try:
-        with tempfile.NamedTemporaryFile(suffix=".tar.zst", delete=True) as tmp:
+        # The profile store removes absent/rejected downloads. Own their directory
+        # instead of a NamedTemporaryFile, whose close unlinks again on Python
+        # 3.11/3.12 and can prevent a new user's workspace from becoming ready.
+        with tempfile.TemporaryDirectory(prefix="srw-ide-seed-") as temp_dir:
+            local_path = os.path.join(temp_dir, "globalStorage.tar.zst")
             global_pointer = pointers.get("globalStorage")
             got_global = (
-                await profile_store.get_globalstorage(user_id, tmp.name, global_pointer)
+                await profile_store.get_globalstorage(
+                    user_id, local_path, global_pointer
+                )
                 if global_pointer is not None
-                else await profile_store.get_globalstorage(user_id, tmp.name)
+                else await profile_store.get_globalstorage(user_id, local_path)
             )
             if got_global:
                 target = await _authorized_mutation_target(
@@ -1567,23 +1573,24 @@ async def seed_ide_profile(
                 push_kwargs: dict[str, Any] = {"key_path": key_path}
                 if target_fingerprint is not None:
                     push_kwargs["expected_host_key_fingerprint"] = target_fingerprint
-                await push(target_host, target_port, tmp.name, **push_kwargs)
+                await push(target_host, target_port, local_path, **push_kwargs)
         for ext_id, info in (ext_items or {}).items():
             if info.get("source") != "bytes":
                 continue
-            with tempfile.NamedTemporaryFile(suffix=".tar.zst", delete=True) as tmp:
+            with tempfile.TemporaryDirectory(prefix="srw-ide-seed-") as temp_dir:
+                local_path = os.path.join(temp_dir, "extension.tar.zst")
                 pointer = pointers.get(f"extension:{ext_id}@{info.get('version', '')}")
                 got_extension = (
                     await profile_store.get_ext_bytes(
                         user_id,
                         ext_id,
                         info.get("version", ""),
-                        tmp.name,
+                        local_path,
                         pointer,
                     )
                     if pointer is not None
                     else await profile_store.get_ext_bytes(
-                        user_id, ext_id, info.get("version", ""), tmp.name
+                        user_id, ext_id, info.get("version", ""), local_path
                     )
                 )
                 if got_extension:
@@ -1601,7 +1608,7 @@ async def seed_ide_profile(
                         push_kwargs["expected_host_key_fingerprint"] = (
                             target_fingerprint
                         )
-                    await push(target_host, target_port, tmp.name, **push_kwargs)
+                    await push(target_host, target_port, local_path, **push_kwargs)
         # chown + sentinel
         target = await _authorized_mutation_target(
             ssh_host,

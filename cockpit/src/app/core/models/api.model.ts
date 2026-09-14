@@ -710,7 +710,16 @@ export interface LlmEndpoint {
   created_at: string | null;
   updated_at: string | null;
   models: never[];
+  /** Who wrote the row last: the `llm.seed` Job, an admin, or an image-shipped seeder. */
+  source?: HelmProvenanceSource | null;
+  /** Declared with `reconcile: true` in Helm values — re-applied on every `helm upgrade`. */
+  managed_by_helm?: boolean;
+  /** Managed, but last edited in the Cockpit: the next upgrade reverts it. */
+  helm_drift?: boolean;
 }
+
+/** `source` column shared by the Helm-reconciled provider tables. */
+export type HelmProvenanceSource = 'helm' | 'ui' | 'default';
 
 export interface LlmEndpointCreateRequest {
   label: string;
@@ -851,6 +860,9 @@ export interface CatalogModel {
   notes: string | null;
   created_at: string | null;
   updated_at: string | null;
+  source?: HelmProvenanceSource | null;
+  managed_by_helm?: boolean;
+  helm_drift?: boolean;
 }
 
 export interface CatalogModelCreateRequest {

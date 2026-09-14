@@ -45,6 +45,29 @@ def _patch_caller_and_db(user: dict, db):
     return stack
 
 
+def _point_at_messaging_factories(fake_request):
+    """Point the extracted ``/api/jobs/{id}/messages*`` routes at the
+    application's own dependency objects.
+
+    ``orchestrator.routers.messaging`` resolves its collaborators through
+    ``request.app.state.*_dependencies_factory``. Each factory is evaluated per
+    call, so it picks up the ``main.postgres_db`` patch installed by
+    ``_patch_caller_and_db`` — which is also the store the route's
+    ``require_job_access`` gate runs against.
+    """
+    from orchestrator.main import (
+        _inbound_reply_dependencies,
+        _message_thread_read_dependencies,
+    )
+
+    state = fake_request.app.state
+    state.message_thread_read_dependencies_factory = (
+        lambda: _message_thread_read_dependencies()
+    )
+    state.inbound_reply_dependencies_factory = lambda: _inbound_reply_dependencies()
+    return fake_request
+
+
 def _patch_audit_unavailable():
     """Make ``main.audit_reader.is_available`` False so list_jobs skips enrichment."""
     fake_reader = MagicMock()
@@ -1013,11 +1036,12 @@ class TestGatedReadEndpoints:
     async def test_list_message_threads_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from orchestrator.main import list_message_threads
+        from orchestrator.routers.messaging import list_message_threads
 
         fake_db.get_message_threads = AsyncMock(
             side_effect=AssertionError("threads called past the gate")
         )
+        _point_at_messaging_factories(fake_request)
         with _patch_caller_and_db(user_b, fake_db):
             with pytest.raises(HTTPException) as exc:
                 await list_message_threads(fake_request, str(job_a["id"]))
@@ -1403,9 +1427,11 @@ class TestJobMutationGates:
     async def test_reply_to_agent_message_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from orchestrator.main import MessageReplyRequest, reply_to_agent_message
+        from orchestrator.main import MessageReplyRequest
+        from orchestrator.routers.messaging import reply_to_agent_message
 
         body = MessageReplyRequest(message="hi", urgent=False)
+        _point_at_messaging_factories(fake_request)
         with _patch_caller_and_db(user_b, fake_db):
             with pytest.raises(HTTPException) as exc:
                 await reply_to_agent_message(

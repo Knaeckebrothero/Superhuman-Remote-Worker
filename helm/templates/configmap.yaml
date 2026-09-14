@@ -779,6 +779,7 @@ data:
   # CONTROLLER first: turning it on here against a controller that still
   # cascade-deletes disks would suspend sessions into nothing.
   VM_PERSISTENT_ROOTDISK: {{ .Values.vmController.persistentRootdisk.enabled | default false | quote }}
+  {{- include "srw.vmPreparationEnvironment" . | nindent 2 }}
 
   {{- if eq (include "srw.vmMode" .) "external" }}
   # Headscale and agent mesh are external-VM topology settings.

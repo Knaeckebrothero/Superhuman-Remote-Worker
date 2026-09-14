@@ -85,7 +85,9 @@ def validated_session_workspace_override(
     return ws
 
 
-def session_ready_timeout_s(backend: Optional[str]) -> int:
+def session_ready_timeout_s(
+    backend: Optional[str], *, preparation: bool = False
+) -> int:
     """Readiness-probe budget for the session-start paths (``provision_or_assign``
     and ``_do_prepare``'s ``wait_for_ready``).
 
@@ -96,5 +98,23 @@ def session_ready_timeout_s(backend: Optional[str]) -> int:
     900 s) so the agent gives up first with the truthful reason.
     """
     if backend == "vm":
-        return int(os.environ.get("VM_WS_READY_TIMEOUT_S", "960"))
+        budget = int(os.environ.get("VM_WS_READY_TIMEOUT_S", "960"))
+        if preparation:
+            from shared.workspace_preparation_settings import PreparationSettings
+
+            budget += PreparationSettings.from_environment().wait_budget
+        return budget
     return int(os.environ.get("WS_READY_TIMEOUT_S", "180"))
+
+
+def preparation_wait_budget(config_override, vm=None):
+    """Additional bounded startup time for an execution-owned preparation."""
+    workspace = (config_override or {}).get("workspace") or {}
+    if not (
+        (vm or {}).get("preparation_request")
+        or (workspace.get("vm") or {}).get("preparation")
+    ):
+        return 0
+    from shared.workspace_preparation_settings import PreparationSettings
+
+    return PreparationSettings.from_environment().wait_budget

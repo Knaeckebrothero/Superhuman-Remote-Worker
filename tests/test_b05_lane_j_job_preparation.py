@@ -35,6 +35,8 @@ file.
 
 from __future__ import annotations
 
+from tests import b08_completion_helpers as b08_helpers
+
 import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -110,8 +112,8 @@ def _workspace_authority_deps() -> (
         vm_mode=lambda: main.vm_provisioner.mode,
         ensure_workspace=main.ensure_workspace,
         workspace_suspension=main.workspace_suspension_service,
-        handle_scholar_completion=main._handle_scholar_completion,
-        handle_delegation_child_completion=main._handle_delegation_child_completion,
+        handle_scholar_completion=b08_helpers.handle_scholar_completion,
+        handle_delegation_child_completion=b08_helpers.handle_delegation_child_completion,
         resolve_inherited_workspace=main._resolve_subjob_inherited_workspace,
         fail_subjob_and_unblock_parent=main._fail_subjob_and_unblock_parent,
         workspace_runtime_unchanged_before_delivery=(
@@ -180,10 +182,12 @@ def _job_assignment_deps() -> job_assignment_routes.JobAssignmentDependencies:
         prepare_job_workspace_runtime=main._prepare_job_workspace_runtime,
         prepare_job_repository_before_claim=main._prepare_job_repository_before_claim,
         resume_missing_workspace=main._resume_missing_workspace,
-        guard_completion_control=main._guard_completion_control,
-        claim_completion_control=main._claim_completion_control,
-        abort_completion_control_claim=main._abort_completion_control_claim,
-        completion_resume_guard_kwargs=main._completion_resume_guard_kwargs,
+        guard_completion_control=main._completion_control_boundary.guard,
+        claim_completion_control=main._completion_control_boundary.claim,
+        abort_completion_control_claim=main._completion_control_boundary.abort,
+        completion_resume_guard_kwargs=(
+            main._completion_control_boundary.resume_guard_kwargs
+        ),
         dispatch_job_to_agent=main._dispatch_job_to_agent,
         resume_job_on_agent=main._resume_job_on_agent,
         trigger_dispatch=main._trigger_dispatch,
@@ -3134,13 +3138,13 @@ LATE_BINDING_TABLE = [
     (
         _workspace_authority_deps,
         "handle_scholar_completion",
-        "_handle_scholar_completion",
+        "b08_helpers.handle_scholar_completion",
         _DIRECT,
     ),
     (
         _workspace_authority_deps,
         "handle_delegation_child_completion",
-        "_handle_delegation_child_completion",
+        "b08_helpers.handle_delegation_child_completion",
         _DIRECT,
     ),
     (
@@ -3339,25 +3343,25 @@ LATE_BINDING_TABLE = [
     (
         _job_assignment_deps,
         "guard_completion_control",
-        "_guard_completion_control",
+        "_completion_control_boundary.guard",
         _DIRECT,
     ),
     (
         _job_assignment_deps,
         "claim_completion_control",
-        "_claim_completion_control",
+        "_completion_control_boundary.claim",
         _DIRECT,
     ),
     (
         _job_assignment_deps,
         "abort_completion_control_claim",
-        "_abort_completion_control_claim",
+        "_completion_control_boundary.abort",
         _DIRECT,
     ),
     (
         _job_assignment_deps,
         "completion_resume_guard_kwargs",
-        "_completion_resume_guard_kwargs",
+        "_completion_control_boundary.resume_guard_kwargs",
         _DIRECT,
     ),
     (_job_assignment_deps, "dispatch_job_to_agent", "_dispatch_job_to_agent", _DIRECT),
@@ -3391,7 +3395,14 @@ class TestLateBoundResolution:
             assert getattr(factory(), field)() == "sentinel-flag"
             return
         sentinel = type("Sentinel", (Exception,), {})
-        monkeypatch.setattr(main, main_name, sentinel)
+        owner = main
+        *parents, attribute = main_name.split(".")
+        if parents and parents[0] == "b08_helpers":
+            owner = b08_helpers
+            parents = parents[1:]
+        for parent in parents:
+            owner = getattr(owner, parent)
+        monkeypatch.setattr(owner, attribute, sentinel)
         assert getattr(factory(), field) is sentinel
 
     @pytest.mark.parametrize(

@@ -13,6 +13,8 @@ virtual backend's own contract tests use — so nothing here needs rclone or SSH
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import io
 import posixpath
 import stat
@@ -1193,6 +1195,93 @@ def _patch_sshclient(monkeypatch, fake_sftp) -> None:
     monkeypatch.setattr(paramiko, "SSHClient", MagicMock(return_value=mock_ssh))
 
 
+# =============================================================================
+# Host-key pinning (CodeQL py/paramiko-missing-host-key-validation, #463/#464)
+#
+# The MagicMock above cannot see host-key verification at all: it swallows
+# set_missing_host_key_policy() and never calls the policy back, so a client
+# that accepts ANY key passes it just as happily as one that checks. These
+# doubles reproduce the part of paramiko's connect() that matters here — the
+# policy is consulted for an unknown host key BEFORE credentials are offered —
+# so "rejected" can be asserted as "raised, and never authenticated".
+# =============================================================================
+
+HOST_KEY_BLOB = b"\x00\x00\x00\x0bssh-ed25519 fake-host-key-blob"
+OTHER_KEY_BLOB = b"\x00\x00\x00\x0bssh-ed25519 attacker-key-blob"
+
+
+def _fingerprint_of(blob: bytes) -> str:
+    """The OpenSSH SHA256 form ``ssh_helpers._fingerprint_host_key`` produces."""
+    digest = hashlib.sha256(blob).digest()
+    return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
+
+
+class _FakeHostKey:
+    """paramiko ``PKey`` stand-in: the wire blob its fingerprint is taken over."""
+
+    def __init__(self, blob: bytes):
+        self._blob = blob
+
+    def get_name(self) -> str:
+        return "ssh-ed25519"
+
+    def asbytes(self) -> bytes:
+        return self._blob
+
+
+class _PolicyRecordingSSHClient:
+    """Minimal ``paramiko.SSHClient`` that exercises the host-key policy.
+
+    ``connect()`` consults the installed policy exactly where paramiko does —
+    after key exchange, before authentication — so a policy that raises stops
+    the connection with no credentials sent. ``authenticated`` records whether
+    we got that far.
+    """
+
+    def __init__(self, sftp, host_key_blob: bytes):
+        self._sftp = sftp
+        self._host_key = _FakeHostKey(host_key_blob)
+        self.policy = None
+        self.authenticated = False
+        self.closed = False
+
+    def set_missing_host_key_policy(self, policy) -> None:
+        self.policy = policy
+
+    def connect(self, hostname, port=22, **kwargs):
+        if self.policy is None:
+            raise AssertionError(
+                "connect() ran without a host-key policy — an unknown host key "
+                "would have been trusted implicitly"
+            )
+        self.policy.missing_host_key(self, hostname, self._host_key)
+        # Only reached when the policy accepted the key.
+        self.authenticated = True
+
+    def open_sftp(self):
+        if not self.authenticated:
+            raise AssertionError("open_sftp() before the host key was accepted")
+        return self._sftp
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _patch_pinned_sshclient(monkeypatch, fake_sftp, host_key_blob: bytes):
+    """Install the recording client and hand back the instance connect() used."""
+    import paramiko
+
+    created = []
+
+    def _factory():
+        client = _PolicyRecordingSSHClient(fake_sftp, host_key_blob)
+        created.append(client)
+        return client
+
+    monkeypatch.setattr(paramiko, "SSHClient", _factory)
+    return created
+
+
 @pytest.fixture
 def sftp_env(monkeypatch):
     """Patch paramiko.SSHClient so _sftp_write_files runs against a fake
@@ -1210,13 +1299,18 @@ def modeless_sftp_env(monkeypatch):
     return fake_sftp
 
 
-def _ssh_target() -> _SshTarget:
+def _ssh_target(host_key_fingerprint: str | None = None) -> _SshTarget:
     return _SshTarget(
         host="10.0.0.5",
         port=22,
         username="agent-host",
         key_path="/key",
         workspace_path="/home/agent-host/workspace",
+        host_key_fingerprint=(
+            _fingerprint_of(HOST_KEY_BLOB)
+            if host_key_fingerprint is None
+            else host_key_fingerprint
+        ),
     )
 
 
@@ -1478,6 +1572,96 @@ class TestSftpDelete:
             _sftp_delete_file(_ssh_target(), "report.pdf")
 
         assert err.value.status_code == 502
+
+
+# =============================================================================
+# Host-key verification (CodeQL #463 / #464)
+#
+# Both SFTP helpers used to install ``paramiko.AutoAddPolicy()``, which trusts
+# whatever key the peer presents — the orchestrator-to-workspace hop had no
+# defence against a man-in-the-middle even though the pinned fingerprint was
+# already verified upstream. These tests pin the behaviour that replaced it.
+# =============================================================================
+
+
+class TestSftpHostKeyVerification:
+    UPLOADS_DIR = "/home/agent-host/workspace/uploads"
+    PAYLOAD = [("notes.md", b"hello", "text/markdown")]
+
+    def test_the_matching_host_key_is_accepted(self, monkeypatch):
+        """The legitimate workspace presents exactly the pinned key."""
+        fake_sftp = _FakeSftp()
+        created = _patch_pinned_sshclient(monkeypatch, fake_sftp, HOST_KEY_BLOB)
+
+        result = _sftp_write_files(
+            _ssh_target(host_key_fingerprint=_fingerprint_of(HOST_KEY_BLOB)),
+            self.PAYLOAD,
+        )
+
+        assert result[0].path == "uploads/notes.md"
+        assert fake_sftp.files[f"{self.UPLOADS_DIR}/notes.md"] == b"hello"
+        assert created[0].authenticated is True
+
+    def test_a_mismatched_host_key_is_refused_before_authenticating(self, monkeypatch):
+        """The man-in-the-middle case: a different key on the expected host.
+
+        The refusal has to land before authentication, or the workspace
+        private key has already been offered to the impostor.
+        """
+        fake_sftp = _FakeSftp()
+        created = _patch_pinned_sshclient(monkeypatch, fake_sftp, OTHER_KEY_BLOB)
+
+        with pytest.raises(ThreadUploadError) as err:
+            _sftp_write_files(
+                _ssh_target(host_key_fingerprint=_fingerprint_of(HOST_KEY_BLOB)),
+                self.PAYLOAD,
+            )
+
+        assert err.value.status_code == 502
+        assert created[0].authenticated is False
+        assert fake_sftp.files == {}
+
+    def test_a_mismatched_host_key_is_refused_on_delete_too(self, monkeypatch):
+        fake_sftp = _FakeSftp()
+        fake_sftp.dirs.add(self.UPLOADS_DIR)
+        fake_sftp.files[f"{self.UPLOADS_DIR}/report.pdf"] = b"bytes"
+        created = _patch_pinned_sshclient(monkeypatch, fake_sftp, OTHER_KEY_BLOB)
+
+        with pytest.raises(ThreadUploadError):
+            _sftp_delete_file(
+                _ssh_target(host_key_fingerprint=_fingerprint_of(HOST_KEY_BLOB)),
+                "report.pdf",
+            )
+
+        assert created[0].authenticated is False
+        assert fake_sftp.files[f"{self.UPLOADS_DIR}/report.pdf"] == b"bytes"
+
+    @pytest.mark.parametrize("fingerprint", ["", "   ", "not-a-fingerprint"])
+    def test_an_unusable_pin_refuses_to_connect_at_all(self, monkeypatch, fingerprint):
+        """No pin means no verification is possible, so there is nothing to
+        fall back to — AutoAddPolicy would be exactly the hole being closed."""
+        fake_sftp = _FakeSftp()
+        created = _patch_pinned_sshclient(monkeypatch, fake_sftp, HOST_KEY_BLOB)
+
+        with pytest.raises(ThreadUploadError):
+            _sftp_write_files(
+                _ssh_target(host_key_fingerprint=fingerprint), self.PAYLOAD
+            )
+
+        assert created == []  # refused before a connection was even opened
+        assert fake_sftp.files == {}
+
+    def test_a_missing_pin_refuses_the_delete_path_too(self, monkeypatch):
+        fake_sftp = _FakeSftp()
+        fake_sftp.dirs.add(self.UPLOADS_DIR)
+        fake_sftp.files[f"{self.UPLOADS_DIR}/report.pdf"] = b"bytes"
+        created = _patch_pinned_sshclient(monkeypatch, fake_sftp, HOST_KEY_BLOB)
+
+        with pytest.raises(ThreadUploadError):
+            _sftp_delete_file(_ssh_target(host_key_fingerprint=""), "report.pdf")
+
+        assert created == []
+        assert fake_sftp.files[f"{self.UPLOADS_DIR}/report.pdf"] == b"bytes"
 
 
 # =============================================================================

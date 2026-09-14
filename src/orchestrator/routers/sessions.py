@@ -593,7 +593,18 @@ async def _do_prepare(
                 _emit("failed", reason="session binding is not authoritative")
             return
 
-        ready_timeout_s = session_workspace_policy.session_ready_timeout_s(_backend)
+        from orchestrator.services.stateless_workspace_gate import (
+            thread_metadata_object,
+        )
+
+        ready_timeout_s = session_workspace_policy.session_ready_timeout_s(
+            _backend,
+            preparation=bool(
+                session_workspace_policy.preparation_wait_budget(
+                    thread_metadata_object(thread).get("config_override")
+                )
+            ),
+        )
         if not await wait_for_ready(
             pod_ip=binding.pod_ip,
             pod_port=binding.pod_port,

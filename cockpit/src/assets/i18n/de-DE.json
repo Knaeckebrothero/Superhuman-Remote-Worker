@@ -869,6 +869,8 @@
       "scopeLabel": "Verbrauchsbereich",
       "scopeNoSubjobs": "Dieser Job hat keine Teil-Jobs, beide Werte sind daher identisch.",
       "scopeSubtree": "Inkl. Teil-Jobs",
+      "showLess": "Weniger anzeigen",
+      "showMore": "Mehr anzeigen",
       "showSubjobRows": "{{count}} ausgeblendete als Zeilen anzeigen",
       "showSubjobRowsHint": "Fügt Unteraufträge zum Herkunftsfilter hinzu, damit sie in der Liste erscheinen.",
       "subjobs": "Unteraufträge ({{count}})",
@@ -897,6 +899,13 @@
     }
   },
   "admin": {
+    "helm": {
+      "badge": "Helm",
+      "badgeDrift": "Helm · überschrieben",
+      "tooltip": "Mit reconcile: true in den Helm-Values des Deployments deklariert. Änderungen hier werden beim nächsten helm upgrade zurückgesetzt.",
+      "tooltipDrift": "Nach dem letzten Helm-Apply hier bearbeitet. Das nächste helm upgrade setzt diese Zeile auf den deklarierten Wert zurück.",
+      "confirmOverride": "Diese Zeile wird von Helm verwaltet (reconcile: true in den Deployment-Values). Die Änderung wird beim nächsten helm upgrade zurückgesetzt, sofern die Values nicht ebenfalls angepasst werden. Fortfahren?"
+    },
     "nav": {
       "models": "Modelle",
       "users": "Benutzer",

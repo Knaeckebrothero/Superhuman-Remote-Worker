@@ -15,7 +15,9 @@ from orchestrator.services.manifest_store import ManifestStore
 from shared.runtime.core.workspace_selection import execution_workspace_config
 
 
-def srw_workspace_config(workspace: dict | None) -> dict:
+def srw_workspace_config(
+    workspace: dict | None, *, instance_recipe: dict | None = None
+) -> dict:
     """Render supported workspace recipes; never silently discard recipe fields."""
     if workspace is None:
         return {"backend": "none"}
@@ -23,37 +25,55 @@ def srw_workspace_config(workspace: dict | None) -> dict:
         validate_workspace_selection(workspace)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
-    recipe = workspace.get("template", {}).get("inline")
+    recipe = (
+        instance_recipe
+        if "instanceRef" in workspace
+        else workspace.get("template", {}).get("inline")
+    )
     if (
         not isinstance(recipe, dict)
-        or set(recipe) - {"backend", "retention", "resources", "environment"}
-        or recipe.get("retention", "Delete") != "Delete"
+        or set(recipe)
+        - {"backend", "retention", "resources", "environment", "initialize"}
+        or (
+            recipe.get("retention", "Delete") != "Delete"
+            and recipe.get("backend") != "vm"
+        )
     ):
         raise HTTPException(
             422,
             "The SRW workspace provisioner supports backend-only templates and "
-            "prebuilt VM images/resources with Delete retention. Initialized recipes, retained instances "
-            "and instanceRef require a supported workspace provisioner.",
+            "prebuilt VM images/resources and initialization. Retained VM references "
+            "must be resolved by the workspace admission service.",
         )
     result = {"backend": recipe["backend"]}
-    if not set(recipe) & {"resources", "environment"}:
+    if not set(recipe) & {"resources", "environment", "initialize"}:
         return result
     if recipe["backend"] != "vm":
         raise HTTPException(
-            422, "SRW template images and resources require backend vm."
+            422, "SRW template images, resources and initialization require backend vm."
         )
     environment = recipe.get("environment", {})
+    vm = {}
     if (
-        set(environment) - {"image", "pullPolicy", "cache"}
+        "prepare" in environment
         or environment.get("pullPolicy", "IfNotPresent") != "IfNotPresent"
         or environment.get("cache", "Reuse") != "Reuse"
     ):
-        raise HTTPException(
-            422,
-            "VM templates support prebuilt images with IfNotPresent/Reuse only; "
-            "preparation and other pull/cache policies are not supported.",
-        )
-    vm = {}
+        from orchestrator.services.vm_preparation import validate_environment
+
+        if instance_recipe is None:
+            settings = validate_environment(environment, recipe.get("resources", {}))
+            vm["preparation"] = deepcopy(environment)
+            vm["disk_size"] = settings.disk_size
+    if "initialize" in recipe:
+        from shared.workspace_initialization import initialization_request
+
+        try:
+            initialization = initialization_request(recipe["initialize"])
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        if initialization["steps"]:
+            vm["initialization"] = initialization
     if "image" in environment:
         image = environment["image"]
         # The VM controller embeds this registry reference in its disk manifest.
@@ -159,8 +179,40 @@ async def select_execution_workspace(
         resolved["template"] = await resolver.selection(
             "WorkspaceTemplate", resolved["template"], scope, dependencies
         )
-    config = srw_workspace_config(resolved)
+    instance_recipe = None
+    instance_generation = None
+    if resolved and "instanceRef" in resolved:
+        from orchestrator.services.retained_vm_workspaces import read_instance
+
+        row = await read_instance(
+            db,
+            resolved["instanceRef"]["uid"],
+            user,
+            project_id=project_id,
+            request=request,
+        )
+        instance_recipe, instance_generation = row["recipe"], row["generation"]
+    if (
+        instance_recipe is not None
+        or (resolved or {}).get("template", {}).get("inline", {}).get("retention")
+        == "Retain"
+    ):
+        from orchestrator.services.retained_vm_workspaces import (
+            require_retained_vm_hosting,
+        )
+
+        require_retained_vm_hosting()
+    config = srw_workspace_config(resolved, instance_recipe=instance_recipe)
     return config, {
+        **(
+            {
+                "instance_recipe": instance_recipe,
+                "instance_generation": instance_generation,
+                "instance_project_id": project_id,
+            }
+            if instance_recipe is not None
+            else {}
+        ),
         "document": deepcopy(workspace),
         "resolved": resolved,
         "dependencies": dependencies,
@@ -181,6 +233,21 @@ async def verify_workspace_selection(
             raise HTTPException(
                 409, "The Project changed during workspace selection; submit again."
             )
+    if selection.get("instance_recipe") is not None:
+        from orchestrator.services.retained_vm_workspaces import read_instance
+
+        user = await db.get_user(owner_id) if owner_id else None
+        if not user:
+            raise HTTPException(409, "Workspace selection owner is unavailable.")
+        uid = selection["resolved"]["instanceRef"]["uid"]
+        current = await read_instance(
+            db, uid, user, project_id=selection.get("instance_project_id")
+        )
+        if (
+            current["generation"] != selection["instance_generation"]
+            or current["recipe"] != selection["instance_recipe"]
+        ):
+            raise HTTPException(409, "Workspace instance changed during selection.")
     if selection.get("dependencies"):
         user = await db.get_user(owner_id) if owner_id else None
         if not user:

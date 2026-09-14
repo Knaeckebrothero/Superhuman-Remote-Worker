@@ -1403,10 +1403,12 @@ class TestSessionCreateValidators:
         "value", ["none", "LOW", " medium ", "high", "xhigh", "max"]
     )
     def test_reasoning_level_vocabulary(self, value):
+        # This used to assert parity against ``main._validated_reasoning_level``.
+        # R1.B07 moved the last in-``main`` consumer of that alias out to
+        # ``services.officer_post_policy``, so the alias is gone and the second
+        # half compared the service against itself. The vocabulary is the thing
+        # under test, and ``overrides`` is now its only owner.
         assert overrides.validated_reasoning_level(value) == value.strip().lower()
-        assert overrides.validated_reasoning_level(
-            value
-        ) == main._validated_reasoning_level(value)
 
     @pytest.mark.parametrize("value", ["", None, "ultra", 5])
     def test_reasoning_level_fails_loud(self, value):

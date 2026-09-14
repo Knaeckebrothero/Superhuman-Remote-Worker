@@ -19,6 +19,13 @@ from orchestrator.schemas.model_catalog import (
     VALID_CATALOG_CAPABILITIES,
     VALID_CATALOG_PROVIDER_KINDS,
 )
+from shared.helm_provenance import (
+    RECONCILE_MANIFEST_KEY,
+    SOURCE_UI,
+    annotate,
+    model_identity,
+)
+
 from orchestrator.schemas.provider_catalog import (
     VALID_DEFAULT_MODEL_KINDS,
     VALID_SYSTEM_API_KEY_PROVIDERS,
@@ -31,6 +38,7 @@ if TYPE_CHECKING:
 
 
 class ModelCatalogStore(Protocol):
+    async def get_system_setting(self, key: str) -> dict[str, Any] | None: ...
     async def get_system_api_key(self, provider: str) -> str | None: ...
     async def get_system_llm_endpoint(
         self, endpoint_id: str
@@ -108,14 +116,57 @@ class ModelCatalogService:
     family_detector: Callable[[str], FamilyDetection]
     reasoning_capability: Callable[[str], dict[str, Any]]
 
-    def _serialize_catalog_model(self, row: dict[str, Any]) -> dict[str, Any]:
+    async def _provenance_context(
+        self,
+    ) -> tuple[dict[str, Any] | None, dict[str, str]]:
+        """The ``helm.reconcile`` manifest and endpoint id → label map that
+        turn a catalog row into its manifest identity."""
+        setting = await self.store.get_system_setting(RECONCILE_MANIFEST_KEY)
+        manifest = setting.get("value") if isinstance(setting, dict) else None
+        if not isinstance(manifest, dict):
+            manifest = None
+        labels = {
+            str(r["id"]): r["label"]
+            for r in await self.store.list_system_llm_endpoints()
+        }
+        return manifest, labels
+
+    def _serialize_catalog_model(
+        self,
+        row: dict[str, Any],
+        *,
+        manifest: dict[str, Any] | None = None,
+        endpoint_labels: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
         """Shape a ``models`` row for API responses.
 
         Single-column source of truth: only the ``capabilities`` array is on
         the wire. Cockpit clients have been migrated to the array form.
+        ``manifest`` / ``endpoint_labels`` (see ``_provenance_context``)
+        drive the Helm-managed annotation; without them a row is reported as
+        unmanaged.
         """
 
         explicit_window = row.get("context_window")
+        provider_ref = str(row["provider_ref"])
+        anchor = (
+            (endpoint_labels or {}).get(provider_ref, provider_ref)
+            if row.get("provider_kind") == "endpoint"
+            else provider_ref
+        )
+        identity = model_identity(
+            row.get("provider_kind") or "system", anchor, row["model_id"]
+        )
+        return annotate(
+            self._catalog_row_shape(row, explicit_window),
+            manifest=manifest,
+            section="models",
+            identity=identity,
+        )
+
+    def _catalog_row_shape(
+        self, row: dict[str, Any], explicit_window: Any
+    ) -> dict[str, Any]:
         return {
             "id": str(row["id"]),
             "provider_kind": row["provider_kind"],
@@ -143,6 +194,7 @@ class ModelCatalogService:
             "routing_needs_review": _catalog_routing(row).needs_review,
             "enabled": row.get("enabled", True),
             "seeded_from": row.get("seeded_from"),
+            "source": row.get("source"),
             "notes": row.get("notes"),
             "created_at": row["created_at"].isoformat()
             if row.get("created_at")
@@ -221,7 +273,11 @@ class ModelCatalogService:
             provider_ref=provider_ref,
             enabled_only=enabled_only,
         )
-        return [self._serialize_catalog_model(r) for r in rows]
+        manifest, labels = await self._provenance_context()
+        return [
+            self._serialize_catalog_model(r, manifest=manifest, endpoint_labels=labels)
+            for r in rows
+        ]
 
     async def create_catalog_model(self, body: CatalogModelCreate) -> dict[str, Any]:
         """Insert a new catalog row.
@@ -247,6 +303,7 @@ class ModelCatalogService:
                 params_json=body.params_json,
                 enabled=body.enabled,
                 notes=body.notes,
+                source=SOURCE_UI,
             )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
@@ -264,7 +321,10 @@ class ModelCatalogService:
             raise HTTPException(
                 status_code=500, detail="Catalog insert returned no row."
             )
-        return self._serialize_catalog_model(row)
+        manifest, labels = await self._provenance_context()
+        return self._serialize_catalog_model(
+            row, manifest=manifest, endpoint_labels=labels
+        )
 
     async def update_catalog_model(
         self, catalog_id: str, body: CatalogModelUpdate
@@ -296,6 +356,9 @@ class ModelCatalogService:
                 fields.get("provider_ref", existing["provider_ref"]),
                 fields["model_id"],
             )
+        # An admin write is recorded as such; a Helm-reconciled row then shows
+        # as overridden until the next `helm upgrade` re-applies it.
+        fields["source"] = SOURCE_UI
         try:
             row = await self.store.update_model(catalog_id, **fields)
         except ValueError as e:
@@ -309,7 +372,10 @@ class ModelCatalogService:
             raise
         if row is None:
             raise HTTPException(status_code=404, detail="Catalog row not found")
-        return self._serialize_catalog_model(row)
+        manifest, labels = await self._provenance_context()
+        return self._serialize_catalog_model(
+            row, manifest=manifest, endpoint_labels=labels
+        )
 
     async def delete_catalog_model(self, catalog_id: str) -> dict[str, Any]:
         """Hard-delete a catalog row. Returns a warning when the row's model_id

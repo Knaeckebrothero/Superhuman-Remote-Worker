@@ -1093,9 +1093,14 @@ async def test_ssh_key_added_open_action_navigates_and_resolves():
     ever leaves `pending` — no source_kind is registered for it, so nothing
     else can resolve it. Also pins the destination: Settings → SSH Keys is
     where a user revokes a key they didn't add."""
+    from orchestrator.services.notification_actions import (
+        register_notification_actions,
+    )
     from orchestrator.services.notification_catalog import ActionContext, action_handler
 
-    orchestrator.main._register_notification_actions()
+    register_notification_actions(
+        dependencies=orchestrator.main._notification_action_dependencies()
+    )
     handler = action_handler("ssh_key_added", "open")
     assert handler is not None
 

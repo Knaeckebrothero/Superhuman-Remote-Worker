@@ -1,0 +1,74 @@
+# Portable conformance input. No images are run and no credentials are supplied.
+apiVersion: srw/v1alpha1
+kind: Expert
+metadata:
+  name: portable-worker
+  scope: {kind: Catalog, name: shared}
+  tags: [worker, conformance]
+  labels: {team: development}
+spec:
+  runtime:
+    image: example.invalid/custom-harness:1
+    config:
+      $extends: a-literal-harness-setting
+      tools: [custom_read_file, tool-not-in-the-image]
+      optional: null
+      values: [true, false, null, 12, 0.5, "yes", "012", "2026-09-13"]
+---
+apiVersion: srw/v1alpha1
+kind: WorkspaceTemplate
+metadata:
+  name: portable-workspace
+  scope: {kind: Catalog, name: shared}
+spec:
+  backend: sandbox
+  environment:
+    image: example.invalid/ssh-workspace:1
+  resources: {cpu: 2, memory: 4Gi, storage: 20Gi}
+  initialize:
+    - command: [mkdir, -p, project]
+  retention: Retain
+---
+apiVersion: srw/v1alpha1
+kind: Connector
+metadata:
+  name: portable-source
+  scope: {kind: Account, name: personal}
+spec:
+  driver: srw.env/v1
+  config:
+    env: {REPOSITORY_URL: "https://example.invalid/source.git"}
+  credentials:
+    REPOSITORY_TOKEN:
+      secretRef: {name: source-access, key: token}
+  access: ReadOnly
+---
+apiVersion: srw/v1alpha1
+kind: Project
+metadata:
+  name: portable-team
+  scope: {kind: Account, name: personal}
+spec:
+  resources:
+    experts:
+      engineer:
+        ref: {name: portable-worker, scope: {kind: Catalog, name: shared}}
+    workspaces:
+      development:
+        ref: {name: portable-workspace, scope: {kind: Catalog, name: shared}}
+    connectors:
+      source:
+        ref: {name: portable-source, scope: {kind: Account, name: personal}}
+  defaults: {expert: engineer, workspace: development, connectors: [source]}
+---
+apiVersion: srw/v1alpha1
+kind: Job
+metadata:
+  name: portable-assignment
+  scope: {kind: Project, name: portable-team}
+spec:
+  task: {text: "Check the supplied repository", data: {ticket: 17, optional: null}}
+  execution: {}
+  completion: {mode: ProcessExit}
+  retry: {maxAttempts: 1}
+  timeoutSeconds: 60

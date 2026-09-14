@@ -17,11 +17,12 @@ import hmac
 import json
 import os
 import re
+import shlex
 import time
 import uuid
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Literal
+from typing import Any, AsyncIterator, Final, Literal
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -45,6 +46,7 @@ SUPPORTED_SCENARIOS = frozenset(
         "search-job",
         "fetch-job",
         "worker-job",
+        "prepared-workspace-job",
     }
 )
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{2,127}$")
@@ -68,6 +70,7 @@ class ArmScenarioRequest(BaseModel):
         "search-job",
         "fetch-job",
         "worker-job",
+        "prepared-workspace-job",
     ] = "reply"
     required_responses: int = Field(default=1, ge=1, le=100)
     chunk_delay_ms: int = Field(default=100, ge=0, le=2_000)
@@ -417,7 +420,7 @@ class ScenarioStore:
                 state.fetch_job_tool_steps += 1
             if (
                 outcome == "success"
-                and decision.scenario == "worker-job"
+                and decision.scenario in {"worker-job", "prepared-workspace-job"}
                 and decision.tool_phase
             ):
                 state.worker_job_tool_steps += 1
@@ -597,12 +600,7 @@ def create_inference_app(
                 raise
 
             structured_name = _structured_output_name(payload)
-            if structured_name not in {
-                None,
-                "ConversationTitle",
-                "ExtractedMemories",
-                "AssemblyResult",
-            }:
+            if structured_name not in _MODELLED_SCHEMAS:
                 await _account_rejection(
                     store,
                     run_id=run_id,
@@ -655,7 +653,10 @@ def create_inference_app(
                         "required_tool_missing",
                         "The search-job scenario requires a tool that was not bound.",
                     )
-            elif structured_name is None and state["scenario"] == "worker-job":
+            elif structured_name is None and state["scenario"] in {
+                "worker-job",
+                "prepared-workspace-job",
+            }:
                 tool_names = _tool_names(payload)
                 if tool_names & {
                     "read_file",
@@ -663,9 +664,14 @@ def create_inference_app(
                     "next_phase_todos",
                     "job_complete",
                 }:
-                    tool_call = _worker_job_tool_call(
-                        state["worker_job_tool_steps"], run_id
-                    )
+                    if state["scenario"] == "prepared-workspace-job":
+                        tool_call = _prepared_workspace_tool_call(
+                            state["worker_job_tool_steps"], run_id, messages
+                        )
+                    else:
+                        tool_call = _worker_job_tool_call(
+                            state["worker_job_tool_steps"], run_id
+                        )
                 if tool_call is not None and tool_call.name not in tool_names:
                     await _account_rejection(
                         store,
@@ -1034,6 +1040,23 @@ def _discover_run_ids(payload: dict[str, Any]) -> set[str]:
     return run_ids
 
 
+#: Structured-output schemas this fixture answers deterministically. Anything
+#: else is a real unexpected call and must stay a 422 — the set is deliberately
+#: an allowlist, not a fallback, so a NEW schema shows up as a rejection rather
+#: than as a silently fabricated answer.
+_MODELLED_SCHEMAS: Final = frozenset(
+    {
+        None,
+        "ConversationTitle",
+        "ExtractedMemories",
+        "AssemblyResult",
+        "ConversationSummary",
+        "CurationResult",
+        "KnowledgeAssemblyResult",
+    }
+)
+
+
 def _structured_output_name(payload: dict[str, Any]) -> str | None:
     response_format = payload.get("response_format")
     if not isinstance(response_format, dict):
@@ -1082,6 +1105,48 @@ def _structured_content(schema_name: str, run_id: str) -> str:
                 "actions_taken": [],
                 "gaps_identified": [],
                 "summary": f"E2E-{run_id} deterministic no-op assembly review.",
+            },
+            separators=(",", ":"),
+        )
+    if schema_name == "ConversationSummary":
+        # Context compaction (`SummarizeTask`) folds a long worker conversation
+        # through this schema. A loop member that runs long enough to compact
+        # asked for it and got a 422, which the agent retried three times and
+        # then degraded to trimming — real behaviour change, and two
+        # `unexpected_schema` rejections that hide a genuine unexpected call.
+        # The deterministic answer is a valid, content-free summary.
+        return json.dumps(
+            {
+                "summary": f"E2E-{run_id} deterministic conversation summary.",
+                "tasks_completed": "",
+                "tasks_in_progress": "",
+                "key_decisions": "",
+                "current_state": "",
+                "blockers": "",
+                "critical_facts": "",
+                "state_changes": "",
+                "pinned_instructions": "",
+                "identity_anchor": "",
+            },
+            separators=(",", ":"),
+        )
+    if schema_name == "CurationResult":
+        return json.dumps(
+            {
+                "notes_created": 0,
+                "notes_updated": 0,
+                "summary": f"E2E-{run_id} deterministic no-op curation.",
+            },
+            separators=(",", ":"),
+        )
+    if schema_name == "KnowledgeAssemblyResult":
+        return json.dumps(
+            {
+                "notes_refreshed": 0,
+                "notes_superseded": 0,
+                "notes_merged": 0,
+                "notes_archived": 0,
+                "summary": f"E2E-{run_id} deterministic no-op convergence.",
             },
             separators=(",", ":"),
         )
@@ -1379,6 +1444,56 @@ def _search_job_tool_call(step: int, run_id: str) -> ToolCallSpec:
             separators=(",", ":"),
         ),
     )
+
+
+def _prepared_workspace_tool_call(
+    step: int, run_id: str, messages: list[dict[str, Any]]
+) -> ToolCallSpec:
+    """Require an actual prepared-workspace shell result before completion."""
+    if step == 6:
+        existing = "-f" if run_id.endswith("-reuse") else "! -e"
+        command = "\n".join(
+            [
+                "set -eu",
+                'test "$(srw-cache-check)" = srw-prepared-tool-v1',
+                'test "$(cat .srw-initialize-count)" = initialized',
+                f"test {existing} .srw-execution-marker",
+                "printf '%s\\n' " + shlex.quote(run_id) + " > .srw-execution-marker",
+                "printf 'SRW_PREPARED_PASS:%s\\n' " + shlex.quote(run_id),
+            ]
+        )
+        if "-job-sudo-" in run_id:
+            # Keep sudo as the first word to exercise the harness gate. This
+            # only queries the installed version; it runs no privileged command.
+            command = "sudo --version >/dev/null && (\n" + command + "\n)"
+        return ToolCallSpec(
+            name="run_command",
+            arguments=json.dumps(
+                {"command": command, "working_dir": ".", "timeout": 30},
+                separators=(",", ":"),
+            ),
+        )
+    if step == 7:
+        previous = next(
+            (
+                message
+                for message in reversed(messages)
+                if isinstance(message, dict) and message.get("role") == "tool"
+            ),
+            {},
+        )
+        output = previous.get("content")
+        if (
+            not isinstance(output, str)
+            or f"SRW_PREPARED_PASS:{run_id}" not in output.splitlines()
+            or "Exit code: 0" not in output.splitlines()
+        ):
+            raise ScenarioError(
+                422,
+                "workspace_proof_missing",
+                "Prepared workspace execution did not return the required proof.",
+            )
+    return _worker_job_tool_call(step if step < 6 else step - 1, run_id)
 
 
 def _worker_job_tool_call(step: int, run_id: str) -> ToolCallSpec:

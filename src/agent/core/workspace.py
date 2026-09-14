@@ -532,20 +532,13 @@ class WorkspaceManager:
         the remote BEFORE creating subdirectories so that the local history
         extends the remote's (required for pushes and subjob branches).
         """
-        # When we have a remote, clone first (needs empty/non-existent dir),
-        # then layer subdirectories on top.
+        # Workspace ownership and resetting belong to the provisioner. A new
+        # harness can receive initialization files or a retained working tree;
+        # starting an assignment must never empty that directory.
+        # When we have a remote, attach/clone before adding framework directories.
         if self.config.git_versioning and self.config.git_remote_url:
             if not self._backend_has_shell:
                 self._workspace_path.parent.mkdir(parents=True, exist_ok=True)
-            else:
-                # Remote backend: workspace dir may have leftover files from a
-                # previous session (static container pool reuse). Clear it so
-                # git clone has an empty target directory.
-                self._backend.shell_run(
-                    f"rm -rf {self._backend.root}/* {self._backend.root}/.[!.]* 2>/dev/null || true",
-                    timeout=30,
-                    tab_name="git",
-                )
             self._initialize_git()
             # Create any subdirectories the clone didn't provide
             for subdir in self.config.structure:
@@ -554,15 +547,6 @@ class WorkspaceManager:
             return
 
         # No remote — standard path: create dirs, then git init
-        if self._backend_has_shell:
-            # Remote backend: workspace dir may have leftover files from a
-            # previous session (static container pool reuse). Clear it so
-            # the new session starts with a clean workspace.
-            self._backend.shell_run(
-                f"rm -rf {self._backend.root}/* {self._backend.root}/.[!.]* 2>/dev/null || true",
-                timeout=30,
-                tab_name="init",
-            )
         self._workspace_path.mkdir(parents=True, exist_ok=True)
         logger.info(f"Initialized workspace at {self._workspace_path}")
 
@@ -587,6 +571,19 @@ class WorkspaceManager:
         from agent.managers.git_manager import GitManager
 
         if self.config.git_remote_url:
+            # A retained root may already be a delivery repository. Keep its
+            # history and uncommitted files, and reject a different origin
+            # before any clone or remote rewrite.
+            if self._backend.exists(".git"):
+                self._git_manager = self._attach_existing_workspace_repo(
+                    {"name": "workspace", "repo_url": self.config.git_remote_url}
+                )
+                if self.config.branch_name:
+                    if not self._git_manager.checkout_branch(
+                        self.config.branch_name, create=True
+                    ):
+                        raise RuntimeError("Could not select the workspace job branch.")
+                return
             # Clone from remote so histories stay connected.
             git_mgr = GitManager.clone(
                 self.config.git_remote_url,

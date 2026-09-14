@@ -1300,7 +1300,13 @@ def test_stateless_sandbox_profile_renders_current_executor_and_workspace_images
 @pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
 @pytest.mark.parametrize(
     "profile_name",
-    ["pinned-virtual", "stateless-sandbox", "forge-sandbox", "cloud-sandbox"],
+    [
+        "pinned-virtual",
+        "stateless-sandbox",
+        "forge-sandbox",
+        "cloud-sandbox",
+        "officer-watchdog",
+    ],
 )
 def test_session_profiles_do_not_render_an_extra_catalog_provider(
     profile_name: str,
@@ -1403,6 +1409,103 @@ def test_cloud_sandbox_extends_forge_sandbox_without_replacing_it() -> None:
     # The backend is a Deployment, so it must be waited on as one.
     assert "srw-e2e-nextcloud" in cloud.additional_deployments
     assert set(forge.additional_deployments) <= set(cloud.additional_deployments)
+
+
+def test_officer_watchdog_extends_forge_sandbox_and_only_flips_reconciliation() -> None:
+    """B07's final gate *extends* forge-sandbox; it never replaces it.
+
+    The Officer watchdog's third duty submits a missing runtime to the shared
+    durable lifecycle owner, and that owner drops every automatic submission
+    while the chart default stands. The overlay exists to flip exactly that
+    one decision, so the profile must inherit the forge stack unchanged and
+    must not have acquired a cloud backend or protected cloud mode along the
+    way.
+    """
+    forge = harness.resolve_profile("forge-sandbox")
+    watchdog = harness.resolve_profile("officer-watchdog")
+
+    assert watchdog.values_files[: len(forge.values_files)] == forge.values_files
+    assert watchdog.values_files[-1] == harness.OFFICER_WATCHDOG_VALUES_FILE
+    assert watchdog.values_files[0] == harness.VALUES_FILE
+    assert watchdog.workspace_backend == forge.workspace_backend == "sandbox"
+    assert watchdog.execution_lane == forge.execution_lane == "stateless"
+    assert watchdog.include_workspace_image is True
+    assert watchdog.stateless_agents is True
+    assert watchdog.forge_enabled is True
+    assert watchdog.additional_deployments == forge.additional_deployments
+    assert watchdog.additional_statefulsets == forge.additional_statefulsets
+    # The one behavioural difference, in both directions.
+    assert watchdog.persistent_reconciliation_enabled is True
+    for name in (
+        "pinned-virtual",
+        "stateless-sandbox",
+        "forge-sandbox",
+        "cloud-sandbox",
+    ):
+        assert harness.resolve_profile(name).persistent_reconciliation_enabled is False
+    # And the gate under test did not drag a backend in with it.
+    assert watchdog.cloud_enabled is False
+    assert watchdog.protected_cloud_enabled is False
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
+def test_officer_watchdog_profile_renders_the_reconciliation_flag(
+    tmp_path: Path,
+) -> None:
+    """The flag must reach the orchestrator, not just the values file.
+
+    The orchestrator Deployment does not ``envFrom`` the shared ConfigMap, so
+    a key that renders into the ConfigMap and is never referenced by the
+    Deployment would leave the duty just as unobservable as the default.
+    """
+    sha = "a" * 40
+    run_id = "20260824-123456-ab12cd34"
+    profile = harness.resolve_profile("officer-watchdog")
+    images, _commands = harness.build_image_commands(
+        sha, run_id, include_workspace=profile.include_workspace_image
+    )
+    image_values = tmp_path / "images.yaml"
+    image_values.write_text(
+        harness._image_values(images, sha, run_id), encoding="utf-8"
+    )
+    command = [
+        "helm",
+        "template",
+        "srw-e2e",
+        str(harness.REPO_ROOT / "helm"),
+        "-n",
+        harness.NAMESPACE,
+    ]
+    for values_file in profile.values_files:
+        command.extend(("-f", str(values_file)))
+    command.extend(("-f", str(image_values)))
+    rendered = subprocess.run(
+        command, check=True, capture_output=True, text=True, timeout=120
+    ).stdout
+    documents = [document for document in yaml.safe_load_all(rendered) if document]
+    configs = [
+        document
+        for document in documents
+        if document.get("kind") == "ConfigMap"
+        and "PERSISTENT_AGENT_RECONCILIATION_ENABLED" in (document.get("data") or {})
+    ]
+    assert len(configs) == 1
+    assert configs[0]["data"]["PERSISTENT_AGENT_RECONCILIATION_ENABLED"] == "true"
+    deployments = [
+        document
+        for document in documents
+        if document.get("kind") == "Deployment"
+        and document["metadata"]["name"] == "srw-e2e-orchestrator"
+    ]
+    assert len(deployments) == 1
+    referenced = {
+        entry["name"]
+        for container in deployments[0]["spec"]["template"]["spec"]["containers"]
+        for entry in (container.get("env") or [])
+        if (entry.get("valueFrom") or {}).get("configMapKeyRef", {}).get("key")
+        == "PERSISTENT_AGENT_RECONCILIATION_ENABLED"
+    }
+    assert referenced == {"PERSISTENT_AGENT_RECONCILIATION_ENABLED"}
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")

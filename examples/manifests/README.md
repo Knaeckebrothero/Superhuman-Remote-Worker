@@ -1,5 +1,8 @@
 # SRW resource manifests (v1alpha1)
 
+See [first-release readiness](v1-readiness.md) for the current supported core,
+verification state and remaining rollout decisions.
+
 Read [resources.yaml](resources.yaml), [referenced-job.yaml](referenced-job.yaml),
 then [project.yaml](project.yaml) for the basic composition.
 [inline-job.yaml](inline-job.yaml) describes an ordinary image with no SRW hooks;
@@ -35,6 +38,13 @@ directly. Omitted Job selections inherit project defaults.
 Explicit `workspace: null` and `connectors: {}` suppress those defaults. No deep merge is performed on
 private settings. The protocol remains `v1alpha1` while migration and execution
 semantics are exercised.
+
+All five resources accept `metadata.tags` (a string list), `metadata.labels`
+(a string map), and `metadata.annotations` (a string map). These classify or
+describe resources; they do not grant access or select execution resources.
+An admitted Job can update this metadata using its expected resource version,
+including after completion. Its authored specification, resolved dependencies
+and execution snapshot remain fixed, and reapplying it never starts another Job.
 
 For the shipped harness, `runtime: {adapter: srw/v1}` selects the installed SRW
 worker pool. Omit `image` so the definition follows installation upgrades; an
@@ -76,15 +86,98 @@ configuration edits and End/Resume. Unattended Project loops, automations and
 Officer dispatch also resolve the Project workspace before connector selection.
 
 The SRW provisioner accepts backend-only templates and prebuilt VM templates
-with `Delete` retention. VM templates can select `environment.image` and
+with `Delete` retention, plus retained same-cluster VM instances for Jobs.
+VM templates can select `environment.image` and
 `resources.cpu`, `memory`, and `storage`. CPUs must be whole cores; the disk
 request is raised to the controller's rootdisk minimum when necessary.
 `IfNotPresent`/`Reuse` uses the controller's existing disk import/clone behavior.
 Use immutable image digests: an existing cached golden disk is keyed by the full
 image reference, so changing the contents behind a tag does not invalidate it.
-Other pull/cache policies, preparation, initialization, retained instances and
-`instanceRef` remain unsupported. Image/resource settings on the SRW sandbox
+Enabled same-cluster VM preparation supports `prepare`, all three pull policies
+and `Reuse`/`Rebuild` caching. See [prepared VM workspaces](workspace-preparation.md)
+and [the example](srw-prepared-development-vm.yaml). Image/resource settings on the SRW sandbox
 and virtual backends are also rejected instead of discarded.
+
+Same-cluster SRW VM templates also accept ordered `initialize` commands. See
+[srw-initialized-development-vm.yaml](srw-initialized-development-vm.yaml).
+Admission freezes the commands with the image and resources; editing the template
+affects new executions. Applying or previewing a template runs no commands.
+
+Initialization runs inside the VM as `agent-host`, with
+`/home/agent-host/workspace` as its working directory and `/home/agent-host` as
+`HOME`. Arguments are literal; use an explicit shell command when shell expansion
+is needed. The VM image must provide Python 3.10+, systemd 254+, cloud-init and
+the SRW guest/SSH contract. The shipped Ubuntu 24.04 VM image supplies these.
+The runner sets `NoNewPrivileges` and adds no privileges beyond the image's
+`agent-host` account. That account's existing access to services such as Docker
+remains available. Put OS packages in the base image; use initialization for
+user-owned environments, caches and project directories.
+
+The agent is released only after all steps exit successfully. This VM stage runs
+before the SRW harness attaches execution connectors or clones its repositories;
+it cannot use those credentials or depend on those checkouts. Generic sandbox
+initialization has its own connector delivery path, described below.
+
+Initialization has a 15-minute total command budget, independent of image import
+and boot budgets, with at most 32 steps and 64 KiB of command input. A failure
+blocks readiness and reports the step and exit code. Command output stays in the
+root-readable guest file `/var/log/srw-workspace-initialization.log`.
+The receipt at `/var/lib/srw-workspace-initialization/status.json` contains only
+recipe/owner identity, phase, step and exit code.
+
+Successful setup is skipped when the same Job or Session resumes on the same
+persistent rootdisk. Enable the installation's existing persistent-rootdisk
+support for that guarantee across VM replacement. A fresh disk runs setup again.
+Interrupted steps may replay on restart, so commands must be idempotent.
+
+For reuse by separate SRW Jobs, select `retention: Retain`. The
+[first assignment example](srw-retained-development-vm.yaml) creates a VM instance;
+the [next assignment example](srw-retained-job.yaml) selects its `instanceRef`.
+Read `workspace_instance_id` from `GET /api/jobs/{id}`, or `status.workspace.uid`
+from the canonical Job resource. Wait for `GET /api/workspace-instances/{uid}`
+to report `Detached` before submitting a different Job with that UID.
+Reapplying a completed Job does not replay it.
+
+Each template allocation gets a fresh instance. Only an explicit `instanceRef`
+reuses one, within its original Account or Project scope and after current access
+checks. The reservation is exclusive and part of Job admission. The instance's
+recipe stays frozen: changing its source template does not rebuild an existing
+disk. Jobs using this SRW adapter still have Reported completion and one attempt.
+
+A completed Job releases its disk only after managed process retirement and proof
+that its VM, VMI and launcher no longer reference the disk. A durable attachment
+fence rejects delayed requests from the prior Job. The next Job gets a fresh VM,
+SSH host key and guest token, with current connector/grant resolution. The PVC
+and successful initialization receipt remain the same. Retained files can include
+previously saved credentials; `connectors: {}` does not erase filesystem contents.
+
+Normal VM teardown and orphan sweeps preserve retained disks. Delete one explicitly
+with `DELETE /api/workspace-instances/{uid}?expected_generation=N`, using the
+current generation returned by GET. A response with `deleted: false` requires a
+retry; `Deleting` remains reserved even if a controller response is lost.
+Deletion verifies the captured PVC identity and refuses active attachments.
+A cancelled Job that never allocated a disk can also release its reservation
+through this endpoint. Storage remains attributed to the workspace's Account or
+Project after the original Job is deleted.
+
+Retained VM hosting requires `VM_MODE=same-cluster`, persistent rootdisks, signed
+lifecycle transport and the Secret-backed cloud-init template. Keep the chart's
+single VM controller and `Recreate` rollout strategy. Apply the database migration
+and updated controller/RBAC before admitting retained recipes. The controller
+keeps a small Lease tombstone for released workspace identities to reject delayed
+creates. VM instances are supported by the installed SRW harness adapter; generic
+harnesses continue to use the separate sandbox workspace provider. Sessions retain
+their own disk through suspend/resume; selecting a retained VM instance for a
+Session is explicitly rejected in this increment.
+
+The [initialization verification](verification/k3d-vm-initialization-2026-09-12.json)
+exercised real VM initialization, failed setup and disk-preserving recreation
+through production admission, provisioning, retirement and readiness services.
+The [retention verification](verification/k3d-vm-retention-2026-09-12.json) also
+passed on real k3d VMs: two separate Jobs reused the same PVC and initialized once,
+with new VM/SSH host identities, stale-operation rejection and explicit deletion.
+Both gates drove terminal Job status through a test fixture; neither executed an
+LLM job or deployed the full SRW stack inside that workspace.
 
 [srw-development-vm.yaml](srw-development-vm.yaml) selects a published VM image
 with Docker Engine, Compose, Buildx, kubectl, Helm, k3d, Tilt, mkcert, Python,
@@ -119,7 +212,7 @@ edits and resume. Changing a template affects new executions; changing VM image
 or resources through a Session settings PATCH requires a new Session.
 These fields are part of the manifest schema and are supported only where the
 selected provisioner implements them. This change does not add a general
-auto-upgrade policy or preparation cache.
+auto-upgrade policy. Preparation has its own [operator capability gate](workspace-preparation.md).
 
 ## Local use
 
@@ -130,6 +223,26 @@ environment. From the checkout:
 python -m shared.manifests validate examples/manifests/*.yaml
 python -m shared.manifests preview examples/manifests/*.yaml
 python -m shared.manifests export examples/manifests/*.yaml --output-format json
+```
+
+### Reading from stdin
+
+Pass `-` once to read UTF-8 YAML or JSON from stdin. It accepts YAML document
+streams and flow mappings, plus JSON objects and exported JSON arrays. Mix `-`
+with file paths to preserve their argument order; file-only commands ignore stdin.
+Repeated `-` operands are rejected before reading any input.
+
+The existing 1 MiB source limit, document/depth limits and duplicate-key checks
+still apply. Oversized stdin is rejected after reading the limit plus one byte.
+For shorter streams, the producer must close its pipe when finished. Invalid
+UTF-8 and parse failures return a nonzero exit without echoing input values.
+
+Export the examples and validate the result through stdin:
+
+```bash
+python -m shared.manifests export examples/manifests/resources.yaml \
+  --scope-kind Account --scope-name personal --output-format json \
+  | python -m shared.manifests validate -
 ```
 
 For resources without explicit metadata scope, provide both `--scope-kind Account`
@@ -388,10 +501,12 @@ explicit `{}` rule allows all egress. CIDR exclusions must be strictly contained
 subnets. Configuring egress does not enable generic hosting or waive the separate
 startup-isolation verification requirement.
 
-Workspace preparation/cache builds, authored network profiles and native VM/virtual
-hosting currently fail admission explicitly. The reference SRW adapter keeps its
-existing workspace provisioner (simple backend selection, Reported completion,
-one attempt). Custom initialized/retained recipes use generic hosting. Existing
+Authored network profiles and VM/virtual workspaces for generic harnesses
+currently fail admission explicitly. Preparation/cache builds are supported by
+the same-cluster SRW VM adapter when enabled; generic builders remain unsupported. The reference SRW adapter keeps its
+existing workspace provisioner (backend selection, prebuilt VM images/resources,
+same-cluster VM preparation, initialization and retained Job instances, Reported completion,
+one attempt). Custom initialized/retained sandbox recipes use generic hosting. Existing
 Officer kit/policy updates publish an atomic Project revision; automatic team
 commissioning and new generic team controllers remain future capabilities.
 
@@ -476,8 +591,8 @@ The orchestrator marks initialization complete after every initializer exits zer
 then omits them on later attachments. Partial failures may repeat earlier steps, so
 initializers must tolerate repetition. This follows [Kubernetes init-container
 sequencing](https://kubernetes.io/docs/concepts/workloads/pods/init-containers/).
-Image preparation/cache builds and custom VM providers remain execution capability
-gates. System packages belong in the workspace image; initialization can populate
+For generic sandbox hosting, image preparation/cache builds and custom VM providers
+remain execution capability gates. System packages belong in the workspace image; initialization can populate
 repositories, files and user-space tool installations in the retained home.
 
 The harness receives a workspace descriptor, its scoped private key and pinned
@@ -747,3 +862,42 @@ evidence and changed namespaces remain refused; independently verified operator
 recovery is required. The earlier test fixtures were recovered and removed, and
 their failed artifacts remain separate from the accepted invocation. Cached
 fixture image layers remain in the local registry.
+
+## Prepared VM cache verification
+
+The preparation backend was exercised on `k3d-srw` with real KubeVirt/CDI VMs,
+production manifest admission and PostgreSQL, signed controller transport,
+host-key-pinned SSH, initialization, retained handoff and cleanup. Two fresh VMs
+shared a prepared toolchain while keeping separate files, writable disks and
+machine identities. Rebuild, controller service restart recovery, failed builds,
+cancellation, cache eviction and Session End during preparation also passed.
+
+The ordinary K3s profile exposed a NetworkPolicy startup window. A separate
+Cilium 1.18.13 cluster with `policyEnforcementMode=always` passed the offline and
+online policy checks, including positive public/DNS reachability and denied
+private traffic, then was removed. Test namespaces, VMs, PVCs, PostgreSQL and
+temporary credentials were cleaned up. No LLM or harness completion was used in
+this gate. See the [recorded evidence](workspace-preparation-k3d-evidence.json)
+and [operator setup](workspace-preparation.md).
+
+The earlier backend regression run with `PYTHONSAFEPATH=1` finished with 30,815
+passes, 179 skips and one source-inspection failure caused by expanding a
+database docstring after the module had already been imported. The affected
+module passed all 10 tests in a fresh process with no runtime changes. The VM
+controller and preparer images built and passed Python 3.12 import checks; Helm lint,
+Ruff, SQL lint and endpoint/runtime-coordinate inventories also passed.
+
+The subsequent [MCP/harness preparation gate](verification/k3d-prepared-srw-mcp-2026-09-13.json)
+passed all six cases and cleanup on 2026-09-13. An owned deterministic model
+provider drove four actual SRW Jobs through SSH tools: cold preparation, a fresh
+cache hit, retained allocation and retained handoff. Failed preparation and
+cancellation of a running builder both stopped before workspace allocation.
+Metadata edits preserved the completed execution snapshots and Job identities.
+
+The [complete Job/Session smoke](verification/k3d-srw-adapter-2026-09-13.json)
+also passed after the cleanup-capture lock correction. It exercised sandbox and
+virtual Jobs, existing Job API selection, Session configuration updates and
+End/Resume, and sandbox/virtual/no-workspace Sessions, including exact cleanup.
+
+The [readiness page](v1-readiness.md) records the subsequent integration fixes,
+complete regression runs and MCP/harness acceptance state.

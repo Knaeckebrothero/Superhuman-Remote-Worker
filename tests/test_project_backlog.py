@@ -7,6 +7,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from orchestrator.routers.project_loops import ProjectLoopsDependencies
+from orchestrator.services.project_loop_spawn import (
+    ProjectLoopDependencies,
+    spawn_loop_job,
+)
+
 
 # =============================================================================
 # Helpers (Task 3: priority on the agent tool surface)
@@ -986,16 +992,60 @@ class TestKickoffInjection:
         assert "could not be read this turn" in kickoff
 
 
+def _loops_deps(**over) -> ProjectLoopsDependencies:
+    """The project-loops router's dependency object.
+
+    In the app this comes from
+    ``request.app.state.project_loops_dependencies_factory``; these tests call
+    the declaration directly, so they hand it in explicitly (the parameter's
+    ``Depends(...)`` default is not resolved off-app).
+    """
+    fields = dict(
+        store=AsyncMock(),
+        vector_store=MagicMock(),
+        spawn_loop_stage=AsyncMock(),
+        writeback_loop_stage=AsyncMock(),
+        resume_project_loop=AsyncMock(),
+        check_vm_permission=AsyncMock(),
+    )
+    fields.update(over)
+    return ProjectLoopsDependencies(**fields)
+
+
+def _loop_deps(**over) -> ProjectLoopDependencies:
+    """The loop engine's one dependency object, built from mocks.
+
+    ``main._project_loop_dependencies()`` binds these fields to the live
+    application globals; the suite binds them to mocks and a test overrides
+    only the field it actually steers.
+    """
+    fields = dict(
+        store=AsyncMock(),
+        vector_store=MagicMock(),
+        notifier=AsyncMock(),
+        gitea_client=MagicMock(),
+        main_cloud_router=MagicMock(),
+        trigger_dispatch=MagicMock(),
+        kick_officer_event_drain=MagicMock(),
+        enforce_dispatch_grants=AsyncMock(),
+        reindex_project_kb=AsyncMock(),
+        completion_commands_enabled=lambda: False,
+        completion_sweep_router=MagicMock(),
+    )
+    fields.update(over)
+    return ProjectLoopDependencies(**fields)
+
+
 class _SpawnLoopJobHarness:
-    """Shared plumbing for exercising ``main._spawn_loop_job`` end to end —
-    every loop spawn funnels through it, so this is where the backlog fetch
-    must be proven wired, not just ``render_backlog_block`` in isolation.
+    """Shared plumbing for exercising ``spawn_loop_job`` end to end — every
+    loop spawn funnels through it, so this is where the backlog fetch must be
+    proven wired, not just ``render_backlog_block`` in isolation.
 
     Mirrors the patch set in
     tests/test_loop_unified_advance.py::test_spawn_loop_job_forwards_park_to_create
-    (postgres_db / _trigger_dispatch / create_loop_job / provision_job_repo),
-    plus ``main.vector_db`` and ``services.project_backlog.fetch_backlog`` for
-    the new backlog fetch.
+    (the engine's dependency object / create_loop_job / provision_job_repo),
+    plus a live ``vector_store`` and ``services.project_backlog.fetch_backlog``
+    for the backlog fetch.
     """
 
     def _loop(self, **over):
@@ -1012,9 +1062,6 @@ class _SpawnLoopJobHarness:
 
         create = AsyncMock(return_value={"id": "job-1"})
         with ExitStack() as stack:
-            stack.enter_context(patch("orchestrator.main.postgres_db", AsyncMock()))
-            stack.enter_context(patch("orchestrator.main.vector_db", MagicMock()))
-            stack.enter_context(patch("orchestrator.main._trigger_dispatch"))
             stack.enter_context(
                 patch("orchestrator.services.project_loops.create_loop_job", create)
             )
@@ -1030,9 +1077,9 @@ class _SpawnLoopJobHarness:
                     fetch_backlog_double,
                 )
             )
-            from orchestrator.main import _spawn_loop_job
-
-            job = await _spawn_loop_job(loop, role="critic", iteration=2)
+            job = await spawn_loop_job(
+                loop, role="critic", iteration=2, dependencies=_loop_deps()
+            )
         return job, create
 
 
@@ -1985,13 +2032,9 @@ class TestBacklogEndpoint:
 
     Patch targets mirror the established idiom for this router (see
     ``test_loop_campaign_scheduling.py::test_start_rejects_planner_with_invalid_template``):
-    the bare ``routers.project_loops`` import root (not
-    ``orchestrator.routers.project_loops`` -- conftest.py puts
-    ``orchestrator/`` first on sys.path so the router module actually
-    executes under the bare name, and patching the dotted name would
-    silently miss it), auth helpers patched where the router module bound
-    them at import time, and ``main.postgres_db`` / ``main.vector_db``
-    patched where the endpoint's late `from main import ...` will find them.
+    auth helpers patched where the router module bound them at import time,
+    and the two stores handed in on ``ProjectLoopsDependencies`` -- the
+    endpoint no longer reaches into ``main`` for them.
     """
 
     PROJECT_ID = "68137e29-6b1f-4f1b-a0c1-4e6dc2be3f9a"
@@ -2041,13 +2084,15 @@ class TestBacklogEndpoint:
                     AsyncMock(side_effect=member_side_effect),
                 )
             )
-            stack.enter_context(patch("orchestrator.main.postgres_db", db))
-            stack.enter_context(patch("orchestrator.main.vector_db", MagicMock()))
             stack.enter_context(
                 patch("orchestrator.routers.project_loops.fetch_backlog", fetch)
             )
 
-            out = await get_project_backlog(MagicMock(), self.PROJECT_ID)
+            out = await get_project_backlog(
+                MagicMock(),
+                self.PROJECT_ID,
+                dependencies=_loops_deps(store=db, vector_store=MagicMock()),
+            )
         return out, fetch
 
     @pytest.mark.asyncio

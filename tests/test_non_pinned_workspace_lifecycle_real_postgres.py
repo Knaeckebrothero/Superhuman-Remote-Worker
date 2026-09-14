@@ -94,6 +94,285 @@ async def db(pg_dsn, _schema_applied):
         await store.close()
 
 
+async def _vm_process_zero(conn, owner_kind, owner, generation):
+    await conn.execute(
+        "INSERT INTO managed_repository_process_zero_receipts "
+        "(owner_kind,owner_id,scope,provisioner,runtime_incarnation,observed_at) "
+        "VALUES ($1,$2,'vm','vm',$3,now())",
+        owner_kind,
+        owner,
+        generation,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner_kind", ("job", "thread"))
+async def test_vm_heartbeat_does_not_create_ide_runtime_authority(db, owner_kind):
+    from orchestrator.security.vm_guest import VmGuestIdentity
+    from orchestrator.services.vm_guest_events import record_heartbeat
+
+    owner, generation = uuid4(), str(uuid4())
+    table, column = (
+        ("jobs", "context") if owner_kind == "job" else ("threads", "metadata")
+    )
+    state = {"vm": {"provision_generation": generation, "status": "ready"}}
+    async with db.acquire() as conn:
+        if owner_kind == "job":
+            await conn.execute(
+                "INSERT INTO jobs (id, description, status, context) VALUES ($1, 'VM heartbeat', 'failed', $2::jsonb)",
+                owner,
+                json.dumps(state),
+            )
+        else:
+            await conn.execute(
+                "INSERT INTO threads (id, status, execution_lane, metadata) VALUES ($1, 'ended', 'stateless', $2::jsonb)",
+                owner,
+                json.dumps(state),
+            )
+    assert await record_heartbeat(
+        db,
+        VmGuestIdentity(owner_kind, str(owner), generation),
+        {"code_server_connections": 0},
+    )
+    async with db.acquire() as conn:
+        value = await conn.fetchval(f"SELECT {column} FROM {table} WHERE id=$1", owner)
+        current = json.loads(value) if isinstance(value, str) else value
+        assert "ide_session" not in current
+        assert current["vm"]["code_server_connections"] == 0
+        with pytest.raises(asyncpg.CheckViolationError):
+            await conn.execute(f"DELETE FROM {table} WHERE id=$1", owner)
+        await _vm_process_zero(conn, owner_kind, owner, generation)
+        await conn.execute(
+            f"UPDATE {table} SET {column}=jsonb_set({column}, '{{vm,status}}', '\"deleted\"'::jsonb) WHERE id=$1",
+            owner,
+        )
+        assert (
+            await conn.execute(f"DELETE FROM {table} WHERE id=$1", owner) == "DELETE 1"
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner_kind", ("job", "thread"))
+@pytest.mark.parametrize(
+    "existing",
+    [
+        {
+            "restore_type": "k8s_container",
+            "status": "active",
+            "_runtime_incarnation": "179da88f-1bf0-4b6e-8586-7ea94c545e52",
+            "pod_ip": "10.42.0.9",
+        },
+        {"status": "idle", "pod_name": "legacy-ide"},
+        {"restore_type": "vm", "status": "expired"},
+        {"restore_type": "vm", "status": "restoring"},
+    ],
+)
+async def test_vm_heartbeat_preserves_other_and_nonready_ide_authority(
+    db, owner_kind, existing
+):
+    from orchestrator.security.vm_guest import VmGuestIdentity
+    from orchestrator.services.vm_guest_events import record_heartbeat
+
+    owner, generation = uuid4(), str(uuid4())
+    table, column = (
+        ("jobs", "context") if owner_kind == "job" else ("threads", "metadata")
+    )
+    state = {
+        "vm": {"provision_generation": generation, "status": "ready"},
+        "ide_session": existing,
+    }
+    async with db.acquire() as conn:
+        if owner_kind == "job":
+            await _execute_pre_0195(
+                conn,
+                "INSERT INTO jobs (id,description,status,context) VALUES ($1,'VM heartbeat','failed',$2::jsonb)",
+                owner,
+                json.dumps(state),
+            )
+        else:
+            await _execute_pre_0195(
+                conn,
+                "INSERT INTO threads (id,status,metadata) VALUES ($1,'ended',$2::jsonb)",
+                owner,
+                json.dumps(state),
+            )
+    assert await record_heartbeat(
+        db,
+        VmGuestIdentity(owner_kind, str(owner), generation),
+        {"code_server_connections": 1},
+    )
+    async with db.acquire() as conn:
+        value = await conn.fetchval(
+            f"SELECT {column}->'ide_session' FROM {table} WHERE id=$1", owner
+        )
+        assert (json.loads(value) if isinstance(value, str) else value) == existing
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner_kind", ("job", "thread"))
+async def test_stale_vm_heartbeat_cannot_update_ide_activity(db, owner_kind):
+    from orchestrator.security.vm_guest import VmGuestIdentity
+    from orchestrator.services.vm_guest_events import record_heartbeat
+
+    owner, generation = uuid4(), str(uuid4())
+    table, column = (
+        ("jobs", "context") if owner_kind == "job" else ("threads", "metadata")
+    )
+    state = {
+        "vm": {"provision_generation": generation, "status": "ready"},
+        "ide_session": {"restore_type": "vm", "status": "idle"},
+    }
+    async with db.acquire() as conn:
+        if owner_kind == "job":
+            await conn.execute(
+                "INSERT INTO jobs (id,description,status,context) VALUES ($1,'VM heartbeat','failed',$2::jsonb)",
+                owner,
+                json.dumps(state),
+            )
+        else:
+            await conn.execute(
+                "INSERT INTO threads (id,status,metadata) VALUES ($1,'ended',$2::jsonb)",
+                owner,
+                json.dumps(state),
+            )
+    assert not await record_heartbeat(
+        db,
+        VmGuestIdentity(owner_kind, str(owner), str(uuid4())),
+        {"code_server_connections": 1},
+    )
+    merge_ide = (
+        db.merge_ide_session_context
+        if owner_kind == "job"
+        else db.merge_thread_ide_session_context
+    )
+    # Also cover a generation change between the liveness merge and IDE merge.
+    assert not await merge_ide(
+        str(owner), {"status": "active"}, expected_vm_generation=str(uuid4())
+    )
+    async with db.acquire() as conn:
+        value = await conn.fetchval(f"SELECT {column} FROM {table} WHERE id=$1", owner)
+        assert (json.loads(value) if isinstance(value, str) else value) == state
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner_kind", ("job", "thread"))
+@pytest.mark.parametrize(
+    "variant", ("heartbeat", "endpoint", "unknown", "unverified", "stale-generation")
+)
+async def test_0246_repairs_only_authenticated_vm_heartbeat_placeholders(
+    db, owner_kind, variant
+):
+    owner, generation = uuid4(), str(uuid4())
+    table, column = (
+        ("jobs", "context") if owner_kind == "job" else ("threads", "metadata")
+    )
+    state = {
+        "vm": {
+            "provision_generation": generation,
+            "identity_provision_generation": generation,
+            "identity_authenticated": True,
+            "vm_uid": str(uuid4()),
+            "status": "deleted",
+        },
+        "ide_session": {"status": "idle", "code_server_connections": 0},
+    }
+    if variant == "endpoint":
+        state["ide_session"]["pod_ip"] = "10.42.0.12"
+    elif variant == "unknown":
+        state["ide_session"]["future_authority"] = "opaque"
+    elif variant == "unverified":
+        state["vm"]["identity_authenticated"] = False
+    elif variant == "stale-generation":
+        state["vm"]["identity_provision_generation"] = str(uuid4())
+    async with db.acquire() as conn:
+        if owner_kind == "job":
+            await _execute_pre_0195(
+                conn,
+                "INSERT INTO jobs (id,description,status,context) VALUES ($1,'old VM heartbeat','failed',$2::jsonb)",
+                owner,
+                json.dumps(state),
+            )
+        else:
+            await _execute_pre_0195(
+                conn,
+                "INSERT INTO threads (id,status,execution_lane,metadata) VALUES ($1,'ended','stateless',$2::jsonb)",
+                owner,
+                json.dumps(state),
+            )
+        await _vm_process_zero(conn, owner_kind, owner, generation)
+        if owner_kind == "job":
+            with pytest.raises(asyncpg.CheckViolationError):
+                await conn.execute(f"DELETE FROM {table} WHERE id=$1", owner)
+        migration = (
+            SCHEMA_FILE.parent / "migrations/app/0246_vm_ide_heartbeat_projection.sql"
+        ).read_text()
+        await conn.execute(migration)
+        await conn.execute(migration)
+        value = await conn.fetchval(f"SELECT {column} FROM {table} WHERE id=$1", owner)
+        current = json.loads(value) if isinstance(value, str) else value
+        if variant == "heartbeat":
+            expected = json.loads(json.dumps(state))
+            expected.pop("ide_session")
+            assert current == expected
+            assert (
+                await conn.execute(f"DELETE FROM {table} WHERE id=$1", owner)
+                == "DELETE 1"
+            )
+        else:
+            assert current == state
+            if owner_kind == "job":
+                with pytest.raises(asyncpg.CheckViolationError):
+                    await conn.execute(f"DELETE FROM {table} WHERE id=$1", owner)
+
+
+@pytest.mark.asyncio
+async def test_0246_cannot_hide_an_ide_creation_reservation(db):
+    # Separate IDE runtime reservations are currently supported for Jobs.
+    owner_kind = "job"
+    (
+        owner,
+        _runtime,
+        _reservation,
+        _state,
+    ) = await _create_inflight_authoritative_runtime(
+        db, owner_kind=owner_kind, scope="ide"
+    )
+    generation = str(uuid4())
+    state = {
+        "vm": {
+            "provision_generation": generation,
+            "identity_provision_generation": generation,
+            "identity_authenticated": True,
+            "vm_uid": str(uuid4()),
+            "status": "deleted",
+        },
+        "ide_session": {"status": "idle", "code_server_connections": 0},
+    }
+    table, column = (
+        ("jobs", "context") if owner_kind == "job" else ("threads", "metadata")
+    )
+    async with db.acquire() as conn:
+        await _execute_pre_0195(
+            conn,
+            f"UPDATE {table} SET {column}=$2::jsonb WHERE id=$1",
+            owner,
+            json.dumps(state),
+        )
+        migration = (
+            SCHEMA_FILE.parent / "migrations/app/0246_vm_ide_heartbeat_projection.sql"
+        ).read_text()
+        await conn.execute(migration)
+        value = await conn.fetchval(f"SELECT {column} FROM {table} WHERE id=$1", owner)
+        assert (json.loads(value) if isinstance(value, str) else value) == state
+        assert not await conn.fetchval(
+            "SELECT vm_ide_heartbeat_cleanup_is_authorized($1,$2,$3::jsonb,$4::jsonb)",
+            owner_kind,
+            owner,
+            json.dumps(state),
+            json.dumps({"vm": state["vm"]}),
+        )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("owner_kind", ("job", "thread"))
 async def test_0195_raw_runtime_insert_requires_creation_reservation(db, owner_kind):

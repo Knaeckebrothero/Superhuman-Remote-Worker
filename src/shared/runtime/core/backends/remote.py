@@ -2661,7 +2661,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         missing session/window must never be mistaken for a successful durable
         guard or key send. Use Paramiko's already-drained remote exit status
         directly, without adding temp-file I/O to the 300 ms capture loop.
-        Pane-scoped capture callers may supply their exact tab and pane identity;
+        Pane-scoped callers may supply their exact tab and pane identity;
         only a follow-up liveness proof can then downgrade the failure to an
         ordinary missing-tab error.
         """
@@ -2689,7 +2689,9 @@ __SRW_WORKSPACE_UID_ZERO_PY__
             # generic 5 MiB SSH cap cannot make a finished command look busy.
             output, exit_code = self._exec_with_status(command, retain_tail=True)
             if exit_code != 0:
-                if pane_context is not None:
+                if exit_code == 1 and pane_context is not None:
+                    # Fence failures use reserved exit codes. A vanished pane
+                    # must never turn a stale owner into a recoverable tab error.
                     tab_name, pane_id = pane_context
                     try:
                         pane_gone = self._tmux_pane_gone(tab_name, pane_id)
@@ -2778,6 +2780,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         *,
         operation: str,
         allow_missing_session: bool = False,
+        pane_context: Optional[tuple[str, str]] = None,
     ) -> str:
         """Serialize a tmux mutation and fence stale stateless claimants."""
         if allow_missing_session and self._shell_owner_token is not None:
@@ -2792,6 +2795,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         return self._tmux_exec_checked(
             self._tmux_lock_command(inner),
             operation=operation,
+            pane_context=pane_context,
         )
 
     def _promote_tmux_owner_token(self) -> None:
@@ -3842,6 +3846,8 @@ __SRW_WORKSPACE_UID_ZERO_PY__
     def _tmux_send_keys(self, tab_name: str, text: str, enter: bool = True) -> None:
         """Send keys to a remote tmux pane."""
         pane = self._tmux_pane_target(tab_name)
+        tab = self._tabs[tab_name]
+        assert tab.pane_id is not None
         if enter:
             command = (
                 f"tmux send-keys -t {pane} -l {shlex.quote(text)}\n"
@@ -3853,6 +3859,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         self._tmux_mutate_checked(
             command,
             operation=f"send keys to {tab_name}",
+            pane_context=(tab_name, tab.pane_id),
         )
 
     def _tmux_capture(self, tab_name: str) -> List[str]:

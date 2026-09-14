@@ -40,7 +40,7 @@ def operator(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
         main, "_require_admin", AsyncMock(return_value={"id": ADMIN_ID})
     )
     monkeypatch.setattr(main, "COMPLETION_COMMANDS_ENABLED", True)
-    monkeypatch.setattr(main, "_get_completion_command_resolution", lambda: service)
+    monkeypatch.setattr(main._completion_runtime, "command_resolution", lambda: service)
     return service
 
 
@@ -268,19 +268,19 @@ def test_safety_preclaim_and_router_reconciliation_follow_reorder_gate(
     reorder_enabled: bool,
 ) -> None:
     monkeypatch.setattr(main, "COMPLETION_STATUS_REORDER_ENABLED", reorder_enabled)
-    monkeypatch.setattr(main, "_completion_finalizer_instance", None)
-    monkeypatch.setattr(main, "_completion_sweep_router_instance", None)
-    monkeypatch.setattr(main, "_completion_command_resolution_instance", None)
+    monkeypatch.setattr(main._completion_runtime, "_finalizer", None)
+    monkeypatch.setattr(main._completion_runtime, "_sweep_router", None)
+    monkeypatch.setattr(main._completion_runtime, "_command_resolution", None)
 
-    finalizer = main._get_completion_finalizer()
-    router = main._get_completion_sweep_router()
+    finalizer = main._completion_runtime.finalizer()
+    router = main._completion_runtime.sweep_router()
 
     if reorder_enabled:
-        resolution = main._completion_command_resolution_instance
+        resolution = main._completion_runtime._command_resolution
         assert resolution is not None
         assert finalizer.preclaim.__self__ is resolution
         assert router.safety_net is resolution
     else:
         assert finalizer.preclaim is None
         assert router.safety_net is None
-        assert main._completion_command_resolution_instance is None
+        assert main._completion_runtime._command_resolution is None
