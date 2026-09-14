@@ -21,7 +21,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import JSONResponse
@@ -1374,8 +1374,14 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                     }
                 )
             return {"tabs": tabs}
-        except Exception as e:
-            return {"tabs": [], "message": f"Error: {str(e)}"}
+        except Exception:
+            error_ref = uuid4().hex[:12]
+            logger.exception("Failed to get shell state (error_ref=%s)", error_ref)
+            return {
+                "tabs": [],
+                "message": "Error: shell state unavailable",
+                "error_ref": error_ref,
+            }
 
     # ===================================================================
     # Worker routes (job dispatch)
@@ -2110,9 +2116,13 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                     "thread_id": thread_id,
                 }
             )
-        except Exception as e:
-            logger.exception("Failed to detach session")
-            return JSONResponse({"error": str(e)}, status_code=500)
+        except Exception:
+            error_ref = uuid4().hex[:12]
+            logger.exception("Failed to detach session (error_ref=%s)", error_ref)
+            return JSONResponse(
+                {"error": "session detach failed", "error_ref": error_ref},
+                status_code=500,
+            )
 
     # --- Persistent-session REST endpoints (orchestrator-driven turns) ---
     #

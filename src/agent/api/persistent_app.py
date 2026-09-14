@@ -6275,9 +6275,17 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                     "sessions_served": _sessions_served,
                 }
             )
-        except Exception as e:
-            logger.exception(f"Failed to detach session for thread {thread_id}")
-            return JSONResponse({"error": str(e)}, status_code=500)
+        except Exception:
+            error_ref = uuid4().hex[:12]
+            logger.exception(
+                "Failed to detach session for thread %s (error_ref=%s)",
+                thread_id,
+                error_ref,
+            )
+            return JSONResponse(
+                {"error": "session detach failed", "error_ref": error_ref},
+                status_code=500,
+            )
 
     @app.post("/cloud-overlay/reset")
     async def cloud_overlay_reset(request: Request):
@@ -6330,18 +6338,35 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
         try:
             await asyncio.to_thread(_session.reset_cloud_overlay)
             return JSONResponse({"ok": True})
-        except CloudOverlayUnavailable as e:
+        except CloudOverlayUnavailable:
             # Precondition only (overlay exists but isn't active — mount
             # failed, or already torn down): 404 = give up, don't retry.
-            return JSONResponse({"error": str(e)}, status_code=404)
-        except Exception as e:
+            error_ref = uuid4().hex[:12]
+            logger.exception(
+                "Cloud overlay unavailable for thread %s (error_ref=%s)",
+                _thread_id,
+                error_ref,
+            )
+            return JSONResponse(
+                {"error": "cloud overlay unavailable", "error_ref": error_ref},
+                status_code=404,
+            )
+        except Exception:
             # EVERYTHING else is a real failure and must surface as 500
             # (retry/alert). This includes OverlayMountError (remount/wipe
             # script) and RcloneMountError (vfs/refresh) — both subclass
             # RuntimeError, so no RuntimeError-shaped clause may sit above
             # this one or real failures get misreported as 404 give-up.
-            logger.exception("Failed to reset cloud overlay for thread %s", _thread_id)
-            return JSONResponse({"error": str(e)}, status_code=500)
+            error_ref = uuid4().hex[:12]
+            logger.exception(
+                "Failed to reset cloud overlay for thread %s (error_ref=%s)",
+                _thread_id,
+                error_ref,
+            )
+            return JSONResponse(
+                {"error": "cloud overlay reset failed", "error_ref": error_ref},
+                status_code=500,
+            )
 
     # --- Headless REST input endpoints (phase 2) ---
     #

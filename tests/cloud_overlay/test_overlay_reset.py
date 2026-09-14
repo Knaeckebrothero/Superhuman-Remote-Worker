@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 from unittest.mock import MagicMock
 
 import pytest
@@ -33,6 +34,14 @@ def _reset_body() -> dict[str, str]:
         "workspace_generation": _RESET_WORKSPACE_GENERATION,
         "workspace_runtime_incarnation": _RESET_RUNTIME_INCARNATION,
     }
+
+
+def _assert_sanitized_reset_error(
+    body: dict[str, str], *, message: str, leaked_exception_text: str
+) -> None:
+    assert body["error"] == message
+    assert re.fullmatch(r"[0-9a-f]{12}", body["error_ref"])
+    assert leaked_exception_text not in str(body)
 
 
 class FakeRemoteBackend:
@@ -255,7 +264,11 @@ def test_route_404_when_no_session_or_no_active_overlay(post_reset):
     inactive = _stub_session(_manager(FakeRemoteBackend()), _FakeRcloneManager())
     resp = post_reset(inactive)
     assert resp.status_code == 404
-    assert "no active cloud overlay" in resp.json()["error"]
+    _assert_sanitized_reset_error(
+        resp.json(),
+        message="cloud overlay unavailable",
+        leaked_exception_text="no active cloud overlay",
+    )
 
 
 def test_route_500_on_overlay_mount_error(post_reset):
@@ -266,7 +279,11 @@ def test_route_500_on_overlay_mount_error(post_reset):
 
     resp = post_reset(_stub_session(mgr, _FakeRcloneManager()))
     assert resp.status_code == 500
-    assert "overlay_remount.sh" in resp.json()["error"]
+    _assert_sanitized_reset_error(
+        resp.json(),
+        message="cloud overlay reset failed",
+        leaked_exception_text="overlay_remount.sh",
+    )
 
 
 def test_route_500_on_rclone_refresh_error(post_reset):
@@ -282,7 +299,11 @@ def test_route_500_on_rclone_refresh_error(post_reset):
 
     resp = post_reset(_stub_session(mgr, rclone))
     assert resp.status_code == 500
-    assert "vfs/refresh failed" in resp.json()["error"]
+    _assert_sanitized_reset_error(
+        resp.json(),
+        message="cloud overlay reset failed",
+        leaked_exception_text="vfs/refresh failed",
+    )
 
 
 def test_route_success_returns_ok_true(post_reset):

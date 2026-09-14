@@ -20,6 +20,7 @@ secret env var is wired.
 from __future__ import annotations
 
 import json
+import re
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
@@ -568,7 +569,13 @@ def test_dry_run_reports_a_build_failure_without_persisting(monkeypatch):
 
     body = wired.client.post(f"{BASE}/test", json=_valid_put_body()).json()
 
-    assert body == {"ok": False, "detail": "build_backend failed: bad url"}
+    # The builder's exception text can name internal hosts and credentials, so
+    # the client gets the route's own wording plus the correlation id that
+    # finds the logged exception.
+    assert body["ok"] is False
+    assert body["detail"] == "build_backend failed"
+    assert "bad url" not in json.dumps(body)
+    assert re.fullmatch(r"[0-9a-f]{12}", body["error_ref"])
     wired.store.delete_system_setting.assert_not_awaited()
 
 

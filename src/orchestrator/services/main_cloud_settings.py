@@ -33,6 +33,7 @@ import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Optional
+from uuid import uuid4
 
 from fastapi import HTTPException
 
@@ -416,14 +417,35 @@ async def test_main_cloud_settings(
 
     try:
         probe_backend = build_backend(db_overlay=probe_overlay)
-    except Exception as e:
-        return {"ok": False, "detail": f"build_backend failed: {e}"}
+    except Exception:
+        error_ref = uuid4().hex[:12]
+        logger.exception(
+            "Main-cloud dry run: build_backend failed for backend %r (error_ref=%s)",
+            backend_id,
+            error_ref,
+        )
+        return {
+            "ok": False,
+            "detail": "build_backend failed",
+            "error_ref": error_ref,
+        }
 
     try:
         try:
             ok = await probe_backend.ensure_initialized()
-        except Exception as e:
-            return {"ok": False, "detail": f"ensure_initialized raised: {e}"}
+        except Exception:
+            error_ref = uuid4().hex[:12]
+            logger.exception(
+                "Main-cloud dry run: ensure_initialized raised for backend %r "
+                "(error_ref=%s)",
+                backend_id,
+                error_ref,
+            )
+            return {
+                "ok": False,
+                "detail": "ensure_initialized raised",
+                "error_ref": error_ref,
+            }
         if not ok:
             return {
                 "ok": False,

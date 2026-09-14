@@ -23,11 +23,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import asyncpg
 from fastapi import HTTPException, Request
@@ -79,6 +80,8 @@ from shared.credential_connectors import (
 from shared.runtime.utils.ssh_key import (
     generate_ed25519_keypair as _generate_ed25519_keypair,
 )
+
+logger = logging.getLogger(__name__)
 
 #: Authenticate the caller. Bound by the router to ``require_approved_user``.
 ApproveCaller = Callable[[], Awaitable[dict[str, Any]]]
@@ -1270,6 +1273,23 @@ async def test_repository_datasource(
     }
 
 
+def _probe_failure(message: str, ds_type: str) -> dict[str, Any]:
+    """Report a failed connectivity probe without disclosing the exception.
+
+    A driver's exception text routinely carries the connection URL (with its
+    password), internal hostnames and ports, so it is logged rather than
+    returned. ``error_ref`` — the same 12-hex-char shape the request-id
+    middleware uses — is what an operator quotes to find that log line.
+    """
+    error_ref = uuid4().hex[:12]
+    logger.exception(
+        "Connectivity probe failed for a %s connector (error_ref=%s)",
+        ds_type,
+        error_ref,
+    )
+    return {"status": "error", "message": message, "error_ref": error_ref}
+
+
 async def test_datasource(
     *,
     resolve_datasource: ResolveDatasourceOwner,
@@ -1296,8 +1316,8 @@ async def test_datasource(
 
             try:
                 return await _test_kb(ds)
-            except Exception as e:
-                return {"status": "error", "message": str(e)[-2000:]}
+            except Exception:
+                return _probe_failure("Knowledge base probe failed", ds_type)
 
         if ds_type == "mcp":
             if not dependencies.mcp_datasources_enabled():
@@ -1314,8 +1334,8 @@ async def test_datasource(
                 version = await conn.fetchval("SELECT version()")
                 await conn.close()
                 return {"status": "ok", "message": f"Connected: {version[:80]}"}
-            except Exception as e:
-                return {"status": "error", "message": str(e)}
+            except Exception:
+                return _probe_failure("PostgreSQL connection failed", ds_type)
 
         elif ds_type == "neo4j":
             try:
@@ -1327,8 +1347,8 @@ async def test_datasource(
                 driver.verify_connectivity()
                 driver.close()
                 return {"status": "ok", "message": "Connected to Neo4j"}
-            except Exception as e:
-                return {"status": "error", "message": str(e)}
+            except Exception:
+                return _probe_failure("Neo4j connection failed", ds_type)
 
         elif ds_type == "mongodb":
             try:
@@ -1338,8 +1358,8 @@ async def test_datasource(
                 client.server_info()
                 client.close()
                 return {"status": "ok", "message": "Connected to MongoDB"}
-            except Exception as e:
-                return {"status": "error", "message": str(e)}
+            except Exception:
+                return _probe_failure("MongoDB connection failed", ds_type)
 
         elif ds_type == "webdav":
             try:
@@ -1354,8 +1374,8 @@ async def test_datasource(
                 )
                 client.list("/")
                 return {"status": "ok", "message": "Connected to WebDAV"}
-            except Exception as e:
-                return {"status": "error", "message": str(e)}
+            except Exception:
+                return _probe_failure("WebDAV connection failed", ds_type)
 
         elif ds_type == "email":
             # Blocking imaplib/smtplib probe runs off the event loop (the
@@ -1372,8 +1392,8 @@ async def test_datasource(
                     "status": "error",
                     "message": "IMAP/SMTP connectivity test timed out after 10s",
                 }
-            except Exception as e:
-                return {"status": "error", "message": str(e)}
+            except Exception:
+                return _probe_failure("IMAP/SMTP connection failed", ds_type)
 
         elif ds_type == "repository":
             return await test_repository_datasource(ds, url, creds)
@@ -1396,4 +1416,9 @@ async def test_datasource(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
+        error_ref = uuid4().hex[:12]
+        logger.exception("Connector test failed (error_ref=%s)", error_ref)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Connector test failed (error_ref={error_ref})",
+        ) from e
