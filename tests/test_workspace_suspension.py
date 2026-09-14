@@ -825,6 +825,40 @@ class TestExtractSnapshotScopedHome:
     """
 
     @pytest.mark.asyncio
+    async def test_snapshot_identity_cannot_control_local_temporary_path(
+        self, tmp_path, monkeypatch
+    ):
+        from pathlib import Path
+        import tempfile
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        svc = make_service()
+        entity_id = "../outside/"
+        downloaded = []
+
+        async def download(identity, path, **kwargs):
+            assert identity == entity_id
+            assert kwargs["entity_type"] == "threads"
+            target = Path(path)
+            assert target.parent == tmp_path
+            target.write_bytes(b"snapshot")
+            downloaded.append(target)
+            return True
+
+        svc._snapshot_service.download_snapshot.side_effect = download
+        with patch(
+            "orchestrator.services.workspace_suspension.stream_extract_snapshot",
+            new=AsyncMock(return_value=(0, b"")),
+        ) as stream:
+            assert await svc._extract_snapshot(
+                entity_id, "10.0.0.9", entity_type="threads"
+            )
+
+        assert len(downloaded) == 1
+        assert stream.call_args.args[2] == str(downloaded[0])
+        assert not downloaded[0].exists()
+
+    @pytest.mark.asyncio
     async def test_pod_extract_uses_home_only_command(self):
         svc = make_service()
         with patch(

@@ -1649,7 +1649,7 @@ class WorkspaceSuspensionService:
             half-populated tree.
         """
         with tempfile.NamedTemporaryFile(
-            suffix=".tar.zst", delete=True, prefix=f"restore_{entity_id[:8]}_"
+            suffix=".tar.zst", delete=True, prefix="restore_"
         ) as tmp:
             tar_path = tmp.name
 
