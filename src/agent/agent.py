@@ -3487,12 +3487,10 @@ class UniversalAgent:
 
         # G2: reattached remote workspace (PVC reattach on crash-recovery). The
         # working tree already lives on the REMOTE backend root, so the
-        # local-path gates below would miss it and clone/initialize() would
-        # `rm -rf {backend.root}/*` (core/workspace.py:295/313) — wiping the
-        # volume we just got back. Detect a real working tree on the backend
+        # local-path gates below would miss it. Detect a real working tree on the backend
         # (`.git`; a fresh/empty PVC has none, so first dispatch still
         # initializes) and PRESERVE it: attach a git handle to the existing repo
-        # — no clone, no rm -rf — then resume on the intact files. Gated on
+        # and resume on the intact files. Gated on
         # `resume`, so any content present belongs to THIS job's continuation
         # (PVCs are owner-keyed by UUID).
         # See knowledge-base/knowledge/features/workspace_pvc_branch_a_implementation.md (G2 / Phase 2).

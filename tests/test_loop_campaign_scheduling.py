@@ -31,6 +31,19 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi import HTTPException
 
+from orchestrator.routers.project_loops import ProjectLoopsDependencies
+from orchestrator.schemas.project_loops import LoopPlanRequest
+from orchestrator.services.loop_plan_filing import (
+    LoopPlanFilingDependencies,
+    file_loop_plan,
+)
+from orchestrator.services.project_loop_advance import (
+    rotate_loop_to_next_stage,
+)
+from orchestrator.services.project_loop_spawn import (
+    ProjectLoopDependencies,
+    notify_loop_event,
+)
 from orchestrator.services.project_loops import (
     LOOP_CAMPAIGN_CAPS_CEILING,
     LOOP_CAMPAIGN_DEFAULT_CAPS,
@@ -338,10 +351,61 @@ def _critic_job(plan: dict | None, *, seq_index: int = 1) -> dict:
     return {"id": CRITIC_JOB_ID, "status": "completed", "context": ctx}
 
 
-def _patched_main(db: AsyncMock, spawn: AsyncMock):
+_ADV = "orchestrator.services.project_loop_advance"
+
+
+def _deps(**over) -> ProjectLoopDependencies:
+    """The loop engine's one dependency object, built from mocks.
+
+    ``main._project_loop_dependencies()`` binds these fields to the live
+    application globals; the suite binds them to mocks and a test overrides
+    only the field it actually steers.
+    """
+    fields = dict(
+        store=AsyncMock(),
+        vector_store=None,
+        notifier=AsyncMock(),
+        gitea_client=MagicMock(),
+        main_cloud_router=MagicMock(),
+        trigger_dispatch=MagicMock(),
+        kick_officer_event_drain=MagicMock(),
+        enforce_dispatch_grants=AsyncMock(),
+        reindex_project_kb=AsyncMock(),
+        completion_commands_enabled=lambda: False,
+        completion_sweep_router=MagicMock(),
+    )
+    fields.update(over)
+    return ProjectLoopDependencies(**fields)
+
+
+def _loops_deps(db, **over) -> ProjectLoopsDependencies:
+    """The project-loops router's dependency object.
+
+    In the app this comes from ``request.app.state.project_loops_dependencies_factory``;
+    these tests call the declaration directly, so they hand it in explicitly
+    (the parameter's ``Depends(...)`` default is not resolved off-app).
+    """
+    fields = dict(
+        store=db,
+        vector_store=None,
+        spawn_loop_stage=AsyncMock(),
+        writeback_loop_stage=AsyncMock(),
+        resume_project_loop=AsyncMock(),
+        check_vm_permission=AsyncMock(),
+    )
+    fields.update(over)
+    return ProjectLoopsDependencies(**fields)
+
+
+def _patched_engine(spawn: AsyncMock):
+    """Stub the stage spawn the rotation reaches for.
+
+    ``rotate_loop_to_next_stage`` resolves ``spawn_loop_stage`` through
+    ``project_loop_advance``'s own module namespace, so the patch has to land
+    there — patching it on ``main`` would be inert.
+    """
     stack = ExitStack()
-    stack.enter_context(patch("orchestrator.main.postgres_db", db))
-    stack.enter_context(patch("orchestrator.main._spawn_loop_stage", spawn))
+    stack.enter_context(patch(f"{_ADV}.spawn_loop_stage", spawn))
     return stack
 
 
@@ -351,14 +415,12 @@ def _spawn_mock(job_id: str = "bbbbbbbb-0000-0000-0000-000000000001"):
 
 @pytest.mark.asyncio
 async def test_rotation_loop_never_enters_planner_branch():
-    from orchestrator.main import _rotate_loop_to_next_stage
-
     db = AsyncMock()
     spawn = _spawn_mock()
     exploding = MagicMock(side_effect=AssertionError("planner branch entered"))
-    with _patched_main(db, spawn):
-        with patch("orchestrator.main._advance_planner_campaign", exploding):
-            await _rotate_loop_to_next_stage(
+    with _patched_engine(spawn):
+        with patch(f"{_ADV}.advance_planner_campaign", exploding):
+            await rotate_loop_to_next_stage(
                 _loop(scheduling="standard"),
                 seq_index_completed=1,
                 base_total=10,
@@ -369,6 +431,7 @@ async def test_rotation_loop_never_enters_planner_branch():
                 completed_job=_critic_job(_plan()),
                 completed_ctx=_critic_job(_plan())["context"],
                 completed_failed=False,
+                dependencies=_deps(store=db),
             )
     spawn.assert_awaited_once()
     assert spawn.call_args.kwargs["stage"] == "developer"  # plain rotation
@@ -378,12 +441,10 @@ async def test_rotation_loop_never_enters_planner_branch():
 
 @pytest.mark.asyncio
 async def test_planner_critic_without_plan_falls_back_to_rotation():
-    from orchestrator.main import _rotate_loop_to_next_stage
-
     db = AsyncMock()
     spawn = _spawn_mock()
-    with _patched_main(db, spawn):
-        await _rotate_loop_to_next_stage(
+    with _patched_engine(spawn):
+        await rotate_loop_to_next_stage(
             _loop(),
             seq_index_completed=1,
             base_total=10,
@@ -394,6 +455,7 @@ async def test_planner_critic_without_plan_falls_back_to_rotation():
             completed_job=_critic_job(None),
             completed_ctx=_critic_job(None)["context"],
             completed_failed=False,
+            dependencies=_deps(store=db),
         )
     spawn.assert_awaited_once()
     assert spawn.call_args.kwargs["stage"] == "developer"
@@ -402,14 +464,12 @@ async def test_planner_critic_without_plan_falls_back_to_rotation():
 
 @pytest.mark.asyncio
 async def test_plan_application_writes_campaign_then_spawns_stamped_member():
-    from orchestrator.main import _rotate_loop_to_next_stage
-
     db = AsyncMock()
     spawn = _spawn_mock()
     actions: list[str] = []
     plan = _plan(stages=["developer", "developer", "bughunter"])
-    with _patched_main(db, spawn):
-        await _rotate_loop_to_next_stage(
+    with _patched_engine(spawn):
+        await rotate_loop_to_next_stage(
             _loop(),
             seq_index_completed=1,
             base_total=10,
@@ -420,6 +480,7 @@ async def test_plan_application_writes_campaign_then_spawns_stamped_member():
             completed_job=_critic_job(plan),
             completed_ctx=_critic_job(plan)["context"],
             completed_failed=False,
+            dependencies=_deps(store=db),
         )
     # Campaign persisted BEFORE the spawn (own write, plan_job_id idempotency
     # anchor), then the member spawn stamped with campaign id + index 0.
@@ -449,14 +510,12 @@ async def test_plan_application_writes_campaign_then_spawns_stamped_member():
 
 @pytest.mark.asyncio
 async def test_member_success_spawns_next_stage_from_stamp():
-    from orchestrator.main import _rotate_loop_to_next_stage
-
     db = AsyncMock()
     spawn = _spawn_mock()
     camp = _campaign()  # 3 stages, cursor=1
     member = _member_job(camp["id"], 0)
-    with _patched_main(db, spawn):
-        await _rotate_loop_to_next_stage(
+    with _patched_engine(spawn):
+        await rotate_loop_to_next_stage(
             _loop(campaign=camp, seq_index=2, current_job_id=member["id"]),
             seq_index_completed=2,
             base_total=11,
@@ -467,6 +526,7 @@ async def test_member_success_spawns_next_stage_from_stamp():
             completed_job=member,
             completed_ctx=member["context"],
             completed_failed=False,
+            dependencies=_deps(store=db),
         )
     kw = spawn.call_args.kwargs
     assert kw["stage"] == "developer"
@@ -482,14 +542,12 @@ async def test_member_stamp_beats_stale_cursor_after_lost_writeback():
     """Tear window: member spawned but its write-back lost (cursor stale at the
     member's own index). The next-stage derivation must ride the completed
     member's stamp, not the row cursor — no double-spawn of the same stage."""
-    from orchestrator.main import _rotate_loop_to_next_stage
-
     db = AsyncMock()
     spawn = _spawn_mock()
     camp = _campaign(cursor=0)  # stale: write-back for member 0's spawn lost
     member = _member_job(camp["id"], 0)
-    with _patched_main(db, spawn):
-        await _rotate_loop_to_next_stage(
+    with _patched_engine(spawn):
+        await rotate_loop_to_next_stage(
             _loop(campaign=camp, seq_index=2, current_job_id=member["id"]),
             seq_index_completed=2,
             base_total=11,
@@ -500,21 +558,20 @@ async def test_member_stamp_beats_stale_cursor_after_lost_writeback():
             completed_job=member,
             completed_ctx=member["context"],
             completed_failed=False,
+            dependencies=_deps(store=db),
         )
     assert spawn.call_args.kwargs["extra_context"]["loop_campaign_index"] == 1
 
 
 @pytest.mark.asyncio
 async def test_last_member_flips_campaign_to_review_and_rotates():
-    from orchestrator.main import _rotate_loop_to_next_stage
-
     db = AsyncMock()
     spawn = _spawn_mock()
     camp = _campaign(cursor=3, stages_done=2)
     member = _member_job(camp["id"], 2)  # last of 3
     actions: list[str] = []
-    with _patched_main(db, spawn):
-        await _rotate_loop_to_next_stage(
+    with _patched_engine(spawn):
+        await rotate_loop_to_next_stage(
             _loop(campaign=camp, seq_index=2, current_job_id=member["id"]),
             seq_index_completed=2,
             base_total=13,
@@ -525,6 +582,7 @@ async def test_last_member_flips_campaign_to_review_and_rotates():
             completed_job=member,
             completed_ctx=member["context"],
             completed_failed=False,
+            dependencies=_deps(store=db),
         )
     # Rotation resumed: seq 2 → wraps to the analysis fan-out at index 0…
     kw = spawn.call_args.kwargs
@@ -539,14 +597,12 @@ async def test_last_member_flips_campaign_to_review_and_rotates():
 
 @pytest.mark.asyncio
 async def test_member_failure_below_threshold_continues_campaign():
-    from orchestrator.main import _rotate_loop_to_next_stage
-
     db = AsyncMock()
     spawn = _spawn_mock()
     camp = _campaign()  # member_failures=0, abort at 2
     member = _member_job(camp["id"], 0, status="failed")
-    with _patched_main(db, spawn):
-        await _rotate_loop_to_next_stage(
+    with _patched_engine(spawn):
+        await rotate_loop_to_next_stage(
             _loop(campaign=camp, seq_index=2, current_job_id=member["id"]),
             seq_index_completed=2,
             base_total=11,
@@ -557,6 +613,7 @@ async def test_member_failure_below_threshold_continues_campaign():
             completed_job=member,
             completed_ctx=member["context"],
             completed_failed=True,
+            dependencies=_deps(store=db),
         )
     kw = spawn.call_args.kwargs
     assert kw["extra_context"]["loop_campaign_index"] == 1
@@ -566,15 +623,13 @@ async def test_member_failure_below_threshold_continues_campaign():
 
 @pytest.mark.asyncio
 async def test_consecutive_member_failures_abort_campaign():
-    from orchestrator.main import _rotate_loop_to_next_stage
-
     db = AsyncMock()
     spawn = _spawn_mock()
     camp = _campaign(member_failures=1)  # one more failure trips abort (2)
     member = _member_job(camp["id"], 1, status="failed")
     actions: list[str] = []
-    with _patched_main(db, spawn):
-        await _rotate_loop_to_next_stage(
+    with _patched_engine(spawn):
+        await rotate_loop_to_next_stage(
             _loop(campaign=camp, seq_index=2, current_job_id=member["id"]),
             seq_index_completed=2,
             base_total=12,
@@ -585,6 +640,7 @@ async def test_consecutive_member_failures_abort_campaign():
             completed_job=member,
             completed_ctx=member["context"],
             completed_failed=True,
+            dependencies=_deps(store=db),
         )
     # Queue flushed by rotation-fallthrough: the next spawn is the analysis
     # stage, not stage 2 of the campaign.
@@ -597,14 +653,12 @@ async def test_consecutive_member_failures_abort_campaign():
 
 @pytest.mark.asyncio
 async def test_success_resets_member_failure_streak():
-    from orchestrator.main import _rotate_loop_to_next_stage
-
     db = AsyncMock()
     spawn = _spawn_mock()
     camp = _campaign(member_failures=1)
     member = _member_job(camp["id"], 0, status="completed")
-    with _patched_main(db, spawn):
-        await _rotate_loop_to_next_stage(
+    with _patched_engine(spawn):
+        await rotate_loop_to_next_stage(
             _loop(campaign=camp, seq_index=2, current_job_id=member["id"]),
             seq_index_completed=2,
             base_total=11,
@@ -615,6 +669,7 @@ async def test_success_resets_member_failure_streak():
             completed_job=member,
             completed_ctx=member["context"],
             completed_failed=False,
+            dependencies=_deps(store=db),
         )
     wb = db.update_project_loop.call_args_list[-1].kwargs
     assert wb["campaign"]["member_failures"] == 0
@@ -622,14 +677,12 @@ async def test_success_resets_member_failure_streak():
 
 @pytest.mark.asyncio
 async def test_stale_member_of_disposed_campaign_rotates_plainly():
-    from orchestrator.main import _rotate_loop_to_next_stage
-
     db = AsyncMock()
     spawn = _spawn_mock()
     current = _campaign(id="ffffffff-0000-0000-0000-00000000000f")
     stale_member = _member_job("some-old-campaign", 0)
-    with _patched_main(db, spawn):
-        await _rotate_loop_to_next_stage(
+    with _patched_engine(spawn):
+        await rotate_loop_to_next_stage(
             _loop(campaign=current, seq_index=2, current_job_id=stale_member["id"]),
             seq_index_completed=2,
             base_total=11,
@@ -640,6 +693,7 @@ async def test_stale_member_of_disposed_campaign_rotates_plainly():
             completed_job=stale_member,
             completed_ctx=stale_member["context"],
             completed_failed=False,
+            dependencies=_deps(store=db),
         )
     assert spawn.call_args.kwargs["stage"] == ["scholar", "product-qa"]
     assert "campaign" not in db.update_project_loop.call_args_list[-1].kwargs
@@ -651,14 +705,12 @@ async def test_healed_rerun_of_applied_plan_resumes_at_cursor():
     the critic and re-advances; the plan_job_id guard must resume spawning at
     the persisted cursor instead of re-applying the plan (no duplicate
     campaign, no duplicate history entry)."""
-    from orchestrator.main import _rotate_loop_to_next_stage
-
     db = AsyncMock()
     spawn = _spawn_mock()
     camp = _campaign(cursor=0)  # written, nothing spawned yet
     plan = _plan(stages=["developer", "developer", "bughunter"])
-    with _patched_main(db, spawn):
-        await _rotate_loop_to_next_stage(
+    with _patched_engine(spawn):
+        await rotate_loop_to_next_stage(
             _loop(campaign=camp),
             seq_index_completed=1,
             base_total=10,
@@ -669,6 +721,7 @@ async def test_healed_rerun_of_applied_plan_resumes_at_cursor():
             completed_job=_critic_job(plan),
             completed_ctx=_critic_job(plan)["context"],
             completed_failed=False,
+            dependencies=_deps(store=db),
         )
     # Exactly one loop-row write: the spawn write-back. No fresh campaign
     # insert, no history append — the plan was NOT re-applied.
@@ -680,14 +733,12 @@ async def test_healed_rerun_of_applied_plan_resumes_at_cursor():
 
 @pytest.mark.asyncio
 async def test_healed_rerun_with_fully_spawned_campaign_rotates():
-    from orchestrator.main import _rotate_loop_to_next_stage
-
     db = AsyncMock()
     spawn = _spawn_mock()
     camp = _campaign(cursor=3)  # everything already spawned
     plan = _plan(stages=["developer", "developer", "bughunter"])
-    with _patched_main(db, spawn):
-        await _rotate_loop_to_next_stage(
+    with _patched_engine(spawn):
+        await rotate_loop_to_next_stage(
             _loop(campaign=camp),
             seq_index_completed=1,
             base_total=10,
@@ -698,14 +749,13 @@ async def test_healed_rerun_with_fully_spawned_campaign_rotates():
             completed_job=_critic_job(plan),
             completed_ctx=_critic_job(plan)["context"],
             completed_failed=False,
+            dependencies=_deps(store=db),
         )
     assert spawn.call_args.kwargs["stage"] == "developer"  # plain rotation
 
 
 @pytest.mark.asyncio
 async def test_disposition_archives_to_history_and_extend_carries_counter():
-    from orchestrator.main import _rotate_loop_to_next_stage
-
     db = AsyncMock()
     spawn = _spawn_mock()
     prior_critic = "aaaaaaaa-0000-0000-0000-00000000dead"
@@ -720,8 +770,8 @@ async def test_disposition_archives_to_history_and_extend_carries_counter():
         stages=["developer"],
         disposition={"outcome": "extend", "notes": "one more push"},
     )
-    with _patched_main(db, spawn):
-        await _rotate_loop_to_next_stage(
+    with _patched_engine(spawn):
+        await rotate_loop_to_next_stage(
             _loop(campaign=reviewed),
             seq_index_completed=1,
             base_total=13,
@@ -732,6 +782,7 @@ async def test_disposition_archives_to_history_and_extend_carries_counter():
             completed_job=_critic_job(plan),
             completed_ctx=_critic_job(plan)["context"],
             completed_failed=False,
+            dependencies=_deps(store=db),
         )
     pre_spawn = db.update_project_loop.call_args_list[0].kwargs
     history = pre_spawn["campaign_history"]
@@ -744,16 +795,14 @@ async def test_disposition_archives_to_history_and_extend_carries_counter():
 
 @pytest.mark.asyncio
 async def test_history_is_capped():
-    from orchestrator.main import _rotate_loop_to_next_stage
-
     db = AsyncMock()
     spawn = _spawn_mock()
     old = [{"id": f"old-{i}"} for i in range(LOOP_CAMPAIGN_HISTORY_LIMIT)]
     prior_critic = "aaaaaaaa-0000-0000-0000-00000000dead"
     reviewed = _campaign(status="review", id=prior_critic, plan_job_id=prior_critic)
     plan = _plan(disposition={"outcome": "ship"})
-    with _patched_main(db, spawn):
-        await _rotate_loop_to_next_stage(
+    with _patched_engine(spawn):
+        await rotate_loop_to_next_stage(
             _loop(campaign=reviewed, campaign_history=old),
             seq_index_completed=1,
             base_total=13,
@@ -764,6 +813,7 @@ async def test_history_is_capped():
             completed_job=_critic_job(plan),
             completed_ctx=_critic_job(plan)["context"],
             completed_failed=False,
+            dependencies=_deps(store=db),
         )
     history = db.update_project_loop.call_args_list[0].kwargs["campaign_history"]
     assert len(history) == LOOP_CAMPAIGN_HISTORY_LIMIT
@@ -775,8 +825,6 @@ async def test_history_is_capped():
 async def test_dispose_only_plan_closes_campaign_and_rotates():
     """Ship/kill without a successor: history written, campaign cleared in the
     same pre-spawn write, then plain K=1 rotation — no new campaign opened."""
-    from orchestrator.main import _rotate_loop_to_next_stage
-
     db = AsyncMock()
     spawn = _spawn_mock()
     actions: list[str] = []
@@ -785,8 +833,8 @@ async def test_dispose_only_plan_closes_campaign_and_rotates():
         status="review", stages_done=3, id=prior_critic, plan_job_id=prior_critic
     )
     plan = {"disposition": {"outcome": "ship", "notes": "acceptance passed"}}
-    with _patched_main(db, spawn):
-        await _rotate_loop_to_next_stage(
+    with _patched_engine(spawn):
+        await rotate_loop_to_next_stage(
             _loop(campaign=reviewed),
             seq_index_completed=1,
             base_total=13,
@@ -797,6 +845,7 @@ async def test_dispose_only_plan_closes_campaign_and_rotates():
             completed_job=_critic_job(plan),
             completed_ctx=_critic_job(plan)["context"],
             completed_failed=False,
+            dependencies=_deps(store=db),
         )
     pre_spawn = db.update_project_loop.call_args_list[0].kwargs
     assert pre_spawn["campaign"] is None
@@ -817,7 +866,7 @@ async def test_dispose_only_plan_closes_campaign_and_rotates():
 
 @pytest.mark.asyncio
 async def test_dispose_only_plan_next_spawn_sees_campaign_cleared():
-    """M7 repro: the `loop` dict `_rotate_loop_to_next_stage` receives still
+    """M7 repro: the `loop` dict `rotate_loop_to_next_stage` receives still
     carries the OLD (just-disposed) campaign -- it's a snapshot taken before
     this advance ran. Before the fix, `_advance_planner_campaign` returned
     `_WB_UNSET` ("unchanged") for campaign_update on the dispose-only path
@@ -825,8 +874,6 @@ async def test_dispose_only_plan_next_spawn_sees_campaign_cleared():
     `loop_for_spawn["campaign"]` kept the disposed campaign and the very
     next job's kickoff would assert an IN PROGRESS campaign that no longer
     exists -- in the one block agents are told to trust."""
-    from orchestrator.main import _rotate_loop_to_next_stage
-
     db = AsyncMock()
     spawn = _spawn_mock()
     prior_critic = "aaaaaaaa-0000-0000-0000-00000000dead"
@@ -834,8 +881,8 @@ async def test_dispose_only_plan_next_spawn_sees_campaign_cleared():
         status="review", stages_done=3, id=prior_critic, plan_job_id=prior_critic
     )
     plan = {"disposition": {"outcome": "ship", "notes": "acceptance passed"}}
-    with _patched_main(db, spawn):
-        await _rotate_loop_to_next_stage(
+    with _patched_engine(spawn):
+        await rotate_loop_to_next_stage(
             _loop(campaign=reviewed),
             seq_index_completed=1,
             base_total=13,
@@ -846,6 +893,7 @@ async def test_dispose_only_plan_next_spawn_sees_campaign_cleared():
             completed_job=_critic_job(plan),
             completed_ctx=_critic_job(plan)["context"],
             completed_failed=False,
+            dependencies=_deps(store=db),
         )
     # _spawn_loop_stage received loop_for_spawn as its first positional arg.
     spawned_loop = spawn.call_args.args[0]
@@ -856,16 +904,14 @@ async def test_dispose_only_plan_next_spawn_sees_campaign_cleared():
 async def test_skipped_review_is_loud_and_leaves_campaign_parked():
     """A checkpoint critic that files nothing while a campaign awaits review
     still falls back to rotation — but the skip is surfaced, not silent."""
-    from orchestrator.main import _rotate_loop_to_next_stage
-
     db = AsyncMock()
     spawn = _spawn_mock()
     notify = AsyncMock()
     actions: list[str] = []
     reviewed = _campaign(status="review", stages_done=3)
-    with _patched_main(db, spawn):
-        with patch("orchestrator.main._notify_loop_event", notify):
-            await _rotate_loop_to_next_stage(
+    with _patched_engine(spawn):
+        with patch(f"{_ADV}.notify_loop_event", notify):
+            await rotate_loop_to_next_stage(
                 _loop(campaign=reviewed),
                 seq_index_completed=1,
                 base_total=13,
@@ -876,6 +922,7 @@ async def test_skipped_review_is_loud_and_leaves_campaign_parked():
                 completed_job=_critic_job(None),
                 completed_ctx=_critic_job(None)["context"],
                 completed_failed=False,
+                dependencies=_deps(store=db),
             )
     spawn.assert_awaited_once()
     assert spawn.call_args.kwargs["stage"] == "developer"
@@ -892,14 +939,12 @@ async def test_skipped_review_is_loud_and_leaves_campaign_parked():
 async def test_apply_time_rejection_degrades_to_rotation():
     """The budget may shrink between intake and apply; a now-unaffordable plan
     must degrade to the K=1 rotation fallback, not wedge or spawn anyway."""
-    from orchestrator.main import _rotate_loop_to_next_stage
-
     db = AsyncMock()
     spawn = _spawn_mock()
     actions: list[str] = []
     plan = _plan(stages=["developer"] * 5)
-    with _patched_main(db, spawn):
-        await _rotate_loop_to_next_stage(
+    with _patched_engine(spawn):
+        await rotate_loop_to_next_stage(
             _loop(remaining_iterations=3),  # affordable = 1
             seq_index_completed=1,
             base_total=10,
@@ -910,6 +955,7 @@ async def test_apply_time_rejection_degrades_to_rotation():
             completed_job=_critic_job(plan),
             completed_ctx=_critic_job(plan)["context"],
             completed_failed=False,
+            dependencies=_deps(store=db),
         )
     assert spawn.call_args.kwargs["stage"] == "developer"  # rotation fallback
     assert "campaign" not in db.update_project_loop.call_args_list[-1].kwargs
@@ -918,14 +964,12 @@ async def test_apply_time_rejection_degrades_to_rotation():
 
 @pytest.mark.asyncio
 async def test_campaign_spawn_failure_marks_loop_failed():
-    from orchestrator.main import _rotate_loop_to_next_stage
-
     db = AsyncMock()
     spawn = AsyncMock(side_effect=RuntimeError("gitea down"))
     actions: list[str] = []
     plan = _plan()
-    with _patched_main(db, spawn):
-        await _rotate_loop_to_next_stage(
+    with _patched_engine(spawn):
+        await rotate_loop_to_next_stage(
             _loop(),
             seq_index_completed=1,
             base_total=10,
@@ -936,6 +980,7 @@ async def test_campaign_spawn_failure_marks_loop_failed():
             completed_job=_critic_job(plan),
             completed_ctx=_critic_job(plan)["context"],
             completed_failed=False,
+            dependencies=_deps(store=db),
         )
     final = db.update_project_loop.call_args_list[-1].kwargs
     assert final["status"] == "failed"
@@ -977,25 +1022,28 @@ def _intake_db(job: dict | None, loop: dict | None) -> AsyncMock:
     return db
 
 
-def _intake_patches(db: AsyncMock, vector_db: Any = None):
-    stack = ExitStack()
-    stack.enter_context(patch("orchestrator.main.require_internal", AsyncMock()))
-    stack.enter_context(patch("orchestrator.main.postgres_db", db))
-    stack.enter_context(patch("orchestrator.main.vector_db", vector_db))
-    return stack
+def _intake_deps(db: AsyncMock, vector_db: Any = None) -> LoopPlanFilingDependencies:
+    """The filing service's dependency object.
+
+    The ``X-Internal-Key`` gate moved out with the route — it is called by
+    ``routers.loop_plan`` before the handler, not by the operation — so there
+    is nothing left to stub for it here.
+    """
+    return LoopPlanFilingDependencies(store=db, vector_store=vector_db)
 
 
 @pytest.mark.asyncio
 async def test_intake_happy_path_stores_normalized_plan():
-    from orchestrator.main import LoopPlanRequest, file_loop_plan
-
     job = _critic_job(None)
     loop = _loop(project_id=None)
     db = _intake_db(job, loop)
-    with _intake_patches(db):
-        out = await file_loop_plan(
-            MagicMock(), CRITIC_JOB_ID, LoopPlanRequest(plan=_plan())
-        )
+    deps = _intake_deps(db)
+    out = await file_loop_plan(
+        MagicMock(),
+        CRITIC_JOB_ID,
+        LoopPlanRequest(plan=_plan()),
+        dependencies=deps,
+    )
     assert out["status"] == "accepted"
     db.merge_job_context.assert_awaited_once()
     stored = db.merge_job_context.call_args.args[1]["loop_plan"]
@@ -1006,17 +1054,18 @@ async def test_intake_happy_path_stores_normalized_plan():
 async def test_intake_accepts_member_when_display_pointer_absent():
     # Pins the membership gate against a pointer-equality revert: the job IS
     # a stage member while the display-only current_job_id disagrees (null).
-    from orchestrator.main import LoopPlanRequest, file_loop_plan
-
     job = _critic_job(None)
     loop = _loop(
         project_id=None, current_job_id=None, current_stage_jobs=[CRITIC_JOB_ID]
     )
     db = _intake_db(job, loop)
-    with _intake_patches(db):
-        out = await file_loop_plan(
-            MagicMock(), CRITIC_JOB_ID, LoopPlanRequest(plan=_plan())
-        )
+    deps = _intake_deps(db)
+    out = await file_loop_plan(
+        MagicMock(),
+        CRITIC_JOB_ID,
+        LoopPlanRequest(plan=_plan()),
+        dependencies=deps,
+    )
     assert out["status"] == "accepted"
     db.merge_job_context.assert_awaited_once()
     stored = db.merge_job_context.call_args.args[1]["loop_plan"]
@@ -1027,8 +1076,6 @@ async def test_intake_accepts_member_when_display_pointer_absent():
 async def test_intake_accepts_dispose_only_plan_and_skips_kb_check():
     # A dispose-only filing has no initiative — the KB existence check must be
     # skipped (nothing to verify), not crash on initiative=None.
-    from orchestrator.main import LoopPlanRequest, file_loop_plan
-
     job = _critic_job(None)
     loop = _loop(
         project_id="11111111-2222-3333-4444-555555555555",
@@ -1036,14 +1083,13 @@ async def test_intake_accepts_dispose_only_plan_and_skips_kb_check():
     )
     db = _intake_db(job, loop)
     kb_fetchrow = AsyncMock(return_value=None)  # would reject if consulted
-    with _intake_patches(db, vector_db=_FakeAcquire(kb_fetchrow)):
-        out = await file_loop_plan(
-            MagicMock(),
-            CRITIC_JOB_ID,
-            LoopPlanRequest(
-                plan={"disposition": {"outcome": "kill", "notes": "dead end"}}
-            ),
-        )
+    deps = _intake_deps(db, vector_db=_FakeAcquire(kb_fetchrow))
+    out = await file_loop_plan(
+        MagicMock(),
+        CRITIC_JOB_ID,
+        LoopPlanRequest(plan={"disposition": {"outcome": "kill", "notes": "dead end"}}),
+        dependencies=deps,
+    )
     assert out["status"] == "accepted"
     kb_fetchrow.assert_not_awaited()
     stored = db.merge_job_context.call_args.args[1]["loop_plan"]
@@ -1054,68 +1100,67 @@ async def test_intake_accepts_dispose_only_plan_and_skips_kb_check():
 
 @pytest.mark.asyncio
 async def test_intake_gating_chain():
-    from orchestrator.main import LoopPlanRequest, file_loop_plan
-
     req = MagicMock()
     plan = LoopPlanRequest(plan=_plan())
 
     # Not a loop job → 400.
     job = {"id": CRITIC_JOB_ID, "context": {}}
-    with _intake_patches(_intake_db(job, None)):
-        with pytest.raises(HTTPException) as e:
-            await file_loop_plan(req, CRITIC_JOB_ID, plan)
+    deps = _intake_deps(_intake_db(job, None))
+    with pytest.raises(HTTPException) as e:
+        await file_loop_plan(req, CRITIC_JOB_ID, plan, dependencies=deps)
     assert e.value.status_code == 400
 
     # Standard-scheduled loop → 409.
     job = _critic_job(None)
-    with _intake_patches(_intake_db(job, _loop(scheduling="standard"))):
-        with pytest.raises(HTTPException) as e:
-            await file_loop_plan(req, CRITIC_JOB_ID, plan)
+    deps = _intake_deps(_intake_db(job, _loop(scheduling="standard")))
+    with pytest.raises(HTTPException) as e:
+        await file_loop_plan(req, CRITIC_JOB_ID, plan, dependencies=deps)
     assert e.value.status_code == 409
 
     # Not the in-flight job → 409, pinning the membership-gate detail (the
     # old pointer-equality gate also raised 409 here, just for the wrong
     # reason — assert the message so a revert to pointer-equality is caught).
-    with _intake_patches(
+    deps = _intake_deps(
         _intake_db(
             job, _loop(current_job_id=None, current_stage_jobs=[str(uuid.uuid4())])
         )
-    ):
-        with pytest.raises(HTTPException) as e:
-            await file_loop_plan(req, CRITIC_JOB_ID, plan)
+    )
+    with pytest.raises(HTTPException) as e:
+        await file_loop_plan(req, CRITIC_JOB_ID, plan, dependencies=deps)
     assert e.value.status_code == 409
     assert "not one of the loop's in-flight jobs" in e.value.detail
 
     # Non-critic role → 403.
     dev = _member_job("c-1", 0)
     dev["id"] = CRITIC_JOB_ID
-    with _intake_patches(_intake_db(dev, _loop())):
-        with pytest.raises(HTTPException) as e:
-            await file_loop_plan(req, CRITIC_JOB_ID, plan)
+    deps = _intake_deps(_intake_db(dev, _loop()))
+    with pytest.raises(HTTPException) as e:
+        await file_loop_plan(req, CRITIC_JOB_ID, plan, dependencies=deps)
     assert e.value.status_code == 403
 
     # A campaign-member critic (sub-critic: stamped at the execution slot,
     # not the checkpoint) → 403.
     sub_critic = _critic_job(None, seq_index=2)
-    with _intake_patches(_intake_db(sub_critic, _loop())):
-        with pytest.raises(HTTPException) as e:
-            await file_loop_plan(req, CRITIC_JOB_ID, plan)
+    deps = _intake_deps(_intake_db(sub_critic, _loop()))
+    with pytest.raises(HTTPException) as e:
+        await file_loop_plan(req, CRITIC_JOB_ID, plan, dependencies=deps)
     assert e.value.status_code == 403
 
     # Invalid plan body → 400 with the domain validator's message.
-    with _intake_patches(_intake_db(_critic_job(None), _loop())):
-        with pytest.raises(HTTPException) as e:
-            await file_loop_plan(
-                req, CRITIC_JOB_ID, LoopPlanRequest(plan={"stages": []})
-            )
+    deps = _intake_deps(_intake_db(_critic_job(None), _loop()))
+    with pytest.raises(HTTPException) as e:
+        await file_loop_plan(
+            req,
+            CRITIC_JOB_ID,
+            LoopPlanRequest(plan={"stages": []}),
+            dependencies=deps,
+        )
     assert e.value.status_code == 400
     assert "kb_note_id" in e.value.detail
 
 
 @pytest.mark.asyncio
 async def test_intake_kb_existence_check():
-    from orchestrator.main import LoopPlanRequest, file_loop_plan
-
     req = MagicMock()
     job = _critic_job(None)
     loop = _loop(project_id=str(uuid.uuid4()))
@@ -1123,23 +1168,29 @@ async def test_intake_kb_existence_check():
     # Note present → accepted.
     vector = _FakeAcquire(AsyncMock(return_value={"?column?": 1}))
     db = _intake_db(job, loop)
-    with _intake_patches(db, vector):
-        out = await file_loop_plan(req, CRITIC_JOB_ID, LoopPlanRequest(plan=_plan()))
+    deps = _intake_deps(db, vector)
+    out = await file_loop_plan(
+        req, CRITIC_JOB_ID, LoopPlanRequest(plan=_plan()), dependencies=deps
+    )
     assert out["status"] == "accepted"
 
     # Note missing → 400.
     vector = _FakeAcquire(AsyncMock(return_value=None))
-    with _intake_patches(_intake_db(job, loop), vector):
-        with pytest.raises(HTTPException) as e:
-            await file_loop_plan(req, CRITIC_JOB_ID, LoopPlanRequest(plan=_plan()))
+    deps = _intake_deps(_intake_db(job, loop), vector)
+    with pytest.raises(HTTPException) as e:
+        await file_loop_plan(
+            req, CRITIC_JOB_ID, LoopPlanRequest(plan=_plan()), dependencies=deps
+        )
     assert e.value.status_code == 400
     assert "not found in the project KB" in e.value.detail
 
     # Store down → accepted (best-effort, KB failures are non-fatal).
     vector = _FakeAcquire(AsyncMock(side_effect=RuntimeError("kb down")))
     db = _intake_db(job, loop)
-    with _intake_patches(db, vector):
-        out = await file_loop_plan(req, CRITIC_JOB_ID, LoopPlanRequest(plan=_plan()))
+    deps = _intake_deps(db, vector)
+    out = await file_loop_plan(
+        req, CRITIC_JOB_ID, LoopPlanRequest(plan=_plan()), dependencies=deps
+    )
     assert out["status"] == "accepted"
 
 
@@ -1169,9 +1220,13 @@ async def test_start_rejects_planner_with_invalid_template():
                 "orchestrator.routers.project_loops.require_project_member", AsyncMock()
             )
         )
-        stack.enter_context(patch("orchestrator.main.postgres_db", AsyncMock()))
         with pytest.raises(HTTPException) as e:
-            await start_project_loop(MagicMock(), str(uuid.uuid4()), body)
+            await start_project_loop(
+                MagicMock(),
+                str(uuid.uuid4()),
+                body,
+                dependencies=_loops_deps(AsyncMock()),
+            )
     assert e.value.status_code == 400
     assert "critic" in e.value.detail
 
@@ -1193,9 +1248,13 @@ async def test_start_rejects_campaign_caps_on_rotation():
                 "orchestrator.routers.project_loops.require_project_member", AsyncMock()
             )
         )
-        stack.enter_context(patch("orchestrator.main.postgres_db", AsyncMock()))
         with pytest.raises(HTTPException) as e:
-            await start_project_loop(MagicMock(), str(uuid.uuid4()), body)
+            await start_project_loop(
+                MagicMock(),
+                str(uuid.uuid4()),
+                body,
+                dependencies=_loops_deps(AsyncMock()),
+            )
     assert e.value.status_code == 400
     assert "campaign_caps" in e.value.detail
 
@@ -1226,9 +1285,10 @@ async def test_start_rejects_project_without_cloud_folder():
                 "orchestrator.routers.project_loops.require_project_member", AsyncMock()
             )
         )
-        stack.enter_context(patch("orchestrator.main.postgres_db", db))
         with pytest.raises(HTTPException) as e:
-            await start_project_loop(MagicMock(), project_id, body)
+            await start_project_loop(
+                MagicMock(), project_id, body, dependencies=_loops_deps(db)
+            )
 
     assert e.value.status_code == 409
     assert "cloud folder" in e.value.detail
@@ -1367,19 +1427,18 @@ class TestLoopNotifications:
 
     @pytest.mark.asyncio
     async def test_notify_records_a_loop_event_row(self):
-        from orchestrator.main import _notify_loop_event
         from orchestrator.services.notification_service import RecordResult
 
         record = AsyncMock(return_value=RecordResult("n-1", True, {"in_app": True}))
         loop = _loop(owner_id="cccccccc-0000-0000-0000-000000000001")
-        with patch("orchestrator.main.notification_service.record", record):
-            await _notify_loop_event(
-                loop,
-                job_id=CRITIC_JOB_ID,
-                event_type="loop_campaign_disposition",
-                subject="Loop campaign ship: F5",
-                message="done",
-            )
+        await notify_loop_event(
+            loop,
+            job_id=CRITIC_JOB_ID,
+            event_type="loop_campaign_disposition",
+            subject="Loop campaign ship: F5",
+            message="done",
+            dependencies=_deps(notifier=MagicMock(record=record)),
+        )
         record.assert_awaited_once()
         kw = record.await_args.kwargs
         assert kw["recipient_id"] == "cccccccc-0000-0000-0000-000000000001"
@@ -1393,32 +1452,28 @@ class TestLoopNotifications:
 
     @pytest.mark.asyncio
     async def test_notify_skips_ownerless_loops(self):
-        from orchestrator.main import _notify_loop_event
-
         record = AsyncMock()
-        with patch("orchestrator.main.notification_service.record", record):
-            await _notify_loop_event(
-                _loop(owner_id=None),
-                job_id=CRITIC_JOB_ID,
-                event_type="x",
-                subject="s",
-                message="m",
-            )
+        await notify_loop_event(
+            _loop(owner_id=None),
+            job_id=CRITIC_JOB_ID,
+            event_type="x",
+            subject="s",
+            message="m",
+            dependencies=_deps(notifier=MagicMock(record=record)),
+        )
         record.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_feed_failure_never_breaks_an_advance(self):
-        from orchestrator.main import _notify_loop_event
-
         record = AsyncMock(side_effect=RuntimeError("feed down"))
-        with patch("orchestrator.main.notification_service.record", record):
-            await _notify_loop_event(
-                _loop(owner_id="cccccccc-0000-0000-0000-000000000001"),
-                job_id=CRITIC_JOB_ID,
-                event_type="x",
-                subject="s",
-                message="m",
-            )  # no raise
+        await notify_loop_event(
+            _loop(owner_id="cccccccc-0000-0000-0000-000000000001"),
+            job_id=CRITIC_JOB_ID,
+            event_type="x",
+            subject="s",
+            message="m",
+            dependencies=_deps(notifier=MagicMock(record=record)),
+        )  # no raise
 
 
 class TestDispositionClosesBacklogTicket:
@@ -1435,8 +1490,6 @@ class TestDispositionClosesBacklogTicket:
 
     @pytest.mark.asyncio
     async def test_ship_closes_the_ticket_as_resolved(self):
-        from orchestrator.main import _rotate_loop_to_next_stage
-
         db = AsyncMock()
         spawn = _spawn_mock()
         close = AsyncMock(return_value=True)
@@ -1446,23 +1499,23 @@ class TestDispositionClosesBacklogTicket:
         )
         plan = {"disposition": {"outcome": "ship", "notes": "acceptance passed"}}
         pid = str(uuid.uuid4())
-        with _patched_main(db, spawn):
-            with patch("orchestrator.main.vector_db", MagicMock()):
-                with patch(
-                    "orchestrator.services.project_backlog.close_backlog_ticket", close
-                ):
-                    await _rotate_loop_to_next_stage(
-                        _loop(campaign=reviewed, project_id=pid),
-                        seq_index_completed=1,
-                        base_total=13,
-                        next_remaining=16,
-                        consecutive=0,
-                        last_error=None,
-                        actions=[],
-                        completed_job=_critic_job(plan),
-                        completed_ctx=_critic_job(plan)["context"],
-                        completed_failed=False,
-                    )
+        with _patched_engine(spawn):
+            with patch(
+                "orchestrator.services.project_backlog.close_backlog_ticket", close
+            ):
+                await rotate_loop_to_next_stage(
+                    _loop(campaign=reviewed, project_id=pid),
+                    seq_index_completed=1,
+                    base_total=13,
+                    next_remaining=16,
+                    consecutive=0,
+                    last_error=None,
+                    actions=[],
+                    completed_job=_critic_job(plan),
+                    completed_ctx=_critic_job(plan)["context"],
+                    completed_failed=False,
+                    dependencies=_deps(store=db, vector_store=MagicMock()),
+                )
         close.assert_awaited_once()
         args = close.await_args.args
         assert args[2] == pid  # project_id
@@ -1471,8 +1524,6 @@ class TestDispositionClosesBacklogTicket:
 
     @pytest.mark.asyncio
     async def test_kill_closes_the_ticket_as_archived(self):
-        from orchestrator.main import _rotate_loop_to_next_stage
-
         db = AsyncMock()
         spawn = _spawn_mock()
         close = AsyncMock(return_value=True)
@@ -1481,23 +1532,23 @@ class TestDispositionClosesBacklogTicket:
             status="review", stages_done=3, id=prior_critic, plan_job_id=prior_critic
         )
         plan = {"disposition": {"outcome": "kill", "notes": "dead end"}}
-        with _patched_main(db, spawn):
-            with patch("orchestrator.main.vector_db", MagicMock()):
-                with patch(
-                    "orchestrator.services.project_backlog.close_backlog_ticket", close
-                ):
-                    await _rotate_loop_to_next_stage(
-                        _loop(campaign=reviewed, project_id=str(uuid.uuid4())),
-                        seq_index_completed=1,
-                        base_total=13,
-                        next_remaining=16,
-                        consecutive=0,
-                        last_error=None,
-                        actions=[],
-                        completed_job=_critic_job(plan),
-                        completed_ctx=_critic_job(plan)["context"],
-                        completed_failed=False,
-                    )
+        with _patched_engine(spawn):
+            with patch(
+                "orchestrator.services.project_backlog.close_backlog_ticket", close
+            ):
+                await rotate_loop_to_next_stage(
+                    _loop(campaign=reviewed, project_id=str(uuid.uuid4())),
+                    seq_index_completed=1,
+                    base_total=13,
+                    next_remaining=16,
+                    consecutive=0,
+                    last_error=None,
+                    actions=[],
+                    completed_job=_critic_job(plan),
+                    completed_ctx=_critic_job(plan)["context"],
+                    completed_failed=False,
+                    dependencies=_deps(store=db, vector_store=MagicMock()),
+                )
         close.assert_awaited_once()
         assert close.await_args.args[4] == "archived"
 
@@ -1506,8 +1557,6 @@ class TestDispositionClosesBacklogTicket:
         """The highest-stakes case: getting this wrong closes a ticket that
         is still being worked by the very campaign that just extended
         itself."""
-        from orchestrator.main import _rotate_loop_to_next_stage
-
         db = AsyncMock()
         spawn = _spawn_mock()
         close = AsyncMock(return_value=True)
@@ -1523,23 +1572,23 @@ class TestDispositionClosesBacklogTicket:
             stages=["developer"],
             disposition={"outcome": "extend", "notes": "one more push"},
         )
-        with _patched_main(db, spawn):
-            with patch("orchestrator.main.vector_db", MagicMock()):
-                with patch(
-                    "orchestrator.services.project_backlog.close_backlog_ticket", close
-                ):
-                    await _rotate_loop_to_next_stage(
-                        _loop(campaign=reviewed, project_id=str(uuid.uuid4())),
-                        seq_index_completed=1,
-                        base_total=13,
-                        next_remaining=16,
-                        consecutive=0,
-                        last_error=None,
-                        actions=[],
-                        completed_job=_critic_job(plan),
-                        completed_ctx=_critic_job(plan)["context"],
-                        completed_failed=False,
-                    )
+        with _patched_engine(spawn):
+            with patch(
+                "orchestrator.services.project_backlog.close_backlog_ticket", close
+            ):
+                await rotate_loop_to_next_stage(
+                    _loop(campaign=reviewed, project_id=str(uuid.uuid4())),
+                    seq_index_completed=1,
+                    base_total=13,
+                    next_remaining=16,
+                    consecutive=0,
+                    last_error=None,
+                    actions=[],
+                    completed_job=_critic_job(plan),
+                    completed_ctx=_critic_job(plan)["context"],
+                    completed_failed=False,
+                    dependencies=_deps(store=db, vector_store=MagicMock()),
+                )
         close.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -1551,8 +1600,6 @@ class TestDispositionClosesBacklogTicket:
         logs."""
         import logging
 
-        from orchestrator.main import _rotate_loop_to_next_stage
-
         db = AsyncMock()
         spawn = _spawn_mock()
         close = AsyncMock(return_value=False)
@@ -1561,24 +1608,24 @@ class TestDispositionClosesBacklogTicket:
             status="review", stages_done=3, id=prior_critic, plan_job_id=prior_critic
         )
         plan = {"disposition": {"outcome": "ship", "notes": "acceptance passed"}}
-        with _patched_main(db, spawn):
-            with patch("orchestrator.main.vector_db", MagicMock()):
-                with patch(
-                    "orchestrator.services.project_backlog.close_backlog_ticket", close
-                ):
-                    with caplog.at_level(logging.WARNING, logger="main"):
-                        await _rotate_loop_to_next_stage(
-                            _loop(campaign=reviewed, project_id=str(uuid.uuid4())),
-                            seq_index_completed=1,
-                            base_total=13,
-                            next_remaining=16,
-                            consecutive=0,
-                            last_error=None,
-                            actions=[],
-                            completed_job=_critic_job(plan),
-                            completed_ctx=_critic_job(plan)["context"],
-                            completed_failed=False,
-                        )
+        with _patched_engine(spawn):
+            with patch(
+                "orchestrator.services.project_backlog.close_backlog_ticket", close
+            ):
+                with caplog.at_level(logging.WARNING, logger=_ADV):
+                    await rotate_loop_to_next_stage(
+                        _loop(campaign=reviewed, project_id=str(uuid.uuid4())),
+                        seq_index_completed=1,
+                        base_total=13,
+                        next_remaining=16,
+                        consecutive=0,
+                        last_error=None,
+                        actions=[],
+                        completed_job=_critic_job(plan),
+                        completed_ctx=_critic_job(plan)["context"],
+                        completed_failed=False,
+                        dependencies=_deps(store=db, vector_store=MagicMock()),
+                    )
         close.assert_awaited_once()
         assert any(
             "close_backlog_ticket reported failure" in r.message for r in caplog.records
@@ -1590,8 +1637,6 @@ class TestDispositionClosesBacklogTicket:
         spuriously log a failure warning."""
         import logging
 
-        from orchestrator.main import _rotate_loop_to_next_stage
-
         db = AsyncMock()
         spawn = _spawn_mock()
         close = AsyncMock(return_value=True)
@@ -1600,49 +1645,12 @@ class TestDispositionClosesBacklogTicket:
             status="review", stages_done=3, id=prior_critic, plan_job_id=prior_critic
         )
         plan = {"disposition": {"outcome": "ship", "notes": "acceptance passed"}}
-        with _patched_main(db, spawn):
-            with patch("orchestrator.main.vector_db", MagicMock()):
-                with patch(
-                    "orchestrator.services.project_backlog.close_backlog_ticket", close
-                ):
-                    with caplog.at_level(logging.WARNING, logger="main"):
-                        await _rotate_loop_to_next_stage(
-                            _loop(campaign=reviewed, project_id=str(uuid.uuid4())),
-                            seq_index_completed=1,
-                            base_total=13,
-                            next_remaining=16,
-                            consecutive=0,
-                            last_error=None,
-                            actions=[],
-                            completed_job=_critic_job(plan),
-                            completed_ctx=_critic_job(plan)["context"],
-                            completed_failed=False,
-                        )
-        assert not any(
-            "close_backlog_ticket reported failure" in r.message for r in caplog.records
-        )
-
-    @pytest.mark.asyncio
-    async def test_no_vector_db_skips_the_close_call(self):
-        """A KB/pgvector outage must cost the mirror, never the disposition
-        itself -- the guard short-circuits before close_backlog_ticket, and
-        the campaign_history entry still gets written."""
-        from orchestrator.main import _rotate_loop_to_next_stage
-
-        db = AsyncMock()
-        spawn = _spawn_mock()
-        close = AsyncMock(return_value=True)
-        prior_critic = "aaaaaaaa-0000-0000-0000-00000000dead"
-        reviewed = _campaign(
-            status="review", stages_done=3, id=prior_critic, plan_job_id=prior_critic
-        )
-        plan = {"disposition": {"outcome": "ship", "notes": "acceptance passed"}}
-        with _patched_main(db, spawn):
-            with patch("orchestrator.main.vector_db", None):
-                with patch(
-                    "orchestrator.services.project_backlog.close_backlog_ticket", close
-                ):
-                    await _rotate_loop_to_next_stage(
+        with _patched_engine(spawn):
+            with patch(
+                "orchestrator.services.project_backlog.close_backlog_ticket", close
+            ):
+                with caplog.at_level(logging.WARNING, logger=_ADV):
+                    await rotate_loop_to_next_stage(
                         _loop(campaign=reviewed, project_id=str(uuid.uuid4())),
                         seq_index_completed=1,
                         base_total=13,
@@ -1653,7 +1661,42 @@ class TestDispositionClosesBacklogTicket:
                         completed_job=_critic_job(plan),
                         completed_ctx=_critic_job(plan)["context"],
                         completed_failed=False,
+                        dependencies=_deps(store=db, vector_store=MagicMock()),
                     )
+        assert not any(
+            "close_backlog_ticket reported failure" in r.message for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_vector_db_skips_the_close_call(self):
+        """A KB/pgvector outage must cost the mirror, never the disposition
+        itself -- the guard short-circuits before close_backlog_ticket, and
+        the campaign_history entry still gets written."""
+        db = AsyncMock()
+        spawn = _spawn_mock()
+        close = AsyncMock(return_value=True)
+        prior_critic = "aaaaaaaa-0000-0000-0000-00000000dead"
+        reviewed = _campaign(
+            status="review", stages_done=3, id=prior_critic, plan_job_id=prior_critic
+        )
+        plan = {"disposition": {"outcome": "ship", "notes": "acceptance passed"}}
+        with _patched_engine(spawn):
+            with patch(
+                "orchestrator.services.project_backlog.close_backlog_ticket", close
+            ):
+                await rotate_loop_to_next_stage(
+                    _loop(campaign=reviewed, project_id=str(uuid.uuid4())),
+                    seq_index_completed=1,
+                    base_total=13,
+                    next_remaining=16,
+                    consecutive=0,
+                    last_error=None,
+                    actions=[],
+                    completed_job=_critic_job(plan),
+                    completed_ctx=_critic_job(plan)["context"],
+                    completed_failed=False,
+                    dependencies=_deps(store=db),
+                )
         close.assert_not_awaited()
         pre_spawn = db.update_project_loop.call_args_list[0].kwargs
         assert pre_spawn["campaign_history"][-1]["outcome"] == "ship"

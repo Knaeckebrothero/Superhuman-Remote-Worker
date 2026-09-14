@@ -1,5 +1,7 @@
 """Generic work cannot enter reference-harness control or orphan recovery."""
 
+from tests import b08_completion_helpers as b08_helpers
+
 from copy import deepcopy
 import re
 from types import SimpleNamespace
@@ -134,7 +136,7 @@ async def test_legacy_mutations_refuse_generic_before_effects(monkeypatch, opera
     elif operation == "resume_without_vm":
         call = main._resume_job_without_vm_internal(WORK)
     elif operation == "complete":
-        call = main._complete_job_legacy(None, WORK, None, _authorized=True)
+        call = b08_helpers.complete_job_legacy(None, WORK, None, _authorized=True)
     elif operation == "session_resume":
         call = main.resume_thread(WORK, None)
     else:

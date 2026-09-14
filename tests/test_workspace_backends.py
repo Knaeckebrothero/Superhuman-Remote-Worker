@@ -2895,6 +2895,90 @@ if os.path.exists(sentinel):
         ):
             assert option in cleanup
 
+    @pytest.mark.parametrize("enter", (False, True))
+    def test_key_send_prunes_closed_tab_without_losing_surviving_shell(
+        self, remote_backend, enter
+    ):
+        backend, _, _ = remote_backend
+        backend.set_shell_owner_token(17)
+        backend._shell_initialized = True
+        backend._tabs["default"] = _RemoteTab("default", pane_id="%1")
+        backend._tabs["closed"] = _RemoteTab("closed", pane_id="%2")
+        commands = []
+
+        def execute(command, **_kwargs):
+            commands.append(command)
+            if "tmux send-keys -t %2" in command:
+                return "", 1
+            if command.startswith("tmux has-session"):
+                return "", 0
+            if command.startswith("tmux list-panes"):
+                return "", 1
+            return "", 0
+
+        with patch.object(backend, "_exec_with_status", side_effect=execute):
+            with pytest.raises(KeyError, match="Tab 'closed' no longer exists"):
+                backend._tmux_send_keys("closed", "C-c", enter=enter)
+            assert backend.shell_send("default", "C-c", enter=False) == (
+                "Sent to 'default'"
+            )
+
+        assert backend._shell_initialized is True
+        assert list(backend._tabs) == ["default"]
+        cleanup = next(command for command in commands if "tmux kill-window" in command)
+        assert '"$_srw_tmux_token" = 17 ] || exit 75' in cleanup
+
+    @pytest.mark.parametrize("exit_code", (75, 78, 79, 80, 81))
+    def test_key_send_fence_failure_cannot_be_downgraded_to_tab_loss(
+        self, remote_backend, exit_code
+    ):
+        backend, _, _ = remote_backend
+        backend.set_shell_owner_token(17)
+        backend._shell_initialized = True
+        backend._tabs["default"] = _RemoteTab("default", pane_id="%1")
+        backend._tabs["closed"] = _RemoteTab("closed", pane_id="%2")
+
+        with (
+            patch.object(
+                backend, "_exec_with_status", return_value=("", exit_code)
+            ) as execute,
+            patch.object(backend, "_tmux_pane_gone") as probe,
+        ):
+            with pytest.raises(
+                WorkspaceUnavailableError, match=f"exit code {exit_code}"
+            ):
+                backend.shell_send("closed", "C-c", enter=False)
+
+        execute.assert_called_once()
+        probe.assert_not_called()
+        assert backend._shell_initialized is False
+        assert backend._tabs == {}
+
+    @pytest.mark.parametrize("failure", ("session", "transport", "pane_present"))
+    def test_key_send_requires_conclusive_pane_absence(self, remote_backend, failure):
+        backend, _, _ = remote_backend
+        backend._shell_initialized = True
+        backend._tabs["default"] = _RemoteTab("default", pane_id="%1")
+        backend._tabs["closed"] = _RemoteTab("closed", pane_id="%2")
+
+        def execute(command, **_kwargs):
+            if "tmux send-keys" in command:
+                return "", 1
+            if command.startswith("tmux has-session"):
+                if failure == "transport":
+                    raise WorkspaceUnavailableError("SSH command failed")
+                return "", 1 if failure == "session" else 0
+            if command.startswith("tmux list-panes"):
+                return "%2\n", 0
+            raise AssertionError("Unexpected remote command")
+
+        with patch.object(backend, "_exec_with_status", side_effect=execute):
+            with pytest.raises(WorkspaceUnavailableError, match="exit code 1"):
+                backend.shell_send("closed", "C-c", enter=False)
+
+        assert backend._shell_initialized is False
+        assert backend._tabs == {}
+
     @pytest.mark.parametrize("probe_failure", ("tmux", "transport"))
     def test_capture_probe_server_failure_keeps_workspace_error_semantics(
         self, remote_backend, probe_failure

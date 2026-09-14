@@ -3206,6 +3206,13 @@ BEGIN
     IF source_kind = 'job' THEN
         old_ide := COALESCE(old_state->'ide_session', '{}'::JSONB);
         new_ide := COALESCE(new_state->'ide_session', '{}'::JSONB);
+        IF public.vm_ide_heartbeat_cleanup_is_authorized(
+            source_kind, source_id, old_state, new_state
+        ) THEN
+            -- No endpoint/process was named by this exact legacy placeholder.
+            -- The VM itself still requires its independent process-zero receipt.
+            old_ide := '{}'::JSONB;
+        END IF;
         inherited_scope := declared_inherited
             AND old_ide <> '{}'::JSONB
             AND (
@@ -9347,7 +9354,13 @@ BEGIN
            AND NOT restore_projection_authorized
            AND NOT cancelled_creation_projection_authorized
            AND NOT cancel_claim_projection_authorized
-           AND NOT terminal_cancel_projection_authorized THEN
+           AND NOT terminal_cancel_projection_authorized
+           AND NOT (
+               scope_name = 'ide'
+               AND public.vm_ide_heartbeat_cleanup_is_authorized(
+                   source_kind, source_id, old_state, new_state
+               )
+           ) THEN
             RAISE EXCEPTION USING
                 ERRCODE = '23514',
                 CONSTRAINT = CASE WHEN scope_name = 'ide'
@@ -13754,6 +13767,51 @@ $$;
 
 
 --
+-- Name: vm_ide_heartbeat_cleanup_is_authorized(text, uuid, jsonb, jsonb); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_ide_heartbeat_cleanup_is_authorized(requested_owner_kind text, requested_owner_id uuid, old_state jsonb, new_state jsonb) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $_$
+    SELECT COALESCE(
+      requested_owner_kind IN ('job', 'thread')
+      AND requested_owner_id IS NOT NULL
+      AND new_state = old_state - 'ide_session'
+      AND jsonb_typeof(old_state -> 'ide_session') = 'object'
+      AND (old_state -> 'ide_session')
+            - ARRAY['status', 'code_server_connections', 'last_activity'] = '{}'::JSONB
+      AND old_state -> 'ide_session' ->> 'status' IN ('active', 'idle')
+      AND jsonb_typeof(old_state -> 'ide_session' -> 'code_server_connections') = 'number'
+      AND old_state -> 'ide_session' ->> 'code_server_connections' ~ '^(0|[1-9][0-9]*)$'
+      AND (NOT (old_state -> 'ide_session' ? 'last_activity')
+           OR jsonb_typeof(old_state -> 'ide_session' -> 'last_activity') = 'string')
+      AND old_state -> 'vm' -> 'identity_authenticated' = 'true'::JSONB
+      AND old_state -> 'vm' ->> 'provision_generation'
+            ~ '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$'
+      AND old_state -> 'vm' ->> 'identity_provision_generation'
+            = old_state -> 'vm' ->> 'provision_generation'
+      AND old_state -> 'vm' ->> 'vm_uid'
+            ~ '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$'
+      AND NOT EXISTS (
+          SELECT 1 FROM public.managed_repository_workspace_creation_reservations AS reservation
+          WHERE reservation.owner_kind = requested_owner_kind
+            AND reservation.owner_id = requested_owner_id AND reservation.scope = 'ide'
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM public.managed_repository_workspace_cleanup_intents AS intent
+          WHERE intent.owner_kind = requested_owner_kind
+            AND intent.owner_id = requested_owner_id AND intent.scope = 'ide'
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM public.managed_repository_process_zero_receipts AS receipt
+          WHERE receipt.owner_kind = requested_owner_kind
+            AND receipt.owner_id = requested_owner_id AND receipt.scope = 'ide'
+      )
+    , FALSE);
+$_$;
+
+
+--
 -- Name: vm_remote_identity_envelope(jsonb); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -15836,7 +15894,11 @@ CREATE TABLE public.llm_endpoints (
     key_prefix character varying(12),
     created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
     updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
-    transport_kind text
+    transport_kind text,
+    source text DEFAULT 'ui'::text NOT NULL,
+    helm_value_hash text,
+    source_updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    CONSTRAINT llm_endpoints_source_check CHECK ((source = ANY (ARRAY['default'::text, 'helm'::text, 'ui'::text])))
 );
 
 
@@ -16500,8 +16562,12 @@ CREATE TABLE public.models (
     notes text,
     created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
     updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
+    source text DEFAULT 'ui'::text NOT NULL,
+    helm_value_hash text,
+    source_updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
     CONSTRAINT models_capabilities_check CHECK (((cardinality(capabilities) >= 1) AND (capabilities <@ ARRAY['chat'::text, 'auxiliary'::text, 'embedding'::text, 'vision'::text, 'whisper'::text, 'tts'::text, 'search'::text, 'fetch'::text, 'rerank'::text]))),
-    CONSTRAINT models_provider_kind_check CHECK ((provider_kind = ANY (ARRAY['system'::text, 'endpoint'::text])))
+    CONSTRAINT models_provider_kind_check CHECK ((provider_kind = ANY (ARRAY['system'::text, 'endpoint'::text]))),
+    CONSTRAINT models_source_check CHECK ((source = ANY (ARRAY['default'::text, 'helm'::text, 'ui'::text])))
 );
 
 
@@ -18402,6 +18468,7 @@ CREATE TABLE public.srw_workspace_instances (
     status text DEFAULT 'Reserved'::text NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    backend_state jsonb DEFAULT '{}'::jsonb NOT NULL,
     CONSTRAINT srw_workspace_instances_retired_owner_check CHECK (((owner_id IS NOT NULL) OR ((status = 'Released'::text) AND (execution_id IS NULL) AND (pod_uid IS NULL))))
 );
 
@@ -18734,6 +18801,10 @@ CREATE TABLE public.system_api_keys (
     updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
     discovery_cache_json jsonb,
     discovery_cache_at timestamp with time zone,
+    source text DEFAULT 'ui'::text NOT NULL,
+    helm_value_hash text,
+    source_updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    CONSTRAINT system_api_keys_source_check CHECK ((source = ANY (ARRAY['default'::text, 'helm'::text, 'ui'::text]))),
     CONSTRAINT valid_system_api_key_provider CHECK (((provider)::text = ANY ((ARRAY['openai'::character varying, 'anthropic'::character varying, 'google'::character varying, 'groq'::character varying, 'openrouter'::character varying, 'mistral'::character varying, 'vision'::character varying])::text[])))
 );
 
@@ -18747,7 +18818,11 @@ CREATE TABLE public.system_settings (
     value jsonb NOT NULL,
     credentials_ref text,
     updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
-    updated_by text
+    updated_by text,
+    source text DEFAULT 'ui'::text NOT NULL,
+    helm_value_hash text,
+    source_updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    CONSTRAINT system_settings_source_check CHECK ((source = ANY (ARRAY['default'::text, 'helm'::text, 'ui'::text])))
 );
 
 

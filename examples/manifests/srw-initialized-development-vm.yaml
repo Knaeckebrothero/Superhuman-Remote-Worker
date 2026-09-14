@@ -1,0 +1,22 @@
+# A prebuilt toolchain plus per-workspace, unprivileged setup.
+# No commands run until an authorized Job or Session allocates this VM recipe.
+apiVersion: srw/v1alpha1
+kind: WorkspaceTemplate
+metadata:
+  name: srw-initialized-development
+spec:
+  backend: vm
+  resources:
+    cpu: 12
+    memory: 24Gi
+    storage: 120Gi
+  environment:
+    image: ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base@sha256:db1015a32173c4553d1ad432bdb48760fdb8ba0782d25ae20349d4aaaf26c28f
+    pullPolicy: IfNotPresent
+    cache: Reuse
+  # Ordered argv commands; cwd is /home/agent-host/workspace.
+  # Execution connectors and repository checkouts arrive after this stage.
+  initialize:
+    - command: [mkdir, -p, /home/agent-host/.cache/project, /home/agent-host/.venvs]
+    - command: [python3, -m, venv, /home/agent-host/.venvs/project]
+  retention: Delete

@@ -58,6 +58,10 @@ MAX_FIRES_PER_TICK = int(os.getenv("AUTOMATIONS_MAX_FIRES_PER_TICK", "50"))
 # Today this is wired to ``_trigger_dispatch`` so the auto-assign dispatcher
 # wakes up immediately instead of waiting its own 30s.
 OnJobCreated = Callable[[], Any]
+# (job_row, db) -> awaitable. The application binds the Gitea/cloud
+# provisioning adapter; a caller that supplies none (every existing test) fires
+# automations without a dedicated repo, exactly as an outage already did.
+ProvisionJobRepo = Callable[[dict[str, Any], Any], Any]
 
 
 async def cron_dispatcher_loop(
@@ -65,12 +69,18 @@ async def cron_dispatcher_loop(
     shutdown_event: asyncio.Event,
     *,
     on_job_created: OnJobCreated | None = None,
+    provision_repo: ProvisionJobRepo | None = None,
 ) -> None:
     """Run the cron tick loop until ``shutdown_event`` is set.
 
-    Caller is responsible for passing the long-lived db handle and the
-    optional ``on_job_created`` poke — both are kept out of module state
-    so tests can inject mocks without monkey-patching.
+    Caller is responsible for passing the long-lived db handle, the optional
+    ``on_job_created`` poke and the ``provision_repo`` adapter — all three are
+    kept out of module state so tests can inject mocks without monkey-patching.
+
+    R1.B07 closed this module's late ``from orchestrator.main import
+    gitea_client, main_cloud_router``: this loop outlives every request, so it
+    carries the provisioning adapter explicitly instead of reaching for the
+    application module when a job happens to be created.
     """
     logger.info(
         "Cron automation dispatcher started (tick=%ds, max_per_tick=%d)",
@@ -79,7 +89,7 @@ async def cron_dispatcher_loop(
     )
     while not shutdown_event.is_set():
         try:
-            fired = await _tick(db)
+            fired = await _tick(db, provision_repo=provision_repo)
         except Exception:
             logger.exception("Cron dispatcher tick raised; will retry next tick")
             fired = 0
@@ -101,11 +111,11 @@ async def cron_dispatcher_loop(
     logger.info("Cron automation dispatcher stopped")
 
 
-async def _tick(db: Any) -> int:
+async def _tick(db: Any, *, provision_repo: ProvisionJobRepo | None = None) -> int:
     """Drain due cron automations. Returns the number processed."""
     drained = 0
     while drained < MAX_FIRES_PER_TICK:
-        processed = await _process_one_due_automation(db)
+        processed = await _process_one_due_automation(db, provision_repo=provision_repo)
         if not processed:
             break
         drained += 1
@@ -117,7 +127,9 @@ async def _tick(db: Any) -> int:
     return drained
 
 
-async def _process_one_due_automation(db: Any) -> bool:
+async def _process_one_due_automation(
+    db: Any, *, provision_repo: ProvisionJobRepo | None = None
+) -> bool:
     """Atomically claim, fire, and advance one due automation.
 
     Returns True if a row was processed (fired, skipped, or disabled),
@@ -244,17 +256,9 @@ async def _process_one_due_automation(db: Any) -> bool:
     # logs and leaves the job repo-less rather than undoing the committed
     # fire (the job still runs, just without a dedicated repo). This is the
     # parity fix so cron-spawned jobs get a workspace repo like manual jobs.
-    if created_job is not None:
+    if created_job is not None and provision_repo is not None:
         try:
-            from orchestrator.main import gitea_client, main_cloud_router
-            from orchestrator.services.job_provisioning import provision_job_repo
-
-            await provision_job_repo(
-                job_row=created_job,
-                gitea_client=gitea_client,
-                postgres_db=db,
-                main_cloud_router=main_cloud_router,
-            )
+            await provision_repo(created_job, db)
         except Exception:
             logger.exception(
                 "cron: repo provisioning failed for job %s "

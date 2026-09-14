@@ -83,7 +83,7 @@ async def test_flag_on_manual_assign_guard_blocks_before_workspace_or_agent_io(
     monkeypatch.setattr(main, "COMPLETION_COMMANDS_ENABLED", True)
     blocked = main.HTTPException(status_code=409, detail="completion finalizing")
     guard = AsyncMock(side_effect=blocked)
-    monkeypatch.setattr(main, "_guard_completion_control", guard)
+    monkeypatch.setattr(main._completion_control_boundary, "guard", guard)
 
     with pytest.raises(main.HTTPException) as exc:
         await main.assign_job_to_agent(MagicMock(), JOB_ID, AGENT_ID)
@@ -102,10 +102,10 @@ async def test_flag_on_missing_workspace_uses_claimed_atomic_preflight(
     job = _job("failed", workspace_status="failed")
     main.postgres_db.get_job.return_value = job
     monkeypatch.setattr(main, "COMPLETION_COMMANDS_ENABLED", True)
-    monkeypatch.setattr(main, "_guard_completion_control", AsyncMock())
+    monkeypatch.setattr(main._completion_control_boundary, "guard", AsyncMock())
     claim = SimpleNamespace(claim_id="00000000-0000-0000-0000-000000000301")
     claim_control = AsyncMock(return_value=claim)
-    monkeypatch.setattr(main, "_claim_completion_control", claim_control)
+    monkeypatch.setattr(main._completion_control_boundary, "claim", claim_control)
 
     result = await main.assign_job_to_agent(MagicMock(), JOB_ID, AGENT_ID)
 
@@ -130,7 +130,7 @@ async def test_flag_on_live_workspace_claims_before_agent_post(
     main.postgres_db.get_job.return_value = job
     main.postgres_db.get_agent.return_value = _agent()
     monkeypatch.setattr(main, "COMPLETION_COMMANDS_ENABLED", True)
-    monkeypatch.setattr(main, "_guard_completion_control", AsyncMock())
+    monkeypatch.setattr(main._completion_control_boundary, "guard", AsyncMock())
     order: list[str] = []
     main.postgres_db.claim_job_for_agent.side_effect = (
         lambda *_args, **_kwargs: order.append("claim") or True
@@ -161,7 +161,7 @@ async def test_manual_assign_waits_for_legacy_runtime_adoption_before_claim(
     )
     job["context"]["workspace_container"].pop("_runtime_incarnation")
     main.postgres_db.get_job.return_value = job
-    monkeypatch.setattr(main, "_guard_completion_control", AsyncMock())
+    monkeypatch.setattr(main._completion_control_boundary, "guard", AsyncMock())
     prepare = AsyncMock(
         return_value=("wait", job, "kubernetes_attestation_unavailable")
     )

@@ -1,0 +1,38 @@
+# First assignment: create an independent VM workspace and keep its disk.
+# Applying the WorkspaceTemplate alone does not start a VM or run commands.
+apiVersion: srw/v1alpha1
+kind: WorkspaceTemplate
+metadata:
+  name: retained-development
+spec:
+  backend: vm
+  resources:
+    cpu: 12
+    memory: 24Gi
+    storage: 120Gi
+  environment:
+    image: ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base@sha256:db1015a32173c4553d1ad432bdb48760fdb8ba0782d25ae20349d4aaaf26c28f
+    pullPolicy: IfNotPresent
+    cache: Reuse
+  initialize:
+    - command: [mkdir, -p, /home/agent-host/.cache/project]
+  retention: Retain
+---
+apiVersion: srw/v1alpha1
+kind: Job
+metadata:
+  name: first-development-assignment
+spec:
+  task:
+    text: Write a short development plan to workspace-plan.md for the next assignment.
+  execution:
+    expert:
+      inline:
+        runtime:
+          adapter: srw/v1
+          config: {config_name: worker_base}
+    workspace: {template: {ref: {name: retained-development}}}
+    connectors: {}
+  completion: {mode: Reported}
+  retry: {maxAttempts: 1}
+  timeoutSeconds: 1800

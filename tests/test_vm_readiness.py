@@ -808,3 +808,25 @@ async def test_scan_presented_wrong_key_is_identity_mismatch(monkeypatch):
     )
     assert line is None
     assert error == b"SSH server host key did not match the pinned fingerprint"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("vmi", [None, "Pending", "Scheduling", "Scheduled"])
+async def test_initial_stopped_vm_keeps_probing_while_its_disk_is_allocating(
+    successful_ssh,
+    vmi,
+):
+    provisioner = FakeProvisioner(
+        {
+            "ready": False,
+            "phase": "Stopped",
+            "credential_runtime_started": vmi is not None,
+            "vmi_phase": vmi,
+        }
+    )
+    await VMReadinessService(
+        FakeDB(jobs=[candidate()]), provisioner, trigger_dispatch=lambda: None
+    ).run_cycle()
+    assert provisioner.writes[-1][3]["status"] == "ssh_pending"
+    assert provisioner.writes[-1][3]["ssh_probe_attempts"] == 1
+    successful_ssh[0].assert_not_awaited()

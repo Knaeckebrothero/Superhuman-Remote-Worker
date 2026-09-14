@@ -27,6 +27,8 @@ These tests exercise the real functions with a mocked ``postgres_db``.
 
 from __future__ import annotations
 
+from tests import b08_completion_helpers as b08_helpers
+
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
@@ -566,8 +568,16 @@ class TestFailSubjobUnblocksParent:
         scholar = AsyncMock()
         delegation = AsyncMock()
         monkeypatch.setattr(main.postgres_db, "update_job_status", update)
-        monkeypatch.setattr(main, "_handle_scholar_completion", scholar)
-        monkeypatch.setattr(main, "_handle_delegation_child_completion", delegation)
+        monkeypatch.setattr(
+            main.subjob_completion_operations,
+            "handle_scholar_completion",
+            scholar,
+        )
+        monkeypatch.setattr(
+            main.subjob_completion_operations,
+            "handle_delegation_child_completion",
+            delegation,
+        )
 
         await main._fail_subjob_and_unblock_parent(job, "cannot inherit")
 
@@ -648,7 +658,7 @@ class TestScholarMaterializationFailure:
         monkeypatch.setattr(main, "_trigger_dispatch", dispatch)
 
         with pytest.raises(DatasourceMaterializationAuthorizationError):
-            await main._spawn_scholar_subjob(job, "worker", {}, {})
+            await b08_helpers.spawn_scholar_subjob(job, "worker", {}, {})
 
         assert [call.kwargs["status"] for call in update_status.await_args_list] == [
             "waiting",

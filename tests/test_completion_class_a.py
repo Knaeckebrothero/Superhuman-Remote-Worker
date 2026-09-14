@@ -8,6 +8,8 @@ disposition, and the live endpoints select the right freeze behavior.
 
 from __future__ import annotations
 
+from tests import b08_completion_helpers as b08_helpers
+
 import dataclasses
 import json
 from contextlib import ExitStack, asynccontextmanager
@@ -487,18 +489,16 @@ def _patch_completion(stack: ExitStack, db: _EndpointDB) -> None:
             AsyncMock(return_value={"actions": []}),
         )
     )
-    for helper in (
-        "_handle_critic_verdict_on_complete",
-        "_handle_scholar_completion",
-        "_handle_delegation_child_completion",
-        "_trigger_verification_on_complete",
-        "_advance_project_loop",
-        "_archive_and_cleanup_workspace",
-        "maybe_wake_session",
+    for target in (
+        "orchestrator.main.verification_operations.handle_critic_verdict_on_complete",
+        "orchestrator.main.subjob_completion_operations.handle_scholar_completion",
+        "orchestrator.main.subjob_completion_operations.handle_delegation_child_completion",
+        "orchestrator.main.verification_operations.trigger_verification_on_complete",
+        "orchestrator.main.project_loop_advance_service.advance_project_loop",
+        "orchestrator.main._archive_and_cleanup_workspace",
+        "orchestrator.main.maybe_wake_session",
     ):
-        stack.enter_context(
-            patch(f"orchestrator.main.{helper}", AsyncMock(return_value=[]))
-        )
+        stack.enter_context(patch(target, AsyncMock(return_value=[])))
     stack.enter_context(
         patch("orchestrator.main._kick_session_wake_drain", MagicMock())
     )
@@ -525,7 +525,7 @@ class TestCompleteJobClassA:
                 )
             )
             with pytest.raises(HTTPException) as exc:
-                await orchestrator.main.complete_job(MagicMock(), JOB_ID, body)
+                await b08_helpers.complete_job(MagicMock(), JOB_ID, body)
 
         assert exc.value.status_code == 409
         current.assert_awaited_once()
@@ -549,7 +549,7 @@ class TestCompleteJobClassA:
                     AsyncMock(return_value=True),
                 )
             )
-            handled = await orchestrator.main.complete_job(MagicMock(), JOB_ID, body)
+            handled = await b08_helpers.complete_job(MagicMock(), JOB_ID, body)
 
         current.assert_awaited_once()
         assert handled["new_status"] == "completed"
@@ -574,7 +574,7 @@ class TestCompleteJobClassA:
                     AsyncMock(return_value=False),
                 )
             )
-            handled = await orchestrator.main.complete_job(MagicMock(), JOB_ID, body)
+            handled = await b08_helpers.complete_job(MagicMock(), JOB_ID, body)
 
         assert handled["new_status"] == "completed"
         current.assert_not_awaited()
@@ -605,7 +605,7 @@ class TestCompleteJobClassA:
                     AsyncMock(return_value=True),
                 )
             )
-            handled = await orchestrator.main.complete_job(MagicMock(), JOB_ID, body)
+            handled = await b08_helpers.complete_job(MagicMock(), JOB_ID, body)
 
         assert handled["new_status"] == status
         assert handled["actions"] == [
@@ -637,7 +637,7 @@ class TestCompleteJobClassA:
                 )
             )
             with pytest.raises(HTTPException) as exc:
-                await orchestrator.main.complete_job(MagicMock(), JOB_ID, body)
+                await b08_helpers.complete_job(MagicMock(), JOB_ID, body)
 
         assert exc.value.status_code == 409
         assert exc.value.detail == (
@@ -669,7 +669,7 @@ class TestCompleteJobClassA:
                     AsyncMock(return_value=True),
                 )
             )
-            handled = await orchestrator.main.complete_job(MagicMock(), JOB_ID, body)
+            handled = await b08_helpers.complete_job(MagicMock(), JOB_ID, body)
 
         assert handled["new_status"] == "completed"
         assert not any("context - 'queued_replies'" in sql for sql, _ in db.statements)
@@ -686,7 +686,7 @@ class TestCompleteJobClassA:
 
         with ExitStack() as stack:
             _patch_completion(stack, db)
-            handled = await orchestrator.main.complete_job(MagicMock(), JOB_ID, body)
+            handled = await b08_helpers.complete_job(MagicMock(), JOB_ID, body)
 
         [(sql, _args)] = db.class_a_statements()
         normalized = _normalized(sql)
@@ -734,10 +734,11 @@ class TestCompleteJobClassA:
             )
             verification = stack.enter_context(
                 patch(
-                    "orchestrator.main._trigger_verification_on_complete", AsyncMock()
+                    "orchestrator.main.verification_operations.trigger_verification_on_complete",
+                    AsyncMock(),
                 )
             )
-            handled = await orchestrator.main.complete_job(MagicMock(), JOB_ID, body)
+            handled = await b08_helpers.complete_job(MagicMock(), JOB_ID, body)
 
         [(sql, args)] = db.class_a_statements()
         normalized = _normalized(sql)
@@ -770,7 +771,7 @@ class TestCompleteJobClassA:
                     AsyncMock(side_effect=RuntimeError(private_detail)),
                 )
             )
-            handled = await orchestrator.main.complete_job(MagicMock(), JOB_ID, body)
+            handled = await b08_helpers.complete_job(MagicMock(), JOB_ID, body)
 
         assert handled["new_status"] == "completed"
         assert private_detail not in caplog.text
@@ -793,7 +794,7 @@ class TestCompleteJobClassA:
 
         with ExitStack() as stack:
             _patch_completion(stack, db)
-            handled = await orchestrator.main.complete_job(MagicMock(), JOB_ID, body)
+            handled = await b08_helpers.complete_job(MagicMock(), JOB_ID, body)
 
         [(sql, args)] = db.class_a_statements()
         normalized = _normalized(sql)
@@ -843,7 +844,10 @@ class TestCompleteJobClassA:
                 )
             )
             stack.enter_context(
-                patch("orchestrator.main._notify_operator_freeze", AsyncMock())
+                patch(
+                    "orchestrator.main.job_freeze_notification_service.notify_operator_freeze",
+                    AsyncMock(),
+                )
             )
             stack.enter_context(
                 patch(
@@ -857,7 +861,7 @@ class TestCompleteJobClassA:
                     MagicMock(side_effect=close_capture),
                 )
             )
-            handled = await orchestrator.main.complete_job(MagicMock(), JOB_ID, body)
+            handled = await b08_helpers.complete_job(MagicMock(), JOB_ID, body)
 
         [(sql, _args)] = db.class_a_statements()
         normalized = _normalized(sql)

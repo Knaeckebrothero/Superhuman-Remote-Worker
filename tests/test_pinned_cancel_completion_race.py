@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests import b08_completion_helpers as b08_helpers
+
 from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID
 
@@ -128,7 +130,9 @@ async def test_real_postgres_inflight_completion_cannot_overwrite_cancel(
         ),
     )
     with pytest.raises(HTTPException) as exc:
-        await main._complete_job_legacy(None, db.job["id"], body, _authorized=True)
+        await b08_helpers.complete_job_legacy(
+            None, db.job["id"], body, _authorized=True
+        )
     assert exc.value.status_code == 409
     assert db.cancelled
     assert (await db.get_job(db.job["id"]))["status"] == "cancelled"
@@ -167,7 +171,7 @@ async def test_real_postgres_recovery_pause_loss_stops_completion_tail(
             else "llm_unavailable"
         }
     with pytest.raises(HTTPException) as exc:
-        await main._complete_job_legacy(
+        await b08_helpers.complete_job_legacy(
             None,
             db.job["id"],
             main.JobCompleteRequest(should_stop=True, error=error, freeze_data=freeze),
@@ -261,7 +265,7 @@ async def test_real_postgres_uncontested_legacy_disposition_still_commits(
         goal_achieved=freeze_type is None,
         freeze_data={"freeze_type": freeze_type} if freeze_type else None,
     )
-    outcome = await main._complete_job_legacy(
+    outcome = await b08_helpers.complete_job_legacy(
         None, db.job["id"], body, _authorized=True
     )
     assert outcome["new_status"] == expected
@@ -294,7 +298,9 @@ async def test_real_deliverable_gate_cannot_swallow_cancelled_resume_race(
         freeze_data={"freeze_type": "job_complete", "summary": "test completion"},
     )
     with pytest.raises(HTTPException) as exc:
-        await main._complete_job_legacy(None, db.job["id"], body, _authorized=True)
+        await b08_helpers.complete_job_legacy(
+            None, db.job["id"], body, _authorized=True
+        )
     assert exc.value.status_code == 409
     assert db.cancelled
     assert (await db.get_job(db.job["id"]))["status"] == "cancelled"

@@ -33,6 +33,7 @@ GET    /api/admin/families/detect                                               
 GET    /api/admin/grants                                                                admin:_require_admin
 DELETE /api/admin/grants/{scope_kind}/{scope_id}/{key}                                  admin:_require_admin
 PUT    /api/admin/grants/{scope_kind}/{scope_id}/{key}                                  admin:_require_admin
+GET    /api/admin/helm-managed                                                          admin:_require_admin
 GET    /api/admin/projects/{project_id}/officer/runtime-verification                    admin:_require_admin
 POST   /api/admin/projects/{project_id}/officer/runtime-verification                    admin:_require_admin
 POST   /api/admin/projects/{project_id}/officer/runtime-verification/{plan_id}/{action} admin:_require_admin
@@ -512,6 +513,8 @@ POST   /api/vms                                                                 
 DELETE /api/vms/{job_id}                                                                gated:require_job_access
 GET    /api/vms/{job_id}                                                                gated:require_job_access
 GET    /api/voice/capabilities                                                          gated:require_approved_user
+GET    /api/workspace-cache                                                             gated:require_approved_user
+DELETE /api/workspace-cache/{artifact_id}                                               gated:require_approved_user
 DELETE /api/workspace-instances/{instance_id}                                           gated:require_approved_user
 GET    /api/workspace-instances/{instance_id}                                           gated:require_approved_user
 GET    /api/workspace/status                                                            admin:_require_admin

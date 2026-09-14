@@ -605,6 +605,7 @@ async def test_pinned_legacy_upload_shape_is_unchanged(monkeypatch):
         username="agent-host",
         key_path="/ssh/key",
         workspace_path="/home/agent-host/workspace",
+        host_key_fingerprint="SHA256:" + "a" * 43,
     )
     called: dict = {}
 

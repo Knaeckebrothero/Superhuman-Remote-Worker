@@ -24,6 +24,7 @@ from orchestrator.services.officer_slots import (
     capacity_lines,
     validate_slots_spec,
 )
+from orchestrator.services.project_loop_spawn import officer_slot_category
 
 NOW = datetime(2026, 8, 15, 12, 0, tzinfo=timezone.utc)
 
@@ -506,15 +507,13 @@ class TestPrecedenceLaw:
         return orchestrator.main
 
     def test_a_pool_slot_resolves_its_category(self):
-        main = self._main()
-        assert main._officer_slot_category(META, "researchers") == "researcher"
-        assert main._officer_slot_category(META, "executors") == "executor"
+        assert officer_slot_category(META, "researchers") == "researcher"
+        assert officer_slot_category(META, "executors") == "executor"
 
     def test_an_uncategorized_or_unknown_slot_has_none(self):
-        main = self._main()
-        assert main._officer_slot_category({"slots": {"a": {"count": 1}}}, "a") is None
-        assert main._officer_slot_category(META, "nope") is None
-        assert main._officer_slot_category(META, None) is None
+        assert officer_slot_category({"slots": {"a": {"count": 1}}}, "a") is None
+        assert officer_slot_category(META, "nope") is None
+        assert officer_slot_category(META, None) is None
 
     def test_the_contract_leads_and_the_officer_brief_follows(self):
         main = self._main()

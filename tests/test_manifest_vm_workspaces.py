@@ -58,6 +58,50 @@ def test_resolved_prebuilt_vm_preserves_allocation_without_changing_the_source()
     assert document == before
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane", ["pinned", "stateless"])
+async def test_initialization_uses_the_frozen_template_after_source_edits(
+    database, actor, lane
+):
+    from shared.workspace_initialization import initialization_request
+
+    service = ManifestResourceService(database)
+    document = template()
+    steps = [{"command": ["sh", "-c", "mkdir -p toolchain && touch toolchain/ready"]}]
+    document["spec"]["initialize"] = steps
+    await service.apply(json.dumps(document), actor, format="json")
+    job = full_schema.assignment(adapter="srw/v1", mode="Reported")
+    job["spec"]["execution"]["workspace"] = {
+        "template": {"ref": {"name": "development"}}
+    }
+    _, _, _, _, work_id, snapshot = await full_schema.admit(database, actor, job)
+    await database.execute(
+        "UPDATE jobs SET execution_lane=$2 WHERE id=$1::uuid", work_id, lane
+    )
+    row = await ManifestStore(database).by_name(
+        "WorkspaceTemplate",
+        {"kind": "Account", "name": str(actor["id"])},
+        "development",
+    )
+    document["spec"]["initialize"] = [{"command": ["false"]}]
+    await service.apply(
+        json.dumps(document),
+        actor,
+        format="json",
+        expected_versions={
+            f"WorkspaceTemplate/Account/{actor['id']}/development": row[
+                "resource_version"
+            ],
+        },
+    )
+    options = await vm_provisioning_options(
+        database, "Job", await database.get_job(work_id)
+    )
+    assert options == {**OPTIONS, "initialization": initialization_request(steps)}
+    reread = await read_execution(database, "Job", work_id)
+    assert reread["resolved"] == snapshot["resolved"]
+
+
 @pytest.mark.parametrize(
     "changes",
     [
@@ -69,8 +113,6 @@ def test_resolved_prebuilt_vm_preserves_allocation_without_changing_the_source()
         {"environment": {"image": IMAGE, "pullPolicy": "Always"}},
         {"environment": {"image": IMAGE, "pullPolicy": "Never"}},
         {"environment": {"image": IMAGE, "cache": "Rebuild"}},
-        {"initialize": []},
-        {"retention": "Retain"},
     ],
 )
 def test_unsupported_vm_recipes_are_refused_instead_of_partially_applied(changes):
@@ -135,16 +177,26 @@ async def test_job_dispatch_keeps_selected_image_and_size_after_template_edit(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("initialize", [False, True])
 async def test_session_snapshot_keeps_vm_allocation_across_unrelated_patch(
-    database, actor
+    database, actor, initialize
 ):
+    from shared.workspace_initialization import initialization_request
+
+    spec = template()["spec"]
+    expected_vm, expected_options = deepcopy(VM), deepcopy(OPTIONS)
+    if initialize:
+        spec["initialize"] = [{"command": ["mkdir", "-p", "project"]}]
+        request = initialization_request(spec["initialize"])
+        expected_vm["initialization"] = request
+        expected_options["initialization"] = request
     workspace, receipt = await select_execution_workspace(
         database,
         actor,
         role="session",
         project_id=None,
         supplied=True,
-        workspace={"template": {"inline": template()["spec"]}},
+        workspace={"template": {"inline": spec}},
     )
     thread_id = await database.create_thread(
         user_id=str(actor["id"]),
@@ -164,9 +216,11 @@ async def test_session_snapshot_keeps_vm_allocation_across_unrelated_patch(
         {"llm": {"temperature": 0.2}},
     )
     _, policy = srw_snapshot_config(prepared)
-    assert policy["workspace"]["vm"] == VM
+    assert policy["workspace"]["vm"] == expected_vm
     assert prepared["resolved"]["spec"]["execution"]["workspace"] == receipt["resolved"]
-    assert await vm_provisioning_options(database, "Session", thread) == OPTIONS
+    assert (
+        await vm_provisioning_options(database, "Session", thread) == expected_options
+    )
     with pytest.raises(HTTPException) as denied:
         await prepare_srw_session_patch(
             database,
@@ -253,3 +307,214 @@ async def test_manifest_vm_admission_obeys_the_existing_operator_gate(
         await full_schema.admit(database, user, job)
     assert denied.value.status_code == 403
     assert await database.fetchval("SELECT count(*) FROM jobs") == 0
+
+
+@pytest.fixture
+def preparation_hosting(monkeypatch):
+    for key, value in {
+        "VM_MODE": "same-cluster",
+        "VM_PERSISTENT_ROOTDISK": "true",
+        "VM_LIFECYCLE_HMAC_SECRET": "test-only-preparation-secret-32-bytes-long",
+        "VM_PREPARATION_ENABLED": "true",
+        "VM_PREPARATION_IMAGE": "registry.example/builder@sha256:" + "b" * 64,
+        "VM_PREPARATION_REGISTRY_HOSTS": '["registry.example"]',
+    }.items():
+        monkeypatch.setenv(key, value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "pull,cache", [("IfNotPresent", "Reuse"), ("Always", "Rebuild"), ("Never", "Reuse")]
+)
+async def test_preparation_is_execution_owned_and_frozen_after_template_edits(
+    database, actor, preparation_hosting, pull, cache
+):
+    document = template()
+    environment = {
+        **document["spec"]["environment"],
+        "pullPolicy": pull,
+        "cache": cache,
+        "prepare": [{"command": ["sh", "-c", "install-project-tools"]}],
+    }
+    document["spec"]["environment"] = deepcopy(environment)
+    service = ManifestResourceService(database)
+    await service.apply(json.dumps(document), actor, format="json")
+    job = full_schema.assignment(adapter="srw/v1", mode="Reported")
+    job["spec"]["execution"]["workspace"] = {
+        "template": {"ref": {"name": "development"}}
+    }
+    _, _, _, _, job_id, _ = await full_schema.admit(database, actor, job)
+    before = await vm_provisioning_options(
+        database, "Job", await database.get_job(job_id)
+    )
+    assert before["preparation"]["scope"] == {
+        "kind": "Account",
+        "uid": str(actor["id"]),
+    }
+    assert before["preparation"]["allocationId"] == job_id
+    assert before["preparation"]["steps"] == environment["prepare"]
+    stored = await ManifestStore(database).by_name(
+        "WorkspaceTemplate",
+        {"kind": "Account", "name": str(actor["id"])},
+        "development",
+    )
+    document["spec"]["environment"]["prepare"] = [{"command": ["false"]}]
+    await service.apply(
+        json.dumps(document),
+        actor,
+        format="json",
+        expected_versions={
+            f"WorkspaceTemplate/Account/{actor['id']}/development": stored[
+                "resource_version"
+            ]
+        },
+    )
+    assert (
+        await vm_provisioning_options(database, "Job", await database.get_job(job_id))
+        == before
+    )
+
+
+@pytest.mark.asyncio
+async def test_session_preparation_is_bound_to_runtime_generation(
+    database, actor, preparation_hosting
+):
+    spec = template()["spec"]
+    spec["environment"]["prepare"] = [{"command": ["touch", "/opt/ready"]}]
+    workspace, receipt = await select_execution_workspace(
+        database,
+        actor,
+        role="session",
+        project_id=None,
+        supplied=True,
+        workspace={"template": {"inline": spec}},
+    )
+    thread_id = await database.create_thread(
+        user_id=str(actor["id"]),
+        datasource_ids=[],
+        initial_metadata={"config_override": {"workspace": workspace}},
+        workspace_selection=receipt,
+    )
+    thread = await database.get_thread(thread_id)
+    options = await vm_provisioning_options(database, "Session", thread)
+    assert options["preparation"]["runtimeGeneration"] == str(
+        thread["runtime_generation"]
+    )
+    assert options["preparation"]["ownerKind"] == "session"
+    assert options["preparation"]["allocationId"] == thread_id
+
+
+def test_prepared_workspace_default_is_large_enough_to_clone(preparation_hosting):
+    spec = {"backend": "vm", "environment": {"image": IMAGE, "prepare": []}}
+    assert (
+        srw_workspace_config({"template": {"inline": spec}})["vm"]["disk_size"]
+        == "30Gi"
+    )
+    spec["resources"] = {"storage": "20Gi"}
+    with pytest.raises(HTTPException, match="smaller"):
+        srw_workspace_config({"template": {"inline": spec}})
+
+
+def test_retained_disk_reference_does_not_require_rebuilding_a_template(monkeypatch):
+    monkeypatch.setenv("VM_PREPARATION_ENABLED", "false")
+    spec = template()["spec"]
+    spec.update(retention="Retain")
+    spec["environment"]["prepare"] = [{"command": ["false"]}]
+    selected = srw_workspace_config(
+        {"instanceRef": {"uid": "11111111-1111-4111-8111-111111111111"}},
+        instance_recipe=spec,
+    )
+    assert "preparation" not in selected["vm"]
+
+
+@pytest.mark.asyncio
+async def test_legacy_override_cannot_supply_an_unadmitted_preparation():
+    with pytest.raises(HTTPException, match="admitted manifest"):
+        await vm_provisioning_options(
+            None,
+            "Job",
+            {"id": "11111111-1111-4111-8111-111111111111"},
+            fallback={
+                "workspace": {"vm": {"preparation": {"image": IMAGE, "prepare": []}}}
+            },
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lost_response", [False, True])
+async def test_session_cache_stage_does_not_create_vm_until_ready(
+    database, actor, preparation_hosting, monkeypatch, lost_response
+):
+    import httpx
+    from orchestrator.services.vm_provisioner import VMProvisioner
+
+    monkeypatch.setenv("VM_CONTROLLER_URL", "http://controller.invalid")
+    spec = template()["spec"]
+    spec["environment"]["prepare"] = [{"command": ["true"]}]
+    workspace, receipt = await select_execution_workspace(
+        database,
+        actor,
+        role="session",
+        project_id=None,
+        supplied=True,
+        workspace={"template": {"inline": spec}},
+    )
+    thread_id = await database.create_thread(
+        user_id=str(actor["id"]),
+        datasource_ids=[],
+        initial_metadata={"config_override": {"workspace": workspace}},
+        workspace_selection=receipt,
+    )
+    thread = await database.get_thread(thread_id)
+    options = await vm_provisioning_options(database, "Session", thread)
+    provisioner = VMProvisioner()
+    provisioner.connect(database)
+    responses = [
+        httpx.ReadTimeout("lost")
+        if lost_response
+        else {
+            "source": None,
+            "waiting": {
+                "status": "waiting_preparation",
+                "preparation": {"phase": "Building"},
+            },
+        },
+        {"source": {"name": "verified-cache"}, "waiting": None},
+    ]
+    provisioner.preparation_operation = AsyncMock(side_effect=responses)
+    provisioner._create_http = AsyncMock(return_value={"status": "created"})
+    try:
+        result = await provisioner.create_thread_vm(
+            thread_id,
+            **options,
+            expected_runtime_generation=str(thread["runtime_generation"]),
+            expected_agent_id=None,
+            expected_attach_token=None,
+            expected_vm_context=None,
+        )
+        assert result["status"] == "waiting_preparation"
+        current = await database.get_thread(thread_id)
+        meta = (
+            json.loads(current["metadata"])
+            if isinstance(current["metadata"], str)
+            else current["metadata"]
+        )
+        assert not meta.get("vm")
+        stage = meta["workspace_preparation"]
+        provisioner._create_http.assert_not_awaited()
+        await provisioner.poll_thread_vm(thread_id, stage["provision_generation"])
+        current = await database.get_thread(thread_id)
+        meta = (
+            json.loads(current["metadata"])
+            if isinstance(current["metadata"], str)
+            else current["metadata"]
+        )
+        assert "workspace_preparation" not in meta
+        assert (
+            meta["vm"]["preparation_wait_started_at"]
+            == stage["preparation_wait_started_at"]
+        )
+        assert meta["vm"]["provision_generation"] != stage["provision_generation"]
+        provisioner._create_http.assert_awaited_once()
+    finally:
+        await provisioner.disconnect()

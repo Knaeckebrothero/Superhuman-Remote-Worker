@@ -1,0 +1,22 @@
+# Replace the placeholder UID with the first Job's workspace_instance_id.
+# Wait for GET /api/workspace-instances/{uid} to report Detached.
+# Use the same Account or Project scope and a new Job name for each assignment.
+apiVersion: srw/v1alpha1
+kind: Job
+metadata:
+  name: next-development-assignment
+spec:
+  task:
+    text: Read workspace-plan.md from the previous assignment and continue the plan.
+  execution:
+    expert:
+      inline:
+        runtime:
+          adapter: srw/v1
+          config: {config_name: worker_base}
+    workspace:
+      instanceRef: {uid: 00000000-0000-4000-8000-000000000001}
+    connectors: {}
+  completion: {mode: Reported}
+  retry: {maxAttempts: 1}
+  timeoutSeconds: 1800

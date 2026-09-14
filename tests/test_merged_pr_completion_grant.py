@@ -407,7 +407,11 @@ class TestApproveJobGate:
             )
         )
         stack.enter_context(
-            patch("orchestrator.main._guard_completion_control", AsyncMock())
+            patch.object(
+                orchestrator.main._completion_control_boundary,
+                "guard",
+                AsyncMock(),
+            )
         )
         stack.enter_context(patch("orchestrator.main.postgres_db", db))
 
@@ -483,14 +487,15 @@ class TestApproveJobGate:
         with ExitStack() as stack:
             self._patch(stack, job, db)
             stack.enter_context(
-                patch(
-                    "orchestrator.main._claim_completion_control",
+                patch.object(
+                    orchestrator.main._completion_control_boundary,
+                    "claim",
                     AsyncMock(side_effect=RuntimeError("past the gate")),
                 )
             )
             with pytest.raises(HTTPException) as excinfo:
                 await orchestrator.main.approve_job(MagicMock(), "job-1", None)
-        # The sentinel fires only if execution reached _claim_completion_control,
+        # The sentinel fires only if execution reached the completion claim,
         # which is past the gate. What matters is that the refusal is not ours.
         assert excinfo.value.status_code != 403
 

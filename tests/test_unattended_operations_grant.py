@@ -19,6 +19,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from fastapi import HTTPException
 
+from orchestrator.routers.project_loops import ProjectLoopsDependencies
+
 PROJECT_ID = str(uuid.uuid4())
 LOOP_ID = str(uuid.uuid4())
 
@@ -48,23 +50,39 @@ def router_auth(monkeypatch):
 
 
 @pytest.fixture
-def db(monkeypatch):
-    import orchestrator.main as orch_main
-
+def db():
     db = MagicMock()
     db.user_can_run_unattended_operations = AsyncMock(return_value=False)
     db.get_active_project_loop = AsyncMock(return_value=_loop_row())
     db.update_project_loop = AsyncMock(return_value=_loop_row(status="stopped"))
     db.get_officer_thread_for_project = AsyncMock(return_value=None)
-    monkeypatch.setattr(orch_main, "postgres_db", db)
     return db
+
+
+@pytest.fixture
+def deps(db):
+    """The router's dependency object.
+
+    In the app it comes from
+    ``request.app.state.project_loops_dependencies_factory``; these tests call
+    the declarations directly, so they hand it in explicitly — the parameter's
+    ``Depends(...)`` default is never resolved off-app.
+    """
+    return ProjectLoopsDependencies(
+        store=db,
+        vector_store=MagicMock(),
+        spawn_loop_stage=AsyncMock(),
+        writeback_loop_stage=AsyncMock(),
+        resume_project_loop=AsyncMock(return_value=_loop_row()),
+        check_vm_permission=AsyncMock(),
+    )
 
 
 class TestGatedVerbs:
     """Start, resume and convert-to-officer put unattended work in motion."""
 
     @pytest.mark.asyncio
-    async def test_start_403s_without_the_grant(self, router_auth, db):
+    async def test_start_403s_without_the_grant(self, router_auth, db, deps):
         from orchestrator.routers.project_loops import (
             ProjectLoopStart,
             start_project_loop,
@@ -72,24 +90,29 @@ class TestGatedVerbs:
 
         with pytest.raises(HTTPException) as exc:
             await start_project_loop(
-                MagicMock(), PROJECT_ID, ProjectLoopStart(max_iterations=5)
+                MagicMock(),
+                PROJECT_ID,
+                ProjectLoopStart(max_iterations=5),
+                dependencies=deps,
             )
 
         assert exc.value.status_code == 403
         assert "unattended_operations" in str(exc.value.detail)
 
     @pytest.mark.asyncio
-    async def test_resume_403s_without_the_grant(self, router_auth, db):
+    async def test_resume_403s_without_the_grant(self, router_auth, db, deps):
         """Resume re-kicks the rotation, so it is a start, not a control action."""
         from orchestrator.routers.project_loops import resume_project_loop
 
         with pytest.raises(HTTPException) as exc:
-            await resume_project_loop(MagicMock(), PROJECT_ID)
+            await resume_project_loop(MagicMock(), PROJECT_ID, dependencies=deps)
 
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
-    async def test_convert_to_officer_403s_without_the_grant(self, router_auth, db):
+    async def test_convert_to_officer_403s_without_the_grant(
+        self, router_auth, db, deps
+    ):
         from orchestrator.routers.project_loops import (
             ProjectLoopScheduling,
             convert_project_loop_scheduling,
@@ -97,13 +120,18 @@ class TestGatedVerbs:
 
         with pytest.raises(HTTPException) as exc:
             await convert_project_loop_scheduling(
-                MagicMock(), PROJECT_ID, ProjectLoopScheduling(scheduling="officer")
+                MagicMock(),
+                PROJECT_ID,
+                ProjectLoopScheduling(scheduling="officer"),
+                dependencies=deps,
             )
 
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
-    async def test_the_grant_is_resolved_against_this_project(self, router_auth, db):
+    async def test_the_grant_is_resolved_against_this_project(
+        self, router_auth, db, deps
+    ):
         """Project scope is the axis an operator most wants; dropping the id
         would silently reduce the key to a user-only capability."""
         from orchestrator.routers.project_loops import (
@@ -113,7 +141,10 @@ class TestGatedVerbs:
 
         with pytest.raises(HTTPException):
             await start_project_loop(
-                MagicMock(), PROJECT_ID, ProjectLoopStart(max_iterations=5)
+                MagicMock(),
+                PROJECT_ID,
+                ProjectLoopStart(max_iterations=5),
+                dependencies=deps,
             )
 
         caller, project_id = db.user_can_run_unattended_operations.await_args.args
@@ -121,7 +152,9 @@ class TestGatedVerbs:
         assert project_id == PROJECT_ID
 
     @pytest.mark.asyncio
-    async def test_start_refuses_before_validating_the_body(self, router_auth, db):
+    async def test_start_refuses_before_validating_the_body(
+        self, router_auth, db, deps
+    ):
         """The gate runs ahead of the budget/role/workspace validation, so a
         user without the grant gets the reason that actually applies to them
         rather than a 400 about iteration budgets."""
@@ -132,7 +165,9 @@ class TestGatedVerbs:
 
         with pytest.raises(HTTPException) as exc:
             # No max_iterations and no run_until — normally a 400.
-            await start_project_loop(MagicMock(), PROJECT_ID, ProjectLoopStart())
+            await start_project_loop(
+                MagicMock(), PROJECT_ID, ProjectLoopStart(), dependencies=deps
+            )
 
         assert exc.value.status_code == 403
 
@@ -144,30 +179,32 @@ class TestHaltingIsNeverGated:
     """
 
     @pytest.mark.asyncio
-    async def test_pause_works_without_the_grant(self, router_auth, db):
+    async def test_pause_works_without_the_grant(self, router_auth, db, deps):
         from orchestrator.routers.project_loops import pause_project_loop
 
         db.update_project_loop = AsyncMock(return_value=_loop_row(status="paused"))
 
-        out = await pause_project_loop(MagicMock(), PROJECT_ID)
+        out = await pause_project_loop(MagicMock(), PROJECT_ID, dependencies=deps)
 
         assert out["status"] == "paused"
         db.user_can_run_unattended_operations.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_stop_works_without_the_grant(self, router_auth, db):
+    async def test_stop_works_without_the_grant(self, router_auth, db, deps):
         from orchestrator.routers.project_loops import stop_project_loop
 
-        out = await stop_project_loop(MagicMock(), PROJECT_ID)
+        out = await stop_project_loop(MagicMock(), PROJECT_ID, dependencies=deps)
 
         assert out["status"] == "stopped"
         db.user_can_run_unattended_operations.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_reading_the_loop_works_without_the_grant(self, router_auth, db):
+    async def test_reading_the_loop_works_without_the_grant(
+        self, router_auth, db, deps
+    ):
         from orchestrator.routers.project_loops import get_project_loop
 
-        out = await get_project_loop(MagicMock(), PROJECT_ID)
+        out = await get_project_loop(MagicMock(), PROJECT_ID, dependencies=deps)
 
         assert out["id"] == LOOP_ID
         db.user_can_run_unattended_operations.assert_not_awaited()
@@ -175,7 +212,7 @@ class TestHaltingIsNeverGated:
 
 class TestAdminBypass:
     @pytest.mark.asyncio
-    async def test_admins_are_not_stopped_by_the_gate(self, router_auth, db):
+    async def test_admins_are_not_stopped_by_the_gate(self, router_auth, db, deps):
         """Admins short-circuit inside the DB helper, so the router gate must
         consult it rather than reading a resolved grants dict itself."""
         from orchestrator.routers.project_loops import _require_unattended_operations

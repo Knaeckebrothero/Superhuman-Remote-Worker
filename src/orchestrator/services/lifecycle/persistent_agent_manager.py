@@ -17,6 +17,7 @@ from typing import Any
 from orchestrator.services.persistent_recycler import (
     PersistentPodObservation,
     PersistentThreadRecycler,
+    read_recycle_record,
 )
 from orchestrator.services.lifecycle.types import Instance
 
@@ -81,9 +82,7 @@ class PersistentAgentInstanceManager:
             thread_id = str(row["id"])
             pod = pods_by_thread.pop(thread_id, None)
             metadata = self._metadata(row.get("metadata"))
-            recycle = self._metadata(
-                self._metadata(metadata.get("agent_pod")).get("recycle")
-            )
+            recycle = read_recycle_record(metadata)
             agent_present = row.get("agent_row_id") is not None
             pod_uid = ""
             labels: dict[str, str] = {}
@@ -269,6 +268,7 @@ class PersistentAgentInstanceManager:
                          t.metadata->'agent_pod'->>'pod_name'
                              LIKE 'persistent-%'
                          OR t.metadata->'agent_pod' ? 'recycle'
+                         OR t.metadata ? 'persistent_recycle'
                          OR t.id = ANY($1::uuid[])
                        )
                  ORDER BY t.id

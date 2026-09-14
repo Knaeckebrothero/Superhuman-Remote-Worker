@@ -473,6 +473,92 @@ async def test_zero_hook_job_process_exit_and_reapply_never_replays(database, ac
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["created", "processing", "completed"])
+async def test_job_metadata_edits_preserve_execution_and_require_current_version(
+    database, actor, phase
+):
+    (
+        execution,
+        process,
+        resources,
+        assignment,
+        first,
+        work_id,
+        execution_id,
+    ) = await native_execution(database, actor)
+    if phase != "created":
+        await execution.reconcile_one(execution_id)
+    if phase == "completed":
+        process.exit()
+        await execution.reconcile_one(execution_id)
+    assert (await database.get_job(work_id))["status"] == phase
+    snapshot = await database.fetchval(
+        "SELECT row_to_json(s)::text FROM srw_execution_specs s"
+    )
+    launches = len(process.launches)
+    edited = deepcopy(assignment)
+    edited["metadata"].update(
+        tags=["development", "reviewed"],
+        labels={"team": "toolchain"},
+        annotations={"example.com/note": "Classification only"},
+    )
+
+    with pytest.raises(HTTPException) as caught:
+        await apply(resources, edited, actor)
+    assert caught.value.status_code == 409
+
+    updated = await apply(resources, edited, actor, expected_versions=expected(first))
+    original, current = first["resources"][0], updated["resources"][0]
+    assert current["uid"] == original["uid"]
+    assert current["resourceVersion"] == original["resourceVersion"] + 1
+    assert current["revision"] == original["revision"]
+    for field in ("tags", "labels", "annotations"):
+        assert current["resource"]["metadata"][field] == edited["metadata"][field]
+    assert updated["executions"] == first["executions"]
+    assert (await database.get_job(work_id))["status"] == phase
+    assert len(process.launches) == launches
+    assert (
+        await database.fetchval(
+            "SELECT row_to_json(s)::text FROM srw_execution_specs s"
+        )
+        == snapshot
+    )
+
+    with pytest.raises(HTTPException) as caught:
+        await apply(resources, assignment, actor, expected_versions=expected(first))
+    assert caught.value.status_code == 409
+    repeated = await apply(
+        resources, edited, actor, expected_versions=expected(updated)
+    )
+    assert not repeated["resources"][0]["changed"]
+    assert repeated["executions"] == first["executions"]
+    if phase == "completed":
+        await execution.reconcile()
+        assert len(process.launches) == launches
+
+
+@pytest.mark.asyncio
+async def test_job_metadata_edit_cannot_change_the_admitted_spec(database, actor):
+    _, _, resources, assignment, first, _, _ = await native_execution(database, actor)
+    original = await database.fetchval(
+        "SELECT row_to_json(s)::text FROM srw_execution_specs s"
+    )
+    edited = deepcopy(assignment)
+    edited["metadata"]["tags"] = ["reviewed"]
+    edited["spec"]["task"]["text"] = "A different assignment"
+    with pytest.raises(HTTPException) as caught:
+        await apply(resources, edited, actor, expected_versions=expected(first))
+    assert caught.value.status_code == 409
+    assert await database.fetchval("SELECT count(*) FROM srw_resource_revisions") == 1
+    assert (
+        await database.fetchval(
+            "SELECT row_to_json(s)::text FROM srw_execution_specs s"
+        )
+        == original
+    )
+
+
+@pytest.mark.asyncio
 async def test_retry_requires_terminal_observation_and_cleanup(database, actor):
     execution, process, _, _, _, work_id, execution_id = await native_execution(
         database, actor, max_attempts=2
@@ -677,6 +763,23 @@ async def test_reapply_job_keeps_original_referenced_generation(database, actor)
     await apply(resources, change, actor, expected_versions=versions)
     repeated = await apply(resources, job(), actor)
     assert repeated["executions"] == first["executions"]
+    assert (
+        await database.fetchval("SELECT resolved::text FROM srw_execution_specs")
+        == original
+    )
+    classified = job()
+    classified["metadata"]["tags"] = ["reviewed"]
+    job_versions = {
+        key: value for key, value in expected(first).items() if key.startswith("Job/")
+    }
+    updated = await apply(resources, classified, actor, expected_versions=job_versions)
+    assert updated["executions"] == first["executions"]
+    current = await resources.store.by_id(updated["resources"][0]["uid"])
+    assert (
+        current["resolved"]["spec"]["execution"]["expert"]["inline"]["runtime"]["image"]
+        == expert()["spec"]["runtime"]["image"]
+    )
+    assert current["resolved"]["metadata"]["tags"] == ["reviewed"]
     assert (
         await database.fetchval("SELECT resolved::text FROM srw_execution_specs")
         == original

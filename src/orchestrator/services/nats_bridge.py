@@ -293,6 +293,7 @@ class NatsBridge:
         set_provisioning: bool = True,
         provision_generation: str | None = None,
         disk_size: Optional[str] = None,
+        initialization: dict | None = None,
     ) -> bool:
         """Publish a VM creation request.
 
@@ -352,6 +353,10 @@ class NatsBridge:
             payload["vm_image"] = vm_image
         if disk_size is not None:
             payload["disk_size"] = disk_size
+        if initialization is not None:
+            from shared.workspace_initialization import validate_initialization_request
+
+            payload["initialization"] = validate_initialization_request(initialization)
         payload = sign_payload(
             payload,
             direction="request",

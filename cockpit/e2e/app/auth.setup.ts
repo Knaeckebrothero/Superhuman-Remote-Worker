@@ -113,9 +113,26 @@ async function bootstrapCatalogAndReadiness(
     'fixture model catalog',
   );
   const enabledModels = models.filter(({ enabled }) => enabled);
-  expect(enabledModels.map(({ model_id }) => model_id).sort()).toEqual(
-    [environment.chatModel, environment.embeddingModel].sort(),
+  // `rerank` is a required capability with its own catalog slot, so an enabled
+  // rerank row is expected: this profile seeds one through `llm.seed`, and an
+  // upgraded deployment gets one from migration 0242 instead. Either way the
+  // row is still checked — it must carry the rerank capability and nothing
+  // else, and every OTHER enabled row must still be exactly the two fixture
+  // models, so a stray enabled chat model would still fail here.
+  const autoRerankRows = enabledModels.filter(({ capabilities }) =>
+    capabilities.includes('rerank'),
   );
+  for (const row of autoRerankRows) {
+    expect(row.capabilities, 'the auto-seeded rerank row carries only rerank').toEqual([
+      'rerank',
+    ]);
+  }
+  expect(
+    enabledModels
+      .filter(({ capabilities }) => !capabilities.includes('rerank'))
+      .map(({ model_id }) => model_id)
+      .sort(),
+  ).toEqual([environment.chatModel, environment.embeddingModel].sort());
 
   const chatRows = enabledModels.filter(({ model_id }) => model_id === environment.chatModel);
   const embeddingRows = enabledModels.filter(
