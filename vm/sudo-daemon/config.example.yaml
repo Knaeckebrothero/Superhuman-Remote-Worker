@@ -21,7 +21,7 @@ rate_limit:
   burst: 3
 
 timeouts:
-  nats_request: 300s       # Must be < plugin's poll() timeout (305s)
+  nats_request: 1830s       # HTTP/NATS total budget: approval TTL + 30s; plugin waits 1845s
   socket_read: 10s         # Time to read the plugin's request
   graceful_shutdown: 30s   # Wait for in-flight requests on SIGTERM
 

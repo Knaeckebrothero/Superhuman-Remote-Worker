@@ -51,6 +51,26 @@ export function categoryIcon(category: string): string {
   return CATEGORY_ICON[category] ?? 'notifications';
 }
 
+/**
+ * The command line the gate evaluated, shell-quoted on one line.
+ *
+ * `command` alone is the resolved binary — `/bin/bash` for a
+ * `sudo -u agent-host bash --login -c '…'` wrapper — so an approver reading it
+ * judges "a bare shell" instead of the script. Mirrors the orchestrator's
+ * `shared/sudo_command_line.py`: argv[0] repeats the program name by
+ * convention and is dropped when it adds nothing, kept when it differs
+ * (`busybox sh`).
+ */
+export function sudoCommandLine(req: SudoRequestRow): string {
+  const binary = (req.command ?? '').trim();
+  let argv = (req.arguments ?? []).map((a) => String(a));
+  if (argv.length && binary && (argv[0] === binary || argv[0] === binary.split('/').pop())) {
+    argv = argv.slice(1);
+  }
+  const quoted = argv.map((a) => (/^[\w@%+=:,./-]+$/.test(a) ? a : `'${a.replace(/'/g, `'\\''`)}'`));
+  return [...(binary ? [binary] : []), ...quoted].join(' ');
+}
+
 /** Risk level for sudo visual badging (presentation only). */
 export function sudoRiskLevel(req: SudoRequestRow): 'low' | 'medium' | 'high' | 'critical' {
   const cmd = req.arguments?.join(' ') || req.command || '';
@@ -188,13 +208,19 @@ export function sudoSecondsLeft(req: SudoRequestRow, now = Date.now()): number {
           } @else if (sudo(); as req) {
             <!-- ===== sudo_request ===== -->
             <div class="command-block">
-              <code>{{ req.arguments?.join(' ') || req.command }}</code>
+              <code>{{ commandLine(req) }}</code>
             </div>
             <div class="source-summary">
+              <span class="meta-label">{{ 'notifications.detail.requestId' | transloco }}</span>
+              <span class="meta-value mono">{{ req.id }}</span>
               <span class="meta-label">{{ 'notifications.detail.requestType' | transloco }}</span>
               <span class="meta-value">{{ req.request_type }}</span>
               <span class="meta-label">{{ 'notifications.detail.requestStatus' | transloco }}</span>
               <span class="meta-value">{{ req.status }}</span>
+              @if (req.expires_at) {
+                <span class="meta-label">{{ 'notifications.detail.expiresAt' | transloco }}</span>
+                <span class="meta-value mono">{{ req.expires_at }}</span>
+              }
               @if (req.vm_name) {
                 <span class="meta-label">{{ 'notifications.detail.vm' | transloco }}</span>
                 <span class="meta-value">{{ req.vm_name }}</span>
@@ -649,6 +675,8 @@ export class NotificationDetailComponent {
   readonly automation = computed(() => this.ofKind<SourceAutomation>('automation'));
   readonly user = computed(() => this.ofKind<SourceUser>('user'));
   readonly permission = computed(() => this.ofKind<SourcePermissionRequest>('permission_request'));
+
+  protected readonly commandLine = sudoCommandLine;
 
   readonly freezeSummary = computed(() => {
     const v = this.job()?.freeze_data?.['summary'];

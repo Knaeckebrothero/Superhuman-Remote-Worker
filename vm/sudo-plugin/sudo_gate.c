@@ -15,7 +15,7 @@
  *
  * Plugin options (set in /etc/sudo.conf):
  *   socket_path=/run/sudo-gated/sudo-gated.sock  — daemon socket
- *   timeout=305                                    — poll() timeout in seconds
+ *   timeout=1845                                    — poll() timeout in seconds
  *   fail_mode=deny                                 — behavior on error: "deny" or "open"
  *
  * CRITICAL: A broken plugin prevents ALL sudo usage. Always test with a
@@ -54,7 +54,7 @@
  * -------------------------------------------------------------------------- */
 
 static const char *cfg_socket_path = "/run/sudo-gated/sudo-gated.sock";
-static int         cfg_timeout_sec = 305;
+static int         cfg_timeout_sec = 1845;
 static bool        cfg_fail_open   = false;  /* false = deny on error (production) */
 
 /* --------------------------------------------------------------------------

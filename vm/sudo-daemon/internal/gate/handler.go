@@ -75,7 +75,7 @@ func NewHandler(cfg HandlerConfig) *Handler {
 func (h *Handler) ApprovalTimeout() time.Duration { return h.approvalTimeout }
 
 // Handle processes a single connection from the C plugin.
-// It reads the length-prefixed JSON request, forwards it to NATS,
+// It reads the length-prefixed JSON request, forwards it to the approver,
 // waits for the reply, and writes the response back.
 func (h *Handler) Handle(ctx context.Context, conn net.Conn) {
 	defer conn.Close()

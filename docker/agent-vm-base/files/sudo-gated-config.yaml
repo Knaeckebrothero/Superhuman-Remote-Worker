@@ -20,7 +20,8 @@ rate_limit:
   burst: 3
 
 timeouts:
-  nats_request: 300s
+  # HTTP/NATS total budget: approval TTL + 30s; plugin waits 1845s
+  nats_request: 1830s
   socket_read: 10s
   graceful_shutdown: 30s
 
