@@ -34,7 +34,12 @@
     "status": "passed",
     "workloads": 7,
     "cleanup": true,
-    "scope": "Sandbox/virtual Jobs, existing Job API selection, Session configuration generations and sandbox/virtual/none selection."
+    "record": "k3d-final-shell-srw-adapter-2026-09-14.json",
+    "sha256": "eee8e2f88abad62802f2136975ca5039b9d42961f4d3c08b2abe7665760a4726",
+    "runtimeSource": "a000c8d3936f25e3d99aa89e5968eea9dcfaabd6",
+    "startedAt": "2026-09-14T01:15:26.237968+00:00",
+    "finishedAt": "2026-09-14T01:21:08.160402+00:00",
+    "scope": "Real SRW Jobs on sandbox/virtual and stateless Sessions on sandbox/virtual/none over HTTP, SSE and referenced workspace snapshots"
   },
   "network": {
     "k3d": {
@@ -172,7 +177,7 @@
       }
     ]
   },
-  "recordedAt": "2026-09-14T01:10:30.207578+00:00",
+  "recordedAt": "2026-09-14T01:21:57.456132+00:00",
   "developmentToolSource": "36e6262ea6ef5789e54d749ebd79b5261a9f09f3",
   "developmentToolTests": {
     "passed": 104,
@@ -293,6 +298,32 @@
       "cleanup": true,
       "scope": "Real SSH/tmux and production workspace adapter; not a RunQueue or VM recovery gate."
     },
-    "purpose": "Classify a proven absent pane during raw-key send without losing the surviving shell; keep ownership/session failures fatal."
+    "purpose": "Classify a proven absent pane during raw-key send without losing the surviving shell; keep ownership/session failures fatal.",
+    "localRollout": {
+      "tiltCI": "passed",
+      "allWorkloadsHealthy": true,
+      "sourceAttestation": {
+        "expectedSHA256": "bf6f8ced5f62cf95da6191a71f60c51508a522d575fd5fa5d8fcb22be98da71f",
+        "pods": [
+          {
+            "pod": "srw-agent-stateless-fc64f6654-8v4jq",
+            "uid": "992f52d0-be75-41c4-ae69-4cea62e5394f",
+            "remoteSHA256": "bf6f8ced5f62cf95da6191a71f60c51508a522d575fd5fa5d8fcb22be98da71f",
+            "imageIDs": [
+              "srw-registry:5000/srw-agent@sha256:45d59d3ba5a7f50b57ed3a47385b906844518bf3ce0052c8ccae895e447805f8"
+            ]
+          },
+          {
+            "pod": "srw-agent-stateless-fc64f6654-bmmnh",
+            "uid": "39a0f367-d66e-4299-ae5d-3353fa264bbb",
+            "remoteSHA256": "bf6f8ced5f62cf95da6191a71f60c51508a522d575fd5fa5d8fcb22be98da71f",
+            "imageIDs": [
+              "srw-registry:5000/srw-agent@sha256:45d59d3ba5a7f50b57ed3a47385b906844518bf3ce0052c8ccae895e447805f8"
+            ]
+          }
+        ],
+        "allMatch": true
+      }
+    }
   }
 }

@@ -43,8 +43,9 @@ captures these candidate checks:
   versions, resolved contents, identical reapply and JSON/YAML exports. This is
   a same-schema rollback result with no pending firewall-enabled preparations,
   not a general database downgrade guarantee.
-- The [ordinary SRW Job/Session smoke](verification/k3d-release-srw-adapter-2026-09-14.json)
-  passed all seven workloads and cleanup.
+- The [ordinary SRW Job/Session smoke](verification/k3d-final-shell-srw-adapter-2026-09-14.json)
+  passed all seven workloads and cleanup after the final shell rollout; running
+  agent Pod source hashes match the tested backend.
 - The complete MCP/VM/harness preparation sequence passed in both
   [offline](verification/k3d-pod-firewall-prepared-srw-2026-09-14.json) and
   [online](verification/k3d-online-prepared-srw-2026-09-14.json) modes. Each run
