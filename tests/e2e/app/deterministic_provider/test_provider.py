@@ -1127,10 +1127,6 @@ async def test_unscoped_unknown_route_and_invalid_correlation_are_globally_visib
     assert overview["unscoped_unexpected_calls"] == 2
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the global provider counter does not retain safe per-request diagnostics",
-)
 async def test_each_unscoped_rejection_has_one_sanitized_diagnostic(
     control: httpx.AsyncClient,
     inference: httpx.AsyncClient,
@@ -1190,6 +1186,28 @@ async def test_each_unscoped_rejection_has_one_sanitized_diagnostic(
     assert calls[2]["correlation_run_ids"] == ["unscoped-missing"]
     assert calls[2]["active_run_ids"] == ["unscoped-a", "unscoped-b"]
     assert all(call["observed_at"].endswith("Z") for call in calls)
+
+
+async def test_reset_while_a_stream_is_pending_is_globally_visible_once(
+    store: ScenarioStore,
+    control: httpx.AsyncClient,
+) -> None:
+    run_id = "reset-pending-001"
+    await arm(control, run_id, scenario="slow-stream", chunk_delay_ms=100)
+    decision = await store.begin_call(
+        run_id=run_id,
+        endpoint="chat.completions",
+        model=CHAT_MODEL_ID,
+        stream=True,
+        consume_required=True,
+    )
+    assert (await control.delete(f"/control/scenarios/{run_id}")).status_code == 200
+    await store.finish_call(decision, "success")
+
+    overview = (await control.get("/control/scenarios")).json()
+    assert overview["unscoped_unexpected_calls"] == 1
+    assert len(overview["unscoped_calls"]) == 1
+    assert overview["unscoped_calls"][0]["outcome"] == ("scenario_reset_before_finish")
 
 
 async def test_control_state_never_retains_prompts_tool_arguments_or_headers(

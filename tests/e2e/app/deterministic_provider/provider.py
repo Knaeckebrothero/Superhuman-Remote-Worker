@@ -22,6 +22,7 @@ import time
 import uuid
 from collections import Counter
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Final, Literal
 
 from fastapi import FastAPI, Request
@@ -54,6 +55,7 @@ _CORRELATION_RE = re.compile(
     r"(?<![A-Za-z0-9_-])E2E-([A-Za-z0-9][A-Za-z0-9_-]{2,127})(?![A-Za-z0-9_-])"
 )
 _DIAGNOSTIC_MODELS = frozenset({CHAT_MODEL_ID, EMBEDDING_MODEL_ID, RERANK_MODEL_ID})
+_MAX_UNSCOPED_DIAGNOSTICS: Final = 4096
 
 
 class ArmScenarioRequest(BaseModel):
@@ -155,6 +157,7 @@ class ScenarioStore:
         self._lock = asyncio.Lock()
         self._runs: dict[str, RunState] = {}
         self._unscoped_unexpected_calls = 0
+        self._unscoped_calls: list[dict[str, Any]] = []
 
     async def arm(self, run_id: str, request: ArmScenarioRequest) -> dict[str, Any]:
         _validate_run_id(run_id)
@@ -193,9 +196,49 @@ class ScenarioStore:
                     self._serialize(self._runs[key]) for key in sorted(self._runs)
                 ],
                 "unscoped_unexpected_calls": self._unscoped_unexpected_calls,
+                "unscoped_calls_truncated": max(
+                    0,
+                    self._unscoped_unexpected_calls - len(self._unscoped_calls),
+                ),
+                "unscoped_calls": list(self._unscoped_calls),
             }
 
-    async def resolve_run(self, payload: dict[str, Any]) -> str:
+    def _record_unscoped_locked(
+        self,
+        *,
+        endpoint: str,
+        outcome: str,
+        model: Any = None,
+        stream: Any = False,
+        correlation_run_ids: set[str] | None = None,
+    ) -> None:
+        """Record one rejected/unaccounted request using safe metadata only."""
+
+        self._unscoped_unexpected_calls += 1
+        sequence = self._unscoped_unexpected_calls
+        diagnostic = {
+            "sequence": sequence,
+            "correlation_id": f"unscoped:{sequence}",
+            "observed_at": datetime.now(timezone.utc)
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z"),
+            "endpoint": endpoint,
+            "model": _diagnostic_model(model),
+            "stream": stream if isinstance(stream, bool) else False,
+            "outcome": outcome,
+            "correlation_run_ids": sorted(correlation_run_ids or ()),
+            "active_run_ids": sorted(self._runs),
+        }
+        if len(self._unscoped_calls) == _MAX_UNSCOPED_DIAGNOSTICS:
+            del self._unscoped_calls[0]
+        self._unscoped_calls.append(diagnostic)
+
+    async def resolve_run(
+        self,
+        payload: dict[str, Any],
+        *,
+        endpoint: str,
+    ) -> str:
         """Resolve one run without retaining any request content.
 
         A correlation token wins.  Calls without a token are accepted only when
@@ -205,9 +248,14 @@ class ScenarioStore:
 
         try:
             explicit_run_id = _metadata_run_id(payload)
-        except ScenarioError:
+        except ScenarioError as exc:
             async with self._lock:
-                self._unscoped_unexpected_calls += 1
+                self._record_unscoped_locked(
+                    endpoint=endpoint,
+                    outcome=exc.error_type,
+                    model=payload.get("model"),
+                    stream=payload.get("stream", False),
+                )
             raise
         discovered = _discover_run_ids(payload)
         if explicit_run_id:
@@ -215,7 +263,13 @@ class ScenarioStore:
 
         async with self._lock:
             if len(discovered) > 1:
-                self._unscoped_unexpected_calls += 1
+                self._record_unscoped_locked(
+                    endpoint=endpoint,
+                    outcome="ambiguous_run",
+                    model=payload.get("model"),
+                    stream=payload.get("stream", False),
+                    correlation_run_ids=discovered,
+                )
                 raise ScenarioError(
                     409,
                     "ambiguous_run",
@@ -224,7 +278,13 @@ class ScenarioStore:
             if discovered:
                 run_id = next(iter(discovered))
                 if run_id not in self._runs:
-                    self._unscoped_unexpected_calls += 1
+                    self._record_unscoped_locked(
+                        endpoint=endpoint,
+                        outcome="scenario_not_armed",
+                        model=payload.get("model"),
+                        stream=payload.get("stream", False),
+                        correlation_run_ids=discovered,
+                    )
                     raise ScenarioError(
                         409,
                         "scenario_not_armed",
@@ -234,7 +294,17 @@ class ScenarioStore:
             if len(self._runs) == 1:
                 return next(iter(self._runs))
 
-            self._unscoped_unexpected_calls += 1
+            outcome = (
+                "run_correlation_required_no_active_scenario"
+                if not self._runs
+                else "run_correlation_required_multiple_active_scenarios"
+            )
+            self._record_unscoped_locked(
+                endpoint=endpoint,
+                outcome=outcome,
+                model=payload.get("model"),
+                stream=payload.get("stream", False),
+            )
             message = (
                 "No E2E scenario is armed."
                 if not self._runs
@@ -283,7 +353,13 @@ class ScenarioStore:
                 target = next(iter(self._runs.values()))
 
             if target is None:
-                self._unscoped_unexpected_calls += 1
+                self._record_unscoped_locked(
+                    endpoint=endpoint,
+                    outcome=outcome,
+                    model=model,
+                    stream=stream,
+                    correlation_run_ids=candidates,
+                )
                 return
             self._record_immediate(
                 target,
@@ -309,7 +385,13 @@ class ScenarioStore:
         async with self._lock:
             state = self._runs.get(run_id)
             if state is None:
-                self._unscoped_unexpected_calls += 1
+                self._record_unscoped_locked(
+                    endpoint=endpoint,
+                    outcome="scenario_reset_before_start",
+                    model=model,
+                    stream=stream,
+                    correlation_run_ids={run_id},
+                )
                 raise ScenarioError(
                     409,
                     "scenario_not_armed",
@@ -400,6 +482,14 @@ class ScenarioStore:
             if state is None:
                 # Reset is allowed only after clients are closed; if a caller violates
                 # that order there is intentionally no recreated/tombstoned state.
+                # Keep the successful/rejected HTTP request globally visible instead.
+                self._record_unscoped_locked(
+                    endpoint=decision.endpoint,
+                    outcome="scenario_reset_before_finish",
+                    model=decision.model,
+                    stream=decision.stream,
+                    correlation_run_ids={decision.run_id},
+                )
                 return
             pending = state.pending.pop(decision.sequence, None)
             if pending is None:
@@ -576,7 +666,7 @@ def create_inference_app(
             payload = await _accounted_json_object(
                 request, store=store, endpoint="chat.completions"
             )
-            run_id = await store.resolve_run(payload)
+            run_id = await store.resolve_run(payload, endpoint="chat.completions")
             try:
                 model = _required_string(payload, "model")
                 messages = payload.get("messages")
@@ -769,7 +859,7 @@ def create_inference_app(
             payload = await _accounted_json_object(
                 request, store=store, endpoint="embeddings"
             )
-            run_id = await store.resolve_run(payload)
+            run_id = await store.resolve_run(payload, endpoint="embeddings")
             try:
                 model = _required_string(payload, "model")
                 raw_input = payload.get("input")
@@ -813,7 +903,7 @@ def create_inference_app(
             payload = await _accounted_json_object(
                 request, store=store, endpoint="rerank"
             )
-            run_id = await store.resolve_run(payload)
+            run_id = await store.resolve_run(payload, endpoint="rerank")
             try:
                 model = _required_string(payload, "model")
                 query = payload.get("query")

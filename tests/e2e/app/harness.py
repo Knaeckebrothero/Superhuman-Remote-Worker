@@ -3366,14 +3366,73 @@ class ApplicationE2EHarness:
             assert forward.local_port is not None
             root = f"http://127.0.0.1:{forward.local_port}/control/scenarios/{urllib.parse.quote(run_id)}"
             headers = {"Authorization": f"Bearer {bundle.provider_control_token}"}
-            state_status, state_body = _http_request(
-                root, headers=headers, expected=(200, 404)
+            try:
+                settle_seconds = float(
+                    os.environ.get("APP_E2E_PROVIDER_SETTLE_SECONDS", "5")
+                )
+                timeout_seconds = float(
+                    os.environ.get("APP_E2E_PROVIDER_SETTLE_TIMEOUT_SECONDS", "120")
+                )
+            except ValueError as exc:
+                raise HarnessError(
+                    "provider settlement bounds must be numeric"
+                ) from exc
+            if settle_seconds < 0 or timeout_seconds <= 0:
+                raise HarnessError("provider settlement bounds are invalid")
+
+            deadline = time.monotonic() + timeout_seconds
+            stable_since: float | None = None
+            stable_call_count: int | None = None
+            state: dict[str, Any] | None = None
+            while time.monotonic() < deadline:
+                state_status, state_body = _http_request(
+                    root, headers=headers, expected=(200, 404)
+                )
+                if state_status == 404:
+                    return
+                candidate = _json_body(state_body, label="provider cleanup state")
+                if not isinstance(candidate, dict):
+                    raise HarnessError("provider cleanup state is invalid")
+                if candidate.get("unexpected_count") != 0:
+                    raise HarnessError("provider scenario ended with unexpected calls")
+                call_count = len(candidate.get("calls", []))
+                settled = (
+                    candidate.get("pending_calls") == 0
+                    and candidate.get("remaining_required_responses") == 0
+                )
+                now = time.monotonic()
+                if settled and call_count == stable_call_count:
+                    stable_since = stable_since if stable_since is not None else now
+                    if now - stable_since >= settle_seconds:
+                        state = candidate
+                        break
+                else:
+                    stable_since = now if settled else None
+                    stable_call_count = call_count if settled else None
+                time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+            if state is None:
+                raise HarnessError(
+                    "provider scenario did not settle with all required calls consumed"
+                )
+
+            overview_root = root.rsplit("/", maxsplit=1)[0]
+            _overview_status, overview_body = _http_request(
+                overview_root, headers=headers
             )
-            if state_status == 404:
-                return
-            state = _json_body(state_body, label="provider cleanup state")
-            if not isinstance(state, dict) or state.get("unexpected_count") != 0:
-                raise HarnessError("provider scenario ended with unexpected calls")
+            overview = _json_body(overview_body, label="provider cleanup overview")
+            if (
+                not isinstance(overview, dict)
+                or overview.get("unscoped_unexpected_calls") != 0
+                or overview.get("unscoped_calls_truncated") != 0
+                or overview.get("unscoped_calls") != []
+            ):
+                raise HarnessError(
+                    "provider cleanup found rejected or unscoped requests"
+                )
+            write_private_json(
+                self._run_dir(ledger) / "provider-cleanup-state.json",
+                {"scenario": state, "overview": overview},
+            )
             _http_request(root, method="DELETE", headers=headers, expected=(200,))
 
     def cleanup(self, ledger: Mapping[str, Any]) -> None:

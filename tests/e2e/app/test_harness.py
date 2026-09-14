@@ -1092,6 +1092,113 @@ def test_cleanup_rejects_nonexact_ledger_ids_before_any_request(
         application.cleanup(ledger)
 
 
+def test_provider_cleanup_waits_for_required_background_work_before_reset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cleanup_clock
+) -> None:
+    run_id = "provider-cleanup-run"
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    ledger = {
+        "kubeconfig": str(tmp_path / "kubeconfig.yaml"),
+        "run_dir": str(run_dir),
+    }
+    resource_ledger = {"run_id": run_id}
+    states = [
+        {
+            "pending_calls": 1,
+            "remaining_required_responses": 1,
+            "unexpected_count": 0,
+            "calls": [],
+        },
+        {
+            "pending_calls": 0,
+            "remaining_required_responses": 0,
+            "unexpected_count": 0,
+            "calls": [{"outcome": "success"}],
+        },
+        {
+            "pending_calls": 0,
+            "remaining_required_responses": 0,
+            "unexpected_count": 0,
+            "calls": [{"outcome": "success"}],
+        },
+    ]
+    overview = {
+        "runs": [states[-1]],
+        "unscoped_unexpected_calls": 0,
+        "unscoped_calls_truncated": 0,
+        "unscoped_calls": [],
+    }
+    requests: list[tuple[str, str]] = []
+
+    def fake_request(url: str, **kwargs):
+        method = kwargs.get("method", "GET")
+        requests.append((method, url))
+        if method == "DELETE":
+            return 200, b"{}"
+        if url.endswith(f"/{run_id}"):
+            return 200, json.dumps(states.pop(0)).encode()
+        return 200, json.dumps(overview).encode()
+
+    application = harness.ApplicationE2EHarness(tmp_path / "state")
+    monkeypatch.setattr(
+        application,
+        "_load_secrets",
+        lambda _ledger: type("Secrets", (), {"provider_control_token": "token"})(),
+    )
+    monkeypatch.setattr(harness, "_http_request", fake_request)
+    monkeypatch.setenv("APP_E2E_PROVIDER_SETTLE_SECONDS", "1")
+    application._cleanup_provider_run(ledger, resource_ledger)
+
+    assert requests[-1][0] == "DELETE"
+    receipt = json.loads((run_dir / "provider-cleanup-state.json").read_text())
+    assert receipt == {"scenario": overview["runs"][0], "overview": overview}
+
+
+def test_provider_cleanup_refuses_global_unscoped_rejections(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cleanup_clock
+) -> None:
+    run_id = "provider-unscoped-run"
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    ledger = {
+        "kubeconfig": str(tmp_path / "kubeconfig.yaml"),
+        "run_dir": str(run_dir),
+    }
+    settled = {
+        "pending_calls": 0,
+        "remaining_required_responses": 0,
+        "unexpected_count": 0,
+        "calls": [{"outcome": "success"}],
+    }
+    overview = {
+        "runs": [settled],
+        "unscoped_unexpected_calls": 1,
+        "unscoped_calls_truncated": 0,
+        "unscoped_calls": [{"outcome": "run_correlation_required"}],
+    }
+    requests: list[str] = []
+
+    def fake_request(url: str, **kwargs):
+        requests.append(kwargs.get("method", "GET"))
+        if url.endswith(f"/{run_id}"):
+            return 200, json.dumps(settled).encode()
+        return 200, json.dumps(overview).encode()
+
+    application = harness.ApplicationE2EHarness(tmp_path / "state")
+    monkeypatch.setattr(
+        application,
+        "_load_secrets",
+        lambda _ledger: type("Secrets", (), {"provider_control_token": "token"})(),
+    )
+    monkeypatch.setattr(harness, "_http_request", fake_request)
+    monkeypatch.setenv("APP_E2E_PROVIDER_SETTLE_SECONDS", "0")
+
+    with pytest.raises(harness.HarnessError, match="rejected or unscoped requests"):
+        application._cleanup_provider_run(ledger, {"run_id": run_id})
+    assert "DELETE" not in requests
+
+
 def test_exact_cleanup_request_receives_the_full_remaining_lifecycle_budget(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
