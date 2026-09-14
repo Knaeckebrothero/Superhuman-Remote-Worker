@@ -325,6 +325,7 @@ PATCH  /api/notifications/{notification_id}/read                                
 GET    /api/officers                                                                    gated:require_approved_user
 GET    /api/persistent/threads                                                          gated:require_approved_user
 POST   /api/persistent/threads                                                          gated:require_approved_user
+POST   /api/persistent/threads/preview                                                  gated:require_approved_user
 DELETE /api/persistent/threads/{thread_id}                                              gated:require_thread_owner
 GET    /api/persistent/threads/{thread_id}                                              gated:require_thread_owner
 PATCH  /api/persistent/threads/{thread_id}                                              gated:require_thread_owner

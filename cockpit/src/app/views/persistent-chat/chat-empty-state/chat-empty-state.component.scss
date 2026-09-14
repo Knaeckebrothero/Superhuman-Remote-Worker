@@ -122,6 +122,8 @@
 
 .draft-connectors {
   display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
   justify-content: center;
   margin-top: 12px;
   min-height: 28px;
@@ -153,6 +155,26 @@
   cursor: pointer;
   text-decoration: underline;
 }
+
+.draft-recovery {
+  align-self: center;
+  margin-inline: auto;
+  .empty-title { font-size: 20px; }
+  .empty-subtitle { font-size: 14px; }
+}
+
+.draft-workspace {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  font-size: 14px;
+  color: var(--text-secondary);
+  app-select { max-width: 100%; }
+}
+
+.draft-retry { margin-top: 16px; }
 
 /* Below ~480px the two-column grid leaves ~90px per label and the longest
    chip wraps to five lines; one column of single-line chips is shorter. */

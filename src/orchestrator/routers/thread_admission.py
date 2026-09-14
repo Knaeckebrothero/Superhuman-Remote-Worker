@@ -1,4 +1,4 @@
-"""``/api/persistent/threads`` — session create and list.
+"""``/api/persistent/threads`` — session creation, preview and list.
 
 Extracted from ``orchestrator.main`` (R1.B06 lane B). Two route declarations,
 moved with their handler names, paths, methods, parameter order and docstrings
@@ -9,6 +9,8 @@ Neither declaration carried ``tags``, ``response_model``, ``status_code`` or a
 ``dependencies`` list, and neither acquires one here. Auth is performed inside
 the handler (``require_approved_user``) exactly as before, which is why it
 arrives through the dependency object rather than through ``Depends``.
+
+The read-only preview added for quick chat shares the creation admission plan.
 """
 
 from __future__ import annotations
@@ -31,6 +33,28 @@ def get_thread_admission_dependencies(
 ) -> thread_admission.ThreadAdmissionDependencies:
     """Resolve collaborators only from the application handling this request."""
     return request.app.state.thread_admission_dependencies_factory()
+
+
+@router.post("/api/persistent/threads/preview")
+async def preview_thread_creation(
+    request_body: ThreadCreateRequest, request: Request
+) -> dict[str, Any]:
+    """Resolve session workspace and connector selection without creating work.
+
+    Uses the create path's read-only admission plan. The returned IDs are a
+    reviewable selection, not authorization: creation revalidates them against
+    the current project, workspace and connector policies.
+    """
+    dependencies = get_thread_admission_dependencies(request)
+    user = await dependencies.require_approved_user(request, dependencies.store)
+    plan = await thread_admission.resolve_thread_creation_plan(
+        request_body, user, dependencies=dependencies
+    )
+    return {
+        "project_ids": plan.effective_project_ids,
+        "workspace_backend": plan.thread_backend,
+        "datasource_ids": plan.selected_datasource_ids,
+    }
 
 
 @router.post("/api/persistent/threads")
@@ -76,5 +100,6 @@ __all__ = [
     "create_thread",
     "get_thread_admission_dependencies",
     "list_threads",
+    "preview_thread_creation",
     "router",
 ]

@@ -188,6 +188,9 @@ function createHarness() {
             return of({});
         }),
         post: vi.fn().mockImplementation((url: string) => {
+            if (url.endsWith('/persistent/threads/preview')) return of({
+                project_ids: [], workspace_backend: 'virtual', datasource_ids: [],
+            });
             if (isThreadsCreate(url)) return createSubject.asObservable();
             if (isInput(url)) {
                 inputPosts += 1;

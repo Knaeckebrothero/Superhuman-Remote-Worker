@@ -1347,15 +1347,16 @@ export class PersistentChatService {
   // owner's defaults (knowledge-base/knowledge/features/instant_landing_session.md). Distinct
   // from the composer's persisted text "draft" (localStorage).
   readonly isDraftSession = signal(false);
-  // Default project prefetched on draft entry; attached to the create body
-  // if it resolved by first-send time (best-effort).
+  // Resolve the default project and session admission before enabling Send.
   private draftProjectIds: string[] | null = null;
   /** Stable, reviewable default selection for the landing draft. Null while
-   * the default-project/eligibility context is unresolved. */
+   * the default-project/workspace context is unresolved. */
   readonly draftDatasourceIds = signal<string[] | null>(null);
   readonly draftDefaultsLoading = signal(false);
   readonly draftDefaultsError = signal(false);
   readonly draftConnectorsEnabled = signal(true);
+  /** Empty means follow the project/account defaults, including workspace recipes. */
+  readonly draftWorkspaceBackend = signal('');
   private draftDefaultsGeneration = 0;
   private creatingFromDraft = false;
 
@@ -2177,8 +2178,9 @@ export class PersistentChatService {
     this.error.set(null);
     this.creatingFromDraft = false;
     this.draftConnectorsEnabled.set(true);
+    this.draftWorkspaceBackend.set('');
     this.isDraftSession.set(true);
-    // Resolve the default project and eligible connector defaults as one
+    // Resolve the default project and compatible connector defaults as one
     // fail-closed context. The composer remains usable for drafting, but
     // Send is disabled until the user has seen this stable preselection.
     void this.retryDraftDefaults();
@@ -2203,23 +2205,29 @@ export class PersistentChatService {
       if (generation !== this.draftDefaultsGeneration || !this.isDraftSession()) return;
       const defaultProject = projects.find((project) => project.is_default);
       this.draftProjectIds = defaultProject ? [defaultProject.id] : [];
-      if (this.capabilities.datasourceScopeAutoAttachAvailable()) {
-        const eligible = await firstValueFrom(
-          this.api.getEligibleDatasources(this.draftProjectIds),
-        );
-        if (generation !== this.draftDefaultsGeneration || !this.isDraftSession()) return;
-        this.draftDatasourceIds.set(
-          eligible.filter((ds) => ds.default_selected).map((ds) => ds.id),
-        );
+      const body = this.draftCreationContext();
+      if (this.capabilities.datasourceScopeAutoAttachAvailable() && this.draftConnectorsEnabled()) {
+        body['use_datasource_defaults'] = true;
       } else {
-        // Loading, failed, or absent rollout capability: no implicit
-        // connector selection. The explicit draft array remains [].
-        this.draftDatasourceIds.set([]);
+        // An opt-out or unavailable rollout capability is an explicit empty
+        // selection, even if the server enables defaults on omission.
+        body['datasource_ids'] = [];
       }
-    } catch {
+      // Admission resolves the workspace before selecting implicit defaults.
+      // Keep the reviewed IDs explicit at create so later auto-attach edits
+      // cannot add a connector the user did not see here.
+      const preview = await firstValueFrom(
+        this.http.post<{project_ids: string[]; workspace_backend: string; datasource_ids: string[]}>(
+          `${environment.apiUrl}/persistent/threads/preview`, body,
+        ),
+      );
+      if (generation !== this.draftDefaultsGeneration || !this.isDraftSession()) return;
+      this.draftProjectIds = preview.project_ids;
+      this.draftDatasourceIds.set(preview.datasource_ids);
+    } catch (err) {
       if (generation !== this.draftDefaultsGeneration || !this.isDraftSession()) return;
       this.draftDefaultsError.set(true);
-      this.error.set(this.transloco.translate('chat.draft.defaultsFailed'));
+      this.error.set(this.errors.translate(err, 'chat.draft.defaultsFailed'));
     } finally {
       if (generation === this.draftDefaultsGeneration) {
         this.draftDefaultsLoading.set(false);
@@ -2229,6 +2237,28 @@ export class PersistentChatService {
 
   setDraftConnectorsEnabled(enabled: boolean): void {
     this.draftConnectorsEnabled.set(enabled);
+    void this.retryDraftDefaults();
+  }
+
+  setDraftWorkspaceBackend(backend: string | null): void {
+    if (!['', 'virtual', 'sandbox', 'vm', 'none'].includes(backend ?? '')) return;
+    this.draftWorkspaceBackend.set(backend ?? '');
+    void this.retryDraftDefaults();
+  }
+
+  private draftCreationContext(): Record<string, any> {
+    const body: Record<string, any> = {};
+    if (this.draftProjectIds?.length) body['project_ids'] = this.draftProjectIds;
+    const backend = this.draftWorkspaceBackend();
+    if (backend) body['config_override'] = {workspace: {backend}};
+    return body;
+  }
+
+  /** Retry the retained queue without appending a second copy of its message. */
+  async retryDraftSession(): Promise<void> {
+    const first = this.outbox()[0];
+    if (!this.isDraftSession() || !first || first.threadId) return;
+    await this._createFromDraftSession(first.displayContent);
   }
 
   /**
@@ -2247,9 +2277,9 @@ export class PersistentChatService {
     )
       return;
     this.creatingFromDraft = true;
+    const generation = this.draftDefaultsGeneration;
     this.isDraftSession.set(false);
-    const body: Record<string, any> = { title: draftTitleFrom(firstMessage) };
-    if (this.draftProjectIds?.length) body['project_ids'] = this.draftProjectIds;
+    const body: Record<string, any> = {...this.draftCreationContext(), title: draftTitleFrom(firstMessage)};
     body['datasource_ids'] = this.draftConnectorsEnabled() ? (this.draftDatasourceIds() ?? []) : [];
     try {
       await this.createAndConnect(body);
@@ -2257,9 +2287,11 @@ export class PersistentChatService {
       // createAndConnect surfaced the error state and re-showed the
       // queued bubbles; re-enter draft so the next send retries the
       // create with the same outbox.
-      if (this.threadId() === null) this.isDraftSession.set(true);
+      if (generation === this.draftDefaultsGeneration && this.threadId() === null) {
+        this.isDraftSession.set(true);
+      }
     } finally {
-      this.creatingFromDraft = false;
+      if (generation === this.draftDefaultsGeneration) this.creatingFromDraft = false;
     }
   }
 
@@ -2281,6 +2313,7 @@ export class PersistentChatService {
     this.threadId.set(null);
     this.usage.set(null);
     this.isCreating.set(true);
+    this.error.set(null);
     this.connectionState.set('connecting');
     this.startupPhase.set('creating');
     // A VM-backed create pays a cold KubeVirt boot — flag it up front so the
@@ -2312,6 +2345,7 @@ export class PersistentChatService {
         this.isCreating.set(false);
         this.connectionState.set('error');
         this.startupPhase.set(null);
+        this.error.set(this.errors.translate(e, 'errors.sessions.createFailed'));
         // The reset at the top of createAndConnect wiped the optimistic
         // bubbles; re-show any queued sends on the error screen so the user
         // doesn't have a silently-retained outbox with no visible messages.
@@ -4518,6 +4552,9 @@ export class PersistentChatService {
   async sendMessage(content: string): Promise<boolean> {
     const trimmed = content.trim();
     const queued = this.pendingAttachments();
+    if (this.isDraftSession() && (
+      this.draftDefaultsLoading() || this.draftDefaultsError() || this.draftDatasourceIds() === null
+    )) return false;
 
     // Soft End has already closed runtime admission but has not yet settled
     // into a resumable lifecycle. Never queue a message that could leak into

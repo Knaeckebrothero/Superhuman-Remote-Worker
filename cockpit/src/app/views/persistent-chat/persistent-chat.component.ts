@@ -1702,6 +1702,22 @@ export function clearDraft(threadId: string | null): void {
           }
         }
 
+        @if (chat.isDraftSession() && chat.outbox().length > 0) {
+          <app-chat-empty-state
+            variant="recovery"
+            [suggestions]="[]"
+            [connectorsLoading]="chat.draftDefaultsLoading()"
+            [connectorsError]="chat.draftDefaultsError()"
+            [connectorsEnabled]="chat.draftConnectorsEnabled()"
+            [datasourceCount]="chat.draftDatasourceIds()?.length ?? 0"
+            [workspaceBackend]="chat.draftWorkspaceBackend()"
+            (connectorsToggled)="chat.setDraftConnectorsEnabled($event)"
+            (workspaceChanged)="chat.setDraftWorkspaceBackend($event)"
+            (retryRequested)="chat.retryDraftDefaults()"
+            (sendRetried)="chat.retryDraftSession()"
+          />
+        }
+
         <!-- Parked unit: the input was accepted but nothing can claim it until
              it is retried (attach failures, a maintenance interruption, a
              settlement failure). Rendered from the durable queue block, so a

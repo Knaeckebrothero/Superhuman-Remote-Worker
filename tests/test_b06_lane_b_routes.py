@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
@@ -201,6 +202,7 @@ class TestRouteInventory:
             for method in route.methods
         }
         assert seen == {
+            ("/api/persistent/threads/preview", "POST", "preview_thread_creation"),
             ("/api/persistent/threads", "POST", "create_thread"),
             ("/api/persistent/threads", "GET", "list_threads"),
             (
@@ -233,6 +235,163 @@ class TestRouteInventory:
             assert route.tags == []
             assert route.status_code is None
             assert route.dependencies == []
+
+
+class TestCreationPreview:
+    @staticmethod
+    def dependencies(backend="virtual"):
+        repository = {
+            "id": "66666666-6666-4666-8666-666666666666",
+            "type": "repository",
+            "created_by": USER["id"],
+            "auto_attach": True,
+            "scope_mode": "all",
+            "policy_revision": 1,
+            "project_ids": [],
+        }
+        compatible = {**repository, "id": GENERATION, "type": "postgresql"}
+        foreign = {**compatible, "id": THREAD, "created_by": THREAD}
+        out_of_scope = {
+            **compatible,
+            "id": "77777777-7777-4777-8777-777777777777",
+            "scope_mode": "projects",
+        }
+        rows = [repository, compatible, foreign, out_of_scope]
+        deps = _admission_deps(
+            resolve_session_account_defaults=AsyncMock(
+                return_value={"workspace": {"backend": backend}}
+            ),
+            store={
+                "get_user": AsyncMock(return_value={**USER, "is_approved": True}),
+                "user_is_member_of_projects": AsyncMock(return_value=True),
+                "list_default_datasource_candidates": AsyncMock(return_value=rows),
+                "get_datasource_policy_rows": AsyncMock(return_value=[repository]),
+                "get_project": AsyncMock(return_value={"id": THREAD}),
+                "get_user_role_in_project": AsyncMock(return_value="owner"),
+            },
+        )
+        return deps, repository
+
+    @pytest.mark.parametrize("backend", ["virtual", "none", "sandbox", "vm"])
+    def test_defaults_follow_effective_workspace_and_scope_without_creating_work(
+        self, backend
+    ):
+        deps, repository = self.dependencies(backend)
+        response = _client(admission=deps).post(
+            "/api/persistent/threads/preview", json={"use_datasource_defaults": True}
+        )
+        assert response.status_code == 200, response.text
+        assert response.json() == {
+            "project_ids": [],
+            "workspace_backend": backend,
+            "datasource_ids": (
+                [repository["id"], GENERATION]
+                if backend in ("sandbox", "vm")
+                else [GENERATION]
+            ),
+        }
+        deps.store.create_thread.assert_not_awaited()
+        deps.store.replace_thread_mounts.assert_not_awaited()
+        deps.provision_or_assign.assert_not_awaited()
+        deps.send_session_attach.assert_not_awaited()
+        deps.schedule_stateless_workspace_ensure.assert_not_called()
+
+    def test_project_default_and_explicit_selection_use_the_create_resolver(
+        self, monkeypatch
+    ):
+        from orchestrator.services import manifest_projects
+
+        project = {
+            "id": THREAD,
+            "kind": "Project",
+            "linked_id": THREAD,
+            "revision": 1,
+            "dependencies": [],
+            "resolved": {
+                "spec": {
+                    "defaults": {"workspace": "code"},
+                    "resources": {
+                        "workspaces": {"code": {"inline": {"backend": "sandbox"}}}
+                    },
+                }
+            },
+        }
+        monkeypatch.setattr(
+            manifest_projects,
+            "active_project_resource",
+            AsyncMock(return_value=project),
+        )
+        deps, repository = self.dependencies()
+        client = _client(admission=deps)
+        body = {"project_ids": [THREAD], "use_datasource_defaults": True}
+        response = client.post("/api/persistent/threads/preview", json=body)
+        assert response.status_code == 200, response.text
+        assert response.json()["workspace_backend"] == "sandbox"
+        assert repository["id"] in response.json()["datasource_ids"]
+        explicit = client.post(
+            "/api/persistent/threads/preview", json={**body, "workspace": None}
+        )
+        assert explicit.status_code == 200, explicit.text
+        assert explicit.json()["workspace_backend"] == "none"
+        assert explicit.json()["datasource_ids"] == [GENERATION]
+        deps.store.create_thread.assert_not_awaited()
+
+    def test_explicit_repository_is_still_refused_and_opt_out_is_empty(self):
+        from orchestrator.services.thread_datasource_authorization import (
+            ThreadDatasourceAuthorizationDependencies,
+            authorize_thread_datasource_selection,
+        )
+
+        deps, repository = self.dependencies()
+
+        async def authorize(user, ids, **kwargs):
+            return await authorize_thread_datasource_selection(
+                user,
+                ids,
+                **kwargs,
+                dependencies=ThreadDatasourceAuthorizationDependencies(
+                    store=deps.store, thread_project_ids=AsyncMock(return_value=[])
+                ),
+            )
+
+        from dataclasses import replace
+
+        deps = replace(deps, authorize_thread_datasource_selection=authorize)
+        client = _client(admission=deps)
+        rejected = client.post(
+            "/api/persistent/threads/preview",
+            json={"datasource_ids": [repository["id"]]},
+        )
+        assert rejected.status_code == 400
+        assert rejected.json() == {
+            "detail": "Repository and credential connectors require a sandbox or VM workspace"
+        }
+        empty = client.post(
+            "/api/persistent/threads/preview", json={"datasource_ids": []}
+        )
+        assert empty.status_code == 200, empty.text
+        assert empty.json()["datasource_ids"] == []
+        deps.store.list_default_datasource_candidates.assert_not_awaited()
+
+    def test_auth_and_project_authority_precede_preview(self):
+        deps, _ = self.dependencies()
+        deps.require_approved_user.side_effect = HTTPException(401, "Not authenticated")
+        response = _client(admission=deps).post(
+            "/api/persistent/threads/preview", json={}
+        )
+        assert response.status_code == 401
+        deps.store.get_user_settings.assert_not_awaited()
+        deps.require_approved_user.side_effect = None
+        deps.authorize_thread_project_ids.side_effect = HTTPException(
+            403, "Project access denied"
+        )
+        response = _client(admission=deps).post(
+            "/api/persistent/threads/preview",
+            json={"project_ids": [THREAD], "use_datasource_defaults": True},
+        )
+        assert response.status_code == 403
+        deps.store.get_user_settings.assert_not_awaited()
+        deps.store.list_default_datasource_candidates.assert_not_awaited()
 
 
 class TestCreate:
