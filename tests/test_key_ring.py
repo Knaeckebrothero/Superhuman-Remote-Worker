@@ -67,10 +67,10 @@ class TestMaskKey:
         assert _mask_key("sk-abcdef1234567890") == "sk-abcde..."
 
     def test_short_key(self):
-        assert _mask_key("sk-ab") == "sk-a..."
+        assert _mask_key("sk-ab") == "..."
 
     def test_exact_eight(self):
-        assert _mask_key("12345678") == "1234..."
+        assert _mask_key("12345678") == "..."
 
     def test_longer_than_eight(self):
         assert _mask_key("123456789") == "12345678..."

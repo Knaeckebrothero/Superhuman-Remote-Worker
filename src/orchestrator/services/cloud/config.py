@@ -15,6 +15,7 @@ See §4.2 of ``knowledge-base/knowledge/features/main_cloud_abstraction.md``.
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Annotated, Literal, Optional, Union
 
@@ -438,6 +439,26 @@ def missing_secret_envs(
                 }
             )
     return missing
+
+
+def warn_main_cloud_missing_secret_config(
+    missing: list[dict], *, logger: logging.Logger
+) -> None:
+    """Warn about absent cloud credentials without logging any configuration value.
+
+    ``missing`` can contain an operator-provided ``credentials_ref`` identity.
+    It is only used as a presence signal here; the warning keeps static cloud,
+    environment, and schema context for operators without copying that identity
+    or the active backend identifier into a log record.
+    """
+    if not missing:
+        return
+    logger.warning(
+        "The active main cloud backend has required secret environment "
+        "configuration unset and is running on built-in DEV credentials; it "
+        "will fail at the first cloud call. Check the configured backend's "
+        "required credential fields and set them via Helm/Vault."
+    )
 
 
 def main_cloud_routing_snapshot(settings: MainCloudConfig) -> dict:
