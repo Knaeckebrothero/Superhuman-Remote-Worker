@@ -106,6 +106,27 @@ def harness():
     return Harness()
 
 
+@pytest.fixture
+def pat_token_vector(monkeypatch):
+    """Synthetic known-answer vector; production must still request 256 bits.
+
+    PATs are random bearer tokens, not human passwords. Keep an exact SHA-256
+    assertion without treating a response field as password input to a hash.
+    """
+    requested_sizes = []
+
+    def random_token(size):
+        requested_sizes.append(size)
+        return "A" * 43  # Base64url encoding of 32 zero bytes, without padding.
+
+    monkeypatch.setattr(access_token_operations.secrets, "token_urlsafe", random_token)
+    yield (
+        "ak_" + "A" * 43,
+        "8207331e1808af9d67b4814f60f30bd2e84fe7b51766fb6296296c732c489907",
+    )
+    assert requested_sizes == [32]
+
+
 def _mcp_row(**over):
     row = {
         "id": UUID("00000000-0000-0000-0000-0000000000c1"),
@@ -718,7 +739,9 @@ async def test_pat_scopes_are_deduplicated_and_sorted_before_storage(harness):
 
 
 @pytest.mark.asyncio
-async def test_pat_creation_returns_the_plaintext_once_and_stores_its_hash(harness):
+async def test_pat_creation_returns_the_plaintext_once_and_stores_its_hash(
+    harness, pat_token_vector
+):
     recorded = {}
 
     async def _create(**kwargs):
@@ -735,8 +758,9 @@ async def test_pat_creation_returns_the_plaintext_once_and_stores_its_hash(harne
     )
 
     token = result["token"]
-    assert token.startswith("ak_")
-    assert recorded["token_hash"] == hashlib.sha256(token.encode("ascii")).hexdigest()
+    expected_token, expected_digest = pat_token_vector
+    assert token == expected_token
+    assert recorded["token_hash"] == expected_digest
     assert recorded["token_prefix"] == token[:12]
     assert recorded["last_four"] == token[-4:]
     assert "token_hash" not in result
@@ -778,7 +802,9 @@ async def test_revoking_a_pat_that_is_not_yours_is_a_404(harness):
 
 
 @pytest.mark.asyncio
-async def test_rotation_mints_a_new_secret_and_is_owner_scoped(harness):
+async def test_rotation_mints_a_new_secret_and_is_owner_scoped(
+    harness, pat_token_vector
+):
     recorded = {}
 
     async def _rotate(**kwargs):
@@ -791,10 +817,11 @@ async def test_rotation_mints_a_new_secret_and_is_owner_scoped(harness):
     )
 
     token = result["token"]
-    assert token.startswith("ak_")
+    expected_token, expected_digest = pat_token_vector
+    assert token == expected_token
     assert recorded["old_id"] == "old-id"
     assert recorded["user_id"] == str(USER_ID)
-    assert recorded["token_hash"] == hashlib.sha256(token.encode("ascii")).hexdigest()
+    assert recorded["token_hash"] == expected_digest
     # Name, scopes and expiry are copied by the store from the source row —
     # a rotation that re-derived them here could silently widen a token.
     assert "scopes" not in recorded

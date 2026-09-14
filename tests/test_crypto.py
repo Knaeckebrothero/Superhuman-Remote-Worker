@@ -26,6 +26,27 @@ def key_b64(monkeypatch):
     crypto.reset_cipher_cache()
 
 
+class TestCredentialFingerprint:
+    def test_stable_and_sensitive_to_plaintext(self, key_b64):
+        first = crypto.credential_fingerprint("synthetic credential")
+        assert first == crypto.credential_fingerprint("synthetic credential")
+        assert first != crypto.credential_fingerprint("changed credential")
+        assert first.startswith("hmac-sha256:")
+        assert len(first.removeprefix("hmac-sha256:")) == 64
+
+    def test_key_rotation_changes_fingerprint(self, monkeypatch):
+        _set_key(monkeypatch, "a" * 32)
+        first = crypto.credential_fingerprint("synthetic credential")
+        _set_key(monkeypatch, "b" * 32)
+        assert first != crypto.credential_fingerprint("synthetic credential")
+
+    @pytest.mark.parametrize("key", [None, "", "too-short"])
+    def test_missing_or_invalid_key_fails_closed(self, monkeypatch, key):
+        _set_key(monkeypatch, key)
+        with pytest.raises(crypto.EncryptionKeyError):
+            crypto.credential_fingerprint("synthetic credential")
+
+
 class TestRoundTrip:
     def test_round_trip_preserves_plaintext(self, key_b64):
         plaintext = "sk-proj-abcdefghijklmnop"

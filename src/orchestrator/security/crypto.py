@@ -23,6 +23,7 @@ than silently storing plaintext.
 from __future__ import annotations
 
 import base64
+import hmac
 import os
 import secrets
 from functools import lru_cache
@@ -79,9 +80,8 @@ def _decode_key(raw: str) -> bytes:
     )
 
 
-@lru_cache(maxsize=1)
-def get_cipher() -> AESGCM:
-    """Return the singleton AES-GCM cipher, loading the key on first call."""
+def _load_key() -> bytes:
+    """Load the deployment key without exposing it in errors or logs."""
     raw = os.getenv(ENV_VAR)
     if raw is None:
         raise EncryptionKeyError(
@@ -90,7 +90,27 @@ def get_cipher() -> AESGCM:
             f"`python -c 'import secrets,base64; "
             f"print(base64.b64encode(secrets.token_bytes(32)).decode())'`"
         )
-    return AESGCM(_decode_key(raw))
+    return _decode_key(raw)
+
+
+@lru_cache(maxsize=1)
+def get_cipher() -> AESGCM:
+    """Return the singleton AES-GCM cipher, loading the key on first call."""
+    return AESGCM(_load_key())
+
+
+def credential_fingerprint(plaintext: str) -> str:
+    """Stable, keyed change detector for credentials, including weak secrets.
+
+    A database-only leak must not provide an offline guessing oracle alongside
+    encrypted credentials. Derive a separate HMAC key from APP_ENCRYPTION_KEY;
+    the domain separates fingerprinting from encryption and other key uses.
+    Rotation changes the fingerprint, causing managed Helm rows to reconcile.
+    This is not a password verifier.
+    """
+    key = hmac.digest(_load_key(), b"srw:credential-fingerprint:v1", "sha256")
+    digest = hmac.digest(key, plaintext.encode("utf-8"), "sha256").hex()
+    return f"hmac-sha256:{digest}"
 
 
 def reset_cipher_cache() -> None:

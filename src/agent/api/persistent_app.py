@@ -3159,10 +3159,10 @@ def _load_expert_config(config_name: str):
         authored_llm_keys,
         load_agent_config_from_dict,
         load_and_merge_config,
-        resolve_config_path,
+        resolve_bundled_config_path,
     )
 
-    config_path, deployment_dir = resolve_config_path(config_name)
+    config_path, deployment_dir = resolve_bundled_config_path(config_name)
     merged_config_data = load_and_merge_config(config_path)
     # The leaf's own llm keys are explicit for the matrix (for a role root
     # such as `session_base`, the overlay + expert_base pair).

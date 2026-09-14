@@ -32,7 +32,7 @@ from shared.runtime.core.loader import (
     normalize_llm_tiers,
     prune_ignored_keys,
     reroot_extends,
-    resolve_config_path,
+    resolve_bundled_config_path,
     serialize_resolved_config,
     strip_loader_owned_keys,
 )
@@ -139,7 +139,7 @@ def resolve_config(
     role = expert_type if expert_type in ROLE_ROOTS else None
     if role is not None and canonical_config_name(base_config_name) in ROOT_NAMES:
         base_config_name = ROLE_ROOTS[role]
-    base_path, deployment_dir = resolve_config_path(base_config_name)
+    base_path, deployment_dir = resolve_bundled_config_path(base_config_name)
     if expert_row and expert_row.get("harness_asset_name"):
         # Asset selection supplies prompt/matrix/skill files only. The saved
         # Expert's actual base and authored leaf remain its sole configuration
@@ -147,7 +147,7 @@ def resolve_config(
         from shared.runtime.core.srw_manifest_config import validate_srw_asset_name
 
         asset_name = validate_srw_asset_name(expert_row["harness_asset_name"])
-        _asset_path, deployment_dir = resolve_config_path(asset_name)
+        _asset_path, deployment_dir = resolve_bundled_config_path(asset_name)
         if not deployment_dir:
             raise ValueError("SRW harness asset_name does not select installed assets")
 
@@ -171,7 +171,7 @@ def resolve_config(
             # Same re-rooting rule the loader applies to a chain link: a link
             # to any root becomes the requested role's overlay.
             parent_name, parent_role = reroot_extends(str(raw_leaf["$extends"]), role)
-            parent_path, _ = resolve_config_path(parent_name)
+            parent_path, _ = resolve_bundled_config_path(parent_name)
             bundled_leaf = dict(raw_leaf)
             bundled_leaf.pop("$extends", None)
             # Read straight off disk, so it bypasses load_and_merge_config's

@@ -104,6 +104,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -115,6 +116,7 @@ from typing import Any, Iterable
 import yaml
 
 from orchestrator.database.postgres import PostgresDB
+from orchestrator.security.crypto import credential_fingerprint
 from shared.helm_provenance import (
     RECONCILE_MANIFEST_KEY,
     SOURCE_DEFAULT,
@@ -423,6 +425,17 @@ def load_payload(path: Path) -> dict[str, Any]:
     return data
 
 
+def _credential_value_hash(value: Any) -> str:
+    """Canonical Helm digest protected by the deployment's credential key.
+
+    Unlike public model/default declarations, endpoint credentials may be
+    low-entropy secrets. Keep their change detector keyed, as their stored
+    plaintext is already protected by APP_ENCRYPTION_KEY.
+    """
+    canonical = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+    return credential_fingerprint(canonical)
+
+
 async def _seed_api_keys(
     db: PostgresDB, entries: Iterable[dict[str, Any]], report: SeedReport
 ) -> None:
@@ -442,7 +455,7 @@ async def _seed_api_keys(
             )
             continue
         label = entry.get("label")
-        declared_hash = value_hash({"api_key": api_key, "label": label})
+        declared_hash = _credential_value_hash({"api_key": api_key, "label": label})
         reconcile = _wants_reconcile(entry)
         if reconcile:
             report.manifest["systemApiKeys"].append(provider)
@@ -528,7 +541,7 @@ async def _seed_endpoints(
         declares_key = any(
             entry.get(k) for k in ("apiKey", "api_key", "apiKeyEnv", "api_key_env")
         )
-        declared_hash = value_hash(
+        declared_hash = _credential_value_hash(
             {
                 "base_url": base_url,
                 "api_key": api_key if (api_key or not declares_key) else "<unresolved>",

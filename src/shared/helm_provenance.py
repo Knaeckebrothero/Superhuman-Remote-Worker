@@ -65,10 +65,12 @@ def provenance_from_breadcrumb(seeded_from: str | None) -> str:
 
 
 def value_hash(value: Any) -> str:
-    """Stable digest of a declared value (any JSON-serialisable shape).
+    """Stable digest of a non-secret declaration (any JSON-serialisable shape).
 
     Canonical JSON (sorted keys, no whitespace) so two renders of the same
     values.yaml hash identically regardless of key order.
+    Credential-bearing seed entries use the seeder's keyed digest instead;
+    an unkeyed hash would allow offline guessing of low-entropy credentials.
     """
     canonical = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()

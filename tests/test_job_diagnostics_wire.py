@@ -185,10 +185,11 @@ def test_level_and_grep_filters_are_reported(tmp_path):
     assert body["lines"] == ["2026-07-15 10:00:00 - src.graph - ERROR - kaboom"]
 
 
-def test_an_invalid_level_is_a_400(tmp_path):
+@pytest.mark.parametrize("level", ["LOUD", "ERROR|INFO", ".*", "(A+)+$", "ERROR\\n"])
+def test_an_invalid_level_is_a_400(tmp_path, level):
     _write_job_log(tmp_path, "anything")
     wire = _wire(tmp_path=tmp_path)
-    resp = wire.client.get(f"/api/jobs/{JOB_ID}/logs", params={"level": "LOUD"})
+    resp = wire.client.get(f"/api/jobs/{JOB_ID}/logs", params={"level": level})
     assert resp.status_code == 400
     assert "Must be DEBUG, INFO, WARNING, or ERROR" in resp.json()["detail"]
 

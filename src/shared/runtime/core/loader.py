@@ -5993,6 +5993,26 @@ def resolve_config_path(config_name: str) -> tuple[str, Optional[str]]:
     return (str(single_file_config), None)
 
 
+def resolve_bundled_config_path(config_name: str) -> tuple[str, Optional[str]]:
+    """Resolve a request's config selector within the installed config tree.
+
+    The CLI resolver also accepts operator-supplied external files. Requests
+    may only select installed assets, including legacy relative YAML paths.
+    Resolve symlinks before containment checks and before returning paths.
+    """
+    config_path, deployment_dir = resolve_config_path(config_name)
+    root = (get_project_root() / "config").resolve()
+    path = Path(config_path).resolve()
+    if not path.is_relative_to(root):
+        raise ValueError("Config must select an asset inside the installed config tree")
+    if deployment_dir is not None:
+        directory = Path(deployment_dir).resolve()
+        if not directory.is_relative_to(root):
+            raise ValueError("Config assets must stay inside the installed config tree")
+        deployment_dir = str(directory)
+    return str(path), deployment_dir
+
+
 def _root_name_for_path(config_path: str) -> Optional[str]:
     """The public root name whose file ``config_path`` is, else ``None``."""
     try:

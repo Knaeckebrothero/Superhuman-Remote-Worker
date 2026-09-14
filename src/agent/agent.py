@@ -2970,12 +2970,12 @@ class UniversalAgent:
                 authored_llm_keys,
                 load_and_merge_config,
                 load_agent_config_from_dict,
-                resolve_config_path,
+                resolve_bundled_config_path,
             )
 
             expert_name = metadata["config_name"]
             try:
-                config_path, deployment_dir = resolve_config_path(expert_name)
+                config_path, deployment_dir = resolve_bundled_config_path(expert_name)
                 logger.info(f"Loading expert config '{expert_name}' from {config_path}")
                 merged_config_data = load_and_merge_config(config_path)
 

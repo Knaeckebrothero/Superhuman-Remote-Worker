@@ -90,8 +90,9 @@ def filter_log_lines(
         # Both formats occur: local dev files use the text formatter
         # ("… - name - LEVEL - …"); archived pod logs are JSON lines
         # ('"level": "LEVEL"'), possibly prefixed with kubelet timestamps.
+        safe_level = re.escape(level_upper)
         pattern = re.compile(
-            rf"^\d{{4}}-\d{{2}}-\d{{2}}\s+\d{{2}}:\d{{2}}:\d{{2}}\s+-\s+\S+\s+-\s+{level_upper}\s+-"
+            rf"^\d{{4}}-\d{{2}}-\d{{2}}\s+\d{{2}}:\d{{2}}:\d{{2}}\s+-\s+\S+\s+-\s+{safe_level}\s+-"
         )
         json_tokens = (f'"level": "{level_upper}"', f'"level":"{level_upper}"')
         all_lines = [

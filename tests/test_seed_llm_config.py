@@ -17,6 +17,7 @@ from orchestrator.schemas.provider_catalog import VALID_DEFAULT_MODEL_KINDS
 from orchestrator.seed.llm_config import (
     DEFAULT_PIN_CAPABILITY_BY_KIND,
     SEEDED_FROM_TAG,
+    _credential_value_hash,
     load_payload,
     seed,
 )
@@ -239,7 +240,7 @@ class TestSeedApiKeys:
                         {
                             "provider": matching_provider,
                             "source": "helm",
-                            "helm_value_hash": value_hash(
+                            "helm_value_hash": _credential_value_hash(
                                 {"api_key": "key", "label": None}
                             ),
                         }
@@ -1032,6 +1033,37 @@ def _model_fields(**overrides):
 
 
 class TestReconcileKeys:
+    def test_credential_digest_is_canonical_and_keyed(self, monkeypatch):
+        value = {"api_key": "synthetic", "label": "Main"}
+        monkeypatch.setenv("APP_ENCRYPTION_KEY", "a" * 32)
+        first = _credential_value_hash(value)
+        assert first == _credential_value_hash(
+            {"label": "Main", "api_key": "synthetic"}
+        )
+        assert first.startswith("hmac-sha256:")
+        monkeypatch.setenv("APP_ENCRYPTION_KEY", "b" * 32)
+        assert first != _credential_value_hash(value)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("old_hash", [None, "0" * 64])
+    async def test_managed_legacy_digest_is_replaced(self, old_hash):
+        db = _fake_db(
+            existing_api_keys=[
+                {"provider": "openai", "source": "helm", "helm_value_hash": old_hash}
+            ]
+        )
+        await seed(
+            db,
+            {
+                "systemApiKeys": [
+                    {"provider": "openai", "apiKey": "synthetic", "reconcile": True}
+                ]
+            },
+        )
+        assert db.upsert_system_api_key.await_args.kwargs["helm_value_hash"].startswith(
+            "hmac-sha256:"
+        )
+
     @pytest.mark.asyncio
     async def test_flag_absent_keeps_insert_only(self):
         db = _fake_db(existing_api_keys=[{"provider": "openai", "source": "ui"}])
@@ -1062,7 +1094,7 @@ class TestReconcileKeys:
         kwargs = db.upsert_system_api_key.await_args.kwargs
         assert kwargs["api_key"] == "sk-new"
         assert kwargs["source"] == "helm"
-        assert kwargs["helm_value_hash"] == value_hash(
+        assert kwargs["helm_value_hash"] == _credential_value_hash(
             {"api_key": "sk-new", "label": None}
         )
         assert report.reconciled == [("systemApiKeys", "openai")]
@@ -1072,7 +1104,7 @@ class TestReconcileKeys:
 
     @pytest.mark.asyncio
     async def test_reconciled_key_unchanged_is_a_noop(self):
-        h = value_hash({"api_key": "sk-same", "label": "Main"})
+        h = _credential_value_hash({"api_key": "sk-same", "label": "Main"})
         db = _fake_db(
             existing_api_keys=[
                 {"provider": "openai", "source": "helm", "helm_value_hash": h}
@@ -1103,7 +1135,7 @@ class TestReconcileKeys:
         await seed(db, {"systemApiKeys": [{"provider": "openai", "apiKey": "sk-x"}]})
         kwargs = db.upsert_system_api_key.await_args.kwargs
         assert kwargs["source"] == "helm"
-        assert kwargs["helm_value_hash"] == value_hash(
+        assert kwargs["helm_value_hash"] == _credential_value_hash(
             {"api_key": "sk-x", "label": None}
         )
 
@@ -1188,7 +1220,7 @@ class TestReconcileEndpoints:
 
     @pytest.mark.asyncio
     async def test_unchanged_reconciled_endpoint_is_a_noop(self):
-        h = value_hash(
+        h = _credential_value_hash(
             {"base_url": "https://old", "api_key": "k", "transport_kind": None}
         )
         db = _fake_db(
