@@ -1454,7 +1454,12 @@ def _strip_markdown_for_speech(text: str) -> str:
         line = re.sub(r"^\s{0,3}>\s?", "", line)  # blockquotes
         line = re.sub(r"^\s*[-*+]\s+", "", line)  # bullets
         line = re.sub(r"^\s*\d+[.)]\s+", "", line)  # ordered list
-        if re.fullmatch(r"\s*([-*_])\1{2,}\s*", line):  # horizontal rule
+        stripped_line = line.strip()
+        if (  # horizontal rule
+            re.fullmatch(r"-{3,}", stripped_line)
+            or re.fullmatch(r"\*{3,}", stripped_line)
+            or re.fullmatch(r"_{3,}", stripped_line)
+        ):
             continue
         out_lines.append(line)
     t = "\n".join(out_lines)

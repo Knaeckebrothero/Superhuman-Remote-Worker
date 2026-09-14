@@ -218,7 +218,7 @@ def _entry_field_names(entry: Any) -> str:
     return ", ".join(names) or "none"
 
 
-def _resolve_secret_value(entry: dict[str, Any], *, context: str) -> str | None:
+def _resolve_secret_value(entry: dict[str, Any]) -> str | None:
     """Resolve an ``apiKey`` from an inline string or an ``apiKeyEnv`` reference.
 
     Returns None when neither field is set or the env var is empty. The
@@ -234,9 +234,8 @@ def _resolve_secret_value(entry: dict[str, Any], *, context: str) -> str | None:
         value = os.environ.get(env_name)
         if not value:
             logger.warning(
-                "%s: env var %s is unset or empty — secret not resolved",
-                context,
-                env_name,
+                "configured API-key environment reference is unset or empty — "
+                "secret not resolved"
             )
             return None
         return value
@@ -401,10 +400,8 @@ def _record_reconcile(
     if previous_source == SOURCE_UI:
         report.reverted.append((section, identity))
         logger.warning(
-            "%s[%s]: admin edit reverted — the entry is declared with "
-            "reconcile: true, so Helm's value wins on every upgrade",
-            section,
-            identity,
+            "admin edit reverted — a Helm-declared entry has reconcile enabled, "
+            "so Helm's value wins on every upgrade"
         )
 
 
@@ -438,11 +435,10 @@ async def _seed_api_keys(
                 _entry_field_names(entry),
             )
             continue
-        api_key = _resolve_secret_value(entry, context=f"systemApiKeys[{provider}]")
+        api_key = _resolve_secret_value(entry)
         if not api_key:
             logger.warning(
-                "skipping systemApiKeys[%s] — no apiKey / apiKeyEnv resolved",
-                provider,
+                "skipping system API-key entry — no apiKey / apiKeyEnv resolved"
             )
             continue
         label = entry.get("label")
@@ -454,16 +450,14 @@ async def _seed_api_keys(
         if current is not None:
             if not reconcile:
                 report.api_keys_skipped.append(provider)
-                logger.info("api key for %s already present — skipped", provider)
+                logger.info("system API-key entry already present — skipped")
                 continue
             if (
                 current.get("source") == SOURCE_HELM
                 and current.get("helm_value_hash") == declared_hash
             ):
                 report.api_keys_skipped.append(provider)
-                logger.info(
-                    "api key for %s matches the declared value — skipped", provider
-                )
+                logger.info("system API-key entry matches the declared value — skipped")
                 continue
 
         await db.upsert_system_api_key(
@@ -477,10 +471,10 @@ async def _seed_api_keys(
         )
         if current is None:
             report.api_keys_seeded.append(provider)
-            logger.info("seeded system api key for %s", provider)
+            logger.info("seeded system API-key entry")
         else:
             _record_reconcile(report, "systemApiKeys", provider, current.get("source"))
-            logger.info("reconciled system api key for %s", provider)
+            logger.info("reconciled system API-key entry")
 
 
 async def _seed_endpoints(
@@ -527,7 +521,7 @@ async def _seed_endpoints(
         existing = by_label.get(label)
         if existing is None and transport_kind == SUBSCRIPTION_PROXY_TRANSPORT:
             existing = subscription_row
-        api_key = _resolve_secret_value(entry, context=f"systemEndpoints[{label}]")
+        api_key = _resolve_secret_value(entry)
         # A declared-but-unresolved credential (empty Secret key, unset env)
         # must never be mistaken for "keyless": reconcile then leaves the
         # stored key alone and only re-applies the URL.
