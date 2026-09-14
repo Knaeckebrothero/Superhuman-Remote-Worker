@@ -609,6 +609,60 @@ def test_runtime_bindings_do_not_replace_frozen_model_or_mutate_snapshot():
     assert blob == original
 
 
+@pytest.mark.parametrize("workspace", ["vm", "denied-sandbox"])
+def test_workspace_sudo_policy_survives_frozen_srw_delivery(workspace):
+    from orchestrator.services.job_workspace_runtime import (
+        apply_sticky_sudo_denial,
+        inject_vm_workspace_config,
+    )
+
+    blob = {
+        "agent": {
+            "llm": {"model": "admitted"},
+            "workspace": {"backend": "sandbox"},
+            "shell": {"sudo_action": "freeze", "max_tabs": 4},
+        }
+    }
+    policy = deepcopy(blob["agent"])
+    original = deepcopy((blob, policy))
+    override = {
+        "llm": {"model": "changed-after-admission"},
+        "shell": {"max_tabs": 99},
+    }
+    if workspace == "vm":
+        override = inject_vm_workspace_config(
+            override, {"status": "ready", "ssh_host": "authorized-vm"}
+        )
+        expected_action = "allow"
+    else:
+        override["workspace"] = {"backend": "sandbox"}
+        override = apply_sticky_sudo_denial(
+            {
+                "context": {
+                    "sudo_denial": {
+                        "denied": True,
+                        "decided_by": "operator",
+                        "reason": "Use a local virtual environment",
+                    }
+                }
+            },
+            override,
+        )
+        expected_action = "block"
+
+    delivered, checked = snapshots.apply_srw_delivery_bindings(blob, policy, override)
+    for settings in (delivered["agent"], checked):
+        assert settings["shell"]["sudo_action"] == expected_action
+        assert settings["shell"]["max_tabs"] == 4
+        assert settings["llm"]["model"] == "admitted"
+        if workspace == "denied-sandbox":
+            assert (
+                settings["shell"]["sudo_block_message"]
+                == override["shell"]["sudo_block_message"]
+            )
+    assert (blob, policy) == original
+
+
 @pytest.mark.asyncio
 async def test_connection_binding_is_task_local():
     outer, other = Connection(), Connection()
@@ -1001,7 +1055,7 @@ async def test_resume_preflight_checks_frozen_policy_without_live_expert(monkeyp
     db = SimpleNamespace(fetchrow=AsyncMock(return_value=frozen))
     check = AsyncMock(side_effect=main.GrantDenied(["revoked model grant"]))
     monkeypatch.setattr(main, "postgres_db", db)
-    monkeypatch.setattr(main, "_guard_completion_control", AsyncMock())
+    monkeypatch.setattr(main._completion_control_boundary, "guard", AsyncMock())
     monkeypatch.setattr(main, "_user_experts_enabled", AsyncMock(return_value=True))
     monkeypatch.setattr(main, "_enforce_dispatch_grants", check)
     monkeypatch.setattr(

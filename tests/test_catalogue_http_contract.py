@@ -298,7 +298,7 @@ async def test_defaults_clear_has_actor_and_null_wire_value(catalogue):
     assert response.status_code == 200
     assert response.json() == {"kind": "chat", "model": None}
     catalogue.store.set_default_llm_model.assert_awaited_once_with(
-        "chat", None, updated_by=ADMIN_ID
+        "chat", None, updated_by=ADMIN_ID, source="ui"
     )
 
 
@@ -314,7 +314,7 @@ async def test_model_patch_distinguishes_null_from_omission_and_zero(catalogue):
     )
     assert response.status_code == 200
     catalogue.store.update_model.assert_awaited_once_with(
-        ROW_ID, context_window=0, params_json=None, enabled=False
+        ROW_ID, context_window=0, params_json=None, enabled=False, source="ui"
     )
     catalogue.store.get_model.assert_not_awaited()
     row = response.json()
@@ -573,6 +573,7 @@ async def test_provider_router_uses_the_application_handling_each_request():
     stores = []
     for provider in ("openai", "anthropic"):
         store = MagicMock()
+        store.get_system_setting = AsyncMock(return_value=None)
         store.list_system_api_keys = AsyncMock(
             return_value=[
                 {

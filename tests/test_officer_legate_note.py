@@ -168,20 +168,57 @@ async def test_a_held_officer_with_no_live_pod_is_reported_held_not_queued():
 
 from unittest.mock import MagicMock  # noqa: E402
 
-import orchestrator.main as orch_main  # noqa: E402
 from fastapi import HTTPException  # noqa: E402
-from orchestrator.main import OfficerNoteRequest, send_project_officer_note  # noqa: E402
+from orchestrator.routers import officers as officers_router  # noqa: E402
+from orchestrator.routers.officers import send_project_officer_note  # noqa: E402
+from orchestrator.schemas.officer_post import OfficerNoteRequest  # noqa: E402
+from orchestrator.services.officer_post_lifecycle import (  # noqa: E402
+    OfficerPostLifecycleDependencies,
+)
+from orchestrator.services.officer_post_policy import (  # noqa: E402
+    OfficerPostPolicyDependencies,
+)
 
 
 @pytest.fixture
-def endpoint_db(monkeypatch):
-    db = SimpleNamespace(
+def endpoint_db():
+    return SimpleNamespace(
         get_officer_thread_for_project=AsyncMock(return_value=_thread()),
         get_pending_officer_timer=AsyncMock(return_value=None),
         enqueue_session_wake_event=AsyncMock(return_value=True),
     )
-    monkeypatch.setattr(orch_main, "postgres_db", db)
-    return db
+
+
+@pytest.fixture
+def delivery():
+    """The wake service's note delivery is a dependency field now, so the stub
+    goes on the dependency object rather than on ``orchestrator.main``."""
+    return AsyncMock(return_value="live")
+
+
+@pytest.fixture
+def endpoint_deps(endpoint_db, delivery) -> OfficerPostLifecycleDependencies:
+    return OfficerPostLifecycleDependencies(
+        store=endpoint_db,
+        persistent_provisioner=MagicMock(),
+        persistent_thread_recycler=None,
+        policy=OfficerPostPolicyDependencies(auto_pull_release_enabled=lambda: False),
+        kick_officer_event_drain=MagicMock(),
+        deliver_officer_note=delivery,
+        create_thread=AsyncMock(),
+        end_thread_flow=AsyncMock(),
+    )
+
+
+@pytest.fixture
+def endpoint_request(endpoint_deps):
+    """The request the route reads its dependencies from — the note endpoint is
+    driven through its real declaration so the owner gate stays covered."""
+    request = MagicMock()
+    request.app.state.officer_post_lifecycle_dependencies_factory = (
+        lambda: endpoint_deps
+    )
+    return request
 
 
 @pytest.fixture
@@ -192,29 +229,22 @@ def as_project_owner(monkeypatch):
             {"name": "Better Resavio"},
         )
     )
-    monkeypatch.setattr(orch_main, "require_project_owner", gate)
+    monkeypatch.setattr(officers_router, "require_project_owner", gate)
     return gate
-
-
-@pytest.fixture
-def delivery(monkeypatch):
-    stub = AsyncMock(return_value="live")
-    monkeypatch.setattr(orch_main, "_deliver_officer_note", stub)
-    return stub
 
 
 @pytest.mark.asyncio
 async def test_the_note_endpoint_sits_behind_project_owner(
-    monkeypatch, endpoint_db, delivery
+    monkeypatch, endpoint_request, delivery
 ):
     monkeypatch.setattr(
-        orch_main,
+        officers_router,
         "require_project_owner",
         AsyncMock(side_effect=HTTPException(status_code=403, detail="owner required")),
     )
     with pytest.raises(HTTPException) as exc:
         await send_project_officer_note(
-            MagicMock(), PROJECT_ID, OfficerNoteRequest(message="hello")
+            endpoint_request, PROJECT_ID, OfficerNoteRequest(message="hello")
         )
     assert exc.value.status_code == 403
     delivery.assert_not_awaited()
@@ -222,12 +252,12 @@ async def test_the_note_endpoint_sits_behind_project_owner(
 
 @pytest.mark.asyncio
 async def test_a_vacant_post_409s_instead_of_swallowing_the_note(
-    endpoint_db, as_project_owner, delivery
+    endpoint_db, endpoint_request, as_project_owner, delivery
 ):
     endpoint_db.get_officer_thread_for_project = AsyncMock(return_value=None)
     with pytest.raises(HTTPException) as exc:
         await send_project_officer_note(
-            MagicMock(), PROJECT_ID, OfficerNoteRequest(message="hello")
+            endpoint_request, PROJECT_ID, OfficerNoteRequest(message="hello")
         )
     assert exc.value.status_code == 409
     assert "vacant" in str(exc.value.detail).lower()
@@ -236,10 +266,12 @@ async def test_a_vacant_post_409s_instead_of_swallowing_the_note(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("bad", ["", "   ", "x" * 8001])
-async def test_an_unusable_message_400s(endpoint_db, as_project_owner, delivery, bad):
+async def test_an_unusable_message_400s(
+    endpoint_db, endpoint_request, as_project_owner, delivery, bad
+):
     with pytest.raises(HTTPException) as exc:
         await send_project_officer_note(
-            MagicMock(), PROJECT_ID, OfficerNoteRequest(message=bad)
+            endpoint_request, PROJECT_ID, OfficerNoteRequest(message=bad)
         )
     assert exc.value.status_code == 400
     delivery.assert_not_awaited()
@@ -247,11 +279,11 @@ async def test_an_unusable_message_400s(endpoint_db, as_project_owner, delivery,
 
 @pytest.mark.asyncio
 async def test_the_delivered_text_names_its_author_and_carries_the_message(
-    endpoint_db, as_project_owner, delivery
+    endpoint_db, endpoint_request, as_project_owner, delivery
 ):
     """An assistant-composed note must not read as words the human typed."""
     result = await send_project_officer_note(
-        MagicMock(), PROJECT_ID, OfficerNoteRequest(message="Cut the theme work.")
+        endpoint_request, PROJECT_ID, OfficerNoteRequest(message="Cut the theme work.")
     )
 
     text = delivery.await_args.args[2]
@@ -263,7 +295,7 @@ async def test_the_delivered_text_names_its_author_and_carries_the_message(
 
 @pytest.mark.asyncio
 async def test_a_queued_note_reports_when_he_will_read_it(
-    endpoint_db, as_project_owner, delivery
+    endpoint_db, endpoint_request, as_project_owner, delivery
 ):
     delivery.return_value = "queued"
     endpoint_db.get_pending_officer_timer = AsyncMock(
@@ -271,7 +303,7 @@ async def test_a_queued_note_reports_when_he_will_read_it(
     )
 
     result = await send_project_officer_note(
-        MagicMock(), PROJECT_ID, OfficerNoteRequest(message="Report on the board.")
+        endpoint_request, PROJECT_ID, OfficerNoteRequest(message="Report on the board.")
     )
 
     assert result["delivered"] == "queued"
@@ -281,11 +313,12 @@ async def test_a_queued_note_reports_when_he_will_read_it(
 def test_the_legate_routes_are_wired():
     from orchestrator.main import app
 
-    registered = {
-        (method, getattr(route, "path", ""))
-        for route in app.routes
-        for method in (getattr(route, "methods", None) or set())
-    }
+    from tests._route_inventory import mounted_routes
+
+    # Both declarations sit on a mounted router now; this FastAPI represents an
+    # include as one opaque wrapper in ``app.routes``, so the inventory has to
+    # walk into it or it reports every mounted route as absent.
+    registered = mounted_routes(app)
     assert ("POST", "/api/projects/{project_id}/officer/note") in registered
     assert ("GET", "/api/officers") in registered
 

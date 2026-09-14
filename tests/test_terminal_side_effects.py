@@ -20,6 +20,8 @@ tests/test_export_to_cloud_endpoint.py).
 
 from __future__ import annotations
 
+from tests import b08_completion_helpers as b08_helpers
+
 import base64
 import dataclasses
 import re
@@ -622,7 +624,8 @@ def _patch_approve(stack: ExitStack, job: dict, gitea: MagicMock, db: _FakeDB, t
     stack.enter_context(patch("orchestrator.main.vector_db", None))
     stack.enter_context(
         patch(
-            "orchestrator.main.resolve_job_repo", AsyncMock(return_value=(REPO, BRANCH))
+            "orchestrator.main.subjob_output_operations.resolve_job_repo",
+            AsyncMock(return_value=(REPO, BRANCH)),
         )
     )
     stack.enter_context(patch("orchestrator.main.maybe_wake_session", AsyncMock()))
@@ -646,19 +649,17 @@ def _patch_complete(stack: ExitStack, job: dict, gitea: MagicMock, db: _FakeDB):
             AsyncMock(side_effect=lambda j, r, s, **kw: (s, [], False)),
         )
     )
-    for helper in (
-        "_handle_critic_verdict_on_complete",
-        "_handle_scholar_completion",
-        "_handle_delegation_child_completion",
-        "_advance_project_loop",
-        "_archive_and_cleanup_workspace",
+    for target in (
+        "orchestrator.main.verification_operations.handle_critic_verdict_on_complete",
+        "orchestrator.main.subjob_completion_operations.handle_scholar_completion",
+        "orchestrator.main.subjob_completion_operations.handle_delegation_child_completion",
+        "orchestrator.main.project_loop_advance_service.advance_project_loop",
+        "orchestrator.main._archive_and_cleanup_workspace",
     ):
-        stack.enter_context(
-            patch(f"orchestrator.main.{helper}", AsyncMock(return_value=[]))
-        )
+        stack.enter_context(patch(target, AsyncMock(return_value=[])))
     stack.enter_context(
         patch(
-            "orchestrator.main._trigger_verification_on_complete",
+            "orchestrator.main.verification_operations.trigger_verification_on_complete",
             AsyncMock(return_value=None),
         )
     )
@@ -790,9 +791,7 @@ class TestLoopCloudCompletion:
 
         with ExitStack() as stack:
             _patch_complete(stack, job, _make_gitea(), db)
-            handled = await orchestrator.main.complete_job(
-                MagicMock(), str(JOB_ID), body
-            )
+            handled = await b08_helpers.complete_job(MagicMock(), str(JOB_ID), body)
 
         assert handled == {
             "status": "handled",
@@ -841,9 +840,7 @@ class TestLoopCloudCompletion:
 
         with ExitStack() as stack:
             _patch_complete(stack, job, _make_gitea(), db)
-            handled = await orchestrator.main.complete_job(
-                MagicMock(), str(JOB_ID), body
-            )
+            handled = await b08_helpers.complete_job(MagicMock(), str(JOB_ID), body)
 
         assert handled["new_status"] == "pending_review"
         assert handled["actions"] == [
@@ -892,7 +889,10 @@ class TestLoopCloudCompletion:
         with ExitStack() as stack:
             _patch_complete(stack, job, gitea, db)
             advance = stack.enter_context(
-                patch("orchestrator.main._advance_project_loop", new_callable=AsyncMock)
+                patch(
+                    "orchestrator.main.project_loop_advance_service.advance_project_loop",
+                    new_callable=AsyncMock,
+                )
             )
             deliver = stack.enter_context(
                 patch(
@@ -900,9 +900,7 @@ class TestLoopCloudCompletion:
                     AsyncMock(return_value=delivery_result),
                 )
             )
-            handled = await orchestrator.main.complete_job(
-                MagicMock(), str(JOB_ID), body
-            )
+            handled = await b08_helpers.complete_job(MagicMock(), str(JOB_ID), body)
 
         assert handled["new_status"] == "completed"
         assert job["merge_status"] == "cloud-applied"
@@ -940,7 +938,10 @@ class TestLoopCloudCompletion:
         with ExitStack() as stack:
             _patch_complete(stack, job, gitea, db)
             advance = stack.enter_context(
-                patch("orchestrator.main._advance_project_loop", new_callable=AsyncMock)
+                patch(
+                    "orchestrator.main.project_loop_advance_service.advance_project_loop",
+                    new_callable=AsyncMock,
+                )
             )
             stack.enter_context(
                 patch(
@@ -955,9 +956,7 @@ class TestLoopCloudCompletion:
                     ),
                 )
             )
-            handled = await orchestrator.main.complete_job(
-                MagicMock(), str(JOB_ID), body
-            )
+            handled = await b08_helpers.complete_job(MagicMock(), str(JOB_ID), body)
 
         assert handled["new_status"] == "pending_review"
         assert job["status"] == "pending_review"
@@ -991,9 +990,7 @@ class TestBothPathsAgree:
         )
         with ExitStack() as stack:
             _patch_complete(stack, complete_job_row, g_complete, db_complete)
-            handled = await orchestrator.main.complete_job(
-                MagicMock(), str(JOB_ID), body
-            )
+            handled = await b08_helpers.complete_job(MagicMock(), str(JOB_ID), body)
 
         assert handled["new_status"] == "completed"
         assert "job change record written to database" in handled["actions"]
@@ -1025,7 +1022,7 @@ class TestBothPathsAgree:
         )
         with ExitStack() as stack:
             _patch_complete(stack, complete_job_row, g_complete, db_complete)
-            await orchestrator.main.complete_job(MagicMock(), str(JOB_ID), body)
+            await b08_helpers.complete_job(MagicMock(), str(JOB_ID), body)
 
         assert _commits(g_approve) == _commits(g_complete)
         assert len(_commits(g_approve)) == 0

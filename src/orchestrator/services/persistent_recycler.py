@@ -1,7 +1,7 @@
 """Durable lifecycle owner for dedicated persistent-thread pods.
 
 The Kubernetes pod is disposable; the thread (and, for Officers, the Post) is
-the authority.  A recycle generation is stored in ``threads.metadata.agent_pod``
+the authority.  A recycle generation is stored in ``threads.metadata``
 and every transition re-locks Post -> thread -> agent -> grant before changing
 authority.  Kubernetes I/O happens outside those transactions and is fenced by
 immutable pod UIDs plus the generation label on the replacement.
@@ -30,6 +30,13 @@ from orchestrator.services.runtime_actor import lock_current_officer_runtime_gra
 logger = logging.getLogger(__name__)
 
 _RECYCLE_KEY = "recycle"
+#: Durable home of a recycle generation, a SIBLING of ``agent_pod`` rather than
+#: a key inside it. The physical endpoint is retired independently of the
+#: lifecycle intent -- ``settle_pinned_thread_retirement`` ends its UPDATE with
+#: ``metadata - 'agent_pod'`` -- so a record nested there is erased exactly when
+#: a missing runtime most needs one, and rebuilding a partial ``agent_pod`` to
+#: hold it is refused by 0185's ``threads_agent_pod_authority_shape``.
+_RECYCLE_METADATA_KEY = "persistent_recycle"
 _HOLD_GENERATION_KEY = "_persistent_recycle_generation"
 _ACTIVE_PHASES = {
     "awaiting_old_pod_exit",
@@ -113,6 +120,61 @@ def _json_object(value: Any) -> dict[str, Any]:
         except (TypeError, ValueError):
             return {}
     return dict(value) if isinstance(value, dict) else {}
+
+
+def _pod_authority_is_complete(agent_pod: dict[str, Any]) -> bool:
+    """Whether a Pod marker carries the identity 0185 requires of a non-empty one."""
+
+    return bool(
+        str(agent_pod.get("pod_name") or "") and str(agent_pod.get("pod_uid") or "")
+    )
+
+
+def _read_recycle_record(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Resolve the recycle record: durable home first, legacy nest second.
+
+    The fallback is what keeps generations written before this correction --
+    and any active one mid-flight across a rollout -- readable and advanceable.
+    """
+
+    record = _json_object(metadata.get(_RECYCLE_METADATA_KEY))
+    if record:
+        return record
+    return _json_object(_json_object(metadata.get("agent_pod")).get(_RECYCLE_KEY))
+
+
+#: Public name for the resolver. Every reader outside this module -- the
+#: lifecycle manager, the Officer Post card, the sitrep, the resume path --
+#: must go through it rather than reaching into ``agent_pod``.
+read_recycle_record = _read_recycle_record
+
+
+def _publish_recycle_record(
+    metadata: dict[str, Any], recycle: dict[str, Any] | None
+) -> None:
+    """Store the record durably, mirroring only into complete Pod authority.
+
+    Two homes, one writer. The sibling is authoritative and always written. The
+    legacy nest is mirrored **only when ``agent_pod`` already carries a complete
+    identity**, which is precisely when the handoff CAS in
+    ``postgres.commit_pinned_agent_pod_recycle_handoff`` matches the record
+    inside the marker -- so that protocol keeps working byte for byte. When the
+    endpoint is absent or retired nothing is invented: no Pod name, no UID, no
+    partial marker, and therefore nothing for 0185 to refuse.
+    """
+
+    if recycle:
+        metadata[_RECYCLE_METADATA_KEY] = recycle
+    else:
+        metadata.pop(_RECYCLE_METADATA_KEY, None)
+    agent_pod = _json_object(metadata.get("agent_pod"))
+    if not _pod_authority_is_complete(agent_pod):
+        return
+    if recycle:
+        agent_pod[_RECYCLE_KEY] = recycle
+    else:
+        agent_pod.pop(_RECYCLE_KEY, None)
+    metadata["agent_pod"] = agent_pod
 
 
 def _now() -> datetime:
@@ -253,7 +315,7 @@ class PersistentThreadRecycler:
                 thread, post, agent = locked
                 metadata = _json_object(thread.get("metadata"))
                 agent_pod = _json_object(metadata.get("agent_pod"))
-                current = _json_object(agent_pod.get(_RECYCLE_KEY))
+                current = _read_recycle_record(metadata)
                 if current.get("phase") in _ACTIVE_PHASES:
                     if (
                         current.get("phase") == "awaiting_old_pod_exit"
@@ -406,10 +468,13 @@ class PersistentThreadRecycler:
                         )
                     },
                 }
-                agent_pod[_RECYCLE_KEY] = recycle
-                agent_pod["observed_build_sha"] = recycle["observed_build_sha"]
-                agent_pod["expected_build_sha"] = target_build_sha
-                metadata["agent_pod"] = agent_pod
+                if _pod_authority_is_complete(agent_pod):
+                    # Only a marker that already names a real Pod may carry the
+                    # drift columns; an absent endpoint gets no invented one.
+                    agent_pod["observed_build_sha"] = recycle["observed_build_sha"]
+                    agent_pod["expected_build_sha"] = target_build_sha
+                    metadata["agent_pod"] = agent_pod
+                _publish_recycle_record(metadata, recycle)
                 await self._write_thread_metadata(conn, thread_uuid, metadata)
 
                 if post is not None and hold_owned:
@@ -485,9 +550,7 @@ class PersistentThreadRecycler:
                     return ParkedBoundaryAcknowledgement(False, False, "not_current")
                 thread, _post, agent = locked
                 metadata = _json_object(thread.get("metadata"))
-                recycle = _json_object(
-                    _json_object(metadata.get("agent_pod")).get(_RECYCLE_KEY)
-                )
+                recycle = _read_recycle_record(metadata)
                 phase = str(recycle.get("phase") or "")
                 if phase not in _ACTIVE_PHASES:
                     return ParkedBoundaryAcknowledgement(False, False, "inactive")
@@ -835,7 +898,7 @@ class PersistentThreadRecycler:
                 thread, post, agent = locked
                 metadata = _json_object(thread.get("metadata"))
                 agent_pod = _json_object(metadata.get("agent_pod"))
-                recycle = _json_object(agent_pod.get(_RECYCLE_KEY))
+                recycle = _read_recycle_record(metadata)
                 if not self._same_state(recycle, current, "awaiting_replacement"):
                     return recycle or None
                 if agent is None or not self._agent_matches(
@@ -933,7 +996,6 @@ class PersistentThreadRecycler:
                 )
                 agent_pod.update(
                     {
-                        _RECYCLE_KEY: recycle,
                         "status": "ready",
                         "pod_name": observation.pod_name,
                         "pod_uid": observation.pod_uid,
@@ -942,6 +1004,7 @@ class PersistentThreadRecycler:
                     }
                 )
                 metadata["agent_pod"] = agent_pod
+                _publish_recycle_record(metadata, recycle)
                 result = await conn.execute(
                     "UPDATE threads SET metadata=$2::jsonb, status='active', "
                     "awaiting_user_since=NULL WHERE id=$1 AND status <> 'ended'",
@@ -1021,7 +1084,6 @@ class PersistentThreadRecycler:
         }
         agent_pod.update(
             {
-                _RECYCLE_KEY: next_recycle,
                 "observed_build_sha": observation.build_sha,
                 "expected_build_sha": target_build_sha,
                 "pod_name": observation.pod_name,
@@ -1029,6 +1091,7 @@ class PersistentThreadRecycler:
             }
         )
         metadata["agent_pod"] = agent_pod
+        _publish_recycle_record(metadata, next_recycle)
         await self._write_thread_metadata(conn, thread["id"], metadata)
         await conn.execute(
             """
@@ -1066,8 +1129,7 @@ class PersistentThreadRecycler:
                     return self._lost(thread_id)
                 thread, post, _agent = locked
                 metadata = _json_object(thread.get("metadata"))
-                agent_pod = _json_object(metadata.get("agent_pod"))
-                recycle = _json_object(agent_pod.get(_RECYCLE_KEY))
+                recycle = _read_recycle_record(metadata)
                 if recycle.get("generation") != current.get("generation"):
                     return self._result(thread_id, recycle)
                 changed = await self._mark_locked_failure(
@@ -1116,9 +1178,7 @@ class PersistentThreadRecycler:
                 "notification": notification,
             }
         )
-        agent_pod = _json_object(metadata.get("agent_pod"))
-        agent_pod[_RECYCLE_KEY] = recycle
-        metadata["agent_pod"] = agent_pod
+        _publish_recycle_record(metadata, recycle)
         await self._write_thread_metadata(conn, thread_uuid, metadata)
         return recycle
 
@@ -1159,8 +1219,7 @@ class PersistentThreadRecycler:
                     return False
                 thread, _post, _agent = locked
                 metadata = _json_object(thread.get("metadata"))
-                agent_pod = _json_object(metadata.get("agent_pod"))
-                recycle = _json_object(agent_pod.get(_RECYCLE_KEY))
+                recycle = _read_recycle_record(metadata)
                 notification = _json_object(recycle.get("notification"))
                 if recycle.get("generation") != generation:
                     return False
@@ -1188,8 +1247,7 @@ class PersistentThreadRecycler:
                     ),
                 }
                 recycle["notification"] = notification
-                agent_pod[_RECYCLE_KEY] = recycle
-                metadata["agent_pod"] = agent_pod
+                _publish_recycle_record(metadata, recycle)
                 await self._write_thread_metadata(conn, thread_uuid, metadata)
                 return True
 
@@ -1209,8 +1267,7 @@ class PersistentThreadRecycler:
                     return
                 thread, _post, _agent = locked
                 metadata = _json_object(thread.get("metadata"))
-                agent_pod = _json_object(metadata.get("agent_pod"))
-                recycle = _json_object(agent_pod.get(_RECYCLE_KEY))
+                recycle = _read_recycle_record(metadata)
                 notification = _json_object(recycle.get("notification"))
                 if (
                     recycle.get("generation") != generation
@@ -1232,8 +1289,7 @@ class PersistentThreadRecycler:
                         settled_at + timedelta(seconds=delay)
                     )
                 recycle["notification"] = settled
-                agent_pod[_RECYCLE_KEY] = recycle
-                metadata["agent_pod"] = agent_pod
+                _publish_recycle_record(metadata, recycle)
                 await self._write_thread_metadata(conn, thread_uuid, metadata)
 
     async def _read_recycle(self, thread_id: str) -> dict[str, Any]:
@@ -1242,7 +1298,7 @@ class PersistentThreadRecycler:
                 "SELECT metadata FROM threads WHERE id=$1::uuid", str(thread_id)
             )
         metadata = _json_object(row["metadata"]) if row else {}
-        return _json_object(_json_object(metadata.get("agent_pod")).get(_RECYCLE_KEY))
+        return _read_recycle_record(metadata)
 
     async def _set_phase(
         self,
@@ -1263,7 +1319,7 @@ class PersistentThreadRecycler:
                 thread, _post, _agent = locked
                 metadata = _json_object(thread.get("metadata"))
                 agent_pod = _json_object(metadata.get("agent_pod"))
-                recycle = _json_object(agent_pod.get(_RECYCLE_KEY))
+                recycle = _read_recycle_record(metadata)
                 if (
                     recycle.get("generation") != generation
                     or recycle.get("phase") != expected_phase
@@ -1275,7 +1331,6 @@ class PersistentThreadRecycler:
                     return recycle or None
                 recycle.update(extras or {})
                 recycle.update({"phase": phase, "updated_at": _iso()})
-                agent_pod[_RECYCLE_KEY] = recycle
                 new_pod_uid = str((extras or {}).get("new_pod_uid") or "")
                 if phase == "awaiting_replacement" and new_pod_uid:
                     # Registration binds only when the immutable thread-side
@@ -1286,7 +1341,8 @@ class PersistentThreadRecycler:
                     # overwrite at bind time.
                     agent_pod["pod_name"] = f"persistent-{str(thread_uuid)[:12]}"
                     agent_pod["pod_uid"] = new_pod_uid
-                metadata["agent_pod"] = agent_pod
+                    metadata["agent_pod"] = agent_pod
+                _publish_recycle_record(metadata, recycle)
                 await self._write_thread_metadata(conn, thread_uuid, metadata)
                 return recycle
 
@@ -1488,7 +1544,7 @@ def persistent_recycle_view(metadata: Any) -> dict[str, Any]:
 
     root = _json_object(metadata)
     agent_pod = _json_object(root.get("agent_pod"))
-    recycle = _json_object(agent_pod.get(_RECYCLE_KEY))
+    recycle = _read_recycle_record(root)
     failure = _json_object(recycle.get("last_failure"))
     observed = agent_pod.get("observed_build_sha") or recycle.get("observed_build_sha")
     expected = agent_pod.get("expected_build_sha") or recycle.get("expected_build_sha")

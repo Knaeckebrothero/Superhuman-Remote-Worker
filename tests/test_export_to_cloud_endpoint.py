@@ -110,7 +110,10 @@ def _patch_endpoint(*, user, job, backend, gitea_files, repo=("job-682baab8", "m
     stack.enter_context(patch("orchestrator.main.gitea_client", gitea))
 
     stack.enter_context(
-        patch("orchestrator.main.resolve_job_repo", AsyncMock(return_value=repo))
+        patch(
+            "orchestrator.main.subjob_output_operations.resolve_job_repo",
+            AsyncMock(return_value=repo),
+        )
     )
 
     db = MagicMock()

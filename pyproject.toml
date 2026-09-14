@@ -154,9 +154,6 @@ ignore_imports = [
     # sudo_gate -> session_wake, the same shape the registration and
     # child-thread services reach it by via managed_repository_authority.
     "orchestrator.services.session_wake -> orchestrator.main",
-    # B07 owns these two, reached onward from session_wake through sitrep.
-    "orchestrator.services.sitrep -> orchestrator.main",
-    "orchestrator.services.project_backlog -> orchestrator.main",
 ]
 unmatched_ignore_imports_alerting = "warn"
 
@@ -246,8 +243,6 @@ forbidden_modules = ["orchestrator.main"]
 # point these entries can come off.
 ignore_imports = [
     "orchestrator.services.session_wake -> orchestrator.main",
-    "orchestrator.services.sitrep -> orchestrator.main",
-    "orchestrator.services.project_backlog -> orchestrator.main",
 ]
 unmatched_ignore_imports_alerting = "warn"
 
@@ -283,12 +278,6 @@ ignore_imports = [
     # function). Reached from every router through orchestrator.security.access
     # -> services.sudo_gate.
     "orchestrator.services.session_wake -> orchestrator.main",
-    # B07 owns this one (services/project_backlog.py:427,546). Reached from the
-    # datasource and knowledge services through kb_datasources -> kb_reindex ->
-    # kb_materialize.
-    "orchestrator.services.project_backlog -> orchestrator.main",
-    # B07 owns this one (services/sitrep.py:115,128).
-    "orchestrator.services.sitrep -> orchestrator.main",
 ]
 # tests/test_import_boundaries.py lints a synthetic tree that contains only the
 # stub modules a contract names, so none of the four edges above exists there.
@@ -333,9 +322,6 @@ forbidden_modules = ["orchestrator.main"]
 ignore_imports = [
     # B10 owns this one (services/session_wake.py, a lazy import in a function).
     "orchestrator.services.session_wake -> orchestrator.main",
-    # B07 owns these two.
-    "orchestrator.services.project_backlog -> orchestrator.main",
-    "orchestrator.services.sitrep -> orchestrator.main",
 ]
 unmatched_ignore_imports_alerting = "warn"
 
@@ -374,9 +360,6 @@ forbidden_modules = ["orchestrator.main"]
 ignore_imports = [
     # B10 owns this one (services/session_wake.py, a lazy import in a function).
     "orchestrator.services.session_wake -> orchestrator.main",
-    # B07 owns these two.
-    "orchestrator.services.project_backlog -> orchestrator.main",
-    "orchestrator.services.sitrep -> orchestrator.main",
 ]
 unmatched_ignore_imports_alerting = "warn"
 
@@ -436,11 +419,60 @@ ignore_imports = [
     # B10 owns this one (services/session_wake.py:919, a lazy import in a
     # function). Comes off when B10 closes its caller.
     "orchestrator.services.session_wake -> orchestrator.main",
-    # B07 owns these two, reached from the registration and child-thread
-    # services through managed_repository_authority -> security.access ->
-    # sudo_gate -> session_wake -> sitrep -> officer_backlog.
-    "orchestrator.services.sitrep -> orchestrator.main",
-    "orchestrator.services.project_backlog -> orchestrator.main",
+]
+unmatched_ignore_imports_alerting = "warn"
+
+[[tool.importlinter.contracts]]
+name = "Message routing, notifications, Officer post and loop operations do not import application startup"
+type = "forbidden"
+source_modules = [
+    "orchestrator.services.agent_messaging",
+    "orchestrator.services.inbound_reply",
+    "orchestrator.services.officer_message_actions",
+    "orchestrator.services.job_freeze_notifications",
+    "orchestrator.services.job_guidance",
+    "orchestrator.services.message_thread_reads",
+    "orchestrator.services.pending_actions",
+    "orchestrator.services.notification_api",
+    "orchestrator.services.notification_actions",
+    "orchestrator.services.officer_conference",
+    "orchestrator.services.officer_notices",
+    "orchestrator.services.officer_paging",
+    "orchestrator.services.officer_post_lifecycle",
+    "orchestrator.services.officer_post_policy",
+    "orchestrator.services.officer_post_views",
+    "orchestrator.services.officer_watchdog",
+    "orchestrator.services.project_loop_spawn",
+    "orchestrator.services.project_loop_advance",
+    "orchestrator.services.loop_plan_filing",
+    "orchestrator.services.curation_final_pass",
+    "orchestrator.services.cron_dispatcher",
+    "orchestrator.services.sitrep",
+    "orchestrator.services.project_backlog",
+    "orchestrator.routers.messaging",
+    "orchestrator.routers.actions",
+    "orchestrator.routers.notifications",
+    "orchestrator.routers.officers",
+    "orchestrator.routers.agent_officer",
+    "orchestrator.routers.loop_plan",
+    "orchestrator.routers.automations",
+    "orchestrator.routers.project_loops",
+    "orchestrator.schemas.messaging",
+    "orchestrator.schemas.notifications",
+    "orchestrator.schemas.officer_post",
+    "orchestrator.schemas.project_loops",
+]
+forbidden_modules = ["orchestrator.main"]
+# One indirect chain remains, and it is not this batch's: every router-adjacent
+# module imports orchestrator.security.access, which reaches main through
+# services.sudo_gate -> services.session_wake. B10 owns that lazy import.
+# Ignoring the exact edge rather than setting `allow_indirect_imports` keeps
+# every other transitive path checked, so a new one would still fail here.
+# B07's own two — services.sitrep and services.project_backlog — are gone for
+# real: the sitrep takes its reporting handles from an explicit startup bind,
+# and the backlog's ticket mirror takes the store from its caller.
+ignore_imports = [
+    "orchestrator.services.session_wake -> orchestrator.main",
 ]
 unmatched_ignore_imports_alerting = "warn"
 
@@ -451,6 +483,41 @@ type = "forbidden"
 source_modules = ["shared"]
 forbidden_modules = ["shared.runtime", "shared.runtime.**"]
 as_packages = false
+
+[[tool.importlinter.contracts]]
+name = "Completion verification delegation and recovery do not import application startup"
+type = "forbidden"
+source_modules = [
+    "orchestrator.routers.job_completion",
+    "orchestrator.routers.verification",
+    "orchestrator.services.job_completion",
+    "orchestrator.services.legacy_job_completion",
+    "orchestrator.services.completion_runtime",
+    "orchestrator.services.completion_session_memory",
+    "orchestrator.services.completion_effects",
+    "orchestrator.services.completion_recovery",
+    "orchestrator.services.completion_control",
+    "orchestrator.services.completion_finalizer",
+    "orchestrator.services.completion_monitor",
+    "orchestrator.services.completion_sweep_router",
+    "orchestrator.services.completion_command_resolution",
+    "orchestrator.services.job_completion_commands",
+    "orchestrator.services.completion_effect_policy",
+    "orchestrator.services.completion_effect_reconciliation",
+    "orchestrator.services.completion_lifecycle",
+    "orchestrator.services.completion_teardown_authority",
+    "orchestrator.services.verification_workflow",
+    "orchestrator.services.verification_ledger",
+    "orchestrator.services.subjob_completion",
+    "orchestrator.services.subjob_output",
+]
+forbidden_modules = ["orchestrator.main"]
+ignore_imports = [
+    # B10 owns the remaining lazy application lookup, reached through the
+    # shared authorization chain. Keep every other transitive path checked.
+    "orchestrator.services.session_wake -> orchestrator.main",
+]
+unmatched_ignore_imports_alerting = "warn"
 
 [[tool.importlinter.contracts]]
 name = "MCP and VM controller do not depend on shared runtime"

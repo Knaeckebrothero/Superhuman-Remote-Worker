@@ -63,6 +63,15 @@ a two-todo tactical phase, reads the verification guide at the completion
 boundary, then returns through `job_complete`. It fails closed the same way when
 a required tool is not bound.
 
+`prepared-workspace-job` extends that workflow with a real `run_command` call
+over the workspace SSH backend. It checks the prepared executable and the
+per-workspace initialization receipt, then writes an execution marker. Fresh
+runs require that marker to be absent; run IDs ending in `-reuse` require an
+existing marker. The fixture advances only after the tool returns both exit
+code zero and the exact run-specific proof. It retains counters, not shell
+output. `scripts/workspace-preparation-srw-k3d-gate.py` uses this scenario to
+exercise MCP admission and prepared VM isolation through the installed harness.
+
 The `fetch-job` scenario follows the same fail-closed pattern for the off-pod fetch
 boundary. It calls `extract_webpage` and `crawl_website` against `example.com` before
 completing the job. It reads both guides required by the runtime's enforced staging and

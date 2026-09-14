@@ -339,6 +339,11 @@ docker_build(
         'src/vm_controller/',
         'src/shared/__init__.py',
         'src/shared/vm_lifecycle_auth.py',
+        'src/shared/workspace_initialization.py',
+        'src/shared/vm_workspace_storage.py',
+        'src/shared/workspace_preparation.py',
+        'src/shared/workspace_preparation_settings.py',
+        'src/shared/workspace_preparation_network.py',
         'pyproject.toml',
         '.dockerignore',
         'docker/Dockerfile.vm-controller',
@@ -350,6 +355,23 @@ docker_build(
 )
 
 # (image name, chart repository key, chart tag key)
+docker_build(
+    'srw-vm-preparer',
+    context='.',
+    dockerfile='docker/Dockerfile.vm-preparer',
+    only=[
+        'src/vm_controller/__init__.py',
+        'src/vm_controller/preparation_builder.py',
+        'src/vm_controller/preparation_firewall.py',
+        'src/shared/__init__.py',
+        'src/shared/workspace_initialization.py',
+        'src/shared/workspace_preparation.py',
+        'src/shared/workspace_preparation_network.py',
+        'pyproject.toml', '.dockerignore', 'docker/Dockerfile.vm-preparer',
+    ],
+    ignore=['**/__pycache__', '**/*.pyc'],
+)
+
 _srw_images = [
     ('srw-orchestrator', 'image.orchestrator.repository', 'image.orchestrator.tag'),
     ('srw-cockpit', 'image.cockpit.repository', 'image.cockpit.tag'),
@@ -357,6 +379,7 @@ _srw_images = [
     ('srw-mcp', 'image.mcp.repository', 'image.mcp.tag'),
     ('srw-workspace', 'image.workspace.repository', 'image.workspace.tag'),
     ('srw-vm-controller', 'vmController.image.repository', 'vmController.image.tag'),
+    ('srw-vm-preparer', 'vmController.preparation.image.repository', 'vmController.preparation.image.tag'),
 ]
 
 # Tilt fills in TILT_IMAGE_<i> (the freshly built+pushed ref) per image_deps
@@ -370,6 +393,10 @@ _srw_helm_env = {
 for i in range(len(_srw_images)):
     _srw_helm_env['TILT_IMAGE_KEY_REPO_%s' % i] = _srw_images[i][1]
     _srw_helm_env['TILT_IMAGE_KEY_TAG_%s' % i] = _srw_images[i][2]
+    # These chart images also accept a digest, which outranks the tag. Tilt
+    # owns the local image selection, including a pin saved by an earlier gate.
+    if _srw_images[i][0] in ['srw-mcp', 'srw-vm-preparer']:
+        _srw_helm_env['TILT_IMAGE_KEY_DIGEST_%s' % i] = _srw_images[i][2][:-4] + '.digest'
 
 k8s_custom_deploy(
     'srw',
@@ -401,6 +428,8 @@ k8s_custom_deploy(
     deps=[
         'deployment/values-local.yaml',
         'deployment/values-tilt.yaml',
+        'scripts/tilt-helm-apply.sh',
+        'scripts/tilt-image-digest.py',
     ],
     image_deps=[img[0] for img in _srw_images],
 )

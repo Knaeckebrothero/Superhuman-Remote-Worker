@@ -558,3 +558,24 @@ async def test_native_srw_admission_delivers_frozen_configuration_from_database(
     assert (await read_execution(database, "Job", work_id))["resolved"] == snapshot[
         "resolved"
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("driver", ["srw.env/v1", "srw.files/v1", "custom/v1"])
+async def test_srw_admission_rejects_undeliverable_connector_before_writes(
+    database, actor, driver
+):
+    document = assignment(adapter="srw/v1", mode="Reported")
+    document["spec"]["execution"]["connectors"] = {
+        "source": {"inline": {"driver": driver, "config": {"literal": None}}}
+    }
+    with pytest.raises(HTTPException) as error:
+        await admit(database, actor, document)
+    assert error.value.status_code == 422
+    assert "Connector driver" in str(error.value.detail)
+    assert await database.fetchval("SELECT count(*) FROM jobs") == 0
+    assert await database.fetchval("SELECT count(*) FROM srw_execution_specs") == 0
+    assert (
+        await database.fetchval("SELECT count(*) FROM srw_resources WHERE kind='Job'")
+        == 0
+    )

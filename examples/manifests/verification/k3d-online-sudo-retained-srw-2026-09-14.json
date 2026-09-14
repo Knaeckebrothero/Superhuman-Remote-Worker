@@ -1,0 +1,518 @@
+{
+  "gate": "prepared-vm-srw-mcp",
+  "context": "k3d-srw",
+  "gateIdentity": "cutover-0c1864543c30-",
+  "startedAt": "2026-09-14T00:14:00.118476+00:00",
+  "status": "passed",
+  "baseImage": "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base@sha256:db1015a32173c4553d1ad432bdb48760fdb8ba0782d25ae20349d4aaaf26c28f",
+  "provider": "deterministic fixture; real SRW harness and SSH tools",
+  "onlinePackage": "hello",
+  "sudoVersionQuery": true,
+  "deployment": {
+    "pod": "srw-orchestrator-5b97669c96-v22x9",
+    "imageID": "srw-registry:5000/srw-orchestrator@sha256:508083c1ccc8ffbcb7fd3200e2f8a9dabcb8c9c1914da5331cac05e6d417b22a",
+    "sourceFilesMatched": 76,
+    "sourceDigest": "821689b77bcfc90a5de47f85082527c469752d309480e92a49ff6271d5937dec",
+    "nativeHostingEnabled": false,
+    "nativeNamespace": "srw-native"
+  },
+  "preparationHosting": {
+    "orchestratorSourceFilesMatched": 11,
+    "controllerSourceFilesMatched": 19,
+    "diskSize": "30Gi",
+    "builderImage": "srw-registry:5000/srw-vm-preparer@sha256:477293ebb80fbf953254afd7b5d03d70d8ac6b7a4c481f281c248b9085c4e6eb",
+    "networkEnabled": true,
+    "podFirewall": true,
+    "networkPolicyRevision": "1d2a423859e7a8bef293445783656bdfe2a258a0165e55f7e3d59a218c7fbb6a"
+  },
+  "agents": [
+    {
+      "pod": "srw-agent-stateless-7d68775b5d-tng78",
+      "uid": "404d27ca-eada-4b11-9d0c-35264a6b169e",
+      "image": "srw-registry:5000/srw-agent:tilt-e038103d0667f907",
+      "sourceFilesMatched": 6
+    },
+    {
+      "pod": "srw-agent-stateless-7d68775b5d-v98qw",
+      "uid": "c08d53d8-8aab-4d7c-a6c5-de8a8a6304cb",
+      "image": "srw-registry:5000/srw-agent:tilt-e038103d0667f907",
+      "sourceFilesMatched": 6
+    }
+  ],
+  "fixtureImage": "srw-registry:5000/srw-manifest-fixture@sha256:745dbf671b06ecb95b6c2f1df2b8b217c4f2c0ce002b31914740a50a25c5df45",
+  "temporaryIdentity": {
+    "name": "srw-manifest-admin-0c1864543c30",
+    "keycloakUID": "dcc7afa8-8a93-47f9-a34f-3325bd414aa1",
+    "applicationUID": "b73d9112-1b9b-4793-bac0-39d0dd3cf540",
+    "oauthClientUID": "57735984-94aa-4c85-8494-5bfa705f599f",
+    "cleanup": {
+      "identityRevoked": true,
+      "identityDeleted": true,
+      "applicationUserDeleted": true,
+      "oauthClientDeleted": true,
+      "defaultProjectRemoved": true
+    }
+  },
+  "fixture": {
+    "namespace": "srw-prepared-gate-33d52ef2789d",
+    "uid": "e300a936-9d31-402c-99f9-71a61b0ed302"
+  },
+  "execution": {
+    "checks": [
+      "Role-authenticated owned provider/model registration preserves configured and effective defaults",
+      "MCP-admitted prepared VM Job first completed with verified guest shell output.",
+      "MCP-admitted prepared VM Job second completed with verified guest shell output.",
+      "MCP-admitted prepared VM Job retained completed with verified guest shell output.",
+      "MCP-admitted prepared VM Job reuse completed with verified guest shell output.",
+      "MCP preparation failed-build stopped before workspace allocation.",
+      "MCP preparation cancelled-build stopped before workspace allocation."
+    ],
+    "cleanup": {
+      "complete": true,
+      "stage": "complete",
+      "workloads": [
+        {
+          "kind": "Job",
+          "workID": "13714a3a-1fc9-4734-9008-902b0cf2d13e",
+          "absent": true,
+          "deleteStatuses": [
+            200
+          ],
+          "computeAbsent": true
+        },
+        {
+          "kind": "Job",
+          "workID": "1752e8d1-2aa6-4d86-8d47-5422020f4fd7",
+          "absent": true,
+          "deleteStatuses": [
+            200
+          ],
+          "computeAbsent": true
+        },
+        {
+          "kind": "Job",
+          "workID": "0f04d41f-d180-46df-85cd-ed93a5dcd222",
+          "absent": true,
+          "deleteStatuses": [
+            200
+          ],
+          "computeAbsent": true
+        },
+        {
+          "kind": "Job",
+          "workID": "b3238612-573a-4126-9405-50b80e2d8d07",
+          "absent": true,
+          "deleteStatuses": [
+            200
+          ],
+          "computeAbsent": true
+        },
+        {
+          "kind": "Job",
+          "workID": "ae9728d8-490c-4ccf-8fde-f44e2178324c",
+          "absent": true,
+          "deleteStatuses": [
+            200
+          ],
+          "computeAbsent": true
+        },
+        {
+          "kind": "Job",
+          "workID": "d094c019-d189-40e7-91f4-1a67f6e10036",
+          "absent": true,
+          "deleteStatuses": [
+            200
+          ],
+          "computeAbsent": true
+        }
+      ],
+      "workloadsAndCatalogRemoved": true,
+      "retainedInstancesReleased": true,
+      "preparedArtifactsRemoved": true,
+      "baseImportPolicy": "Scoped base import follows the installed cache TTL.",
+      "mcpTokenRevoked": true
+    },
+    "preparedJobs": [
+      {
+        "case": "first",
+        "workID": "d094c019-d189-40e7-91f4-1a67f6e10036",
+        "runtime": {
+          "vmUID": "e28f770c-d231-4743-a865-89f56c845082",
+          "pvcUID": "ce13a612-437c-4230-b9b7-005bc4d90ed1",
+          "vmStatus": "ready",
+          "preparation": {
+            "uid": "69d0cf57-f504-40e3-8b49-8b390220aa3c",
+            "phase": "Succeeded",
+            "cacheHit": false,
+            "cacheKey": "6a0b054bd8995828a9dc34d3a36b1af19ac851761bde1a737b132202a90a6921",
+            "diskSha256": "6d6ebe0195d822c72c6dec9342b66fd05dc5bb097091aa1a282c38e30fa01212"
+          },
+          "initialization": {
+            "phase": "Succeeded",
+            "step": 1,
+            "exitCode": 0
+          },
+          "instance": null
+        },
+        "provider": {
+          "consumed_required_responses": 0,
+          "worker_job_tool_steps": 13,
+          "unexpected_count": 0,
+          "pending_calls": 0
+        },
+        "snapshot": {
+          "id": "cfacda78-1ab4-45a9-8594-0ead40964e18",
+          "generation": 1,
+          "revision": "sha256:ede76f3a2e9583da0a93ec0ab0830627e48536464dbb080561d88f7682b1333b",
+          "adapter": "srw/v1",
+          "image": "srw-registry:5000/srw-agent:tilt-e038103d0667f907",
+          "model": "zz-srw-manifest-db5ee51aa7f8",
+          "temperature": 0.17,
+          "workspaceBackend": "vm",
+          "workspace": {
+            "template": {
+              "ref": {
+                "name": "cutover-0c1864543c30-prepared"
+              }
+            }
+          },
+          "resolvedWorkspace": {
+            "template": {
+              "inline": {
+                "backend": "vm",
+                "resources": {
+                  "cpu": 2,
+                  "memory": "3Gi",
+                  "storage": "30Gi"
+                },
+                "retention": "Delete",
+                "initialize": [
+                  {
+                    "command": [
+                      "sh",
+                      "-c",
+                      "set -eu\ntest \"$(wc -l < /opt/srw-preparation-gate/build-count)\" -eq 1\ntest \"$(srw-cache-check)\" = srw-prepared-tool-v1\nprintf '%s\\n' initialized >> .srw-initialize-count"
+                    ]
+                  }
+                ],
+                "environment": {
+                  "cache": "Reuse",
+                  "image": "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base@sha256:db1015a32173c4553d1ad432bdb48760fdb8ba0782d25ae20349d4aaaf26c28f",
+                  "prepare": [
+                    {
+                      "command": [
+                        "sh",
+                        "-c",
+                        "set -eu\ninstall -d -m 0755 /opt/srw-preparation-gate\nif command -v hello >/dev/null 2>&1; then exit 23; fi\napt-get -o Acquire::Retries=2 update\nDEBIAN_FRONTEND=noninteractive apt-get -y --no-install-recommends install hello\ntest \"$(hello)\" = 'Hello, world!'\ndpkg-query -W -f='${Version}\\n' hello > /opt/srw-preparation-gate/package-version\nprintf %s '#!/bin/sh\nset -eu\ntest \"$(hello)\" = '\"'\"'Hello, world!'\"'\"'\nprintf '\"'\"'%s\\n'\"'\"' srw-prepared-tool-v1\n' > /usr/local/bin/srw-cache-check\nchmod 0755 /usr/local/bin/srw-cache-check\nprintf '%s\\n' 'cutover-0c1864543c30-' >> /opt/srw-preparation-gate/build-count"
+                      ]
+                    }
+                  ],
+                  "pullPolicy": "IfNotPresent"
+                }
+              }
+            }
+          },
+          "sourceDigest": "23a9b2ccda3764c3d4eda349ef012dcc33318d6bf5295553c0c2853c7ca6f756",
+          "job": {
+            "execution_lane": "pinned",
+            "status": "completed",
+            "has_workspace_container": false
+          }
+        },
+        "metadataEditPreservedExecution": true
+      },
+      {
+        "case": "second",
+        "workID": "ae9728d8-490c-4ccf-8fde-f44e2178324c",
+        "runtime": {
+          "vmUID": "74c68aca-67f3-480f-818f-a06f4aa6c500",
+          "pvcUID": "07bd0a69-f6ea-4510-9fd0-af9547c5c46b",
+          "vmStatus": "ready",
+          "preparation": {
+            "uid": "69d0cf57-f504-40e3-8b49-8b390220aa3c",
+            "phase": "Succeeded",
+            "cacheHit": true,
+            "cacheKey": "6a0b054bd8995828a9dc34d3a36b1af19ac851761bde1a737b132202a90a6921",
+            "diskSha256": "6d6ebe0195d822c72c6dec9342b66fd05dc5bb097091aa1a282c38e30fa01212"
+          },
+          "initialization": {
+            "phase": "Succeeded",
+            "step": 1,
+            "exitCode": 0
+          },
+          "instance": null
+        },
+        "provider": {
+          "consumed_required_responses": 0,
+          "worker_job_tool_steps": 13,
+          "unexpected_count": 0,
+          "pending_calls": 0
+        },
+        "snapshot": {
+          "id": "65bd10f4-0115-4135-842c-2828a74142fe",
+          "generation": 1,
+          "revision": "sha256:6270e8efa86bcb77b67759d312c8d8b648d4bbe5c52f02039d1c498d7ae1f7e2",
+          "adapter": "srw/v1",
+          "image": "srw-registry:5000/srw-agent:tilt-e038103d0667f907",
+          "model": "zz-srw-manifest-db5ee51aa7f8",
+          "temperature": 0.17,
+          "workspaceBackend": "vm",
+          "workspace": {
+            "template": {
+              "ref": {
+                "name": "cutover-0c1864543c30-prepared"
+              }
+            }
+          },
+          "resolvedWorkspace": {
+            "template": {
+              "inline": {
+                "backend": "vm",
+                "resources": {
+                  "cpu": 2,
+                  "memory": "3Gi",
+                  "storage": "30Gi"
+                },
+                "retention": "Delete",
+                "initialize": [
+                  {
+                    "command": [
+                      "sh",
+                      "-c",
+                      "set -eu\ntest \"$(wc -l < /opt/srw-preparation-gate/build-count)\" -eq 1\ntest \"$(srw-cache-check)\" = srw-prepared-tool-v1\nprintf '%s\\n' initialized >> .srw-initialize-count"
+                    ]
+                  }
+                ],
+                "environment": {
+                  "cache": "Reuse",
+                  "image": "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base@sha256:db1015a32173c4553d1ad432bdb48760fdb8ba0782d25ae20349d4aaaf26c28f",
+                  "prepare": [
+                    {
+                      "command": [
+                        "sh",
+                        "-c",
+                        "set -eu\ninstall -d -m 0755 /opt/srw-preparation-gate\nif command -v hello >/dev/null 2>&1; then exit 23; fi\napt-get -o Acquire::Retries=2 update\nDEBIAN_FRONTEND=noninteractive apt-get -y --no-install-recommends install hello\ntest \"$(hello)\" = 'Hello, world!'\ndpkg-query -W -f='${Version}\\n' hello > /opt/srw-preparation-gate/package-version\nprintf %s '#!/bin/sh\nset -eu\ntest \"$(hello)\" = '\"'\"'Hello, world!'\"'\"'\nprintf '\"'\"'%s\\n'\"'\"' srw-prepared-tool-v1\n' > /usr/local/bin/srw-cache-check\nchmod 0755 /usr/local/bin/srw-cache-check\nprintf '%s\\n' 'cutover-0c1864543c30-' >> /opt/srw-preparation-gate/build-count"
+                      ]
+                    }
+                  ],
+                  "pullPolicy": "IfNotPresent"
+                }
+              }
+            }
+          },
+          "sourceDigest": "23a9b2ccda3764c3d4eda349ef012dcc33318d6bf5295553c0c2853c7ca6f756",
+          "job": {
+            "execution_lane": "pinned",
+            "status": "completed",
+            "has_workspace_container": false
+          }
+        },
+        "metadataEditPreservedExecution": true
+      },
+      {
+        "case": "retained",
+        "workID": "b3238612-573a-4126-9405-50b80e2d8d07",
+        "runtime": {
+          "vmUID": "dcef9fcd-4900-47f5-af28-20d6727c4e9d",
+          "pvcUID": "09c96500-554f-406a-9e5d-c06af6d831b2",
+          "vmStatus": "ready",
+          "preparation": {
+            "uid": "69d0cf57-f504-40e3-8b49-8b390220aa3c",
+            "phase": "Succeeded",
+            "cacheHit": true,
+            "cacheKey": "6a0b054bd8995828a9dc34d3a36b1af19ac851761bde1a737b132202a90a6921",
+            "diskSha256": "6d6ebe0195d822c72c6dec9342b66fd05dc5bb097091aa1a282c38e30fa01212"
+          },
+          "initialization": {
+            "phase": "Succeeded",
+            "step": 1,
+            "exitCode": 0
+          },
+          "instance": {
+            "id": "2ff82d2e-1abc-43f5-9c7e-5c98abb3feea",
+            "generation": "1",
+            "status": "Attached",
+            "pvc_uid": "09c96500-554f-406a-9e5d-c06af6d831b2"
+          }
+        },
+        "provider": {
+          "consumed_required_responses": 0,
+          "worker_job_tool_steps": 13,
+          "unexpected_count": 0,
+          "pending_calls": 0
+        },
+        "snapshot": {
+          "id": "ce8217b4-d3b0-4ad4-ba63-720239187c5a",
+          "generation": 1,
+          "revision": "sha256:3098762be2f4546d36769bb93e6d56272f0143ead5f4b6500eb3075ece857b39",
+          "adapter": "srw/v1",
+          "image": "srw-registry:5000/srw-agent:tilt-e038103d0667f907",
+          "model": "zz-srw-manifest-db5ee51aa7f8",
+          "temperature": 0.17,
+          "workspaceBackend": "vm",
+          "workspace": {
+            "template": {
+              "ref": {
+                "name": "cutover-0c1864543c30-retained"
+              }
+            }
+          },
+          "resolvedWorkspace": {
+            "template": {
+              "inline": {
+                "backend": "vm",
+                "resources": {
+                  "cpu": 2,
+                  "memory": "3Gi",
+                  "storage": "30Gi"
+                },
+                "retention": "Retain",
+                "initialize": [
+                  {
+                    "command": [
+                      "sh",
+                      "-c",
+                      "set -eu\ntest \"$(wc -l < /opt/srw-preparation-gate/build-count)\" -eq 1\ntest \"$(srw-cache-check)\" = srw-prepared-tool-v1\nprintf '%s\\n' initialized >> .srw-initialize-count"
+                    ]
+                  }
+                ],
+                "environment": {
+                  "cache": "Reuse",
+                  "image": "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base@sha256:db1015a32173c4553d1ad432bdb48760fdb8ba0782d25ae20349d4aaaf26c28f",
+                  "prepare": [
+                    {
+                      "command": [
+                        "sh",
+                        "-c",
+                        "set -eu\ninstall -d -m 0755 /opt/srw-preparation-gate\nif command -v hello >/dev/null 2>&1; then exit 23; fi\napt-get -o Acquire::Retries=2 update\nDEBIAN_FRONTEND=noninteractive apt-get -y --no-install-recommends install hello\ntest \"$(hello)\" = 'Hello, world!'\ndpkg-query -W -f='${Version}\\n' hello > /opt/srw-preparation-gate/package-version\nprintf %s '#!/bin/sh\nset -eu\ntest \"$(hello)\" = '\"'\"'Hello, world!'\"'\"'\nprintf '\"'\"'%s\\n'\"'\"' srw-prepared-tool-v1\n' > /usr/local/bin/srw-cache-check\nchmod 0755 /usr/local/bin/srw-cache-check\nprintf '%s\\n' 'cutover-0c1864543c30-' >> /opt/srw-preparation-gate/build-count"
+                      ]
+                    }
+                  ],
+                  "pullPolicy": "IfNotPresent"
+                }
+              }
+            }
+          },
+          "sourceDigest": "23a9b2ccda3764c3d4eda349ef012dcc33318d6bf5295553c0c2853c7ca6f756",
+          "job": {
+            "execution_lane": "pinned",
+            "status": "completed",
+            "has_workspace_container": false
+          }
+        },
+        "metadataEditPreservedExecution": true
+      },
+      {
+        "case": "reuse",
+        "workID": "1752e8d1-2aa6-4d86-8d47-5422020f4fd7",
+        "runtime": {
+          "vmUID": "7cd032c9-f689-456d-8c72-1ceafeb1ec6f",
+          "pvcUID": "09c96500-554f-406a-9e5d-c06af6d831b2",
+          "vmStatus": "ready",
+          "preparation": {
+            "uid": null,
+            "phase": null,
+            "cacheHit": null,
+            "cacheKey": null,
+            "diskSha256": null
+          },
+          "initialization": {
+            "phase": "Succeeded",
+            "step": 1,
+            "exitCode": 0
+          },
+          "instance": {
+            "id": "2ff82d2e-1abc-43f5-9c7e-5c98abb3feea",
+            "generation": "2",
+            "status": "Attached",
+            "pvc_uid": "09c96500-554f-406a-9e5d-c06af6d831b2"
+          }
+        },
+        "provider": {
+          "consumed_required_responses": 0,
+          "worker_job_tool_steps": 13,
+          "unexpected_count": 0,
+          "pending_calls": 0
+        },
+        "snapshot": {
+          "id": "90a1753d-fd27-4d09-a0a6-8a0141fce257",
+          "generation": 1,
+          "revision": "sha256:4b7d9b86822f2a3dbb13c0538c9f917dcf3c1ee1fd6f2a2e10209ab11a07b900",
+          "adapter": "srw/v1",
+          "image": "srw-registry:5000/srw-agent:tilt-e038103d0667f907",
+          "model": "zz-srw-manifest-db5ee51aa7f8",
+          "temperature": 0.17,
+          "workspaceBackend": "vm",
+          "workspace": {
+            "instanceRef": {
+              "uid": "2ff82d2e-1abc-43f5-9c7e-5c98abb3feea"
+            }
+          },
+          "resolvedWorkspace": {
+            "instanceRef": {
+              "uid": "2ff82d2e-1abc-43f5-9c7e-5c98abb3feea"
+            }
+          },
+          "sourceDigest": "23a9b2ccda3764c3d4eda349ef012dcc33318d6bf5295553c0c2853c7ca6f756",
+          "job": {
+            "execution_lane": "pinned",
+            "status": "completed",
+            "has_workspace_container": false
+          }
+        },
+        "metadataEditPreservedExecution": true
+      },
+      {
+        "case": "failed-build",
+        "workID": "13714a3a-1fc9-4734-9008-902b0cf2d13e",
+        "runtime": {
+          "vmUID": null,
+          "pvcUID": null,
+          "vmStatus": "failed",
+          "preparation": {
+            "uid": "b0f15c98-34dc-40a9-968e-8e59c55597b4",
+            "phase": "Failed",
+            "cacheHit": false,
+            "cacheKey": "17857ec08ff35e63ee15c1c7ced9536660b28a86ec0c0d871ca2b14df5a09150",
+            "diskSha256": null
+          },
+          "initialization": {
+            "phase": null,
+            "step": null,
+            "exitCode": null
+          },
+          "instance": null
+        },
+        "outcome": "failed",
+        "noWorkspaceAllocated": true
+      },
+      {
+        "case": "cancelled-build",
+        "workID": "0f04d41f-d180-46df-85cd-ed93a5dcd222",
+        "cancelledBuilderUID": "ac7180de-64df-445f-98fa-a56a8e3a4962",
+        "runtime": {
+          "vmUID": null,
+          "pvcUID": null,
+          "vmStatus": "retiring_process_zero",
+          "preparation": {
+            "uid": "ac7180de-64df-445f-98fa-a56a8e3a4962",
+            "phase": "Building",
+            "cacheHit": false,
+            "cacheKey": "c79d076332a52fc91fd37a9f5015e3f751bcad4b2c38025f40247f887d71f3e5",
+            "diskSha256": null
+          },
+          "initialization": {
+            "phase": null,
+            "step": null,
+            "exitCode": null
+          },
+          "instance": null
+        },
+        "outcome": "cancelled",
+        "noWorkspaceAllocated": true
+      }
+    ],
+    "stage": "cutover-0c1864543c30-job-cancelled-build"
+  },
+  "finishedAt": "2026-09-14T00:34:55.429905+00:00"
+}

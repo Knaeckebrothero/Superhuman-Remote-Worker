@@ -372,7 +372,12 @@ async def provision_or_assign(
         if expected_runtime is None:
             await _safe_emit("failed", reason="session runtime identity is unavailable")
             return
-        ready_timeout_s = session_ready_timeout_s(_backend_from_override(co))
+        ready_timeout_s = session_ready_timeout_s(
+            _backend_from_override(co),
+            preparation=bool(
+                ((co or {}).get("workspace") or {}).get("vm", {}).get("preparation")
+            ),
+        )
         cur = await postgres_db.get_thread(tid)
         if not await _same_runtime(cur):
             return

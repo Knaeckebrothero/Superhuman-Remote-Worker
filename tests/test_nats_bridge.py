@@ -401,22 +401,26 @@ class TestRequestVmCreate:
         self, bridge_with_db, mock_nc, entity_type
     ):
         from orchestrator.services.vm_lifecycle_auth import verify_payload
+        from shared.workspace_initialization import initialization_request
 
         secret = b"development-vm-test-lifecycle-secret-32-bytes"
         bridge_with_db._lifecycle_hmac_secret = secret
+        initialization = initialization_request([{"command": ["true"]}])
         await bridge_with_db.request_vm_create(
             job_id="test-job",
             entity_type=entity_type,
             vm_image="registry.example/dev-vm:v1",
             disk_size="120Gi",
+            initialization=initialization,
             provision_generation=PROVISION_GENERATION,
         )
         payload = json.loads(mock_nc.publish.call_args.args[1])
         assert payload["disk_size"] == "120Gi"
+        assert payload["initialization"] == initialization
         assert verify_payload(
             payload, direction="request", operation="create", secret=secret
         )
-        payload["disk_size"] = "240Gi"
+        payload["initialization"]["steps"][0]["command"] = ["false"]
         assert not verify_payload(
             payload, direction="request", operation="create", secret=secret
         )

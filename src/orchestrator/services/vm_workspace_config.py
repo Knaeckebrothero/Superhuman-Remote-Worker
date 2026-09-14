@@ -20,6 +20,7 @@ async def vm_provisioning_options(store, work_kind: str, work: dict, *, fallback
     comes from the database's execution join, never a caller's context.
     """
     configuration = fallback
+    snapshot = None
     if work.get("execution_harness_adapter") is not None:
         snapshot = await read_execution(store, work_kind, str(work["id"]))
         if snapshot is None:
@@ -27,13 +28,45 @@ async def vm_provisioning_options(store, work_kind: str, work: dict, *, fallback
         _, configuration = srw_snapshot_config(snapshot)
     workspace = object_value(object_value(configuration).get("workspace"))
     vm = object_value(workspace.get("vm"))
-    return {
+    options = {
         target: deepcopy(vm[source])
         for source, target in (
             ("image", "vm_image"),
             ("cpu_cores", "cpu_cores"),
             ("memory", "memory"),
             ("disk_size", "disk_size"),
+            ("initialization", "initialization"),
         )
         if vm.get(source) is not None
     }
+
+    if vm.get("preparation") is not None:
+        if snapshot is None:
+            raise HTTPException(
+                422, "Workspace preparation requires an admitted manifest execution."
+            )
+        from orchestrator.services.vm_preparation import execution_request
+
+        options["preparation"] = execution_request(
+            snapshot,
+            vm["preparation"],
+            runtime_generation=work.get("runtime_generation"),
+        )
+
+    if work_kind == "Job" and snapshot is not None:
+        selection = snapshot["resolved"]["spec"]["execution"]["workspace"] or {}
+        if (
+            "instanceRef" in selection
+            or selection.get("template", {}).get("inline", {}).get("retention")
+            == "Retain"
+        ):
+            from orchestrator.services.retained_vm_workspaces import provision_binding
+
+            options["workspace_storage"] = await provision_binding(
+                store, str(work["id"])
+            )
+            if options["workspace_storage"] is None:
+                raise HTTPException(
+                    409, "Retained workspace reservation is unavailable."
+                )
+    return options

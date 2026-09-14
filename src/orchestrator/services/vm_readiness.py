@@ -183,6 +183,21 @@ class VMReadinessService:
         reprobe: bool,
     ) -> None:
         key = (entity_type, entity_id, generation)
+        if entity_type == "thread" and (
+            vm.get("status")
+            in {
+                "waiting_preparation",
+                "waiting_golden",
+                "waiting_capacity",
+                "waiting_headscale",
+            }
+            or vm.get("status") == "provisioning"
+            and vm.get("preparation_request") is not None
+            and vm.get("identity_authenticated") is False
+        ):
+            await self._provisioner.poll_thread_vm(entity_id, generation)
+            self._retry_after[key] = time.monotonic() + 5.0
+            return
         status = await self._provisioner.query_status(
             entity_id, entity_type=entity_type
         )
@@ -214,6 +229,23 @@ class VMReadinessService:
             )
             return
 
+        if vm.get("preparation_request") is not None:
+            prepared = status.get("preparation") or vm.get("preparation") or {}
+            if not isinstance(prepared, Mapping) or prepared.get("phase") not in {
+                "Succeeded",
+                "ExistingWorkspace",
+            }:
+                await self._transient_failure(
+                    key,
+                    entity_type,
+                    entity_id,
+                    generation,
+                    vm,
+                    "prepared workspace artifact is not attested",
+                    reprobe=False,
+                )
+                return
+
         if status.get("status") == "not_found":
             await self._provisioner._set_context_if_generation(
                 entity_type,
@@ -225,6 +257,28 @@ class VMReadinessService:
             return
 
         phase = str(status.get("phase") or "")
+        if (
+            phase.lower() == "stopped"
+            and not reprobe
+            and (
+                status.get("credential_runtime_started") is False
+                or status.get("vmi_phase") in {"Pending", "Scheduling", "Scheduled"}
+            )
+        ):
+            # KubeVirt briefly reports Stopped before the first VMI runs,
+            # including with a Pending VMI while CDI allocates its disk. Keep this initial
+            # allocation in the bounded boot loop, not outside the candidate
+            # query as an unreachable formerly-running guest.
+            await self._transient_failure(
+                key,
+                entity_type,
+                entity_id,
+                generation,
+                vm,
+                "Waiting for the first VM instance",
+                reprobe=False,
+            )
+            return
         if phase.lower() in {"stopped", "succeeded"}:
             await self._provisioner._set_context_if_generation(
                 entity_type,
@@ -303,7 +357,27 @@ class VMReadinessService:
             )
             return
         if unchanged_ready_identity:
-            return
+            if vm.get("initialization") is None:
+                return
+            from shared.workspace_initialization import (
+                initialization_receipt,
+                validate_initialization_request,
+            )
+
+            try:
+                request = validate_initialization_request(vm["initialization"])
+                previous = initialization_receipt(
+                    vm.get("initialization_receipt"),
+                    owner_id=(vm.get("workspace_storage") or {}).get("uid", entity_id),
+                    revision=request["revision"],
+                )
+            except ValueError:
+                pass
+            else:
+                if previous["phase"] == "Succeeded" and previous["step"] == len(
+                    request["steps"]
+                ):
+                    return
 
         verified_at = datetime.now(timezone.utc).isoformat()
         registration_id = uuid4().hex
@@ -374,6 +448,60 @@ class VMReadinessService:
                 current.port,
                 current.ssh_host_key_fingerprint,
             )
+
+        if vm.get("initialization") is not None:
+            from orchestrator.services.vm_initialization import read_vm_initialization
+            from shared.workspace_initialization import TIMEOUT_SECONDS
+
+            try:
+                receipt = await read_vm_initialization(
+                    initial_attestation,
+                    owner_id=(vm.get("workspace_storage") or {}).get("uid", entity_id),
+                    request=vm["initialization"],
+                )
+            except Exception:
+                receipt = None
+            if await mutation_authority() is None:
+                return
+            now = time.time()
+            started = vm.get("initialization_started_at")
+            if started is None:
+                started = now
+            valid_start = type(started) in (int, float) and 0 < started <= now
+            updates = {
+                "initialization_started_at": started,
+                "initialization_receipt": receipt,
+            }
+            if receipt is None or receipt["phase"] != "Succeeded":
+                failed = receipt is not None and receipt["phase"] == "Failed"
+                expired = not valid_start or now - started > TIMEOUT_SECONDS + 60
+                error = (
+                    f"Workspace initialization failed at step {receipt['step'] + 1} "
+                    f"(exit {receipt['exitCode']})"
+                    if failed
+                    else "Workspace initialization timed out"
+                    if expired
+                    else "Waiting for workspace initialization"
+                )
+                updates.update(
+                    status="failed" if failed or expired else "ssh_pending",
+                    ssh_probe_error=error,
+                    error=error if failed or expired else None,
+                )
+            record = (
+                self._db.merge_thread_vm_context_if_current
+                if entity_type == "thread"
+                else self._db.merge_vm_context_if_current
+            )
+            accepted = await record(entity_id, registration_id, updates)
+            if not accepted or receipt is None or receipt["phase"] != "Succeeded":
+                if (
+                    accepted
+                    and updates.get("status") == "failed"
+                    and entity_type == "job"
+                ):
+                    self._trigger_dispatch()
+                return
 
         seeded = await seed_ide_config_for_user(
             self._db,
@@ -498,6 +626,11 @@ async def vm_readiness_prober(
 ) -> None:
     if os.getenv("VM_MODE", "off").strip().lower() != "same-cluster":
         return
-    await VMReadinessService(db, provisioner, trigger_dispatch=trigger_dispatch).run(
-        shutdown_event
+    from orchestrator.services.vm_preparation import cancellation_loop
+
+    await asyncio.gather(
+        VMReadinessService(db, provisioner, trigger_dispatch=trigger_dispatch).run(
+            shutdown_event
+        ),
+        cancellation_loop(shutdown_event, db=db, provisioner=provisioner),
     )

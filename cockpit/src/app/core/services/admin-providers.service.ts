@@ -5,6 +5,7 @@ import {
   ApiKeyProvider,
   ApiKeySetRequest,
   DiscoveryResponse,
+  HelmProvenanceSource,
   LlmEndpoint,
   LlmEndpointCreateRequest,
   LlmEndpointDiscoveryResult,
@@ -30,6 +31,44 @@ export interface SystemApiKeyEntry {
   seeded_from: string | null;
   created_at: string | null;
   updated_at: string | null;
+  source?: HelmProvenanceSource | null;
+  managed_by_helm?: boolean;
+  helm_drift?: boolean;
+}
+
+/** One default pin as `GET /api/admin/helm-managed` reports it. */
+export interface HelmManagedDefault {
+  model: string | null;
+  source: HelmProvenanceSource | null;
+  managed_by_helm: boolean;
+  helm_drift: boolean;
+}
+
+/**
+ * `GET /api/admin/helm-managed`: the reconcile manifest the seed Job last
+ * wrote plus per-row provenance. Keys/endpoints/models carry the same
+ * annotation on their list endpoints; the defaults are only available here.
+ */
+export interface HelmManagedOverview {
+  manifest: {
+    systemApiKeys: string[];
+    systemEndpoints: string[];
+    models: string[];
+    defaults: string[];
+  };
+  applied_at: string | null;
+  keys: SystemApiKeyEntry[];
+  endpoints: LlmEndpoint[];
+  models: {
+    id: string;
+    provider_kind: string;
+    provider_ref: string;
+    model_id: string;
+    source: HelmProvenanceSource | null;
+    managed_by_helm: boolean;
+    helm_drift: boolean;
+  }[];
+  defaults: Partial<Record<DefaultModelKind, HelmManagedDefault>>;
 }
 
 /**
@@ -127,6 +166,8 @@ export class AdminProvidersService {
   readonly systemApiKeys = signal<SystemApiKeyEntry[]>([]);
   readonly systemEndpoints = signal<LlmEndpoint[]>([]);
   readonly defaults = signal<Record<DefaultModelKind, string | null>>({...EMPTY_DEFAULTS});
+  /** Helm reconcile manifest + provenance; null until loaded or when unavailable. */
+  readonly helmManaged = signal<HelmManagedOverview | null>(null);
   readonly subscriptionAvailability = signal<SubscriptionAvailability>({
     ...EMPTY_SUBSCRIPTION_AVAILABILITY,
   });
@@ -286,9 +327,18 @@ export class AdminProvidersService {
       .pipe(
         tap(() => {
           this.loadDefaults();
+          this.loadHelmManaged();
           this.readiness.load();
         }),
       );
+  }
+
+  /** Refresh which rows Helm reconciles (badges + drift on the Defaults page). */
+  loadHelmManaged(): void {
+    this.http
+      .get<HelmManagedOverview>(`${this.baseUrl}/admin/helm-managed`)
+      .pipe(catchError(() => of(null)))
+      .subscribe((overview) => this.helmManaged.set(overview));
   }
 
   // ── Subscription Proxy ────────────────────────────────────────

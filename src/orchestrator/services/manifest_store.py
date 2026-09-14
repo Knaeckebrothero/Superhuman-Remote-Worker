@@ -153,9 +153,17 @@ class ManifestStore:
                 raise HTTPException(
                     409, "Updating a resource requires its expected resource version."
                 )
-            if old["kind"] == "Job" and await self.db.fetchval(
-                "SELECT EXISTS(SELECT 1 FROM srw_execution_specs WHERE resource_id=$1)",
-                old["id"],
+            if (
+                old["kind"] == "Job"
+                and (
+                    old["document"]["spec"] != document["spec"]
+                    or old["resolved"]["spec"] != resolved["spec"]
+                    or old["dependencies"] != dependencies
+                )
+                and await self.db.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM srw_execution_specs WHERE resource_id=$1)",
+                    old["id"],
+                )
             ):
                 raise HTTPException(
                     409,

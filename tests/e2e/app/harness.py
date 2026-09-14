@@ -40,6 +40,7 @@ VALUES_FILE: Final = ASSET_ROOT / "values-e2e.yaml"
 STATELESS_SANDBOX_VALUES_FILE: Final = ASSET_ROOT / "values-stateless-sandbox.yaml"
 FORGE_SANDBOX_VALUES_FILE: Final = ASSET_ROOT / "values-forge-sandbox.yaml"
 CLOUD_SANDBOX_VALUES_FILE: Final = ASSET_ROOT / "values-cloud-sandbox.yaml"
+OFFICER_WATCHDOG_VALUES_FILE: Final = ASSET_ROOT / "values-officer-watchdog.yaml"
 PROVIDER_MANIFEST: Final = ASSET_ROOT / "deterministic_provider/kubernetes.yaml"
 PROVIDER_DOCKERFILE: Final = ASSET_ROOT / "deterministic_provider/Dockerfile"
 PLAYWRIGHT_RUNNER_DOCKERFILE: Final = ASSET_ROOT / "Dockerfile.playwright"
@@ -148,6 +149,15 @@ class ApplicationE2EProfile:
     #: the "disabled" refusal and the mount builders are never asked for a
     #: payload. Behavioural, for the same reason as the flag above.
     protected_cloud_enabled: bool = False
+    #: This profile lets the shared durable lifecycle owner accept an
+    #: *automatic* submission. The Officer watchdog's third duty hands a
+    #: missing runtime to that owner rather than repairing it itself, and the
+    #: owner drops every automatic submission while the chart default
+    #: (``PERSISTENT_AGENT_RECONCILIATION_ENABLED: false``) stands, so the duty
+    #: is unobservable without it. Behavioural, for the same reason as the
+    #: flags above: a later profile composing this overlay must not silently
+    #: lose the property the check depends on.
+    persistent_reconciliation_enabled: bool = False
 
 
 APPLICATION_E2E_PROFILES: Final = {
@@ -202,6 +212,23 @@ APPLICATION_E2E_PROFILES: Final = {
         forge_enabled=True,
         cloud_enabled=True,
         protected_cloud_enabled=True,
+    ),
+    "officer-watchdog": ApplicationE2EProfile(
+        name="officer-watchdog",
+        values_files=(
+            VALUES_FILE,
+            STATELESS_SANDBOX_VALUES_FILE,
+            FORGE_SANDBOX_VALUES_FILE,
+            OFFICER_WATCHDOG_VALUES_FILE,
+        ),
+        workspace_backend="sandbox",
+        execution_lane="stateless",
+        include_workspace_image=True,
+        additional_deployments=("srw-e2e-agent-stateless",),
+        additional_statefulsets=("srw-e2e-gitea",),
+        stateless_agents=True,
+        forge_enabled=True,
+        persistent_reconciliation_enabled=True,
     ),
 }
 

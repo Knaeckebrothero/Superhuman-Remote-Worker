@@ -355,7 +355,10 @@ async def _rest_create(db, fake_request, body, resolver):
             "orchestrator.main._enforce_job_create_grants", AsyncMock(return_value=None)
         ),
         patch("orchestrator.services.job_provisioning.provision_job_repo", AsyncMock()),
-        patch("orchestrator.main._spawn_scholar_subjob", AsyncMock(return_value=None)),
+        patch(
+            "orchestrator.main.subjob_completion_operations.spawn_scholar_subjob",
+            AsyncMock(return_value=None),
+        ),
         patch("orchestrator.main._trigger_dispatch", MagicMock()),
     ]
     with ExitStack() as stack:

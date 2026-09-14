@@ -1,0 +1,158 @@
+{
+  "date": "2026-09-12",
+  "backend": "same-cluster KubeVirt/CDI, linux/amd64",
+  "cluster": "k3d-srw",
+  "checks": [
+    {
+      "event": "controller_preparation_service_restarted",
+      "job_id": "d869de17-7378-4cf5-a989-1acffbbbdb5e"
+    },
+    {
+      "event": "two_fresh_vms_share_one_preparation",
+      "cache_hit": true,
+      "separate_disks": true,
+      "separate_machine_ids": true,
+      "initialize_once_each": true,
+      "tool_available": true
+    },
+    {
+      "event": "controller_preparation_service_restarted",
+      "job_id": "5f44d3fd-6d9c-4e66-b88f-e3f5e49f9370"
+    },
+    {
+      "event": "rebuild_produces_new_artifact",
+      "cache_hit": false
+    },
+    {
+      "event": "retained_handoff_works_with_preparer_disabled",
+      "same_disk": true,
+      "initialize_count": 1
+    },
+    {
+      "event": "controller_preparation_service_restarted",
+      "job_id": "52dd3616-456b-48b3-a7cf-7bea0fdebc11"
+    },
+    {
+      "event": "failed_build_does_not_create_a_vm"
+    },
+    {
+      "event": "cancellation_stops_builder_before_any_vm_and_rejects_late_create"
+    },
+    {
+      "event": "scoped_cache_api_eviction_passed"
+    },
+    {
+      "event": "full_gate_passed"
+    }
+  ],
+  "session": [
+    {
+      "event": "session_builder_started_without_vm_intent",
+      "thread_id": "7eb88a6c-c850-4864-a9a3-286bafb98062"
+    },
+    {
+      "event": "session_end_cancels_builder_and_fences_delayed_poll",
+      "no_vm": true
+    },
+    {
+      "event": "session_gate_passed"
+    }
+  ],
+  "failed_import_cleanup": {
+    "passed": true,
+    "failed_import_pvc_and_datavolume_removed": true,
+    "exact_uid_retirement": true
+  },
+  "network": {
+    "local_k3s": {
+      "startup_policy_enforcement": false,
+      "online_preparation_approved": false
+    },
+    "separate_cilium_k3d": {
+      "version": "1.18.13",
+      "mode": "always",
+      "checks": {
+        "control": {
+          "public_https": true,
+          "private_service": true
+        },
+        "offline": {
+          "public_https": false,
+          "private_service": false
+        },
+        "online": {
+          "public_https": true,
+          "private_service": false
+        },
+        "dns": {
+          "public_dns": true
+        },
+        "passed": true
+      },
+      "cluster_removed": true,
+      "registry_networks_restored": true,
+      "default_kubeconfig_unchanged": true
+    }
+  },
+  "images": {
+    "builder_dockerfile_build": "passed",
+    "controller_dockerfile_build": "passed",
+    "production_python": "3.12.14",
+    "production_import_checks": "passed",
+    "orchestrator_gate_python": "3.11"
+  },
+  "limits": [
+    "No model or harness completion was exercised; the VM gate used production admission, provisioning, SSH initialization, cancellation and retirement paths.",
+    "The cache is a CDI PVC; no OCI/S3 artifact export was exercised.",
+    "The ordinary K3s network profile failed startup enforcement. Online policy was verified separately under Cilium always-enforce."
+  ],
+  "fixture_corrections": [
+    "The second VM gate continued from its failure-case checkpoint after correcting its expected-404 assertion for a VM that was never created.",
+    "The Cilium gate used a reachable private control service; the disposable cluster Kubernetes API was unsuitable as a positive TCP control."
+  ],
+  "cleanup": {
+    "namespace_removed": true,
+    "owned_pvs_remaining": 0,
+    "fixture_postgres_removed": true,
+    "temporary_ssh_hmac_database_credentials_removed": true,
+    "shared_srw_golden_datavolume_uid": "3e151824-f929-4e7a-920c-90304ad1031f",
+    "shared_srw_golden_phase": "Succeeded",
+    "unrelated_srw_b06_scratch_untouched": true
+  },
+  "implementation_commit": "d752bdedb4ad32145c96217903d8a453e77e4a2a",
+  "verification": {
+    "focused_preparation_and_api_checks": "passed",
+    "initial_full_suite": {
+      "passed": 30787,
+      "failed": 9,
+      "skipped": 179,
+      "failure_resolution": "Updated build contracts, migration pin and reviewed runtime-coordinate inventory; targeted reruns passed."
+    },
+    "final_full_suite": {
+      "command": "PYTHONSAFEPATH=1 SRW_PYTHON=.venv/bin/python SRW_PYTEST_WORKERS=4 ./scripts/pytest-fast.sh tests/ -q --tb=short",
+      "python": "3.13.15",
+      "passed": 30815,
+      "failed": 1,
+      "skipped": 179,
+      "warnings": 173,
+      "duration_seconds": 2224.4,
+      "failure": "tests/test_rewind_orchestrator.py::test_orchestrator_live_readers_filter_tombstones",
+      "cause": "A database docstring was expanded after pytest imported the module. inspect.getsource used the previously loaded line coordinates against the updated file and returned a neighboring line. The method still contains its tombstone filter.",
+      "fresh_process_rerun": {
+        "scope": "tests/test_rewind_orchestrator.py (entire module)",
+        "passed": 10,
+        "failed": 0,
+        "duration_seconds": 2.82,
+        "runtime_changes_required": false
+      }
+    },
+    "helm_lint": [
+      "default test values",
+      "customer external values"
+    ],
+    "sql_lint": "Squawk: 0 issues",
+    "endpoint_inventory": "passed",
+    "runtime_coordinate_inventory": "passed"
+  },
+  "completed_date": "2026-09-13"
+}
