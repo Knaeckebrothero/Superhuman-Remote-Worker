@@ -1,4 +1,4 @@
-module github.com/knaeckebrothero/superhuman-remote-worker/sudo-gated
+module github.com/superhuman-remote-worker/srw/sudo-gated
 
 go 1.22.0
 

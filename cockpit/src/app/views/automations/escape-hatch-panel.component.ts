@@ -33,7 +33,7 @@ import {environment} from '../../core/environment';
           <app-icon size="inherit">menu_book</app-icon>
           {{ 'automations.escapeHatch.apiDocs' | transloco }}
         </a>
-        <a class="link" href="https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/blob/main/docs/features/automations_api.md" target="_blank" rel="noopener">
+        <a class="link" href="https://github.com/superhuman-remote-worker/srw/blob/main/docs/features/automations_api.md" target="_blank" rel="noopener">
           <app-icon size="inherit">description</app-icon>
           {{ 'automations.escapeHatch.guide' | transloco }}
         </a>

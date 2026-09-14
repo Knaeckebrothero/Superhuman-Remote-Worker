@@ -40,7 +40,7 @@ _THREAD_ID = UUID("22222222-2222-2222-2222-222222222222")
 _PROJECT_ID = UUID("33333333-3333-3333-3333-333333333333")
 _ORCHESTRATOR_REVISION = "a" * 40
 _AGENT_REVISION = "b" * 40
-_SOURCE_URL = "https://github.com/knaeckebrothero/Superhuman-Remote-Worker"
+_SOURCE_URL = "https://github.com/superhuman-remote-worker/srw"
 _DOCUMENTATION_URL = f"{_SOURCE_URL}/tree/main/docs"
 _ROOT = Path(__file__).resolve().parents[1]
 

@@ -17,7 +17,7 @@ updates.
 Do not open a public issue for a suspected vulnerability.
 
 Use
-[GitHub Private Vulnerability Reporting](https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/security/advisories/new)
+[GitHub Private Vulnerability Reporting](https://github.com/superhuman-remote-worker/srw/security/advisories/new)
 and include:
 
 - a description of the vulnerability and likely impact;

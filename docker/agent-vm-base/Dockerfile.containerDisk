@@ -1,18 +1,18 @@
 # Wraps the Packer-built qcow2 as a KubeVirt containerDisk image.
 #
 # Build (after packer build):
-#   podman build -t ghcr.io/knaeckebrothero/agent-vm-base:latest \
+#   podman build -t ghcr.io/superhuman-remote-worker/srw-agent-vm-base:latest \
 #     -f Dockerfile.containerDisk .
 #
 # Push:
-#   podman push ghcr.io/knaeckebrothero/agent-vm-base:latest
+#   podman push ghcr.io/superhuman-remote-worker/srw-agent-vm-base:latest
 
 FROM scratch
 
 ARG SRW_SOURCE_REVISION=""
-ARG SRW_SOURCE_URL="https://github.com/knaeckebrothero/Superhuman-Remote-Worker"
+ARG SRW_SOURCE_URL="https://github.com/superhuman-remote-worker/srw"
 ARG SRW_RELEASE_VERSION=""
-ARG SRW_DOCUMENTATION_URL="https://github.com/knaeckebrothero/Superhuman-Remote-Worker"
+ARG SRW_DOCUMENTATION_URL="https://github.com/superhuman-remote-worker/srw"
 
 LABEL org.opencontainers.image.source="${SRW_SOURCE_URL}"
 LABEL org.opencontainers.image.revision="${SRW_SOURCE_REVISION}"

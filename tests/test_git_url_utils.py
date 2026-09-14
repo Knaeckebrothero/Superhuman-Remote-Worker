@@ -17,8 +17,8 @@ from agent.utils.git_url import repo_name_from_url
     "url,expected",
     [
         (
-            "https://github.com/Knaeckebrothero/Superhuman-Remote-Worker.git",
-            "Superhuman-Remote-Worker",
+            "https://github.com/superhuman-remote-worker/srw.git",
+            "srw",
         ),
         ("https://github.com/foo/bar.git", "bar"),
         ("https://github.com/foo/bar", "bar"),

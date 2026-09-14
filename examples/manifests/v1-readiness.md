@@ -66,13 +66,13 @@ captures these candidate checks:
 These are candidate results, not a main-dev rollout. Main dev still runs chart
 `0.0.999`, revision 971, with offline preparation. That revision only increased
 the VM-controller memory limit after an observed OOM. PRs
-[#127](https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/pull/127) and
-[#128](https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/pull/128) require
+[#127](https://github.com/superhuman-remote-worker/srw/pull/127) and
+[#128](https://github.com/superhuman-remote-worker/srw/pull/128) require
 the normal review and release process before the new profile can be enabled
 there.
 
 The [real-provider development exercise](verification/srw-development-2026-09-14.json)
-produced [PR #129](https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/pull/129):
+produced [PR #129](https://github.com/superhuman-remote-worker/srw/pull/129):
 stdin support for local manifest validation, preview and export. An MCP-admitted
 MiniMax-M3 Job used a prepared VM, implemented the functional change, and built
 the full nested SRW stack with k3d/Tilt. Supervisor review corrected documentation
@@ -179,7 +179,7 @@ deployment.
 ## Release decisions still required
 
 Develop publication uses CI-built component images and a versioned Helm chart;
-[GitHub Actions](https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/actions?query=branch%3Adevelop)
+[GitHub Actions](https://github.com/superhuman-remote-worker/srw/actions?query=branch%3Adevelop)
 records those publication checks. Preparation remains disabled by default in the
 chart. Main dev enables offline preparation through Fleet. Its
 [six-case acceptance](verification/main-dev-prepared-srw-2026-09-13.json) passed

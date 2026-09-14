@@ -39,7 +39,7 @@ def installed_srw_image() -> str:
         "AGENT_IMAGE",
         os.environ.get(
             "PERSISTENT_AGENT_IMAGE",
-            "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent:latest",
+            "ghcr.io/superhuman-remote-worker/srw-agent:latest",
         ),
     )
 

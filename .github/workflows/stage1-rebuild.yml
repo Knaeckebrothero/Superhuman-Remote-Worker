@@ -32,8 +32,8 @@ concurrency:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
-  SRW_SOURCE_URL: https://github.com/knaeckebrothero/Superhuman-Remote-Worker
-  SRW_DOCUMENTATION_URL: https://github.com/knaeckebrothero/Superhuman-Remote-Worker
+  SRW_SOURCE_URL: https://github.com/superhuman-remote-worker/srw
+  SRW_DOCUMENTATION_URL: https://github.com/superhuman-remote-worker/srw
 
 jobs:
   build-agent-vm-base-stage1:

@@ -43,9 +43,9 @@ env:
   # but GHCR rejects uppercase image paths. docker/metadata-action handles
   # this for production tags; YAML expressions can't lowercase, so we hardcode.
   # Update this if the repo is renamed.
-  REPO_LOWER: knaeckebrothero/superhuman-remote-worker
-  SRW_SOURCE_URL: https://github.com/knaeckebrothero/Superhuman-Remote-Worker
-  SRW_DOCUMENTATION_URL: https://github.com/knaeckebrothero/Superhuman-Remote-Worker
+  REPO_LOWER: superhuman-remote-worker/srw
+  SRW_SOURCE_URL: https://github.com/superhuman-remote-worker/srw
+  SRW_DOCUMENTATION_URL: https://github.com/superhuman-remote-worker/srw
   SRW_RELEASE_VERSION: 0.0.0-dev.sha-${{ github.sha }}
 
 jobs:
@@ -806,7 +806,7 @@ jobs:
           # redundant build. The opposite would ship a commit with no image.
           image_missing() {
             local component="$1" sha="$2"
-            local ref="ghcr.io/knaeckebrothero/superhuman-remote-worker-${component}:sha-${sha:0:7}"
+            local ref="ghcr.io/superhuman-remote-worker/srw-${component}:sha-${sha:0:7}"
             if docker buildx imagetools inspect "$ref" >/dev/null 2>&1; then
               echo "false"
             else
@@ -2189,6 +2189,6 @@ jobs:
             --app-version "${{ steps.tag.outputs.sha }}" \
             --destination ./dist
           helm push ./dist/srw-dev-${{ steps.tag.outputs.chart_version }}.tgz \
-            oci://ghcr.io/knaeckebrothero/charts
+            oci://ghcr.io/superhuman-remote-worker/charts
           # Restore working copy (never commit the name override or baked tags)
           git checkout helm/Chart.yaml helm/values.yaml

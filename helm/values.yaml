@@ -27,7 +27,7 @@ namespace:
 # the LICENSE file of the source repository. You must explicitly accept those
 # terms to install and run the application.
 #
-#   See: https://github.com/knaeckebrothero/Superhuman-Remote-Worker/blob/main/LICENSE
+#   See: https://github.com/superhuman-remote-worker/srw/blob/main/LICENSE
 #
 # The chart refuses to render when license.acceptTerms is false, and the
 # orchestrator refuses to start (enforced at runtime via LICENSE_TERMS_ACCEPTED).
@@ -67,27 +67,27 @@ global:
 # =============================================================================
 image:
   orchestrator:
-    repository: ghcr.io/knaeckebrothero/superhuman-remote-worker-orchestrator
+    repository: ghcr.io/superhuman-remote-worker/srw-orchestrator
     tag: latest
     digest: ""
     pullPolicy: Always
   agent:
-    repository: ghcr.io/knaeckebrothero/superhuman-remote-worker-agent
+    repository: ghcr.io/superhuman-remote-worker/srw-agent
     tag: latest
     digest: ""
     pullPolicy: Always
   cockpit:
-    repository: ghcr.io/knaeckebrothero/superhuman-remote-worker-cockpit
+    repository: ghcr.io/superhuman-remote-worker/srw-cockpit
     tag: latest
     digest: ""
     pullPolicy: Always
   mcp:
-    repository: ghcr.io/knaeckebrothero/superhuman-remote-worker-mcp
+    repository: ghcr.io/superhuman-remote-worker/srw-mcp
     tag: latest
     digest: ""
     pullPolicy: Always
   workspace:
-    repository: ghcr.io/knaeckebrothero/superhuman-remote-worker-workspace
+    repository: ghcr.io/superhuman-remote-worker/srw-workspace
     tag: latest
     digest: ""
     pullPolicy: Always
@@ -96,8 +96,8 @@ image:
 # never display tags. Artifact digests remain empty unless the corresponding
 # image is actually deployed by digest above.
 provenance:
-  sourceUrl: https://github.com/knaeckebrothero/Superhuman-Remote-Worker
-  documentationUrl: https://github.com/knaeckebrothero/Superhuman-Remote-Worker/tree/main/docs
+  sourceUrl: https://github.com/superhuman-remote-worker/srw
+  documentationUrl: https://github.com/superhuman-remote-worker/srw/tree/main/docs
   releaseVersion: ""
   components:
     orchestrator:
@@ -3432,13 +3432,13 @@ vmController:
   # -- Must be empty in same-cluster mode; controller and VMs use the release namespace.
   namespace: ""
   image:
-    repository: ghcr.io/knaeckebrothero/superhuman-remote-worker-vm-controller
+    repository: ghcr.io/superhuman-remote-worker/srw-vm-controller
     tag: latest
     pullPolicy: Always
   service:
     port: 8080
   # -- Default VM image — override per-job via the orchestrator API.
-  # When empty, defaults to ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:v<Chart.AppVersion>
+  # When empty, defaults to ghcr.io/superhuman-remote-worker/srw-agent-vm-base:v<Chart.AppVersion>
   # so the VM base tracks the chart release. Set explicitly to pin a specific tag.
   defaultVmImage: ""
   # -- Per-VM size. Workspace
@@ -3487,7 +3487,7 @@ vmController:
   preparation:
     enabled: false
     image:
-      repository: ghcr.io/knaeckebrothero/superhuman-remote-worker-vm-preparer
+      repository: ghcr.io/superhuman-remote-worker/srw-vm-preparer
       tag: latest
       digest: ""
     diskSize: 30Gi

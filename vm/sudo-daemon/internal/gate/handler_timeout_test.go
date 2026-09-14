@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/knaeckebrothero/superhuman-remote-worker/sudo-gated/internal/config"
+	"github.com/superhuman-remote-worker/srw/sudo-gated/internal/config"
 )
 
 // Exercise the production handler framing, HTTP transport, and loaded budgets.

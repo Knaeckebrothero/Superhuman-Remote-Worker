@@ -33,9 +33,9 @@ env:
   # but GHCR rejects uppercase image paths. docker/metadata-action handles
   # this for production tags; YAML expressions can't lowercase, so we hardcode.
   # Update this if the repo is renamed.
-  REPO_LOWER: knaeckebrothero/superhuman-remote-worker
-  SRW_SOURCE_URL: https://github.com/knaeckebrothero/Superhuman-Remote-Worker
-  SRW_DOCUMENTATION_URL: https://github.com/knaeckebrothero/Superhuman-Remote-Worker
+  REPO_LOWER: superhuman-remote-worker/srw
+  SRW_SOURCE_URL: https://github.com/superhuman-remote-worker/srw
+  SRW_DOCUMENTATION_URL: https://github.com/superhuman-remote-worker/srw
 
 jobs:
   # Match each runtime role's Python/dependencies independently of the unit union.
@@ -1499,7 +1499,7 @@ jobs:
       - name: Push chart to OCI registry
         run: |
           helm push "./dist/superhuman-remote-worker-${{ needs.resolve-version.outputs.version }}.tgz" \
-            oci://ghcr.io/knaeckebrothero/charts
+            oci://ghcr.io/superhuman-remote-worker/charts
       - name: Push git tag
         run: |
           git config user.name "github-actions[bot]"

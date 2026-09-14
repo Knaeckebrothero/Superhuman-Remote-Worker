@@ -101,7 +101,7 @@ if not isinstance(VM_TOLERATIONS, list) or not all(
     raise ValueError("VM_TOLERATIONS must be a JSON array of objects")
 DEFAULT_VM_IMAGE = os.environ.get(
     "DEFAULT_VM_IMAGE",
-    "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:latest",
+    "ghcr.io/superhuman-remote-worker/srw-agent-vm-base:latest",
 )
 DEFAULT_CPU = int(os.environ.get("DEFAULT_CPU", "2"))
 DEFAULT_MEMORY = os.environ.get("DEFAULT_MEMORY", "4Gi")

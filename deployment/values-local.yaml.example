@@ -441,7 +441,7 @@ logFormat: "text"
 # vmController:
 #   # Tilt builds srw-vm-controller from vm/controller and injects image.* itself.
 #   # The VM image is only built by CI — pin a published sha tag:
-#   defaultVmImage: ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:sha-XXXXXXX
+#   defaultVmImage: ghcr.io/superhuman-remote-worker/srw-agent-vm-base:sha-XXXXXXX
 #   defaultCpu: 4
 #   defaultMemory: 8Gi
 #   maxConcurrentVms: 2
