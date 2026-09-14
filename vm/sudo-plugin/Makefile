@@ -21,7 +21,7 @@ install: $(TARGET)
 	install -o root -g root -m 0644 $(TARGET) /usr/libexec/sudo/
 	@echo "Installed to /usr/libexec/sudo/$(TARGET)"
 	@echo "Add to /etc/sudo.conf:"
-	@echo "  Plugin sudo_gate_approval sudo_gate.so socket_path=/run/sudo-gated/sudo-gated.sock timeout=305 fail_mode=deny"
+	@echo "  Plugin sudo_gate_approval sudo_gate.so socket_path=/run/sudo-gated/sudo-gated.sock timeout=1845 fail_mode=deny"
 
 uninstall:
 	rm -f /usr/libexec/sudo/$(TARGET)

@@ -88,7 +88,8 @@ class TestShortIdResolution:
         assert "approved" in out
 
     @pytest.mark.asyncio
-    async def test_unique_short_id_resolves_to_the_full_uuid(self):
+    @pytest.mark.parametrize("prefix", ["f678a94d", "F678A94D", " f678a94d-2f1e "])
+    async def test_unique_short_id_resolves_to_the_full_uuid(self, prefix):
         """The listing prints 8 characters; approving from it must work."""
         client = _client(
             list_sudo_requests=[
@@ -98,7 +99,7 @@ class TestShortIdResolution:
             approve_sudo_request={"status": "approved"},
         )
         with patch.object(_mcp_server_mod, "_get_client", return_value=client):
-            out = await _mcp_server_mod.approve_sudo_request("f678a94d")
+            out = await _mcp_server_mod.approve_sudo_request(prefix)
 
         client.approve_sudo_request.assert_awaited_once_with(REQUEST_ID, reason="")
         assert REQUEST_ID in out
@@ -151,3 +152,37 @@ class TestShortIdResolution:
             await _mcp_server_mod.approve_sudo_request("f678a94d")
 
         assert client.list_sudo_requests.await_args.kwargs.get("status") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["approve", "deny"])
+@pytest.mark.parametrize(
+    "request_id",
+    [
+        "",
+        " ",
+        "\t\n",
+        "not-an-id",
+        "f678a94d!",
+        "-",
+        "f678a94d-2f1e-4f0a-9a1c-7b3d5e2c8a10x",
+    ],
+)
+async def test_invalid_id_never_lists_or_decides_the_only_visible_request(
+    action, request_id
+):
+    """Blank prefixes used to select the sole pending request and execute it."""
+    client = _client(
+        list_sudo_requests=[LOGIN_SHELL_REQUEST],
+        approve_sudo_request={"status": "approved"},
+        deny_sudo_request={"status": "denied"},
+    )
+    with patch.object(_mcp_server_mod, "_get_client", return_value=client):
+        tool = getattr(_mcp_server_mod, f"{action}_sudo_request")
+        out = await tool(request_id, reason="operator decision")
+
+    assert out.startswith(f"Failed to {action}:")
+    assert "invalid" in out.lower()
+    client.list_sudo_requests.assert_not_awaited()
+    client.approve_sudo_request.assert_not_awaited()
+    client.deny_sudo_request.assert_not_awaited()

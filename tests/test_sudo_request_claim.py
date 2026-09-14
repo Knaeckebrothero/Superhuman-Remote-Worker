@@ -13,6 +13,7 @@ import pytest_asyncio
 from testcontainers.postgres import PostgresContainer
 
 from orchestrator.database.postgres import PostgresDB
+from orchestrator.services import sudo_gate as sudo_gate_module
 from orchestrator.services.sudo_gate import SudoGateService
 
 JOB = "11111111-1111-1111-1111-111111111111"
@@ -47,6 +48,9 @@ async def gate(pg_dsn):
                 requesting_user    varchar(255) NOT NULL,
                 target_user        varchar(255) NOT NULL DEFAULT 'root',
                 status             text NOT NULL DEFAULT 'pending',
+                decided_at         timestamptz,
+                decided_by         text,
+                decision_reason    text,
                 requested_at       timestamptz NOT NULL DEFAULT now(),
                 ttl_seconds        integer NOT NULL DEFAULT 300,
                 expires_at         timestamptz NOT NULL DEFAULT (now() + interval '300 seconds'),
@@ -120,3 +124,49 @@ async def test_db_error_raises_not_none(gate):
     # None (swallowed); the new contract raises. This is the red test.
     with pytest.raises(Exception):
         await _claim(gate, "_INBOX.cccccccccccc", user=None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "configured_ttl,still_pending_after", [(None, 600), ("90", 60), ("2400", 2340)]
+)
+async def test_real_database_expiry_uses_configured_command_window(
+    gate, monkeypatch, configured_ttl, still_pending_after
+):
+    """A ten-minute-old request must still be decidable; shorter TTLs expire too."""
+    if configured_ttl is None:
+        monkeypatch.delenv("SUDO_COMMAND_TTL_SECONDS", raising=False)
+    else:
+        monkeypatch.setenv("SUDO_COMMAND_TTL_SECONDS", configured_ttl)
+    ttl = sudo_gate_module._ttl_seconds_from_env("SUDO_COMMAND_TTL_SECONDS", 1800)
+    monkeypatch.setattr(sudo_gate_module, "SUDO_COMMAND_TTL_SECONDS", ttl)
+    request_id = await _claim(gate, REPLY)
+    async with gate._db.acquire() as conn:
+        await conn.execute(
+            "UPDATE sudo_approval_requests SET "
+            "requested_at = requested_at - $1::integer * INTERVAL '1 second', "
+            "expires_at = expires_at - $1::integer * INTERVAL '1 second' WHERE id = $2",
+            still_pending_after,
+            request_id,
+        )
+    assert await gate.sweep_expired() == 0
+    async with gate._db.acquire() as conn:
+        assert (
+            await conn.fetchval(
+                "SELECT status FROM sudo_approval_requests WHERE id = $1", request_id
+            )
+            == "pending"
+        )
+        await conn.execute(
+            "UPDATE sudo_approval_requests SET expires_at = expires_at - $1::integer * INTERVAL '1 second' WHERE id = $2",
+            ttl - still_pending_after + 1,
+            request_id,
+        )
+    assert await gate.sweep_expired() == 1
+    async with gate._db.acquire() as conn:
+        assert (
+            await conn.fetchval(
+                "SELECT status FROM sudo_approval_requests WHERE id = $1", request_id
+            )
+            == "expired"
+        )

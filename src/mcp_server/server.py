@@ -2197,11 +2197,22 @@ async def _resolve_sudo_request_id(client: Any, request_id: str) -> str:
     shorter is matched against the ids of recent requests and must identify
     exactly one.
     """
-    candidate = (request_id or "").strip()
+    candidate = request_id.strip().lower() if isinstance(request_id, str) else ""
     try:
         return str(UUID(candidate))
     except (AttributeError, TypeError, ValueError):
         pass
+
+    # A prefix must be a nonempty beginning of a canonical UUID. In particular,
+    # startswith("") matches every row and can silently decide the sole request.
+    shape = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+    if not 1 <= len(candidate) < len(shape) or any(
+        char != "-" if shape[index] == "-" else char not in "0123456789abcdef"
+        for index, char in enumerate(candidate)
+    ):
+        raise _SudoIdError(
+            "invalid sudo request id — provide a UUID or its short prefix"
+        )
 
     requests = await client.list_sudo_requests(limit=100)
     matches = sorted(
