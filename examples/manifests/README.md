@@ -225,6 +225,21 @@ python -m shared.manifests preview examples/manifests/*.yaml
 python -m shared.manifests export examples/manifests/*.yaml --output-format json
 ```
 
+Pass `-` as a file argument to read UTF-8 YAML or JSON from stdin; a single
+`-` may be mixed with file paths in argument order. Multiple `-` arguments
+are rejected before stdin is read, oversized or invalid UTF-8 input exits
+non-zero with no traceback, and the existing 1 MiB / 100-document /
+parser-contract limits still apply. For example, fetch a stored resource
+from the local API and preview it against the local definition set:
+
+```bash
+curl --silent --cacert "$HOME/.local/share/mkcert/rootCA.pem" \
+  -H "Authorization: Bearer $SRW_TOKEN" \
+  https://api.localhost/api/resources/Account/personal/Job/example \
+  | python -m shared.manifests preview - \
+      --scope-kind Account --scope-name personal
+```
+
 For resources without explicit metadata scope, provide both `--scope-kind Account`
 and `--scope-name personal` (or the intended Project/Catalog scope). Validation
 permits omitted scope; preview/export must resolve it. A Project itself requires
