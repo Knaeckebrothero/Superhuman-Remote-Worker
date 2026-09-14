@@ -34,6 +34,8 @@ separate. Initialization and ordinary working files never flow back into the
 cache. `retention: Retain` and `instanceRef` preserve one working disk across Jobs;
 they do not turn that disk into a template. Reusing a retained instance works
 with new preparation disabled and does not rerun successful initialization.
+Its reported initialization success also survives a later attachment that fails
+before producing an initialization receipt.
 Starting the SRW harness preserves initialized files and existing working trees.
 An existing delivery repository must match the requested remote; a different
 remote is rejected without clearing the workspace.

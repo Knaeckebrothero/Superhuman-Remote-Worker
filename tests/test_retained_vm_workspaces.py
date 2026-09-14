@@ -114,6 +114,53 @@ async def test_job_completion_without_fenced_teardown_keeps_ownership(database, 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("initialization_succeeded", [False, True])
+async def test_failed_later_attachment_preserves_the_disks_initialization_status(
+    database, actor, initialization_succeeded
+):
+    from orchestrator.services.manifest_workspaces import ManifestWorkspaceService
+
+    job_id, _, binding = await first(database, actor)
+    await database.merge_job_context(
+        job_id,
+        {
+            "vm": {
+                "initialization_receipt": {
+                    "phase": "Succeeded" if initialization_succeeded else "Failed"
+                }
+            }
+        },
+    )
+    pvc_uid = await finished(database, job_id, binding)
+    service = ManifestWorkspaceService(
+        database, None, namespace="test-vms", default_image="unused"
+    )
+    assert (await service.view(binding["uid"], actor))["initialized"] is (
+        initialization_succeeded
+    )
+
+    ref = {"instanceRef": {"uid": binding["uid"]}}
+    *_, next_job, _ = await full_schema.admit(database, actor, assignment(ref))
+    next_binding = await provision_binding(database, next_job)
+    assert next_binding["pvc_uid"] == pvc_uid
+    # The later attachment failed before a guest initialization receipt. This
+    # callback follows fenced teardown; it must not erase an earlier success
+    # for this same disk or invent one for a disk that was never initialized.
+    await database.execute(
+        "UPDATE jobs SET status='failed' WHERE id=$1::uuid", next_job
+    )
+    await record_detached(database, next_job, next_binding)
+    state = await service.view(binding["uid"], actor)
+    assert state["status"] == "Detached" and state["executionId"] is None
+    assert state["generation"] == 2
+    assert state["initialized"] is initialization_succeeded
+
+    *_, third_job, _ = await full_schema.admit(database, actor, assignment(ref))
+    third_binding = await provision_binding(database, third_job)
+    assert third_binding == {**next_binding, "generation": 3}
+
+
+@pytest.mark.asyncio
 async def test_running_job_cannot_be_detached_by_a_cleanup_acknowledgement(
     database, actor
 ):
