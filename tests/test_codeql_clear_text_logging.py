@@ -195,7 +195,9 @@ class TestSeedLlmConfigLogging:
         assert "sk-live-ENDPOINT-KEY-987654" not in _messages(caplog)
 
     @pytest.mark.asyncio
-    async def test_seeding_a_key_logs_the_provider_not_the_key(self, caplog):
+    async def test_seeding_a_key_logs_a_constant_outcome_and_preserves_provider(
+        self, caplog
+    ):
         from orchestrator.seed import llm_config
 
         db = MagicMock()
@@ -212,7 +214,10 @@ class TestSeedLlmConfigLogging:
 
         emitted = _messages(caplog)
         assert "sk-live-SEEDED-KEY-424242" not in emitted
-        assert "openai" in emitted
+        assert "openai" not in emitted
+        assert "seeded system API-key entry" in emitted
+        assert report.api_keys_seeded == ["openai"]
+        assert db.upsert_system_api_key.await_args.kwargs["provider"] == "openai"
 
 
 # =============================================================================
