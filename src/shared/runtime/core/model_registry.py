@@ -354,6 +354,12 @@ def family_of(model_id: str, default: str = "default") -> str:
         return "o-series"
     if "deepseek" in name:
         return "deepseek"
+    # Flash has vision; the flagship is text-only. Both have a narrower
+    # reasoning ladder than older GLM models, so match before generic glm.
+    if "glm-5.3-flash" in name:
+        return "glm-5.3-flash"
+    if "glm-5.3" in name:
+        return "glm-5.3"
     if "glm" in name:
         return "glm"
     if name.startswith(

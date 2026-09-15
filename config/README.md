@@ -167,7 +167,10 @@ config/
 │   ├── summarization_prompt_minimax_m3.txt # MiniMax M3 summarization
 │   ├── systemprompt_glm.txt                # GLM-5.2 worker system prompt
 │   ├── systemprompt_interactive_glm.txt    # GLM-5.2 persistent-chat system prompt
-│   └── persona_glm.txt                     # GLM-5.2 persona
+│   ├── persona_glm.txt                     # GLM-5.2 persona
+│   ├── systemprompt_glm_5_3.txt            # GLM-5.3 / Flash worker prompt
+│   ├── systemprompt_interactive_glm_5_3.txt # GLM-5.3 / Flash chat prompt
+│   └── persona_glm_5_3.txt                 # GLM-5.3 / Flash persona
 └── templates/                   # Instruction templates (non-prompt files)
     ├── instructions.md                  # Default agent instructions
     ├── instructions_minimax.md          # MiniMax M2.7-optimized instructions
@@ -706,6 +709,23 @@ tools:
 `null` clears a key for *that* merge only — a later layer (a job override)
 re-adds it. Keys a role must never see are declared with `$ignore_keys` on the
 role overlay instead (see above); they are pruned after every layer.
+
+## Z.ai GLM-5.3 models
+
+The `glm-5.3` family covers the text-only flagship; `glm-5.3-flash` also enables
+image input. Both use the GLM-5.3 worker/chat/persona prompts, temperature `1.0`,
+top-p `0.95`, reasoning `max` (options: `low`, `high`, `max`), a 1M-token context,
+and a 131,072-token output budget. Reasoning cannot be disabled. Older models
+such as GLM-5.2 retain the `glm` family.
+
+In **Admin → Models**, add `z-ai/glm-5.3-flash` using your OpenRouter provider;
+`openrouter/z-ai/glm-5.3-flash` is also recognized. The family is detected
+automatically. For Z.ai's OpenAI-compatible endpoint, use the bare model ID
+`glm-5.3-flash`. Explicit model/expert/user settings override the family defaults.
+
+Sampling and reasoning follow [Z.ai's documented settings](https://docs.z.ai/guides/vlm/glm-5.3-flash).
+Context limits can vary by OpenRouter provider; an explicit catalog context/output
+limit overrides the family values. Adding a family does not create a catalog row.
 
 ## Schema Validation
 

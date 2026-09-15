@@ -8,6 +8,16 @@ import {
 import type {EffectiveModels} from '../../core/models/api.model';
 
 describe('detectModelFamily — GLM', () => {
+  it.each(['', 'z-ai/', 'openrouter/z-ai/', 'zai-org/'])(
+    'distinguishes GLM-5.3 Flash vision settings with prefix %s', (prefix) => {
+      expect(detectModelFamily(`${prefix}GLM-5.3-Flash`)).toBe('glm-5.3-flash');
+      expect(detectModelFamily(`${prefix}glm-5.3-flash:exacto`)).toBe('glm-5.3-flash');
+      expect(detectModelFamily(`${prefix}glm-5.3`)).toBe('glm-5.3');
+      expect(detectModelFamily(`${prefix}glm-5.3-20260816`)).toBe('glm-5.3');
+      expect(detectModelFamily(`${prefix}glm-4.7-flash`)).toBe('glm');
+    },
+  );
+
   it('maps GLM-5.2 IDs to the glm family across transports', () => {
     expect(detectModelFamily('openrouter/z-ai/glm-5.2')).toBe('glm');
     expect(detectModelFamily('z-ai/glm-5.2')).toBe('glm');
