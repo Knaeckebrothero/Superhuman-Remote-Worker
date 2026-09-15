@@ -637,6 +637,9 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
         display: flex;
         flex-direction: column;
         height: 100%;
+        /* Short viewports with stacked banners may not fit the filters and
+           footer. Keep those controls reachable by scrolling the list. */
+        overflow-y: auto;
         background: var(--panel-bg, var(--panel-bg));
       }
 
@@ -719,6 +722,7 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
       /* Table */
       .table-container {
         flex: 1;
+        min-height: 6rem;
         overflow-y: auto;
         overflow-x: hidden;
       }
