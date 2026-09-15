@@ -398,7 +398,7 @@ class TestPermissionNotifySweeperSQL:
     async def test_selects_aged_pending_gates_without_a_feed_row(self, monkeypatch):
         import asyncio
 
-        import orchestrator.main as orch_main
+        import orchestrator.services.thread_permissions as thread_permissions_module
 
         captured: dict = {}
         evt = asyncio.Event()
@@ -426,9 +426,10 @@ class TestPermissionNotifySweeperSQL:
         # awaits a real DB method.
         fake_db = MagicMock()
         fake_db.acquire = lambda: _Acquire()
-        monkeypatch.setattr(orch_main, "postgres_db", fake_db)
 
-        await orch_main.thread_permission_notify_sweeper(evt)
+        await thread_permissions_module.thread_permission_notify_sweeper(
+            evt, db=fake_db
+        )
 
         q = captured.get("query", "")
         # Only gates still pending and older than the age threshold …

@@ -737,20 +737,36 @@ class TestMagicLinkWakeProvisioningFailsLoudly:
                 return None
 
         db.acquire = lambda: _Acquire()
+        import orchestrator.services.thread_permissions as thread_permissions_module
+
+        # The emit wrapper is main-owned and reads main's postgres_db global
+        # at call time, so the fake db must be patched there too.
         monkeypatch.setattr(orch_main, "postgres_db", db)
         monkeypatch.setattr(
-            orch_main, "persistent_provisioner", _refusing_persistent_provisioner()
+            thread_permissions_module,
+            "persistent_provisioner",
+            _refusing_persistent_provisioner(),
         )
-        monkeypatch.setattr(orch_main, "_persistent_thread_recycler", None)
         svc = MagicMock()
         svc.is_enabled = True
-        monkeypatch.setattr(orch_main, "workspace_suspension_service", svc)
+        monkeypatch.setattr(
+            thread_permissions_module, "workspace_suspension_service", svc
+        )
 
         tasks = _CollectingCreateTask()
         recorder = _LifecycleRecorder()
-        with patch("orchestrator.main.asyncio.create_task", tasks):
+        with patch(
+            "orchestrator.services.thread_permissions.asyncio.create_task", tasks
+        ):
             with patch("orchestrator.services.session_lifecycle.emit", recorder):
-                await orch_main._phase5_wake_if_suspended(THREAD_ID)
+                await thread_permissions_module._phase5_wake_if_suspended(
+                    THREAD_ID,
+                    db=db,
+                    emit_session_provisioning_failure=(
+                        orch_main._emit_session_provisioning_failure
+                    ),
+                    persistent_thread_recycler=None,
+                )
                 assert await tasks.drain("_create_after_magic_link") == 1
 
         assert len(recorder.failures) == 1

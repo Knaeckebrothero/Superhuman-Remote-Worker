@@ -6,7 +6,6 @@ Run with:
 
 import asyncio
 import functools
-import html
 import json
 import logging
 import os
@@ -14,7 +13,6 @@ import sys
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-import urllib.parse
 from urllib.parse import urlparse
 
 from dotenv import find_dotenv, load_dotenv
@@ -58,7 +56,6 @@ from fastapi import (  # noqa: E402
 )
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.responses import (  # noqa: E402
-    HTMLResponse,
     JSONResponse,
     Response,
     StreamingResponse,
@@ -337,6 +334,8 @@ from orchestrator.schemas.project_loops import LoopPlanRequest  # noqa: E402,F40
 from orchestrator.routers import job_completion as job_completion_routes  # noqa: E402
 from orchestrator.routers import job_controls as job_control_routes  # noqa: E402
 from orchestrator.services import attention_sleep as attention_sleep_service  # noqa: E402
+from orchestrator.routers import thread_permissions as thread_permissions_routes  # noqa: E402
+from orchestrator.services import thread_permissions as thread_permissions_service  # noqa: E402
 from orchestrator.routers import job_lifecycle as job_lifecycle_routes  # noqa: E402
 from orchestrator.routers import thread_lifecycle as thread_lifecycle_routes  # noqa: E402
 from orchestrator.routers import verification as verification_routes  # noqa: E402
@@ -684,7 +683,6 @@ from orchestrator.services.thread_interrupt_inbox import (  # noqa: E402
 from shared.thread_presence import (  # noqa: E402
     DEFAULT_PRESENCE_RENEW_SECONDS,
     DEFAULT_PRESENCE_TTL_SECONDS,
-    promote_expired_stateless_pauses,
     refresh_thread_presence,
 )
 from shared.pinned_session_identity import PinnedSessionBinding  # noqa: E402
@@ -777,7 +775,6 @@ from orchestrator.services.session_runtime_admission import (  # noqa: E402
     ThreadRuntimeAuthority,
     pinned_binding_invalid_detail,
     protected_cloud_marker_state,
-    same_thread_runtime_authority,
     thread_runtime_authority,
     thread_runtime_refusal_detail,
 )
@@ -873,7 +870,6 @@ from orchestrator.services.docker_provisioner import docker_provisioner  # noqa:
 from orchestrator.services.persistent_provisioner import persistent_provisioner  # noqa: E402
 from orchestrator.services.persistent_recycler import (  # noqa: E402
     PersistentThreadRecycler,
-    read_recycle_record,
 )
 from orchestrator.services.pinned_agent_authority import (  # noqa: E402
     reconcile_legacy_pinned_agent_authority,
@@ -929,8 +925,6 @@ from orchestrator.services.ide_proxy import (  # noqa: E402
     ide_proxy_service,
 )
 from orchestrator.services.email import email_service  # noqa: E402
-from orchestrator.services import headless_notifications  # noqa: E402
-from orchestrator.services.brand import TRAVERTINE as _BRAND  # noqa: E402
 from orchestrator.services.imap_poller import imap_poller  # noqa: E402
 from orchestrator.services.notification_service import (  # noqa: E402
     notification_service,
@@ -5806,7 +5800,13 @@ async def lifespan(app: FastAPI):
         run_retention_sweeper(postgres_db, _shutdown_event, is_leader.is_set)
     )
     headless_notify_task = asyncio.create_task(
-        run_when_leader(thread_permission_notify_sweeper, _shutdown_event)
+        run_when_leader(
+            functools.partial(
+                thread_permissions_service.thread_permission_notify_sweeper,
+                db=postgres_db,
+            ),
+            _shutdown_event,
+        )
     )
     # Leader-gated: both snapshot/teardown idle workspaces (attention-sleep) or
     # delete idle IDE VMs/pods (ide-sweeper) after a plain SELECT, with no
@@ -7265,7 +7265,11 @@ def _notification_action_dependencies() -> (
         apply_vm_upgrade_decision=lambda *args, **kwargs: (
             _job_control_operations().apply_vm_upgrade_decision(*args, **kwargs)
         ),
-        decide_permission_request=_decide_permission_request,
+        decide_permission_request=lambda *args, **kwargs: (
+            thread_permissions_service._decide_permission_request(
+                *args, **kwargs, db=postgres_db
+            )
+        ),
         job_resume_request=JobResumeRequest,
         job_approve_request=JobApproveRequest,
     )
@@ -8637,6 +8641,21 @@ app.include_router(media_routes.router)
 app.include_router(ide_routes.router)
 app.include_router(workspace_access_routes.router)
 app.include_router(thread_files_routes.router)
+
+
+def _thread_permissions_dependencies() -> (
+    thread_permissions_routes.ThreadPermissionsDependencies
+):
+    """Resolve collaborators only from the application handling this request."""
+    return thread_permissions_routes.ThreadPermissionsDependencies(
+        store=postgres_db,
+        emit_session_provisioning_failure=_emit_session_provisioning_failure,
+        persistent_thread_recycler=_persistent_thread_recycler,
+    )
+
+
+app.state.thread_permissions_dependencies_factory = _thread_permissions_dependencies
+app.include_router(thread_permissions_routes.router)
 app.include_router(job_repo_routes.router)
 app.include_router(job_diff_routes.router)
 app.include_router(job_review_routes.router)
@@ -12669,103 +12688,6 @@ async def thread_interrupt(
     return {"accepted": True, "agent": result}
 
 
-class ThreadApproveRequest(BaseModel):
-    """Body for POST /api/persistent/threads/{id}/approve/{approval_id}."""
-
-    decision: str  # "approve" or "deny"
-
-
-@app.post("/api/persistent/threads/{thread_id}/approve/{approval_id}")
-async def thread_approve(
-    thread_id: str,
-    approval_id: str,
-    body: ThreadApproveRequest,
-    request: Request,
-) -> dict[str, Any]:
-    """Resolve a pending permission gate by updating thread_permission_requests
-    directly. The DB trigger fires NOTIFY → the agent's LISTEN wakes its
-    permission_check. No agent forwarding hop — this endpoint is the
-    canonical resolution path for magic-link approvals and MCP clients
-    alike. The cockpit WS approve method does the same UPDATE inside the
-    agent for back-compat.
-
-    Returns:
-        200 — request resolved (status flipped)
-        400 — invalid decision
-        403 — not thread owner
-        404 — approval_id not found, or wrong thread, or no pending request
-        409 — request already decided (idempotent re-clicks land here)
-    """
-    user, thread = await require_thread_owner(request, postgres_db, thread_id)
-    decided_by = str(user.get("id") or user.get("sub") or "rest_client")
-    outcome = await _decide_permission_request(
-        thread_id, approval_id, body.decision, decided_by=decided_by
-    )
-    await notification_service.resolve_source(
-        "permission_request", approval_id, resolved_by=f"user:{decided_by}"
-    )
-    return outcome
-
-
-async def _decide_permission_request(
-    thread_id: str, approval_id: str, decision: str, *, decided_by: str
-) -> dict[str, Any]:
-    """The one UPDATE that decides a permission gate — shared by the REST
-    endpoint and the notification's approve/deny actions. Raises the
-    endpoint's HTTP errors: 400 bad decision, 404 unknown, 409 decided."""
-    if decision == "approve":
-        new_status = "approved"
-    elif decision == "deny":
-        new_status = "denied"
-    else:
-        raise HTTPException(
-            status_code=400,
-            detail="decision must be 'approve' or 'deny'",
-        )
-
-    async with postgres_db.acquire() as conn:
-        # Lookup-then-update so we can distinguish 404 (wrong id/thread)
-        # from 409 (already decided).
-        existing = await conn.fetchrow(
-            "SELECT id, status, tool_call_id FROM thread_permission_requests "
-            "WHERE id = $1 AND thread_id = $2",
-            approval_id,
-            thread_id,
-        )
-        if existing is None:
-            raise HTTPException(
-                status_code=404,
-                detail="Permission request not found for this thread",
-            )
-        if existing["status"] != "pending":
-            raise HTTPException(
-                status_code=409,
-                detail=f"Already {existing['status']}",
-            )
-        row = await conn.fetchrow(
-            "UPDATE thread_permission_requests "
-            "SET status = $2, decided_at = now(), decided_by = $3 "
-            "WHERE id = $1 AND status = 'pending' "
-            "RETURNING id, status, tool_call_id",
-            approval_id,
-            new_status,
-            decided_by,
-        )
-    if row is None:
-        # Lost the race — somebody else just decided this. Idempotency.
-        raise HTTPException(
-            status_code=409,
-            detail="Already decided (race lost)",
-        )
-    return {
-        "accepted": True,
-        "decision": decision,
-        "approval_id": str(row["id"]),
-        "status": row["status"],
-        "tool_call_id": row["tool_call_id"],
-    }
-
-
 async def thread_events_prune_sweeper(
     shutdown_event: asyncio.Event,
 ) -> None:
@@ -12923,873 +12845,6 @@ async def ssh_attachments_prune_sweeper(shutdown_event: asyncio.Event) -> None:
 # and UPDATEs thread_permission_requests via the same trigger path as
 # the cockpit WS approve handler.
 #
-# Background watcher (thread_permission_notify_sweeper) detects pending
-# requests older than 30s with no notification on record and dispatches
-# the email via services.headless_notifications.
-
-
-# Phase 5: per-thread cap on /magic/extend clicks. 4 × 60min = 4h total
-# awaiting_user before unconditional suspension. Configurable via env for
-# ops tuning during incident response.
-_MAGIC_EXTEND_CAP: int = int(os.environ.get("HEADLESS_EXTEND_CAP", "4"))
-
-
-def _magic_link_confirmation_page(
-    *,
-    tool_name: str,
-    tool_args_preview: str,
-    intended_decision: Optional[str],
-    token: str,
-    extend_status: Optional[str] = None,
-    extends_remaining: Optional[int] = None,
-) -> str:
-    """Render the GET landing page. Single button POSTs back to the same
-    URL with the actual decision; this is what prevents email-link
-    prefetchers (Outlook Safe Links, Gmail) from auto-consuming tokens.
-
-    Phase 5: a second form lets the user POST /magic/extend/{token} to
-    bump the attention-sleep clock by 60 min without consuming the
-    approval token. extend_status (when set) drives an inline toast:
-    'extended' on success, 'cap_reached' when extend_count >= cap,
-    'not_awaiting' when the thread is no longer in awaiting_user.
-    """
-    # Both values come from the agent's pending tool call and land in element
-    # content; the token below lands in an attribute. html.escape(quote=True)
-    # covers & < > " ' in one pass — the hand-rolled chains here missed ">" on
-    # the tool name and the quotes on both, which is the reflected-XSS hole.
-    safe_args = html.escape(tool_args_preview, quote=True)
-    safe_tool = html.escape(tool_name, quote=True)
-    if intended_decision == "approved":
-        button_label = "Confirm: Approve"
-        button_color = _BRAND["success"]
-    elif intended_decision == "denied":
-        button_label = "Confirm: Deny"
-        button_color = _BRAND["danger"]
-    else:
-        button_label = "Confirm decision"
-        button_color = _BRAND["accent-color"]
-
-    # The token lands in a form ``action`` attribute. Percent-encoding already
-    # removes every character that could close the attribute; escaping the
-    # result as well is a no-op on that output but keeps the sanitizer
-    # explicit at the sink rather than inferred from the encoder.
-    quoted_token = html.escape(urllib.parse.quote(token, safe=""), quote=True)
-
-    # Extend banner copy — friendly, action-specific.
-    extend_banner_html = ""
-    if extend_status == "extended":
-        remaining_str = (
-            f" — {extends_remaining} extends remaining"
-            if extends_remaining is not None
-            else ""
-        )
-        extend_banner_html = (
-            f'<div style="background: {_BRAND["surface-0"]}; border: 1px solid {_BRAND["success"]}; '
-            "padding: 10px 12px; margin: 0 0 12px 0; "
-            f'color: {_BRAND["success"]}; font-size: 13px;">Window extended by 60 minutes'
-            f"{remaining_str}.</div>"
-        )
-    elif extend_status == "cap_reached":
-        extend_banner_html = (
-            f'<div style="background: {_BRAND["surface-0"]}; border: 1px solid {_BRAND["text-secondary"]}; '
-            "padding: 10px 12px; margin: 0 0 12px 0; "
-            f'color: {_BRAND["text-secondary"]}; font-size: 13px;">Extend limit reached — please '
-            "approve, deny, or open the cockpit.</div>"
-        )
-    elif extend_status == "not_awaiting":
-        extend_banner_html = (
-            f'<div style="background: {_BRAND["surface-0"]}; border: 1px solid {_BRAND["accent-color"]}; '
-            "padding: 10px 12px; margin: 0 0 12px 0; "
-            f'color: {_BRAND["accent-color"]}; font-size: 13px;">No extend needed — the agent '
-            "is already active.</div>"
-        )
-
-    # Disable the extend button if we already know the cap was hit.
-    #
-    # The disabled look MUST be merged into the button's own style attribute.
-    # HTML keeps the FIRST style= on an element and ignores every later one,
-    # so emitting a second one meant the cap_reached branch -- and only that
-    # branch -- rendered a button with opacity/cursor and none of the brand
-    # colours, border or type scale.
-    _extend_cap_reached = extend_status == "cap_reached"
-    extend_disabled_attr = " disabled" if _extend_cap_reached else ""
-    extend_button_style = (
-        f"background: transparent; color: {_BRAND['accent-color']}; "
-        f"padding: 10px 20px; border: 1px solid {_BRAND['accent-color']}; "
-        f"font-weight: 600; font-size: 14px; "
-        + (
-            "opacity: 0.5; cursor: not-allowed;"
-            if _extend_cap_reached
-            else "cursor: pointer;"
-        )
-    )
-
-    return f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>SRW — Confirm Decision</title></head>
-<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: {_BRAND["app-bg"]}; color: {_BRAND["text-primary"]}; padding: 40px 20px;">
-  <div style="max-width: 600px; margin: 0 auto; background: {_BRAND["panel-bg"]}; border: 1px solid {_BRAND["border-color"]}; overflow: hidden;">
-    <div style="background: {_BRAND["surface-0"]}; padding: 16px 20px; border-bottom: 1px solid {_BRAND["border-color"]};">
-      <h2 style="margin: 0; color: {_BRAND["accent-color"]}; font-size: 16px;">Confirm tool decision</h2>
-    </div>
-    <div style="padding: 20px; font-size: 14px; line-height: 1.6;">
-      {extend_banner_html}
-      <p>The agent wants to call <code style="background: {_BRAND["surface-0"]}; padding: 2px 6px;">{safe_tool}</code> with these arguments:</p>
-      <pre style="background: {_BRAND["surface-0"]}; padding: 12px; overflow-x: auto; font-size: 12px; color: {_BRAND["success"]};">{safe_args}</pre>
-    </div>
-    <div style="background: {_BRAND["surface-0"]}; padding: 16px 20px; border-top: 1px solid {_BRAND["border-color"]}; text-align: center;">
-      <form method="POST" action="/magic/approve/{quoted_token}" style="display: inline;">
-        <button type="submit" style="background: {button_color}; color: {_BRAND["on-accent"]}; padding: 10px 28px; border: 0; cursor: pointer; font-weight: 600; font-size: 14px;">{button_label}</button>
-      </form>
-      <form method="POST" action="/magic/extend/{quoted_token}" style="display: inline; margin-left: 8px;">
-        <button type="submit"{extend_disabled_attr} style="{extend_button_style}">I'm reviewing — extend 60min</button>
-      </form>
-      <p style="margin: 16px 0 0 0; color: {_BRAND["text-secondary"]}; font-size: 12px;">Approve link is single-use and expires in 30 minutes.</p>
-    </div>
-  </div>
-</body></html>"""
-
-
-def _magic_link_result_page(
-    *,
-    title: str,
-    body: str,
-    cockpit_url: str,
-    is_error: bool = False,
-) -> str:
-    accent = _BRAND["danger"] if is_error else _BRAND["success"]
-    return f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>SRW — {title}</title></head>
-<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: {_BRAND["app-bg"]}; color: {_BRAND["text-primary"]}; padding: 40px 20px;">
-  <div style="max-width: 600px; margin: 0 auto; background: {_BRAND["panel-bg"]}; border: 1px solid {_BRAND["border-color"]}; overflow: hidden;">
-    <div style="background: {_BRAND["surface-0"]}; padding: 16px 20px; border-bottom: 1px solid {_BRAND["border-color"]};">
-      <h2 style="margin: 0; color: {accent}; font-size: 16px;">{title}</h2>
-    </div>
-    <div style="padding: 20px; font-size: 14px; line-height: 1.6;">
-      <p>{body}</p>
-      <p style="margin-top: 16px;"><a href="{cockpit_url}" style="color: {_BRAND["accent-color"]};">Open the cockpit</a></p>
-    </div>
-  </div>
-</body></html>"""
-
-
-@app.get("/magic/approve/{token}")
-async def magic_link_get(token: str) -> HTMLResponse:
-    """Show a confirmation page for the magic-link token.
-
-    Does NOT consume the token (POST does). This separation is critical:
-    email link previewers (Outlook Safe Links, Gmail) auto-fetch URLs
-    server-side; a GET-executes link would be consumed by a bot before
-    the human ever clicks.
-    """
-    cockpit_external_url = email_service.cockpit_url or "http://localhost:4200"
-
-    row = await headless_notifications.validate_magic_link(postgres_db, token)
-    if row is None:
-        return HTMLResponse(
-            _magic_link_result_page(
-                title="Link expired or already used",
-                body=(
-                    "This approval link is no longer valid. It may have "
-                    "expired, been used already, or been invalidated by a "
-                    "newer approval. Open the cockpit to see the current "
-                    "state."
-                ),
-                cockpit_url=cockpit_external_url,
-                is_error=True,
-            ),
-            status_code=404,
-        )
-
-    # Fetch tool details for the confirmation page.
-    async with postgres_db.acquire() as conn:
-        permission_row = await conn.fetchrow(
-            "SELECT id, tool_name, tool_args, status "
-            "FROM thread_permission_requests WHERE id = $1",
-            row["approval_id"],
-        )
-
-    if permission_row is None or permission_row["status"] != "pending":
-        return HTMLResponse(
-            _magic_link_result_page(
-                title="Already decided",
-                body=(
-                    "The agent's request has already been resolved. No "
-                    "further action is needed."
-                ),
-                cockpit_url=cockpit_external_url,
-            ),
-            status_code=409,
-        )
-
-    tool_args = permission_row["tool_args"]
-    if isinstance(tool_args, str):
-        try:
-            tool_args = json.loads(tool_args)
-        except Exception:
-            tool_args = {}
-    elif tool_args is None:
-        tool_args = {}
-    args_preview = json.dumps(tool_args, indent=2, default=str)
-    if len(args_preview) > 600:
-        args_preview = args_preview[:600] + "\n… (truncated)"
-
-    page = _magic_link_confirmation_page(
-        tool_name=permission_row["tool_name"],
-        tool_args_preview=args_preview,
-        intended_decision=row.get("intended_decision"),
-        token=token,
-    )
-    return HTMLResponse(page)
-
-
-@app.post("/magic/approve/{token}")
-async def magic_link_post(token: str) -> HTMLResponse:
-    """Consume the token and resolve the permission request.
-
-    CAS UPDATE on magic_link_tokens (single-use) + a second UPDATE on
-    thread_permission_requests (which the agent's LISTEN picks up via
-    the existing trigger). Distinguishes 404 (invalid) from 409 (token
-    already used or request already decided) for clean UX on double-clicks.
-    """
-    cockpit_external_url = email_service.cockpit_url or "http://localhost:4200"
-
-    row = await headless_notifications.validate_magic_link(postgres_db, token)
-    if row is None:
-        return HTMLResponse(
-            _magic_link_result_page(
-                title="Link expired or already used",
-                body=(
-                    "This approval link is no longer valid. It may have "
-                    "expired or been used already."
-                ),
-                cockpit_url=cockpit_external_url,
-                is_error=True,
-            ),
-            status_code=404,
-        )
-
-    decision = row.get("intended_decision") or "approved"
-
-    consumed = await headless_notifications.consume_magic_link(
-        postgres_db, str(row["id"]), decision
-    )
-    if consumed is None:
-        return HTMLResponse(
-            _magic_link_result_page(
-                title="Already used",
-                body=(
-                    "This link has already been used. The agent's request "
-                    "is being processed."
-                ),
-                cockpit_url=cockpit_external_url,
-            ),
-            status_code=409,
-        )
-
-    # Resolve the permission request. CAS-style UPDATE so we don't race
-    # with the cockpit having already decided it.
-    decided_by_label = "magic_link"
-    if consumed.get("user_id"):
-        decided_by_label = f"user:{consumed['user_id']}"
-    async with postgres_db.acquire() as conn:
-        permission_row = await conn.fetchrow(
-            "UPDATE thread_permission_requests "
-            "SET status = $2, decided_at = now(), decided_by = $3 "
-            "WHERE id = $1 AND status = 'pending' "
-            "RETURNING id, status, tool_call_id, tool_name, thread_id",
-            consumed["approval_id"],
-            decision,
-            decided_by_label,
-        )
-
-    if permission_row is None:
-        return HTMLResponse(
-            _magic_link_result_page(
-                title="Already decided",
-                body=(
-                    "The agent's request was already resolved by another "
-                    "approval path (cockpit click, REST, or expired). "
-                    "Your action was not needed."
-                ),
-                cockpit_url=cockpit_external_url,
-            ),
-            status_code=409,
-        )
-
-    # Phase 5: if attention sleep fired since the email was sent, wake through
-    # the thread's existing execution plane. Pinned sessions retain workspace
-    # restore + agent-pod re-creation. Stateless sessions retain their exact
-    # queued/leased turn and converge the workspace without binding a pod. The
-    # permission-row id is the wake task's freshness fence.
-    asyncio.create_task(
-        _phase5_wake_if_suspended(
-            str(permission_row["thread_id"]),
-            permission_request_id=str(permission_row["id"]),
-        ),
-        name=f"phase5-wake-{str(permission_row['thread_id'])[:8]}",
-    )
-
-    pretty = "approved" if decision == "approved" else "denied"
-    return HTMLResponse(
-        _magic_link_result_page(
-            title=f"Tool {pretty}",
-            body=(
-                f"The agent's request to call "
-                f"<code>{permission_row['tool_name']}</code> has been "
-                f"{pretty}. The agent will resume shortly."
-            ),
-            cockpit_url=cockpit_external_url,
-        )
-    )
-
-
-@app.post("/magic/extend/{token}")
-async def magic_link_extend(token: str) -> HTMLResponse:
-    """Extend the attention-sleep window for the thread bound to this token.
-
-    Validates the token (same hash + expiry + single-use checks as
-    /magic/approve) but does NOT consume it — the user is signaling
-    "I'm still reviewing" without making the approve decision. Bumps
-    threads.awaiting_user_since forward by 60 minutes per click, capped
-    at HEADLESS_EXTEND_CAP (default 4 = 4h total ceiling).
-
-    Re-renders the confirmation page with a toast so the user can still
-    click approve/deny on the same screen. Status_code 200 throughout —
-    the page itself carries the success/cap/not-awaiting signal.
-
-    Why a separate route and not "extend ↔ approve same POST": the
-    approve handler consumes the token (single-use CAS). If extend
-    shared that path, every extend click would burn the approval token
-    and the user couldn't approve afterward.
-    """
-    cockpit_external_url = email_service.cockpit_url or "http://localhost:4200"
-
-    row = await headless_notifications.validate_magic_link(postgres_db, token)
-    if row is None:
-        return HTMLResponse(
-            _magic_link_result_page(
-                title="Link expired or already used",
-                body=(
-                    "This link is no longer valid. Open the cockpit to "
-                    "review the agent's current state."
-                ),
-                cockpit_url=cockpit_external_url,
-                is_error=True,
-            ),
-            status_code=404,
-        )
-
-    thread_id = row.get("thread_id")
-    if thread_id is None:
-        return HTMLResponse(
-            _magic_link_result_page(
-                title="Cannot extend",
-                body="This link is not bound to a thread.",
-                cockpit_url=cockpit_external_url,
-                is_error=True,
-            ),
-            status_code=400,
-        )
-
-    # Bump awaiting_user_since iff the thread is still in awaiting_user
-    # and extend_count < cap. The CAS UPDATE returns the new row state so
-    # we can show the right banner. status='active' or 'suspended' means
-    # there's nothing to extend — the agent has either woken up already
-    # or moved beyond awaiting_user.
-    async with postgres_db.acquire() as conn:
-        updated = await conn.fetchrow(
-            "UPDATE threads "
-            "SET awaiting_user_since = now(), "
-            "    extend_count = extend_count + 1 "
-            "WHERE id = $1 "
-            "  AND status = 'awaiting_user' "
-            "  AND extend_count < $2 "
-            "RETURNING extend_count",
-            str(thread_id),
-            _MAGIC_EXTEND_CAP,
-        )
-
-    if updated is None:
-        # Distinguish cap_reached from not_awaiting for the banner copy.
-        async with postgres_db.acquire() as conn:
-            row_state = await conn.fetchrow(
-                "SELECT status, extend_count FROM threads WHERE id = $1",
-                str(thread_id),
-            )
-        if row_state is None:
-            extend_status = "not_awaiting"
-        elif row_state["status"] != "awaiting_user":
-            extend_status = "not_awaiting"
-        elif row_state["extend_count"] >= _MAGIC_EXTEND_CAP:
-            extend_status = "cap_reached"
-        else:
-            # Edge case — concurrent change between our UPDATE and SELECT.
-            # Render not_awaiting which is the gentler banner.
-            extend_status = "not_awaiting"
-        extends_remaining = None
-    else:
-        extend_status = "extended"
-        extends_remaining = max(0, _MAGIC_EXTEND_CAP - int(updated["extend_count"]))
-
-    # Re-render the confirmation page with the banner. Load the permission
-    # row again (status may have changed underneath us).
-    approval_id = row.get("approval_id")
-    if approval_id is not None:
-        async with postgres_db.acquire() as conn:
-            permission_row = await conn.fetchrow(
-                "SELECT tool_name, tool_args, status FROM "
-                "thread_permission_requests WHERE id = $1",
-                approval_id,
-            )
-    else:
-        permission_row = None
-
-    if permission_row is None or permission_row["status"] != "pending":
-        return HTMLResponse(
-            _magic_link_result_page(
-                title="Already decided",
-                body=(
-                    "The agent's request has been resolved. No further "
-                    "action is needed."
-                ),
-                cockpit_url=cockpit_external_url,
-            ),
-            status_code=200,
-        )
-
-    tool_args = permission_row["tool_args"]
-    if isinstance(tool_args, str):
-        try:
-            tool_args = json.loads(tool_args)
-        except Exception:
-            tool_args = {}
-    elif tool_args is None:
-        tool_args = {}
-    args_preview = json.dumps(tool_args, indent=2, default=str)
-    if len(args_preview) > 600:
-        args_preview = args_preview[:600] + "\n… (truncated)"
-
-    page = _magic_link_confirmation_page(
-        tool_name=permission_row["tool_name"],
-        tool_args_preview=args_preview,
-        intended_decision=row.get("intended_decision"),
-        token=token,
-        extend_status=extend_status,
-        extends_remaining=extends_remaining,
-    )
-    return HTMLResponse(page)
-
-
-async def _phase5_wake_stateless_if_suspended(
-    thread_id: str,
-    *,
-    permission_request_id: str | None,
-) -> None:
-    """Wake one queue-served permission continuation without binding a pod.
-
-    A magic-link task can run well after its originating request was resolved.
-    Revalidate every authority under the global ``threads -> run_queue`` lock
-    order: exact stateless lane/class/tier, no pinned-agent binding, the exact
-    terminal permission row, and a queued/leased session turn whose human input
-    is still unconsumed.  ``done`` is deliberately not revived: no durable
-    permission-continuation watermark exists yet, so a done row would hit the
-    executor's skip-if-answered edge and falsely claim the tool resumed.
-
-    The queue row itself is left untouched.  A live lease keeps ownership; a
-    queued retry keeps its token/fairness/affinity.  Workspace convergence uses
-    the owner-keyed session provisioner, which restores a Kubernetes sandbox,
-    refreshes a virtual binding, and is a no-op for ``none``.  It never creates
-    a persistent agent pod.
-    """
-    from shared.run_queue import (
-        LANE_STATELESS,
-        STATE_LEASED,
-        STATE_QUEUED,
-        UNIT_KIND_SESSION_TURN,
-    )
-
-    if permission_request_id is None:
-        logger.warning(
-            "magic-link wake: refusing unfenced stateless wake for thread %s",
-            thread_id,
-        )
-        return
-
-    should_ensure_workspace = False
-    async with postgres_db.acquire() as conn:
-        async with conn.transaction():
-            locked_thread = await conn.fetchrow(
-                "SELECT id, execution_lane, agent_id, status, metadata "
-                "FROM threads WHERE id = $1::uuid FOR UPDATE",
-                thread_id,
-            )
-            if locked_thread is None:
-                return
-            thread = dict(locked_thread)
-            if (
-                thread.get("execution_lane") != LANE_STATELESS
-                or thread.get("agent_id") is not None
-            ):
-                logger.warning(
-                    "magic-link wake: stateless authority moved for thread %s "
-                    "(lane=%r agent_id=%r)",
-                    thread_id,
-                    thread.get("execution_lane"),
-                    thread.get("agent_id"),
-                )
-                return
-            try:
-                _require_stateless_workspace(thread)
-            except HTTPException as exc:
-                logger.warning(
-                    "magic-link wake: refusing stateless workspace/class for "
-                    "thread %s: %s",
-                    thread_id,
-                    exc.detail,
-                )
-                return
-
-            # Keep the repository-wide threads -> run_queue lock order.  The
-            # lock makes the pending-input test atomic with a concurrent claim,
-            # completion, release or reaper steal.
-            queue = await conn.fetchrow(
-                "SELECT state, input_seq, consumed_seq "
-                "FROM run_queue "
-                "WHERE unit_id = $1::uuid AND unit_kind = $2 "
-                "FOR UPDATE",
-                thread_id,
-                UNIT_KIND_SESSION_TURN,
-            )
-            if queue is None:
-                logger.warning(
-                    "magic-link wake: no session queue authority for thread %s",
-                    thread_id,
-                )
-                return
-            queue_state = str(queue["state"] or "")
-            input_seq = queue["input_seq"]
-            consumed_seq = queue["consumed_seq"]
-            has_unconsumed_input = input_seq is not None and (
-                consumed_seq is None or int(input_seq) > int(consumed_seq)
-            )
-            if (
-                queue_state not in {STATE_QUEUED, STATE_LEASED}
-                or not has_unconsumed_input
-            ):
-                logger.warning(
-                    "magic-link wake: refusing stale stateless continuation for "
-                    "thread %s (queue_state=%s input_seq=%r consumed_seq=%r)",
-                    thread_id,
-                    queue_state,
-                    input_seq,
-                    consumed_seq,
-                )
-                return
-
-            decision = await conn.fetchval(
-                "SELECT status FROM thread_permission_requests "
-                "WHERE id = $2::uuid AND thread_id = $1::uuid "
-                "  AND status IN ('approved', 'denied')",
-                thread_id,
-                permission_request_id,
-            )
-            if decision not in {"approved", "denied"}:
-                logger.warning(
-                    "magic-link wake: exact permission fence rejected thread %s "
-                    "request %s",
-                    thread_id,
-                    permission_request_id,
-                )
-                return
-
-            thread_status = str(thread.get("status") or "")
-            if thread_status not in {"active", "awaiting_user", "suspended"}:
-                logger.warning(
-                    "magic-link wake: thread %s is not resumable (status=%r)",
-                    thread_id,
-                    thread_status,
-                )
-                return
-
-            if thread_status in {"awaiting_user", "suspended"}:
-                updated = await conn.fetchval(
-                    "UPDATE threads "
-                    "SET status = 'active', "
-                    "    awaiting_user_since = NULL, "
-                    "    extend_count = 0, "
-                    "    control_admission_agent_id = NULL "
-                    "WHERE id = $1::uuid "
-                    "  AND execution_lane = $2 "
-                    "  AND agent_id IS NULL "
-                    "  AND status IN ('suspended', 'awaiting_user') "
-                    "RETURNING id",
-                    thread_id,
-                    LANE_STATELESS,
-                )
-                if updated is None:
-                    return
-            should_ensure_workspace = True
-
-    if not should_ensure_workspace:
-        return
-    # Queue/lifecycle admission commits before this potentially slow side
-    # effect.  A claimant may arrive first, but its attach path polls the same
-    # durable workspace lifecycle until it is ready.
-    await ensure_session_workspace(
-        thread_id,
-        db=postgres_db,
-        provisioner=container_provisioner,
-        suspension=workspace_suspension_service,
-    )
-    logger.info(
-        "magic-link wake: stateless permission continuation admitted for "
-        "thread %s request %s",
-        thread_id,
-        permission_request_id,
-    )
-
-
-async def _phase5_wake_if_suspended(
-    thread_id: str,
-    *,
-    permission_request_id: str | None = None,
-) -> None:
-    """Wake a suspended thread after a magic-link decision.
-
-    Fire-and-forget — the HTTP response has already returned. Stateless
-    sessions delegate to the queue-fenced, topology-neutral helper above.
-    Pinned sessions preserve the historical resume pattern: restore from S3,
-    then spawn the agent pod if the persistent provisioner is wired.
-    """
-    try:
-        thread = await postgres_db.get_thread(thread_id)
-        if not thread:
-            return
-        if thread.get("execution_lane") == "stateless":
-            await _phase5_wake_stateless_if_suspended(
-                thread_id,
-                permission_request_id=permission_request_id,
-            )
-            return
-        if not _thread_uses_pinned_execution(thread):
-            logger.warning(
-                "magic-link wake: refusing pinned wake for thread %s on "
-                "execution lane %r",
-                thread_id,
-                thread.get("execution_lane"),
-            )
-            return
-        wake_authority = thread_runtime_authority(thread)
-        if wake_authority is None:
-            return
-        metadata = thread.get("metadata") or {}
-        if isinstance(metadata, str):
-            try:
-                metadata = json.loads(metadata)
-            except (json.JSONDecodeError, TypeError):
-                metadata = {}
-        recycle = read_recycle_record(metadata)
-        if isinstance(recycle, dict) and recycle.get("phase") not in {
-            None,
-            "",
-            "complete",
-            "cancelled",
-        }:
-            if _persistent_thread_recycler is not None:
-                await _persistent_thread_recycler.request_and_reconcile(
-                    thread_id=thread_id,
-                    reason="resume_during_recycle",
-                    expected_build_sha=persistent_provisioner.expected_build_sha,
-                    expected_project_id=(
-                        str(thread.get("project_id"))
-                        if thread.get("project_id")
-                        else None
-                    ),
-                )
-            return
-        ws_ctx = metadata.get("workspace_container") or {}
-        ws_status = ws_ctx.get("status")
-        if ws_status == "suspended" and workspace_suspension_service.is_enabled:
-            logger.info(
-                "magic-link wake: restoring suspended workspace for thread %s",
-                thread_id,
-            )
-            restored = await ensure_session_workspace(
-                thread_id,
-                db=postgres_db,
-                provisioner=container_provisioner,
-                suspension=workspace_suspension_service,
-                expected_runtime_generation=wake_authority.generation,
-            )
-            if restored is None or restored.outcome is EnsureOutcome.FAILED:
-                logger.warning(
-                    "magic-link wake: workspace restore failed or lost authority "
-                    "for thread %s",
-                    thread_id,
-                )
-                return
-
-        # Publish wake only to the exact post-suspension generation. A G2
-        # restore delayed across another End/Resume cannot wake G3.
-        async with postgres_db.acquire() as conn:
-            woke = await conn.fetchval(
-                "UPDATE threads "
-                "SET status = 'active', "
-                "    awaiting_user_since = NULL, "
-                "    extend_count = 0, "
-                "    control_admission_agent_id = NULL "
-                "WHERE id = $1::uuid "
-                "  AND execution_lane='pinned' "
-                "  AND runtime_generation=$2::uuid "
-                "  AND runtime_retirement_token IS NULL "
-                "  AND status IN ('suspended', 'awaiting_user') "
-                "RETURNING id",
-                thread_id,
-                wake_authority.generation,
-            )
-        if woke is None and not same_thread_runtime_authority(
-            await postgres_db.get_thread(thread_id), wake_authority
-        ):
-            return
-
-        # Agent pod may also have been deleted on suspension
-        # (workspace_suspension.py:502-504). Re-provision if a persistent
-        # provisioner is configured. fire-and-forget — the agent's boot
-        # will restore the LangGraph checkpoint and re-enter permission_check
-        # for the same tool_call_id, where the select-first guard picks up
-        # the decision we just UPDATEd.
-        current = await postgres_db.get_thread(thread_id)
-        if not same_thread_runtime_authority(current, wake_authority):
-            return
-        if persistent_provisioner is not None and not current.get("agent_id"):
-            config_name = canonical_config_name(
-                thread.get("config_name", "session_base")
-            )
-
-            async def _create_after_magic_link() -> None:
-                # This closure sits lexically inside the wake handler's
-                # try/except, but it is scheduled as its own task — so that
-                # handler NEVER sees anything raised here. Its own guard is the
-                # only thing between a raise and a silently vanished wake.
-                try:
-                    result = await persistent_provisioner.create_agent_pod(
-                        thread_id,
-                        config_name=config_name,
-                        expected_runtime_generation=wake_authority.generation,
-                    )
-                    if not result.usable:
-                        logger.warning(
-                            "magic-link persistent provisioning for thread %s "
-                            "is %s (%s)",
-                            thread_id,
-                            result.status.value,
-                            result.failure_class or "no-detail",
-                        )
-                        await _emit_session_provisioning_failure(
-                            thread_id,
-                            str(thread.get("user_id") or "") or None,
-                            wake_authority,
-                            f"magic-link wake provisioning {result.status.value}"
-                            f" ({result.failure_class or 'no-detail'})",
-                        )
-                except Exception as exc:
-                    logger.exception(
-                        "magic-link persistent provisioning for thread %s raised: %s",
-                        thread_id,
-                        exc,
-                    )
-                    await _emit_session_provisioning_failure(
-                        thread_id,
-                        str(thread.get("user_id") or "") or None,
-                        wake_authority,
-                        str(exc),
-                    )
-
-            asyncio.create_task(
-                _create_after_magic_link(),
-                name=f"phase5-create-agent-{thread_id[:8]}",
-            )
-    except Exception as e:
-        logger.warning(
-            "magic-link wake task failed for thread %s: %s",
-            thread_id,
-            e,
-        )
-
-
-async def thread_permission_notify_sweeper(
-    shutdown_event: asyncio.Event,
-) -> None:
-    """Background task: a permission request that has waited longer than
-    HEADLESS_NOTIFY_AGE_S without a decision becomes a ``session_permission``
-    feed row for the thread owner — ``high``, so the mail (with the two magic
-    links) goes out now, and the row resolves when the gate is decided by any
-    path. In-session gates are answered within seconds through the agent's
-    LISTEN, so only abandoned ones ever get here.
-
-    Runs every HEADLESS_NOTIFY_INTERVAL_S (default 30s). Idempotent: the
-    feed row is keyed on the request id, and rows already recorded are
-    filtered out so the magic-link tokens are minted once.
-
-    Best-effort. Survives transient errors by logging and continuing.
-    """
-    interval_s = int(os.environ.get("HEADLESS_NOTIFY_INTERVAL_S", "30"))
-    age_threshold_s = int(os.environ.get("HEADLESS_NOTIFY_AGE_S", "30"))
-    logger.info(
-        "Headless permission-notify sweeper started (interval=%ds, age_threshold=%ds)",
-        interval_s,
-        age_threshold_s,
-    )
-    cockpit_external_url = email_service.cockpit_url or "http://localhost:4200"
-
-    while not shutdown_event.is_set():
-        try:
-            async with postgres_db.acquire() as conn:
-                rows = await conn.fetch(
-                    "SELECT r.id, r.thread_id, r.tool_name, r.tool_args, "
-                    "       r.requested_at, t.user_id, t.title "
-                    "FROM thread_permission_requests r "
-                    "JOIN threads t ON t.id = r.thread_id "
-                    "WHERE r.status = 'pending' "
-                    "  AND r.requested_at < now() - ($1::int * interval '1 second') "
-                    "  AND NOT EXISTS ("
-                    "    SELECT 1 FROM notifications n "
-                    "    WHERE n.source_kind = 'permission_request' "
-                    "      AND n.source_id = r.id::text"
-                    "  ) "
-                    "ORDER BY r.requested_at ASC "
-                    "LIMIT 50",
-                    age_threshold_s,
-                )
-            for row in rows:
-                try:
-                    result = await headless_notifications.record_permission_pending(
-                        postgres_db,
-                        notification_service,
-                        row=dict(row),
-                        cockpit_external_url=cockpit_external_url,
-                    )
-                    if result.get("status") == "recorded":
-                        logger.info(
-                            "Recorded permission-pending notification "
-                            "(thread=%s req=%s)",
-                            str(row["thread_id"])[:8],
-                            str(row["id"])[:8],
-                        )
-                except Exception as e:
-                    logger.warning(
-                        "Permission-pending notification failed (req=%s): %s",
-                        str(row["id"])[:8],
-                        e,
-                    )
-        except Exception as e:
-            logger.warning("headless permission-notify sweep error: %s", e)
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=float(interval_s))
-            break
-        except asyncio.TimeoutError:
-            pass
-    logger.info("Headless permission-notify sweeper stopped")
 
 
 # =============================================================================

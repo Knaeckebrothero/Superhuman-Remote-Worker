@@ -32,7 +32,7 @@ CATPPUCCIN = {
 
 
 def _pages() -> list[str]:
-    from orchestrator.main import (
+    from orchestrator.services.thread_permissions import (
         _magic_link_confirmation_page,
         _magic_link_result_page,
     )
@@ -126,7 +126,9 @@ def test_disabled_extend_button_keeps_its_brand_styling() -> None:
     the brand colour, border or type scale. The palette tests above cannot see
     it: the page as a whole still contains every brand hex.
     """
-    from orchestrator.main import _magic_link_confirmation_page
+    from orchestrator.services.thread_permissions import (
+        _magic_link_confirmation_page,
+    )
 
     page = _magic_link_confirmation_page(
         tool_name="run_command",
