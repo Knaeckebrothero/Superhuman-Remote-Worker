@@ -536,13 +536,15 @@ class TestMagicLinkExtendCap:
 
         # Stub validate_magic_link to return a valid token row.
         thread_permissions_routes.headless_notifications = MagicMock()
-        thread_permissions_routes.headless_notifications.validate_magic_link = AsyncMock(
-            return_value={
-                "id": "tok-1",
-                "approval_id": "appr-1",
-                "thread_id": "thread-abc",
-                "intended_decision": "approved",
-            }
+        thread_permissions_routes.headless_notifications.validate_magic_link = (
+            AsyncMock(
+                return_value={
+                    "id": "tok-1",
+                    "approval_id": "appr-1",
+                    "thread_id": "thread-abc",
+                    "intended_decision": "approved",
+                }
+            )
         )
 
         resp = await thread_permissions_routes.magic_link_extend(
@@ -576,13 +578,15 @@ class TestMagicLinkExtendCap:
         thread_permissions_routes.email_service = MagicMock()
         thread_permissions_routes.email_service.cockpit_url = "http://localhost:4200"
         thread_permissions_routes.headless_notifications = MagicMock()
-        thread_permissions_routes.headless_notifications.validate_magic_link = AsyncMock(
-            return_value={
-                "id": "tok-1",
-                "approval_id": "appr-1",
-                "thread_id": "thread-abc",
-                "intended_decision": "approved",
-            }
+        thread_permissions_routes.headless_notifications.validate_magic_link = (
+            AsyncMock(
+                return_value={
+                    "id": "tok-1",
+                    "approval_id": "appr-1",
+                    "thread_id": "thread-abc",
+                    "intended_decision": "approved",
+                }
+            )
         )
 
         resp = await thread_permissions_routes.magic_link_extend(
@@ -614,13 +618,15 @@ class TestMagicLinkExtendCap:
         thread_permissions_routes.email_service = MagicMock()
         thread_permissions_routes.email_service.cockpit_url = "http://localhost:4200"
         thread_permissions_routes.headless_notifications = MagicMock()
-        thread_permissions_routes.headless_notifications.validate_magic_link = AsyncMock(
-            return_value={
-                "id": "tok-1",
-                "approval_id": "appr-1",
-                "thread_id": "thread-abc",
-                "intended_decision": "approved",
-            }
+        thread_permissions_routes.headless_notifications.validate_magic_link = (
+            AsyncMock(
+                return_value={
+                    "id": "tok-1",
+                    "approval_id": "appr-1",
+                    "thread_id": "thread-abc",
+                    "intended_decision": "approved",
+                }
+            )
         )
 
         resp = await thread_permissions_routes.magic_link_extend(
@@ -637,8 +643,8 @@ class TestMagicLinkExtendCap:
         thread_permissions_routes.email_service = MagicMock()
         thread_permissions_routes.email_service.cockpit_url = "http://localhost:4200"
         thread_permissions_routes.headless_notifications = MagicMock()
-        thread_permissions_routes.headless_notifications.validate_magic_link = AsyncMock(
-            return_value=None
+        thread_permissions_routes.headless_notifications.validate_magic_link = (
+            AsyncMock(return_value=None)
         )
 
         resp = await thread_permissions_routes.magic_link_extend(

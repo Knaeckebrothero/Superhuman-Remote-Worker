@@ -28,7 +28,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-import orchestrator.main
+from orchestrator.routers import thread_projection as tp_routes
+from tests._b10_deps import _tp_deps
 
 
 # ---------------------------------------------------------------------------
@@ -38,15 +39,13 @@ import orchestrator.main
 
 class TestRedactThreadMetadataCarriesSshHandle:
     def test_present_handle_survives_redaction(self):
-        out = orchestrator.main._redact_thread_metadata(
-            {"id": "t", "ssh_handle": "s-7f3a91c2"}
-        )
+        out = tp_routes._redact_thread_metadata({"id": "t", "ssh_handle": "s-7f3a91c2"})
         assert out["ssh_handle"] == "s-7f3a91c2"
 
     def test_null_handle_survives_as_none(self):
         """A real ``SELECT *`` row for a thread predating 0202 carries the
         column with a NULL value, not an absent key."""
-        out = orchestrator.main._redact_thread_metadata({"id": "t", "ssh_handle": None})
+        out = tp_routes._redact_thread_metadata({"id": "t", "ssh_handle": None})
         assert out["ssh_handle"] is None
 
 
@@ -64,7 +63,10 @@ def _patch_caller_and_db(user, db):
     tests don't also have to wire up mount rows."""
     stack = ExitStack()
     stack.enter_context(
-        patch("orchestrator.main.require_approved_user", AsyncMock(return_value=user))
+        patch(
+            "orchestrator.routers.thread_projection.require_approved_user",
+            AsyncMock(return_value=user),
+        )
     )
     stack.enter_context(
         patch(
@@ -84,13 +86,15 @@ def _patch_caller_and_db(user, db):
 class TestGetThreadMintsSshHandleOnView:
     @pytest.mark.asyncio
     async def test_mints_a_handle_when_missing(self, user_a, thread_a, fake_db):
-        from orchestrator.main import get_thread
+        from orchestrator.routers.thread_projection import get_thread
 
         thread_a["ssh_handle"] = None
         fake_db.ensure_thread_ssh_handle = AsyncMock(return_value="s-newlymnt")
 
         with _patch_caller_and_db(user_a, fake_db):
-            result = await get_thread(str(thread_a["id"]), MagicMock())
+            result = await get_thread(
+                str(thread_a["id"]), MagicMock(), dependencies=_tp_deps()
+            )
 
         assert result["ssh_handle"] == "s-newlymnt"
         fake_db.ensure_thread_ssh_handle.assert_awaited_once_with(str(thread_a["id"]))
@@ -101,7 +105,7 @@ class TestGetThreadMintsSshHandleOnView:
     ):
         """Minting is a write; a thread that already has a handle must not
         pay for one on every view."""
-        from orchestrator.main import get_thread
+        from orchestrator.routers.thread_projection import get_thread
 
         thread_a["ssh_handle"] = "s-7f3a91c2"
         fake_db.ensure_thread_ssh_handle = AsyncMock(
@@ -109,7 +113,9 @@ class TestGetThreadMintsSshHandleOnView:
         )
 
         with _patch_caller_and_db(user_a, fake_db):
-            result = await get_thread(str(thread_a["id"]), MagicMock())
+            result = await get_thread(
+                str(thread_a["id"]), MagicMock(), dependencies=_tp_deps()
+            )
 
         assert result["ssh_handle"] == "s-7f3a91c2"
         fake_db.ensure_thread_ssh_handle.assert_not_awaited()
@@ -122,7 +128,7 @@ class TestGetThreadMintsSshHandleOnView:
         read-only view. A read-only replica or a full disk -- this
         deployment has actually had one -- must not turn the whole thread
         view into a 500 for the sake of one SSH-panel field."""
-        from orchestrator.main import get_thread
+        from orchestrator.routers.thread_projection import get_thread
 
         thread_a["ssh_handle"] = None
         fake_db.ensure_thread_ssh_handle = AsyncMock(
@@ -130,7 +136,9 @@ class TestGetThreadMintsSshHandleOnView:
         )
 
         with _patch_caller_and_db(user_a, fake_db):
-            result = await get_thread(str(thread_a["id"]), MagicMock())
+            result = await get_thread(
+                str(thread_a["id"]), MagicMock(), dependencies=_tp_deps()
+            )
 
         assert result["ssh_handle"] is None
         fake_db.ensure_thread_ssh_handle.assert_awaited_once_with(str(thread_a["id"]))

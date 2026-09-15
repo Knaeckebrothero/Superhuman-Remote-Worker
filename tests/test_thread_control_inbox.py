@@ -28,6 +28,9 @@ from orchestrator.services.thread_control_inbox import (
     ControlAdmissionNotReady,
     admit_thread_control,
 )
+from orchestrator.routers import thread_projection as tp_routes
+from orchestrator.schemas.thread_projection import ThreadControlRequest
+from tests._b10_deps import _tp_deps
 
 
 THREAD_ID = UUID("11111111-aaaa-4444-8888-111111111111")
@@ -194,16 +197,12 @@ def _calls(conn: _ControlConn, operation: str, contains: str):
     ],
 )
 def test_public_control_envelope_rejects_invalid_method_mode_or_request_id(payload):
-    import orchestrator.main as orchestrator_main
-
     with pytest.raises(ValidationError):
-        orchestrator_main.ThreadControlRequest.model_validate(payload)
+        ThreadControlRequest.model_validate(payload)
 
 
 def test_public_workspace_undo_envelope_has_empty_canonical_payload():
-    import orchestrator.main as orchestrator_main
-
-    body = orchestrator_main.ThreadControlRequest(
+    body = ThreadControlRequest(
         client_request_id=CLIENT_REQUEST_ID,
         method="workspace.undo",
     )
@@ -211,7 +210,7 @@ def test_public_workspace_undo_envelope_has_empty_canonical_payload():
     assert body.control_payload() == {}
 
     with pytest.raises(ValidationError, match="does not accept a mode"):
-        orchestrator_main.ThreadControlRequest(
+        ThreadControlRequest(
             client_request_id=CLIENT_REQUEST_ID,
             method="workspace.undo",
             mode="auto",
@@ -243,18 +242,20 @@ async def test_control_endpoint_stops_at_exact_owner_gate():
     owner = AsyncMock(side_effect=denial)
     admit = AsyncMock()
     request = MagicMock()
-    body = orchestrator_main.ThreadControlRequest(
+    body = ThreadControlRequest(
         client_request_id=CLIENT_REQUEST_ID,
         method="narration.set",
         mode="verbose",
     )
 
     with (
-        patch.object(orchestrator_main, "require_thread_owner", owner),
-        patch.object(orchestrator_main, "admit_thread_control", admit),
+        patch.object(tp_routes, "require_thread_owner", owner),
+        patch.object(tp_routes, "admit_thread_control", admit),
     ):
         with pytest.raises(HTTPException) as exc:
-            await orchestrator_main.submit_thread_control(str(THREAD_ID), body, request)
+            await tp_routes.submit_thread_control(
+                str(THREAD_ID), body, request, dependencies=_tp_deps()
+            )
 
     assert exc.value is denial
     owner.assert_awaited_once_with(
@@ -289,25 +290,28 @@ async def test_control_endpoint_admits_owner_request_without_exposing_lane():
     admit = AsyncMock(return_value=admitted)
     audit = AsyncMock()
     request = MagicMock()
-    body = orchestrator_main.ThreadControlRequest(
+    body = ThreadControlRequest(
         client_request_id=CLIENT_REQUEST_ID,
         method="mode.set",
         mode="supervised",
     )
 
     with (
-        patch.object(orchestrator_main, "require_thread_owner", owner),
+        patch.object(tp_routes, "require_thread_owner", owner),
         patch.object(
-            orchestrator_main,
+            tp_routes,
             "find_existing_thread_control",
             new=AsyncMock(return_value=None),
         ),
         patch.object(orchestrator_main, "_enforce_session_create_grants", enforce),
-        patch.object(orchestrator_main, "admit_thread_control", admit),
-        patch.object(orchestrator_main, "log_security_event", audit),
+        patch.object(tp_routes, "admit_thread_control", admit),
+        patch.object(tp_routes, "log_security_event", audit),
     ):
-        result = await orchestrator_main.submit_thread_control(
-            str(THREAD_ID), body, request
+        result = await tp_routes.submit_thread_control(
+            str(THREAD_ID),
+            body,
+            request,
+            dependencies=_tp_deps(),
         )
 
     assert result == {
@@ -345,8 +349,6 @@ async def test_control_endpoint_admits_owner_request_without_exposing_lane():
 
 @pytest.mark.asyncio
 async def test_control_endpoint_refuses_unattested_stateless_sandbox_request():
-    import orchestrator.main as orchestrator_main
-
     thread = {
         "id": THREAD_ID,
         "user_id": OWNER_ID,
@@ -357,26 +359,27 @@ async def test_control_endpoint_refuses_unattested_stateless_sandbox_request():
     admit = AsyncMock()
     with (
         patch.object(
-            orchestrator_main,
+            tp_routes,
             "require_thread_owner",
             AsyncMock(return_value=({"id": OWNER_ID}, thread)),
         ),
         patch.object(
-            orchestrator_main,
+            tp_routes,
             "find_existing_thread_control",
             AsyncMock(return_value=None),
         ),
-        patch.object(orchestrator_main, "admit_thread_control", admit),
+        patch.object(tp_routes, "admit_thread_control", admit),
     ):
         with pytest.raises(HTTPException) as exc:
-            await orchestrator_main.submit_thread_control(
+            await tp_routes.submit_thread_control(
                 str(THREAD_ID),
-                orchestrator_main.ThreadControlRequest(
+                ThreadControlRequest(
                     client_request_id=CLIENT_REQUEST_ID,
                     method="narration.set",
                     mode="verbose",
                 ),
                 MagicMock(),
+                dependencies=_tp_deps(),
             )
 
     assert exc.value.status_code == 409
@@ -407,27 +410,28 @@ async def test_control_endpoint_admits_lane_free_workspace_undo_payload():
     gate = MagicMock(return_value="sandbox")
     with (
         patch.object(
-            orchestrator_main,
+            tp_routes,
             "require_thread_owner",
             AsyncMock(return_value=({"id": OWNER_ID}, thread)),
         ),
         patch.object(
-            orchestrator_main,
+            tp_routes,
             "find_existing_thread_control",
             AsyncMock(return_value=None),
         ) as find_existing,
-        patch.object(orchestrator_main, "_require_stateless_workspace", gate),
+        patch.object(tp_routes, "_require_stateless_workspace", gate),
         patch.object(orchestrator_main, "_enforce_session_create_grants") as grants,
-        patch.object(orchestrator_main, "admit_thread_control", admit),
-        patch.object(orchestrator_main, "log_security_event", AsyncMock()),
+        patch.object(tp_routes, "admit_thread_control", admit),
+        patch.object(tp_routes, "log_security_event", AsyncMock()),
     ):
-        response = await orchestrator_main.submit_thread_control(
+        response = await tp_routes.submit_thread_control(
             str(THREAD_ID),
-            orchestrator_main.ThreadControlRequest(
+            ThreadControlRequest(
                 client_request_id=CLIENT_REQUEST_ID,
                 method="workspace.undo",
             ),
             MagicMock(),
+            dependencies=_tp_deps(),
         )
 
     assert response["method"] == "workspace.undo"
@@ -464,27 +468,28 @@ async def test_admin_can_control_ownerless_legacy_thread_without_fake_uuid():
     enforce = AsyncMock()
     with (
         patch.object(
-            orchestrator_main,
+            tp_routes,
             "require_thread_owner",
             AsyncMock(return_value=({"id": admin_id, "is_admin": True}, thread)),
         ),
         patch.object(
-            orchestrator_main,
+            tp_routes,
             "find_existing_thread_control",
             AsyncMock(return_value=None),
         ),
         patch.object(orchestrator_main, "_enforce_session_create_grants", enforce),
-        patch.object(orchestrator_main, "admit_thread_control", admit),
-        patch.object(orchestrator_main, "log_security_event", AsyncMock()),
+        patch.object(tp_routes, "admit_thread_control", admit),
+        patch.object(tp_routes, "log_security_event", AsyncMock()),
     ):
-        response = await orchestrator_main.submit_thread_control(
+        response = await tp_routes.submit_thread_control(
             str(THREAD_ID),
-            orchestrator_main.ThreadControlRequest(
+            ThreadControlRequest(
                 client_request_id=CLIENT_REQUEST_ID,
                 method="mode.set",
                 mode="supervised",
             ),
             MagicMock(),
+            dependencies=_tp_deps(),
         )
 
     assert response["accepted"] is True
@@ -499,9 +504,7 @@ async def test_admin_can_control_ownerless_legacy_thread_without_fake_uuid():
 
 @pytest.mark.asyncio
 async def test_control_endpoint_maps_admission_conflict_to_409():
-    import orchestrator.main as orchestrator_main
-
-    body = orchestrator_main.ThreadControlRequest(
+    body = ThreadControlRequest(
         client_request_id=CLIENT_REQUEST_ID,
         method="narration.set",
         mode="silent",
@@ -516,20 +519,23 @@ async def test_control_endpoint_maps_admission_conflict_to_409():
     # (``services``), while unit tests also import it through ``orchestrator``;
     # raise the exact class object the route catches.
     conflict = AsyncMock(
-        side_effect=orchestrator_main.ControlAdmissionError(
+        side_effect=ControlAdmissionError(
             "client_request_id was already used for a different control"
         )
     )
     admit = AsyncMock()
 
     with (
-        patch.object(orchestrator_main, "require_thread_owner", owner),
-        patch.object(orchestrator_main, "find_existing_thread_control", conflict),
-        patch.object(orchestrator_main, "admit_thread_control", admit),
+        patch.object(tp_routes, "require_thread_owner", owner),
+        patch.object(tp_routes, "find_existing_thread_control", conflict),
+        patch.object(tp_routes, "admit_thread_control", admit),
     ):
         with pytest.raises(HTTPException) as exc:
-            await orchestrator_main.submit_thread_control(
-                str(THREAD_ID), body, MagicMock()
+            await tp_routes.submit_thread_control(
+                str(THREAD_ID),
+                body,
+                MagicMock(),
+                dependencies=_tp_deps(),
             )
 
     assert exc.value.status_code == 409
@@ -539,9 +545,7 @@ async def test_control_endpoint_maps_admission_conflict_to_409():
 
 @pytest.mark.asyncio
 async def test_control_endpoint_maps_transient_owner_readiness_to_425():
-    import orchestrator.main as orchestrator_main
-
-    body = orchestrator_main.ThreadControlRequest(
+    body = ThreadControlRequest(
         client_request_id=CLIENT_REQUEST_ID,
         method="narration.set",
         mode="silent",
@@ -553,24 +557,25 @@ async def test_control_endpoint_maps_transient_owner_readiness_to_425():
         )
     )
     admit = AsyncMock(
-        side_effect=orchestrator_main.ControlAdmissionNotReady(
-            "Session is not ready to accept controls"
-        )
+        side_effect=ControlAdmissionNotReady("Session is not ready to accept controls")
     )
 
     with (
-        patch.object(orchestrator_main, "require_thread_owner", owner),
+        patch.object(tp_routes, "require_thread_owner", owner),
         patch.object(
-            orchestrator_main,
+            tp_routes,
             "find_existing_thread_control",
             AsyncMock(return_value=None),
         ),
-        patch.object(orchestrator_main, "admit_thread_control", admit),
-        patch.object(orchestrator_main, "log_security_event", AsyncMock()),
+        patch.object(tp_routes, "admit_thread_control", admit),
+        patch.object(tp_routes, "log_security_event", AsyncMock()),
     ):
         with pytest.raises(HTTPException) as exc:
-            await orchestrator_main.submit_thread_control(
-                str(THREAD_ID), body, MagicMock()
+            await tp_routes.submit_thread_control(
+                str(THREAD_ID),
+                body,
+                MagicMock(),
+                dependencies=_tp_deps(),
             )
 
     assert exc.value.status_code == 425
@@ -776,27 +781,28 @@ async def test_committed_retry_bypasses_mutable_grant_policy():
     admit = AsyncMock(return_value=duplicate)
     with (
         patch.object(
-            orchestrator_main,
+            tp_routes,
             "require_thread_owner",
             AsyncMock(return_value=({"id": OWNER_ID}, thread)),
         ),
         patch.object(
-            orchestrator_main,
+            tp_routes,
             "find_existing_thread_control",
             AsyncMock(return_value=duplicate),
         ),
         patch.object(orchestrator_main, "_enforce_session_create_grants", enforce),
-        patch.object(orchestrator_main, "admit_thread_control", admit),
-        patch.object(orchestrator_main, "log_security_event", AsyncMock()),
+        patch.object(tp_routes, "admit_thread_control", admit),
+        patch.object(tp_routes, "log_security_event", AsyncMock()),
     ):
-        response = await orchestrator_main.submit_thread_control(
+        response = await tp_routes.submit_thread_control(
             str(THREAD_ID),
-            orchestrator_main.ThreadControlRequest(
+            ThreadControlRequest(
                 client_request_id=CLIENT_REQUEST_ID,
                 method="mode.set",
                 mode="autonomous",
             ),
             MagicMock(),
+            dependencies=_tp_deps(),
         )
 
     assert response["state"] == "applied"

@@ -8,6 +8,9 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 import pytest
 from fastapi import HTTPException
 
+from orchestrator.routers import thread_projection as tp_routes
+from tests._b10_deps import _tp_deps
+
 from orchestrator.services.session_state_snapshot import (
     build_session_state_snapshot,
 )
@@ -819,14 +822,17 @@ async def test_owner_gated_route_resolves_only_safe_display_config():
     build = AsyncMock(side_effect=_build_with_captured_resolver)
 
     with (
-        patch.object(orchestrator_main, "require_thread_owner", owner),
+        patch.object(tp_routes, "require_thread_owner", owner),
         patch.object(orchestrator_main, "_resolve_session_config", resolve),
-        patch.object(orchestrator_main, "build_session_state_snapshot", build),
+        patch.object(tp_routes, "build_session_state_snapshot", build),
     ):
         response = MagicMock()
         response.headers = {}
-        result = await orchestrator_main.get_thread_session_state(
-            "thread-1", MagicMock(), response
+        result = await tp_routes.get_thread_session_state(
+            "thread-1",
+            MagicMock(),
+            response,
+            dependencies=_tp_deps(),
         )
 
     assert result is snapshot
@@ -849,7 +855,7 @@ async def test_owner_gated_route_returns_404_if_thread_vanishes_after_auth():
 
     with (
         patch.object(
-            orchestrator_main,
+            tp_routes,
             "require_thread_owner",
             AsyncMock(return_value=({"id": "user-1"}, _thread())),
         ),
@@ -859,13 +865,16 @@ async def test_owner_gated_route_returns_404_if_thread_vanishes_after_auth():
             AsyncMock(return_value=None),
         ),
         patch.object(
-            orchestrator_main,
+            tp_routes,
             "build_session_state_snapshot",
             AsyncMock(return_value=None),
         ),
     ):
         with pytest.raises(HTTPException) as exc:
-            await orchestrator_main.get_thread_session_state(
-                "thread-gone", MagicMock(), MagicMock()
+            await tp_routes.get_thread_session_state(
+                "thread-gone",
+                MagicMock(),
+                MagicMock(),
+                dependencies=_tp_deps(),
             )
     assert exc.value.status_code == 404

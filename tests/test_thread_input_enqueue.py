@@ -797,7 +797,6 @@ async def test_interrupt_on_pinned_lane_still_forwards(monkeypatch):
 async def test_exact_forward_rechecks_after_client_entry_and_adds_fingerprint(
     monkeypatch,
 ):
-
     binding = _pinned_binding()
     order: list[str] = []
     observed: dict = {}
@@ -864,7 +863,6 @@ async def test_exact_forward_binding_loss_after_client_entry_sends_nothing(
 ):
     from fastapi import HTTPException
 
-
     binding = _pinned_binding()
     post = AsyncMock()
 
@@ -911,7 +909,6 @@ async def test_exact_forward_binding_loss_after_client_entry_sends_nothing(
 @pytest.mark.asyncio
 async def test_agent_identity_mismatch_becomes_generation_bound_refusal(monkeypatch):
     from fastapi import HTTPException
-
 
     binding = _pinned_binding()
 

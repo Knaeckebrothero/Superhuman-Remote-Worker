@@ -13,14 +13,18 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from orchestrator.main import _stamp_tool_categories, get_thread_messages_history
+from orchestrator.routers.thread_projection import (
+    _stamp_tool_categories,
+    get_thread_messages_history,
+)
+from tests._b10_deps import _tp_deps
 
 
 def _patched(db):
     """Patch the endpoint's module-level deps: auth + the db singleton."""
     owner = AsyncMock(return_value=({"id": "u1"}, {"id": "t1", "user_id": "u1"}))
     return (
-        patch("orchestrator.main.require_thread_owner", owner),
+        patch("orchestrator.routers.thread_projection.require_thread_owner", owner),
         patch("orchestrator.main.postgres_db", db),
     )
 
@@ -91,7 +95,9 @@ class TestEndpointStamps:
         )
         p1, p2 = _patched(db)
         with p1, p2:
-            out = await get_thread_messages_history("t1", MagicMock())
+            out = await get_thread_messages_history(
+                "t1", MagicMock(), dependencies=_tp_deps()
+            )
         assert out["messages"][0]["tool_calls"][0]["category"] == "citation"
 
     async def test_cursor_window_stamps_too(self):
@@ -104,7 +110,10 @@ class TestEndpointStamps:
         p1, p2 = _patched(db)
         with p1, p2:
             out = await get_thread_messages_history(
-                "t1", MagicMock(), before="2026-07-15T00:00:00Z"
+                "t1",
+                MagicMock(),
+                before="2026-07-15T00:00:00Z",
+                dependencies=_tp_deps(),
             )
         assert out["messages"][0]["tool_calls"][0]["category"] == "research"
 
@@ -116,5 +125,7 @@ class TestEndpointStamps:
         db.get_thread_message_count = AsyncMock(return_value=1)
         p1, p2 = _patched(db)
         with p1, p2:
-            out = await get_thread_messages_history("t1", MagicMock(), limit=10)
+            out = await get_thread_messages_history(
+                "t1", MagicMock(), limit=10, dependencies=_tp_deps()
+            )
         assert out["messages"][0]["tool_calls"][0]["category"] == "shell"

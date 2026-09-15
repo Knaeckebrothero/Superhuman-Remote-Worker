@@ -19,6 +19,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from shared.runtime.core.session_tool_overrides import SESSION_TOOL_OVERRIDE_NAMES
+
+from orchestrator.routers import thread_projection as tp_routes
+from tests._b10_deps import _tp_deps
 from shared.runtime.core.tool_report import (
     MEASURED_ORIGINS,
     ORIGIN_AGENT,
@@ -129,14 +132,17 @@ def _report(categories, *, observed_at="2026-08-02T12:00:00Z", backend=None):
 
 async def _call(user, db, thread_row, fake_request, *, routes=None, grants=None):
     """Drive the endpoint with a fake agent transport and explicit grants."""
-    from orchestrator.main import get_thread_tool_groups
+    from orchestrator.routers.thread_projection import get_thread_tool_groups
 
     db.get_thread = AsyncMock(return_value=thread_row)
     db.get_agent = AsyncMock(return_value=_AGENT_ROW)
     http_patch, calls = _agent_http(routes or {})
     with ExitStack() as stack:
         stack.enter_context(
-            patch("orchestrator.main.require_approved_user", _approved(user))
+            patch(
+                "orchestrator.routers.thread_projection.require_approved_user",
+                _approved(user),
+            )
         )
         stack.enter_context(
             patch(
@@ -147,7 +153,8 @@ async def _call(user, db, thread_row, fake_request, *, routes=None, grants=None)
         stack.enter_context(patch("orchestrator.main.postgres_db", db))
         stack.enter_context(
             patch(
-                "orchestrator.main._is_experts_db_enabled", MagicMock(return_value=True)
+                "orchestrator.routers.thread_projection._is_experts_db_enabled",
+                MagicMock(return_value=True),
             )
         )
         stack.enter_context(
@@ -162,7 +169,9 @@ async def _call(user, db, thread_row, fake_request, *, routes=None, grants=None)
             )
         )
         stack.enter_context(http_patch)
-        result = await get_thread_tool_groups(str(thread_row["id"]), fake_request)
+        result = await get_thread_tool_groups(
+            str(thread_row["id"]), fake_request, dependencies=_tp_deps()
+        )
     return result, calls
 
 
@@ -381,20 +390,24 @@ class TestPredictionIsLabelled:
         self, user_a, fake_db, fake_request
     ):
         """A dead pod's row keeps its ``pod_ip``, and the pane blocks on us."""
-        from orchestrator.main import get_thread_tool_groups
+        from orchestrator.routers.thread_projection import get_thread_tool_groups
 
         fake_db.get_thread = AsyncMock(return_value=_thread(agent_id="agent-1"))
         fake_db.get_agent = AsyncMock(return_value={**_AGENT_ROW, "status": "offline"})
         http_patch, calls = _agent_http({})
         with (
-            patch("orchestrator.main.require_approved_user", _approved(user_a)),
+            patch(
+                "orchestrator.routers.thread_projection.require_approved_user",
+                _approved(user_a),
+            ),
             patch(
                 "orchestrator.security.access.require_approved_user",
                 AsyncMock(return_value=user_a),
             ),
             patch("orchestrator.main.postgres_db", fake_db),
             patch(
-                "orchestrator.main._is_experts_db_enabled", MagicMock(return_value=True)
+                "orchestrator.routers.thread_projection._is_experts_db_enabled",
+                MagicMock(return_value=True),
             ),
             patch(
                 "orchestrator.main._user_experts_enabled", AsyncMock(return_value=True)
@@ -404,7 +417,9 @@ class TestPredictionIsLabelled:
             ),
             http_patch,
         ):
-            result = await get_thread_tool_groups(str(_thread()["id"]), fake_request)
+            result = await get_thread_tool_groups(
+                str(_thread()["id"]), fake_request, dependencies=_tp_deps()
+            )
 
         assert result["origin"] == ORIGIN_PREDICTION
         assert "offline" in result["prediction_reason"]
@@ -420,7 +435,7 @@ class TestPredictionIsLabelled:
         for the first minute of every session — the exact class of silently
         wrong answer this endpoint exists to remove.
         """
-        from orchestrator.main import get_thread_tool_groups
+        from orchestrator.routers.thread_projection import get_thread_tool_groups
 
         fake_db.get_thread = AsyncMock(return_value=_thread(agent_id="agent-1"))
         fake_db.get_agent = AsyncMock(return_value={**_AGENT_ROW, "status": "ready"})
@@ -432,14 +447,18 @@ class TestPredictionIsLabelled:
             }
         )
         with (
-            patch("orchestrator.main.require_approved_user", _approved(user_a)),
+            patch(
+                "orchestrator.routers.thread_projection.require_approved_user",
+                _approved(user_a),
+            ),
             patch(
                 "orchestrator.security.access.require_approved_user",
                 AsyncMock(return_value=user_a),
             ),
             patch("orchestrator.main.postgres_db", fake_db),
             patch(
-                "orchestrator.main._is_experts_db_enabled", MagicMock(return_value=True)
+                "orchestrator.routers.thread_projection._is_experts_db_enabled",
+                MagicMock(return_value=True),
             ),
             patch(
                 "orchestrator.main._user_experts_enabled", AsyncMock(return_value=True)
@@ -449,7 +468,9 @@ class TestPredictionIsLabelled:
             ),
             http_patch,
         ):
-            result = await get_thread_tool_groups(str(_thread()["id"]), fake_request)
+            result = await get_thread_tool_groups(
+                str(_thread()["id"]), fake_request, dependencies=_tp_deps()
+            )
 
         assert result["origin"] == ORIGIN_AGENT
         assert calls
@@ -604,18 +625,22 @@ class TestUnavailableCarriesAReason:
     ):
         """The PDP enforces; this only explains. Inventing a denial is its own
         D1 violation, so a lookup failure must read as no restriction."""
-        from orchestrator.main import get_thread_tool_groups
+        from orchestrator.routers.thread_projection import get_thread_tool_groups
 
         fake_db.get_thread = AsyncMock(return_value=_thread())
         with (
-            patch("orchestrator.main.require_approved_user", _approved(user_a)),
+            patch(
+                "orchestrator.routers.thread_projection.require_approved_user",
+                _approved(user_a),
+            ),
             patch(
                 "orchestrator.security.access.require_approved_user",
                 AsyncMock(return_value=user_a),
             ),
             patch("orchestrator.main.postgres_db", fake_db),
             patch(
-                "orchestrator.main._is_experts_db_enabled", MagicMock(return_value=True)
+                "orchestrator.routers.thread_projection._is_experts_db_enabled",
+                MagicMock(return_value=True),
             ),
             patch(
                 "orchestrator.main._user_experts_enabled", AsyncMock(return_value=True)
@@ -625,7 +650,9 @@ class TestUnavailableCarriesAReason:
                 AsyncMock(side_effect=RuntimeError("db down")),
             ),
         ):
-            result = await get_thread_tool_groups(str(_thread()["id"]), fake_request)
+            result = await get_thread_tool_groups(
+                str(_thread()["id"]), fake_request, dependencies=_tp_deps()
+            )
 
         assert result["categories"]["shell"]["reason"] is None
 
@@ -643,7 +670,7 @@ class TestResolveFailureWithAMeasurement:
         A session that is running has, by construction, already resolved — so
         a resolve failing now says nothing about what the agent holds.
         """
-        from orchestrator.main import get_thread_tool_groups
+        from orchestrator.routers.thread_projection import get_thread_tool_groups
 
         fake_db.get_thread = AsyncMock(return_value=_thread(agent_id="agent-1"))
         fake_db.get_agent = AsyncMock(return_value=_AGENT_ROW)
@@ -655,14 +682,18 @@ class TestResolveFailureWithAMeasurement:
             }
         )
         with (
-            patch("orchestrator.main.require_approved_user", _approved(user_a)),
+            patch(
+                "orchestrator.routers.thread_projection.require_approved_user",
+                _approved(user_a),
+            ),
             patch(
                 "orchestrator.security.access.require_approved_user",
                 AsyncMock(return_value=user_a),
             ),
             patch("orchestrator.main.postgres_db", fake_db),
             patch(
-                "orchestrator.main._is_experts_db_enabled", MagicMock(return_value=True)
+                "orchestrator.routers.thread_projection._is_experts_db_enabled",
+                MagicMock(return_value=True),
             ),
             patch(
                 "orchestrator.main._user_experts_enabled", AsyncMock(return_value=True)
@@ -671,12 +702,14 @@ class TestResolveFailureWithAMeasurement:
                 "orchestrator.main._resolve_runner_grants", AsyncMock(return_value=None)
             ),
             patch(
-                "orchestrator.main._merged_session_tool_policy",
+                "orchestrator.routers.thread_projection._merged_session_tool_policy",
                 MagicMock(side_effect=RuntimeError("boom")),
             ),
             http_patch,
         ):
-            result = await get_thread_tool_groups(str(_thread()["id"]), fake_request)
+            result = await get_thread_tool_groups(
+                str(_thread()["id"]), fake_request, dependencies=_tp_deps()
+            )
 
         assert result["source"] == "error"
         assert result["origin"] == ORIGIN_AGENT
@@ -689,17 +722,23 @@ class TestResolveFailureWithAMeasurement:
 class TestPreviewEndpoint:
     @pytest.mark.asyncio
     async def test_always_a_prediction(self, user_a, fake_db, fake_request):
-        from orchestrator.main import ToolGroupPreviewRequest, preview_tool_groups
+        from orchestrator.schemas.thread_projection import ToolGroupPreviewRequest
+        from orchestrator.routers.thread_projection import preview_tool_groups
 
         with (
-            patch("orchestrator.main.require_approved_user", _approved(user_a)),
+            patch(
+                "orchestrator.routers.thread_projection.require_approved_user",
+                _approved(user_a),
+            ),
             patch("orchestrator.main.postgres_db", fake_db),
             patch(
                 "orchestrator.main._resolve_runner_grants", AsyncMock(return_value=None)
             ),
         ):
             result = await preview_tool_groups(
-                ToolGroupPreviewRequest(config_name="session_base"), fake_request
+                ToolGroupPreviewRequest(config_name="session_base"),
+                fake_request,
+                dependencies=_tp_deps(),
             )
 
         assert result["origin"] == ORIGIN_PREDICTION
@@ -709,10 +748,14 @@ class TestPreviewEndpoint:
 
     @pytest.mark.asyncio
     async def test_reflects_the_requested_override(self, user_a, fake_db, fake_request):
-        from orchestrator.main import ToolGroupPreviewRequest, preview_tool_groups
+        from orchestrator.schemas.thread_projection import ToolGroupPreviewRequest
+        from orchestrator.routers.thread_projection import preview_tool_groups
 
         with (
-            patch("orchestrator.main.require_approved_user", _approved(user_a)),
+            patch(
+                "orchestrator.routers.thread_projection.require_approved_user",
+                _approved(user_a),
+            ),
             patch("orchestrator.main.postgres_db", fake_db),
             patch(
                 "orchestrator.main._resolve_runner_grants", AsyncMock(return_value=None)
@@ -724,6 +767,7 @@ class TestPreviewEndpoint:
                     config_override={"tools": {"canvas": ["get_canvas", "set_canvas"]}},
                 ),
                 fake_request,
+                dependencies=_tp_deps(),
             )
             off = await preview_tool_groups(
                 ToolGroupPreviewRequest(
@@ -731,6 +775,7 @@ class TestPreviewEndpoint:
                     config_override={"tools": {"canvas": []}},
                 ),
                 fake_request,
+                dependencies=_tp_deps(),
             )
 
         assert on["tool_groups"]["canvas"] is True
@@ -754,20 +799,28 @@ class TestPreviewEndpoint:
         So this pins the base routing, and the mutation that breaks it is
         defaulting a worker request to ``session_base``.
         """
-        from orchestrator.main import ToolGroupPreviewRequest, preview_tool_groups
+        from orchestrator.schemas.thread_projection import ToolGroupPreviewRequest
+        from orchestrator.routers.thread_projection import preview_tool_groups
 
         with (
-            patch("orchestrator.main.require_approved_user", _approved(user_a)),
+            patch(
+                "orchestrator.routers.thread_projection.require_approved_user",
+                _approved(user_a),
+            ),
             patch("orchestrator.main.postgres_db", fake_db),
             patch(
                 "orchestrator.main._resolve_runner_grants", AsyncMock(return_value=None)
             ),
         ):
             session = await preview_tool_groups(
-                ToolGroupPreviewRequest(expert_type="session"), fake_request
+                ToolGroupPreviewRequest(expert_type="session"),
+                fake_request,
+                dependencies=_tp_deps(),
             )
             worker = await preview_tool_groups(
-                ToolGroupPreviewRequest(expert_type="worker"), fake_request
+                ToolGroupPreviewRequest(expert_type="worker"),
+                fake_request,
+                dependencies=_tp_deps(),
             )
 
         def bound(view):
@@ -792,7 +845,8 @@ class TestPreviewEndpoint:
         self, user_a, fake_db, fake_request
     ):
         """No `config_name` on the job form must mean worker_base, not session_base."""
-        from orchestrator.main import ToolGroupPreviewRequest, preview_tool_groups
+        from orchestrator.schemas.thread_projection import ToolGroupPreviewRequest
+        from orchestrator.routers.thread_projection import preview_tool_groups
 
         seen: dict = {}
 
@@ -801,18 +855,23 @@ class TestPreviewEndpoint:
             return {}, {}
 
         with (
-            patch("orchestrator.main.require_approved_user", _approved(user_a)),
+            patch(
+                "orchestrator.routers.thread_projection.require_approved_user",
+                _approved(user_a),
+            ),
             patch("orchestrator.main.postgres_db", fake_db),
             patch(
                 "orchestrator.main._resolve_runner_grants", AsyncMock(return_value=None)
             ),
             patch(
-                "orchestrator.main._merged_session_tool_policy",
+                "orchestrator.routers.thread_projection._merged_session_tool_policy",
                 MagicMock(side_effect=_spy),
             ),
         ):
             await preview_tool_groups(
-                ToolGroupPreviewRequest(expert_type="worker"), fake_request
+                ToolGroupPreviewRequest(expert_type="worker"),
+                fake_request,
+                dependencies=_tp_deps(),
             )
 
         assert seen["base_config_name"] == "worker_base"
@@ -873,19 +932,25 @@ class TestPreviewEndpoint:
     ):
         from fastapi import HTTPException
 
-        from orchestrator.main import ToolGroupPreviewRequest, preview_tool_groups
+        from orchestrator.schemas.thread_projection import ToolGroupPreviewRequest
+        from orchestrator.routers.thread_projection import preview_tool_groups
 
         with (
-            patch("orchestrator.main.require_approved_user", _approved(user_a)),
+            patch(
+                "orchestrator.routers.thread_projection.require_approved_user",
+                _approved(user_a),
+            ),
             patch("orchestrator.main.postgres_db", fake_db),
             patch(
-                "orchestrator.main._merged_session_tool_policy",
+                "orchestrator.routers.thread_projection._merged_session_tool_policy",
                 MagicMock(side_effect=RuntimeError("boom")),
             ),
         ):
             with pytest.raises(HTTPException) as exc:
                 await preview_tool_groups(
-                    ToolGroupPreviewRequest(config_name="session_base"), fake_request
+                    ToolGroupPreviewRequest(config_name="session_base"),
+                    fake_request,
+                    dependencies=_tp_deps(),
                 )
         assert exc.value.status_code == 422
 
@@ -893,17 +958,20 @@ class TestPreviewEndpoint:
     async def test_requires_an_approved_user(self, fake_db, fake_request):
         from fastapi import HTTPException
 
-        from orchestrator.main import ToolGroupPreviewRequest, preview_tool_groups
+        from orchestrator.schemas.thread_projection import ToolGroupPreviewRequest
+        from orchestrator.routers.thread_projection import preview_tool_groups
 
         with (
             patch(
-                "orchestrator.main.require_approved_user",
+                "orchestrator.routers.thread_projection.require_approved_user",
                 AsyncMock(side_effect=HTTPException(status_code=403)),
             ),
             patch("orchestrator.main.postgres_db", fake_db),
         ):
             with pytest.raises(HTTPException) as exc:
-                await preview_tool_groups(ToolGroupPreviewRequest(), fake_request)
+                await preview_tool_groups(
+                    ToolGroupPreviewRequest(), fake_request, dependencies=_tp_deps()
+                )
         assert exc.value.status_code == 403
 
 
@@ -925,17 +993,23 @@ class TestEnumerateOnlyRidesBothReads:
 
     @pytest.mark.asyncio
     async def test_the_preview_read_serves_it(self, user_a, fake_db, fake_request):
-        from orchestrator.main import ToolGroupPreviewRequest, preview_tool_groups
+        from orchestrator.schemas.thread_projection import ToolGroupPreviewRequest
+        from orchestrator.routers.thread_projection import preview_tool_groups
 
         with (
-            patch("orchestrator.main.require_approved_user", _approved(user_a)),
+            patch(
+                "orchestrator.routers.thread_projection.require_approved_user",
+                _approved(user_a),
+            ),
             patch("orchestrator.main.postgres_db", fake_db),
             patch(
                 "orchestrator.main._resolve_runner_grants", AsyncMock(return_value=None)
             ),
         ):
             result = await preview_tool_groups(
-                ToolGroupPreviewRequest(config_name="session_base"), fake_request
+                ToolGroupPreviewRequest(config_name="session_base"),
+                fake_request,
+                dependencies=_tp_deps(),
             )
         assert result["enumerate_only"]["shell"]
 
@@ -974,13 +1048,17 @@ class TestPreviewModelsTheLegacyPathToo:
     """
 
     async def _preview(self, user, db, req, *, experts, override=None):
-        from orchestrator.main import ToolGroupPreviewRequest, preview_tool_groups
+        from orchestrator.schemas.thread_projection import ToolGroupPreviewRequest
+        from orchestrator.routers.thread_projection import preview_tool_groups
 
         with (
-            patch("orchestrator.main.require_approved_user", _approved(user)),
+            patch(
+                "orchestrator.routers.thread_projection.require_approved_user",
+                _approved(user),
+            ),
             patch("orchestrator.main.postgres_db", db),
             patch(
-                "orchestrator.main._is_experts_db_enabled",
+                "orchestrator.routers.thread_projection._is_experts_db_enabled",
                 MagicMock(return_value=experts),
             ),
             patch(
@@ -996,6 +1074,7 @@ class TestPreviewModelsTheLegacyPathToo:
                     config_name="session_base", config_override=override
                 ),
                 req,
+                dependencies=_tp_deps(),
             )
 
     @pytest.mark.asyncio
@@ -1051,7 +1130,6 @@ class TestOneDeadlineForTheWholeProbe:
     async def test_a_slow_two_hop_probe_is_cut_off_and_labelled(
         self, user_a, fake_db, fake_request
     ):
-        import orchestrator.main as orch_main
         from orchestrator.services import agent_toolset_probe
 
         async def _crawl(url):
@@ -1067,14 +1145,18 @@ class TestOneDeadlineForTheWholeProbe:
         fake_db.get_agent = AsyncMock(return_value=_AGENT_ROW)
         started = asyncio.get_event_loop().time()
         with (
-            patch("orchestrator.main.require_approved_user", _approved(user_a)),
+            patch(
+                "orchestrator.routers.thread_projection.require_approved_user",
+                _approved(user_a),
+            ),
             patch(
                 "orchestrator.security.access.require_approved_user",
                 AsyncMock(return_value=user_a),
             ),
             patch("orchestrator.main.postgres_db", fake_db),
             patch(
-                "orchestrator.main._is_experts_db_enabled", MagicMock(return_value=True)
+                "orchestrator.routers.thread_projection._is_experts_db_enabled",
+                MagicMock(return_value=True),
             ),
             patch(
                 "orchestrator.main._user_experts_enabled", AsyncMock(return_value=True)
@@ -1090,8 +1172,10 @@ class TestOneDeadlineForTheWholeProbe:
                 "orchestrator.main.httpx.AsyncClient", MagicMock(return_value=client)
             ),
         ):
-            result = await orch_main.get_thread_tool_groups(
-                str(_thread()["id"]), fake_request
+            result = await tp_routes.get_thread_tool_groups(
+                str(_thread()["id"]),
+                fake_request,
+                dependencies=_tp_deps(),
             )
         elapsed = asyncio.get_event_loop().time() - started
 
@@ -1102,20 +1186,24 @@ class TestOneDeadlineForTheWholeProbe:
     @pytest.mark.asyncio
     async def test_a_booting_agent_is_not_probed(self, user_a, fake_db, fake_request):
         """Registered but not serving: nothing bound, so nothing to measure."""
-        from orchestrator.main import get_thread_tool_groups
+        from orchestrator.routers.thread_projection import get_thread_tool_groups
 
         fake_db.get_thread = AsyncMock(return_value=_thread(agent_id="agent-1"))
         fake_db.get_agent = AsyncMock(return_value={**_AGENT_ROW, "status": "booting"})
         http_patch, calls = _agent_http({})
         with (
-            patch("orchestrator.main.require_approved_user", _approved(user_a)),
+            patch(
+                "orchestrator.routers.thread_projection.require_approved_user",
+                _approved(user_a),
+            ),
             patch(
                 "orchestrator.security.access.require_approved_user",
                 AsyncMock(return_value=user_a),
             ),
             patch("orchestrator.main.postgres_db", fake_db),
             patch(
-                "orchestrator.main._is_experts_db_enabled", MagicMock(return_value=True)
+                "orchestrator.routers.thread_projection._is_experts_db_enabled",
+                MagicMock(return_value=True),
             ),
             patch(
                 "orchestrator.main._user_experts_enabled", AsyncMock(return_value=True)
@@ -1125,7 +1213,9 @@ class TestOneDeadlineForTheWholeProbe:
             ),
             http_patch,
         ):
-            result = await get_thread_tool_groups(str(_thread()["id"]), fake_request)
+            result = await get_thread_tool_groups(
+                str(_thread()["id"]), fake_request, dependencies=_tp_deps()
+            )
 
         assert result["origin"] == ORIGIN_PREDICTION
         assert "booting" in result["prediction_reason"]
@@ -1243,7 +1333,8 @@ class TestPreviewRoster:
 
         import yaml
 
-        from orchestrator.main import ToolGroupPreviewRequest, preview_tool_groups
+        from orchestrator.schemas.thread_projection import ToolGroupPreviewRequest
+        from orchestrator.routers.thread_projection import preview_tool_groups
         from shared.manifests.resolution import content_revision
         from tests.conftest import _UID_A
 
@@ -1287,12 +1378,13 @@ class TestPreviewRoster:
         )
         with (
             patch(
-                "orchestrator.main.require_approved_user",
+                "orchestrator.routers.thread_projection.require_approved_user",
                 AsyncMock(return_value=user_a),
             ),
             patch("orchestrator.main.postgres_db", fake_db),
             patch(
-                "orchestrator.main._is_experts_db_enabled", MagicMock(return_value=True)
+                "orchestrator.routers.thread_projection._is_experts_db_enabled",
+                MagicMock(return_value=True),
             ),
             patch(
                 "orchestrator.main._user_experts_enabled", AsyncMock(return_value=True)
@@ -1306,9 +1398,12 @@ class TestPreviewRoster:
                     config_name="session_base", expert_id=expert_id
                 ),
                 fake_request,
+                dependencies=_tp_deps(),
             )
             bare = await preview_tool_groups(
-                ToolGroupPreviewRequest(config_name="session_base"), fake_request
+                ToolGroupPreviewRequest(config_name="session_base"),
+                fake_request,
+                dependencies=_tp_deps(),
             )
 
         assert with_roster["subagents"]["default"] == "reader"
@@ -1323,13 +1418,17 @@ class TestPreviewRoster:
 async def test_explicit_workspace_preview_overrides_expert_recommendation(
     user_a, fake_db, fake_request, backend
 ):
-    from orchestrator.main import ToolGroupPreviewRequest, preview_tool_groups
+    from orchestrator.schemas.thread_projection import ToolGroupPreviewRequest
+    from orchestrator.routers.thread_projection import preview_tool_groups
 
     selected = (
         None if backend == "none" else {"template": {"inline": {"backend": backend}}}
     )
     with (
-        patch("orchestrator.main.require_approved_user", _approved(user_a)),
+        patch(
+            "orchestrator.routers.thread_projection.require_approved_user",
+            _approved(user_a),
+        ),
         patch("orchestrator.main.postgres_db", fake_db),
         patch("orchestrator.main._resolve_runner_grants", AsyncMock(return_value=None)),
     ):
@@ -1341,6 +1440,7 @@ async def test_explicit_workspace_preview_overrides_expert_recommendation(
                 config_override={"tools": {"shell": ["run_command"]}},
             ),
             fake_request,
+            dependencies=_tp_deps(),
         )
     assert result["workspace"] == {
         "backend": backend,
