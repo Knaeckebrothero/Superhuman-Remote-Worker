@@ -653,9 +653,9 @@ from orchestrator.services.cron_dispatcher import cron_dispatcher_loop  # noqa: 
 from orchestrator.services.project_loop_sweeper import project_loop_sweeper_loop  # noqa: E402
 from orchestrator.services.session_wake import (  # noqa: E402
     deliver_officer_note as _deliver_officer_note,
-    kick_drain as _kick_session_wake_drain,
-    kick_event_drain as _kick_officer_event_drain,
-    maybe_wake_session,
+    kick_drain as _kick_session_wake_drain_service,
+    kick_event_drain as _kick_officer_event_drain_service,
+    maybe_wake_session as _maybe_wake_session_service,
     notify_all_officers,
     notify_officer,
     notify_owning_officers,
@@ -980,6 +980,30 @@ _ssh_gateway_host_key_cache = ssh_access_operations.SshGatewayHostKeyCache(
 # app pools and the usage_rates migration are ready; None until then (and on
 # deployments without the audit tier — metering disabled, non-load-bearing).
 usage_ledger: UsageLedger | None = None
+
+
+async def maybe_wake_session(
+    db: Any, job_id: str, terminal_status: str
+) -> bool:
+    """Bind the session-wake fast path to this application's ledger."""
+
+    return await _maybe_wake_session_service(
+        db, job_id, terminal_status, usage_ledger=usage_ledger
+    )
+
+
+def _kick_session_wake_drain(db: Any) -> None:
+    """Bind the job-wake drain to this application's current ledger."""
+
+    _kick_session_wake_drain_service(db, usage_ledger=usage_ledger)
+
+
+def _kick_officer_event_drain(db: Any) -> None:
+    """Bind the officer-wake drain to this application's current ledger."""
+
+    _kick_officer_event_drain_service(db, usage_ledger=usage_ledger)
+
+
 # Rollup writer + rollup-aware read surface over usage_ledger. Built alongside
 # usage_ledger once both pools are ready; None until then (and without the audit
 # tier). The 3 /api/usage endpoints read through it (rollup for closed days, raw
@@ -5338,7 +5362,9 @@ async def lifespan(app: FastAPI):
     # NATS handle when available (live sudo_command daemon requests need it).
     # Pre-fix, no NATS meant every /api/sudo/* endpoint 404'd and the
     # vm_upgrade freeze never even created its approval row.
-    sudo_gate.connect(db=postgres_db)
+    sudo_gate.connect(
+        db=postgres_db, kick_officer_event_drain=_kick_officer_event_drain
+    )
 
     # Initialize NATS bridge for VM lifecycle (graceful if unavailable)
     await nats_bridge.connect(db=postgres_db, on_vm_ready=_trigger_dispatch)
@@ -5960,7 +5986,9 @@ async def lifespan(app: FastAPI):
     # the row claim, which works from every replica, and leader-gating would
     # make this a SPOF across a handover. See services/session_wake.py.
     session_wake_sweeper_task = asyncio.create_task(
-        session_wake_sweeper_loop(postgres_db, _shutdown_event)
+        session_wake_sweeper_loop(
+            postgres_db, _shutdown_event, usage_ledger=usage_ledger
+        )
     )
 
     # Slice-3 KB index freshness sweep: catch out-of-band vault edits (human
@@ -7162,6 +7190,7 @@ def _project_loops_dependencies() -> (
             )
         ),
         check_vm_permission=_check_vm_permission,
+        kick_officer_event_drain=_kick_officer_event_drain,
     )
 
 

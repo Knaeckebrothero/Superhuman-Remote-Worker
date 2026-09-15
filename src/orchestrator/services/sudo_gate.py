@@ -20,7 +20,7 @@ import os
 import re
 from datetime import datetime, timedelta, timezone
 from fnmatch import fnmatch
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from uuid import UUID
 
 from shared.sudo_command_line import render_sudo_command_line
@@ -104,11 +104,19 @@ class SudoGateService:
         self._sse_queues: list[asyncio.Queue] = []
         self._lock = asyncio.Lock()
         self._pending_msgs: dict[str, Any] = {}  # request_id → NATS msg for respond()
+        self._kick_officer_event_drain: Optional[Callable[[Any], None]] = None
 
-    def connect(self, db: Any, nc: Optional[Any] = None) -> None:
-        """Bind to database and optional NATS connection."""
+    def connect(
+        self,
+        db: Any,
+        nc: Optional[Any] = None,
+        *,
+        kick_officer_event_drain: Optional[Callable[[Any], None]] = None,
+    ) -> None:
+        """Bind to database, optional NATS, and the application's wake drain."""
         self._db = db
         self._nc = nc
+        self._kick_officer_event_drain = kick_officer_event_drain
 
     async def open_request(self, identity: Any, body: Any) -> SudoOpenResult:
         """Idempotently create and evaluate an HTTP guest sudo request."""
@@ -880,7 +888,10 @@ class SudoGateService:
                 },
             )
             if enqueued:
-                session_wake.kick_event_drain(self._db)
+                if self._kick_officer_event_drain is not None:
+                    self._kick_officer_event_drain(self._db)
+                else:
+                    session_wake.kick_event_drain(self._db)
         except Exception:
             logger.warning(
                 "sudo gate: officer notify failed for request %s (non-fatal)",

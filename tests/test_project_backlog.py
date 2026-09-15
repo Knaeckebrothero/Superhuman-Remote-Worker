@@ -1007,6 +1007,7 @@ def _loops_deps(**over) -> ProjectLoopsDependencies:
         writeback_loop_stage=AsyncMock(),
         resume_project_loop=AsyncMock(),
         check_vm_permission=AsyncMock(),
+        kick_officer_event_drain=MagicMock(),
     )
     fields.update(over)
     return ProjectLoopsDependencies(**fields)

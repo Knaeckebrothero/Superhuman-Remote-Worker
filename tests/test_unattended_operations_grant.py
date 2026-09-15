@@ -75,6 +75,7 @@ def deps(db):
         writeback_loop_stage=AsyncMock(),
         resume_project_loop=AsyncMock(return_value=_loop_row()),
         check_vm_permission=AsyncMock(),
+        kick_officer_event_drain=MagicMock(),
     )
 
 

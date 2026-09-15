@@ -195,7 +195,7 @@ async def officer_watchdog_check_one(
                     },
                     fire_at=now,
                 )
-                session_wake_svc.kick_event_drain(dependencies.store)
+                dependencies.kick_officer_event_drain(dependencies.store)
         else:
             fire_at = timer.get("fire_at")
             if fire_at is not None and (now - fire_at) > timedelta(
@@ -210,7 +210,7 @@ async def officer_watchdog_check_one(
                     (now - fire_at).total_seconds(),
                     thread_id[:8],
                 )
-                session_wake_svc.kick_event_drain(dependencies.store)
+                dependencies.kick_officer_event_drain(dependencies.store)
         return
 
     # Duty 3: a missing pod is another observation for the same durable
