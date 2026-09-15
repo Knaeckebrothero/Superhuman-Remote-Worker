@@ -366,7 +366,7 @@ async def test_completion_hook_and_outbox_share_blocked_officer_dedup_key(
         }
     )
     db.route_project_officer_job_transition = AsyncMock(return_value={"enqueued": True})
-    monkeypatch.setattr(session_wake, "kick_event_drain", lambda _db: None)
+    monkeypatch.setattr(session_wake, "kick_event_drain", lambda _db, **_kw: None)
 
     assert await session_wake._notify_project_officer_of_job(db, JOB_ID, "cancelled")
     kwargs = db.route_project_officer_job_transition.await_args.kwargs
@@ -802,7 +802,7 @@ async def test_a_batch_is_delivered_concurrently_within_a_cap(monkeypatch):
     inflight = 0
     peak = 0
 
-    async def _slow(db, row):
+    async def _slow(db, row, **_kwargs):
         nonlocal inflight, peak
         inflight += 1
         peak = max(peak, inflight)

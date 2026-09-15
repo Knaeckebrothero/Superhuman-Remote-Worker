@@ -277,6 +277,7 @@ def _project_loops_app(store: Any):
             writeback_loop_stage=None,
             resume_project_loop=None,
             check_vm_permission=None,
+            kick_officer_event_drain=lambda _db: None,
         )
     )
     return app

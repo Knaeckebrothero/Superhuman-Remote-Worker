@@ -153,7 +153,13 @@ def _job_wake_delivery_id(row: dict[str, Any]) -> str:
 # --------------------------------------------------------------------------
 
 
-async def maybe_wake_session(db: Any, job_id: str, terminal_status: str) -> bool:
+async def maybe_wake_session(
+    db: Any,
+    job_id: str,
+    terminal_status: str,
+    *,
+    usage_ledger: Any = None,
+) -> bool:
     """Record that ``job_id`` reaching ``terminal_status`` owes a session a wake.
 
     Returns True iff a wake was newly enqueued. Safe to call from any completion
@@ -204,7 +210,9 @@ async def maybe_wake_session(db: Any, job_id: str, terminal_status: str) -> bool
     # Independent of the jobs-outbox guard below — the officer hears about
     # every project job, not just session-created ones.
     if terminal_status in OFFICER_NOTIFY_STATUSES:
-        await _notify_project_officer_of_job(db, job_id, terminal_status)
+        await _notify_project_officer_of_job(
+            db, job_id, terminal_status, usage_ledger=usage_ledger
+        )
 
     if terminal_status not in TERMINAL_STATUSES:
         return False
@@ -224,7 +232,7 @@ async def maybe_wake_session(db: Any, job_id: str, terminal_status: str) -> bool
     return enqueued
 
 
-def kick_drain(db: Any) -> None:
+def kick_drain(db: Any, *, usage_ledger: Any = None) -> None:
     """Fire-and-forget the claim-and-send right after a completion commits.
 
     Pure latency optimization. Losing this task — cancelled at shutdown, raised
@@ -235,7 +243,7 @@ def kick_drain(db: Any) -> None:
 
     async def _run() -> None:
         try:
-            await drain_pending_wakes(db)
+            await drain_pending_wakes(db, usage_ledger=usage_ledger)
         except Exception:
             logger.exception("session wake: opportunistic drain raised (non-fatal)")
 
@@ -251,7 +259,9 @@ def kick_drain(db: Any) -> None:
 # --------------------------------------------------------------------------
 
 
-async def drain_pending_wakes(db: Any, *, limit: int = CLAIM_BATCH) -> int:
+async def drain_pending_wakes(
+    db: Any, *, limit: int = CLAIM_BATCH, usage_ledger: Any = None
+) -> int:
     """Claim owed wakes and deliver them. Returns the number delivered.
 
     Claim first, COMMIT, then send — the claim call returns with its transaction
@@ -290,7 +300,9 @@ async def drain_pending_wakes(db: Any, *, limit: int = CLAIM_BATCH) -> int:
 
     async def _one(row: dict[str, Any]) -> bool:
         async with gate:
-            return await _deliver_and_settle(db, row)
+            return await _deliver_and_settle(
+                db, row, usage_ledger=usage_ledger
+            )
 
     results = await asyncio.gather(
         *(_one(row) for row in claimed), return_exceptions=True
@@ -298,7 +310,9 @@ async def drain_pending_wakes(db: Any, *, limit: int = CLAIM_BATCH) -> int:
     return sum(1 for r in results if r is True)
 
 
-async def _deliver_and_settle(db: Any, row: dict[str, Any]) -> bool:
+async def _deliver_and_settle(
+    db: Any, row: dict[str, Any], *, usage_ledger: Any = None
+) -> bool:
     """Deliver one claimed wake and record the outcome. True iff delivered.
 
     Settling is in its own try: a delivery that succeeded but whose settle write
@@ -309,7 +323,7 @@ async def _deliver_and_settle(db: Any, row: dict[str, Any]) -> bool:
     job_id = str(row["id"])
     status = str(row.get("status") or "")
     try:
-        outcome = await _deliver(db, row)
+        outcome = await _deliver(db, row, usage_ledger=usage_ledger)
     except Exception:
         logger.exception("session wake: delivery raised for job %s", job_id[:8])
         outcome = WakeDeliveryResult.FAILED
@@ -351,7 +365,9 @@ async def _deliver_and_settle(db: Any, row: dict[str, Any]) -> bool:
     return False
 
 
-async def _deliver(db: Any, row: dict[str, Any]) -> bool | WakeDeliveryResult:
+async def _deliver(
+    db: Any, row: dict[str, Any], *, usage_ledger: Any = None
+) -> bool | WakeDeliveryResult:
     """Deliver one claim, distinguishing persistence from execution."""
     thread_id = row.get("created_by_thread_id")
     if not thread_id:
@@ -406,7 +422,7 @@ async def _deliver(db: Any, row: dict[str, Any]) -> bool | WakeDeliveryResult:
                 str(row["id"])[:8],
             )
             return False
-        kick_event_drain(db)
+        kick_event_drain(db, usage_ledger=usage_ledger)
         return True
 
     text = await _format_wake_message(db, row, thread_id)
@@ -752,7 +768,9 @@ def _truncate(text: str, limit: int) -> str:
 # --------------------------------------------------------------------------
 
 
-async def session_wake_sweeper_loop(db: Any, shutdown_event: asyncio.Event) -> None:
+async def session_wake_sweeper_loop(
+    db: Any, shutdown_event: asyncio.Event, *, usage_ledger: Any = None
+) -> None:
     """Deliver every wake the fast path missed, until shutdown.
 
     Two classes of miss, both handled by the same claim query: a send whose
@@ -782,7 +800,7 @@ async def session_wake_sweeper_loop(db: Any, shutdown_event: asyncio.Event) -> N
     gc_countdown = _OFFICER_GC_EVERY_TICKS
     while not shutdown_event.is_set():
         try:
-            sent = await drain_pending_wakes(db)
+            sent = await drain_pending_wakes(db, usage_ledger=usage_ledger)
             if sent:
                 logger.info("Session wake sweeper delivered %d wake(s)", sent)
         except Exception:
@@ -791,7 +809,9 @@ async def session_wake_sweeper_loop(db: Any, shutdown_event: asyncio.Event) -> N
         # Officer event outbox (centurion.md §4): same claim discipline,
         # separate table — timers become due here, events retry here.
         try:
-            sent = await drain_pending_event_wakes(db)
+            sent = await drain_pending_event_wakes(
+                db, usage_ledger=usage_ledger
+            )
             if sent:
                 logger.info("Session wake sweeper delivered %d officer wake(s)", sent)
         except Exception:
@@ -915,10 +935,6 @@ async def _officer_ceiling_deferral(
     if ceiling <= 0:
         return None
     try:
-        if usage_ledger is None:
-            import orchestrator.main as orchestrator_main
-
-            usage_ledger = getattr(orchestrator_main, "usage_ledger", None)
         if usage_ledger is None or not getattr(usage_ledger, "is_available", False):
             return None
         now = datetime.now(timezone.utc)
@@ -990,7 +1006,9 @@ async def _note_ceiling_breach(
         logger.exception("officer wake: ceiling notice failed (non-fatal)")
 
 
-async def _notify_project_officer_of_job(db: Any, job_id: str, status: str) -> bool:
+async def _notify_project_officer_of_job(
+    db: Any, job_id: str, status: str, *, usage_ledger: Any = None
+) -> bool:
     """Enqueue an officer wake for a job transition, by project. Never raises.
 
     The database makes one post-locked decision: enqueue for the exact current
@@ -1012,7 +1030,7 @@ async def _notify_project_officer_of_job(db: Any, job_id: str, status: str) -> b
         )
         enqueued = bool(decision.get("enqueued"))
         if enqueued:
-            kick_event_drain(db)
+            kick_event_drain(db, usage_ledger=usage_ledger)
         return enqueued
     except Exception:
         logger.exception(
@@ -1195,7 +1213,7 @@ async def deliver_officer_note(db: Any, thread: dict[str, Any], text: str) -> st
     return "held" if hold else "queued"
 
 
-def kick_event_drain(db: Any) -> None:
+def kick_event_drain(db: Any, *, usage_ledger: Any = None) -> None:
     """Fire-and-forget the officer event drain after an enqueue commits.
 
     Latency optimization only — the sweeper re-claims anything this misses.
@@ -1203,7 +1221,7 @@ def kick_event_drain(db: Any) -> None:
 
     async def _run() -> None:
         try:
-            await drain_pending_event_wakes(db)
+            await drain_pending_event_wakes(db, usage_ledger=usage_ledger)
         except Exception:
             logger.exception("officer wake: opportunistic drain raised (non-fatal)")
 
@@ -1248,7 +1266,7 @@ def _format_officer_wake(rows: list[dict[str, Any]]) -> str:
 
 
 async def drain_pending_event_wakes(
-    db: Any, *, limit: int = _OFFICER_CLAIM_BATCH
+    db: Any, *, limit: int = _OFFICER_CLAIM_BATCH, usage_ledger: Any = None
 ) -> int:
     """Claim due officer wake events and deliver one coalesced wake per thread.
 
@@ -1332,7 +1350,9 @@ async def drain_pending_event_wakes(
             # burned) everything to the UTC budget reset and note it once in
             # the digest. Timers ride along, so the watchdog sees a pending
             # timer and files nothing new.
-            deferred_to = await _officer_ceiling_deferral(db, thread)
+            deferred_to = await _officer_ceiling_deferral(
+                db, thread, usage_ledger=usage_ledger
+            )
             if deferred_to is not None:
                 await db.defer_session_wake_events(ids, fire_at=deferred_to)
                 await _note_ceiling_breach(db, thread_id, thread, deferred_to)

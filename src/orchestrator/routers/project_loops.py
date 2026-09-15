@@ -49,6 +49,7 @@ class ProjectLoopsDependencies:
     writeback_loop_stage: Callable[..., Awaitable[dict[str, Any] | None]]
     resume_project_loop: Callable[[str], Awaitable[dict[str, Any] | None]]
     check_vm_permission: Callable[..., Awaitable[Any]]
+    kick_officer_event_drain: Callable[[Any], None]
 
 
 def get_project_loops_dependencies(request: Request) -> ProjectLoopsDependencies:
@@ -279,7 +280,7 @@ async def start_project_loop(
         # No first spawn: empty stage pointers are the officer loop's steady
         # state. Wake the centurion instead — the loop now exists and every
         # dispatch is his call.
-        from orchestrator.services.session_wake import kick_event_drain, notify_officer
+        from orchestrator.services.session_wake import notify_officer
 
         await notify_officer(
             dependencies.store,
@@ -294,7 +295,7 @@ async def start_project_loop(
                 ),
             },
         )
-        kick_event_drain(dependencies.store)
+        dependencies.kick_officer_event_drain(dependencies.store)
         return loop
 
     # Spawn the first stage (1 job for a single-role entry, N concurrent jobs
@@ -429,7 +430,7 @@ async def convert_project_loop_scheduling(
     officer; plus an enabled centurion on the project. An in-flight TURN is
     fine — its completion hits the officer branch and wakes him.
     """
-    from orchestrator.services.session_wake import kick_event_drain, notify_officer
+    from orchestrator.services.session_wake import notify_officer
 
     caller = await require_approved_user(request, dependencies.store)
     await require_project_member(
@@ -481,7 +482,7 @@ async def convert_project_loop_scheduling(
             ),
         },
     )
-    kick_event_drain(dependencies.store)
+    dependencies.kick_officer_event_drain(dependencies.store)
     return updated
 
 

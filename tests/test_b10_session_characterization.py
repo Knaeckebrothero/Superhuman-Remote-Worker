@@ -215,8 +215,10 @@ async def test_application_kick_adapter_reads_its_ledger_at_call_time(monkeypatc
 @pytest.mark.asyncio
 async def test_periodic_sweeper_forwards_the_explicit_ledger(monkeypatch):
     shutdown = asyncio.Event()
+    ledger = object()
 
-    async def _job_drain(_db):
+    async def _job_drain(_db, *, usage_ledger=None):
+        assert usage_ledger is ledger
         shutdown.set()
         return 0
 
@@ -224,7 +226,6 @@ async def test_periodic_sweeper_forwards_the_explicit_ledger(monkeypatch):
     monkeypatch.setattr(session_wake, "drain_pending_wakes", _job_drain)
     monkeypatch.setattr(session_wake, "drain_pending_event_wakes", event_drain)
     db = object()
-    ledger = object()
 
     await session_wake.session_wake_sweeper_loop(
         db,
