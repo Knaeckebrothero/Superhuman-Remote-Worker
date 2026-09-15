@@ -237,7 +237,7 @@ class TestSweeperPerThreadTTL:
 
     @pytest.mark.asyncio
     async def test_sweeper_sql_joins_users_and_coalesces(self, monkeypatch):
-        import orchestrator.main as orch_main
+        import orchestrator.services.attention_sleep as attention_sleep_module
 
         captured: dict = {}
         evt = asyncio.Event()
@@ -260,14 +260,15 @@ class TestSweeperPerThreadTTL:
             async def __aexit__(self_inner, exc_type, exc, tb):
                 return None
 
-        # monkeypatch, not bare assignment: these are module globals, and a
-        # leaked MagicMock `postgres_db` breaks every later test in the run
-        # that awaits a real DB method.
+        # R1.B10: the sweeper takes its collaborators explicitly — db and the
+        # retirement-operations factory are parameters now. Remaining module
+        # globals are patched on the owning module via monkeypatch (never bare
+        # assignment — a leaked MagicMock would break every later test).
         fake_db = MagicMock()
         fake_db.acquire = lambda: _Acquire()
-        monkeypatch.setattr(orch_main, "postgres_db", fake_db)
+
         monkeypatch.setattr(
-            orch_main,
+            attention_sleep_module,
             "promote_expired_stateless_pauses",
             AsyncMock(return_value=[]),
         )
@@ -275,9 +276,15 @@ class TestSweeperPerThreadTTL:
         suspension = MagicMock()
         suspension.is_enabled = True
         suspension.suspend_thread_workspace = AsyncMock(return_value=False)
-        monkeypatch.setattr(orch_main, "workspace_suspension_service", suspension)
+        monkeypatch.setattr(
+            attention_sleep_module, "workspace_suspension_service", suspension
+        )
 
-        await orch_main.attention_sleep_sweeper(evt)
+        await attention_sleep_module.attention_sleep_sweeper(
+            evt,
+            db=fake_db,
+            thread_retirement_operations=lambda: None,
+        )
 
         q = captured.get("query", "")
         assert "LEFT JOIN users" in q
@@ -285,4 +292,6 @@ class TestSweeperPerThreadTTL:
         assert "t.metadata->'config_override'->'headless'" in q
         assert "u.settings->'persistent_agent'" in q
         # Global default is the only bound parameter, passed as int.
-        assert captured.get("args") == (int(orch_main._ATTENTION_SLEEP_MINUTES),)
+        assert captured.get("args") == (
+            int(attention_sleep_module._ATTENTION_SLEEP_MINUTES),
+        )
