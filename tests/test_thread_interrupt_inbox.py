@@ -17,6 +17,31 @@ from orchestrator.services.thread_interrupt_inbox import (
     find_existing_thread_interrupt,
 )
 from shared.session_retirement import STATELESS_STOP_KEYS
+from orchestrator.schemas.thread_transport import ThreadInterruptRequest
+
+
+def _tt_routes():
+    from orchestrator.routers import thread_transport as tt_routes
+
+    return tt_routes
+
+
+def _tt_service():
+    from orchestrator.services import thread_transport as tt_service
+
+    return tt_service
+
+
+def _tt_deps(orch_main):
+    from orchestrator.routers.thread_transport import ThreadTransportDependencies
+
+    return ThreadTransportDependencies(
+        store=orch_main.postgres_db,
+        schedule_stateless_workspace_ensure=(
+            orch_main._schedule_stateless_workspace_ensure
+        ),
+        protected_cloud_delivery_state=(orch_main._protected_cloud_delivery_state),
+    )
 
 
 THREAD_ID = UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
@@ -384,7 +409,9 @@ async def test_admission_fails_closed_when_exact_gate_is_not_open(queue_patch):
 
 
 def test_public_envelope_is_complete_and_js_safe():
-    from orchestrator.main import ThreadInterruptRequest
+    from orchestrator.schemas.thread_transport import (
+        ThreadInterruptRequest,
+    )
 
     with pytest.raises(ValidationError):
         ThreadInterruptRequest(client_request_id=uuid4())
@@ -400,13 +427,13 @@ def test_public_envelope_is_complete_and_js_safe():
 def _patch_owner(monkeypatch, orch_main, thread):
     user = {"id": str(OWNER_ID), "is_admin": False}
     monkeypatch.setattr(
-        orch_main,
+        _tt_routes(),
         "require_thread_owner",
         AsyncMock(return_value=(user, thread)),
     )
     monkeypatch.setattr(orch_main, "postgres_db", MagicMock())
     monkeypatch.setattr(
-        orch_main,
+        _tt_routes(),
         "find_existing_thread_interrupt",
         AsyncMock(return_value=None),
     )
@@ -427,13 +454,25 @@ async def test_pinned_legacy_empty_body_forwards_byte_identical_payload(monkeypa
     agent = {"id": "agent-a", "pod_ip": "10.0.0.2", "pod_port": 8001}
     resolve = AsyncMock(return_value=(thread, agent))
     forward = AsyncMock(return_value={"ack": True, "mode": "hard"})
-    monkeypatch.setattr(orch_main, "_resolve_thread_for_forwarding", resolve)
-    monkeypatch.setattr(orch_main, "_forward_to_agent", forward)
+    monkeypatch.setattr(_tt_routes(), "_resolve_thread_for_forwarding", resolve)
+    monkeypatch.setattr(_tt_routes(), "_forward_to_agent", forward)
 
-    result = await orch_main.thread_interrupt(str(THREAD_ID), MagicMock(), None)
+    result = await _tt_routes().thread_interrupt(
+        str(THREAD_ID),
+        MagicMock(),
+        None,
+        dependencies=_tt_deps(orch_main),
+    )
 
-    resolve.assert_awaited_once_with(str(THREAD_ID), user)
-    forward.assert_awaited_once_with(agent, "/api/interrupt", {})
+    resolve.assert_awaited_once_with(
+        str(THREAD_ID),
+        user,
+        db=orch_main.postgres_db,
+        protected_cloud_delivery_state=(orch_main._protected_cloud_delivery_state),
+    )
+    forward.assert_awaited_once_with(
+        agent, "/api/interrupt", {}, db=orch_main.postgres_db
+    )
     assert result == {"accepted": True, "agent": {"ack": True, "mode": "hard"}}
 
 
@@ -450,19 +489,24 @@ async def test_pinned_correlated_envelope_forwards_target_intact(monkeypatch):
     _patch_owner(monkeypatch, orch_main, thread)
     agent = {"id": "agent-a", "pod_ip": "10.0.0.2", "pod_port": 8001}
     monkeypatch.setattr(
-        orch_main,
+        _tt_routes(),
         "_resolve_thread_for_forwarding",
         AsyncMock(return_value=(thread, agent)),
     )
     forward = AsyncMock(return_value={"ack": True, "mode": "hard"})
-    monkeypatch.setattr(orch_main, "_forward_to_agent", forward)
+    monkeypatch.setattr(_tt_routes(), "_forward_to_agent", forward)
     client_request_id = uuid4()
-    body = orch_main.ThreadInterruptRequest(
+    body = ThreadInterruptRequest(
         client_request_id=client_request_id,
         target_turn_id=7,
     )
 
-    await orch_main.thread_interrupt(str(THREAD_ID), MagicMock(), body)
+    await _tt_routes().thread_interrupt(
+        str(THREAD_ID),
+        MagicMock(),
+        body,
+        dependencies=_tt_deps(orch_main),
+    )
 
     forward.assert_awaited_once_with(
         agent,
@@ -471,6 +515,7 @@ async def test_pinned_correlated_envelope_forwards_target_intact(monkeypatch):
             "client_request_id": str(client_request_id),
             "target_turn_id": 7,
         },
+        db=orch_main.postgres_db,
     )
 
 
@@ -496,20 +541,21 @@ async def test_masked_stateless_retry_is_returned_before_pinned_forward(monkeypa
         duplicate=True,
     )
     monkeypatch.setattr(
-        orch_main,
+        _tt_routes(),
         "find_existing_thread_interrupt",
         AsyncMock(return_value=existing),
     )
     forward = AsyncMock(side_effect=AssertionError("retry must not hit pinned agent"))
-    monkeypatch.setattr(orch_main, "_forward_to_agent", forward)
+    monkeypatch.setattr(_tt_routes(), "_forward_to_agent", forward)
 
-    response = await orch_main.thread_interrupt(
+    response = await _tt_routes().thread_interrupt(
         str(THREAD_ID),
         MagicMock(),
-        orch_main.ThreadInterruptRequest(
+        ThreadInterruptRequest(
             client_request_id=client_request_id,
             target_turn_id=7,
         ),
+        dependencies=_tt_deps(orch_main),
     )
 
     assert response.status_code == 202
@@ -540,17 +586,18 @@ async def test_stateless_route_returns_admission_only(monkeypatch):
         duplicate=False,
     )
     admit = AsyncMock(return_value=admitted)
-    monkeypatch.setattr(orch_main, "admit_thread_interrupt", admit)
+    monkeypatch.setattr(_tt_routes(), "admit_thread_interrupt", admit)
     forward = AsyncMock(side_effect=AssertionError("stateless path must not forward"))
-    monkeypatch.setattr(orch_main, "_forward_to_agent", forward)
+    monkeypatch.setattr(_tt_routes(), "_forward_to_agent", forward)
 
-    response = await orch_main.thread_interrupt(
+    response = await _tt_routes().thread_interrupt(
         str(THREAD_ID),
         MagicMock(),
-        orch_main.ThreadInterruptRequest(
+        ThreadInterruptRequest(
             client_request_id=client_request_id,
             target_turn_id=7,
         ),
+        dependencies=_tt_deps(orch_main),
     )
 
     assert response.status_code == 202

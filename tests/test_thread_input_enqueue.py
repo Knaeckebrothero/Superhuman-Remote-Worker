@@ -20,6 +20,31 @@ import pytest
 
 from shared.pinned_session_identity import PinnedSessionBinding
 
+
+def _tt_routes():
+    from orchestrator.routers import thread_transport as tt_routes
+
+    return tt_routes
+
+
+def _tt_service():
+    from orchestrator.services import thread_transport as tt_service
+
+    return tt_service
+
+
+def _tt_deps(orch_main):
+    from orchestrator.routers.thread_transport import ThreadTransportDependencies
+
+    return ThreadTransportDependencies(
+        store=orch_main.postgres_db,
+        schedule_stateless_workspace_ensure=(
+            orch_main._schedule_stateless_workspace_ensure
+        ),
+        protected_cloud_delivery_state=(orch_main._protected_cloud_delivery_state),
+    )
+
+
 THREAD_ID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 USER = {"id": "user-1", "is_admin": False}
 _USE_DB_THREAD = object()
@@ -185,7 +210,7 @@ def _patch_common(monkeypatch, orch_main, db):
     async def _fake_user(request, _db):
         return dict(USER)
 
-    monkeypatch.setattr(orch_main, "require_approved_user", _fake_user)
+    monkeypatch.setattr(_tt_routes(), "require_approved_user", _fake_user)
     monkeypatch.setattr(orch_main, "postgres_db", db)
 
 
@@ -202,10 +227,11 @@ async def test_stateless_input_single_transaction_and_response_parity(monkeypatc
     schedule = MagicMock()
     monkeypatch.setattr(orch_main, "_schedule_stateless_workspace_ensure", schedule)
 
-    out = await orch_main.thread_input(
+    out = await _tt_routes().thread_input(
         THREAD_ID,
-        orch_main.ThreadInputRequest(content="hello queue"),
+        _tt_routes().ThreadInputRequest(content="hello queue"),
         MagicMock(),
+        dependencies=_tt_deps(orch_main),
     )
 
     # --- transaction shape: exactly one txn; all three writes inside it ---
@@ -265,12 +291,15 @@ async def test_stateless_input_skips_per_turn_lock(monkeypatch):
     db = FakeDB(_stateless_thread(), conn)
     _patch_common(monkeypatch, orch_main, db)
     lock_spy = MagicMock(side_effect=AssertionError("lock must not be used"))
-    monkeypatch.setattr(orch_main, "_ensure_thread_turn_lock", lock_spy)
+    monkeypatch.setattr(_tt_routes(), "_ensure_thread_turn_lock", lock_spy)
     forward_spy = AsyncMock(side_effect=AssertionError("no agent forward"))
-    monkeypatch.setattr(orch_main, "_forward_to_agent", forward_spy)
+    monkeypatch.setattr(_tt_routes(), "_forward_to_agent", forward_spy)
 
-    out = await orch_main.thread_input(
-        THREAD_ID, orch_main.ThreadInputRequest(content="x"), MagicMock()
+    out = await _tt_routes().thread_input(
+        THREAD_ID,
+        _tt_routes().ThreadInputRequest(content="x"),
+        MagicMock(),
+        dependencies=_tt_deps(orch_main),
     )
     assert out["accepted"] is True
     lock_spy.assert_not_called()
@@ -288,8 +317,11 @@ async def test_stateless_input_rejects_empty_content(monkeypatch):
     _patch_common(monkeypatch, orch_main, db)
 
     with pytest.raises(HTTPException) as exc:
-        await orch_main.thread_input(
-            THREAD_ID, orch_main.ThreadInputRequest(content=""), MagicMock()
+        await _tt_routes().thread_input(
+            THREAD_ID,
+            _tt_routes().ThreadInputRequest(content=""),
+            MagicMock(),
+            dependencies=_tt_deps(orch_main),
         )
     assert exc.value.status_code == 400
     assert conn.calls == []  # nothing persisted
@@ -314,10 +346,11 @@ async def test_stateless_input_rejects_unsupported_workspace_before_writes(
     _patch_common(monkeypatch, orch_main, db)
 
     with pytest.raises(HTTPException) as exc:
-        await orch_main.thread_input(
+        await _tt_routes().thread_input(
             THREAD_ID,
-            orch_main.ThreadInputRequest(content="must not queue"),
+            _tt_routes().ThreadInputRequest(content="must not queue"),
             MagicMock(),
+            dependencies=_tt_deps(orch_main),
         )
 
     assert exc.value.status_code == 409
@@ -344,10 +377,11 @@ async def test_stateless_input_accepts_attested_k8s_sandbox(monkeypatch):
     schedule.side_effect = _after_commit
     monkeypatch.setattr(orch_main, "_schedule_stateless_workspace_ensure", schedule)
 
-    out = await orch_main.thread_input(
+    out = await _tt_routes().thread_input(
         THREAD_ID,
-        orch_main.ThreadInputRequest(content="sandbox turn"),
+        _tt_routes().ThreadInputRequest(content="sandbox turn"),
         MagicMock(),
+        dependencies=_tt_deps(orch_main),
     )
 
     assert out["accepted"] is True
@@ -370,10 +404,11 @@ async def test_awaiting_user_sandbox_input_commits_before_workspace_ensure(monke
     )
     monkeypatch.setattr(orch_main, "_schedule_stateless_workspace_ensure", schedule)
 
-    out = await orch_main.thread_input(
+    out = await _tt_routes().thread_input(
         THREAD_ID,
-        orch_main.ThreadInputRequest(content="continue from approval"),
+        _tt_routes().ThreadInputRequest(content="continue from approval"),
         MagicMock(),
+        dependencies=_tt_deps(orch_main),
     )
 
     assert out["accepted"] is True
@@ -401,10 +436,11 @@ async def test_stateless_input_rechecks_locked_workspace_before_any_write(monkey
     _patch_common(monkeypatch, orch_main, db)
 
     with pytest.raises(HTTPException) as exc:
-        await orch_main.thread_input(
+        await _tt_routes().thread_input(
             THREAD_ID,
-            orch_main.ThreadInputRequest(content="must not race into the queue"),
+            _tt_routes().ThreadInputRequest(content="must not race into the queue"),
             MagicMock(),
+            dependencies=_tt_deps(orch_main),
         )
 
     assert exc.value.status_code == 409
@@ -436,10 +472,11 @@ async def test_stateless_input_rechecks_locked_protected_cloud_before_any_write(
     _patch_common(monkeypatch, orch_main, db)
 
     with pytest.raises(HTTPException) as exc:
-        await orch_main.thread_input(
+        await _tt_routes().thread_input(
             THREAD_ID,
-            orch_main.ThreadInputRequest(content="must remain pinned"),
+            _tt_routes().ThreadInputRequest(content="must remain pinned"),
             MagicMock(),
+            dependencies=_tt_deps(orch_main),
         )
 
     assert exc.value.status_code == 409
@@ -475,10 +512,11 @@ async def test_stateless_input_refuses_malformed_session_class_before_writes(
     _patch_common(monkeypatch, orch_main, db)
 
     with pytest.raises(HTTPException) as exc:
-        await orch_main.thread_input(
+        await _tt_routes().thread_input(
             THREAD_ID,
-            orch_main.ThreadInputRequest(content="must remain pinned"),
+            _tt_routes().ThreadInputRequest(content="must remain pinned"),
             MagicMock(),
+            dependencies=_tt_deps(orch_main),
         )
 
     assert exc.value.status_code == 409
@@ -498,10 +536,11 @@ async def test_ended_stateless_input_requires_explicit_resume_before_writes(
     _patch_common(monkeypatch, orch_main, db)
 
     with pytest.raises(HTTPException, match="status=ended") as exc:
-        await orch_main.thread_input(
+        await _tt_routes().thread_input(
             THREAD_ID,
-            orch_main.ThreadInputRequest(content="must resume first"),
+            _tt_routes().ThreadInputRequest(content="must resume first"),
             MagicMock(),
+            dependencies=_tt_deps(orch_main),
         )
 
     assert exc.value.status_code == 409
@@ -527,10 +566,11 @@ async def test_suspended_sandbox_input_commits_then_schedules_workspace_restore(
     ensure_workspace = AsyncMock()
     monkeypatch.setattr(orch_main, "ensure_session_workspace", ensure_workspace)
 
-    out = await orch_main.thread_input(
+    out = await _tt_routes().thread_input(
         THREAD_ID,
-        orch_main.ThreadInputRequest(content="wake and continue"),
+        _tt_routes().ThreadInputRequest(content="wake and continue"),
         MagicMock(),
+        dependencies=_tt_deps(orch_main),
     )
     await asyncio.sleep(0)
 
@@ -573,8 +613,11 @@ async def test_stateless_input_accepts_none_workspace(monkeypatch):
     schedule = MagicMock()
     monkeypatch.setattr(orch_main, "_schedule_stateless_workspace_ensure", schedule)
 
-    out = await orch_main.thread_input(
-        THREAD_ID, orch_main.ThreadInputRequest(content="lite"), MagicMock()
+    out = await _tt_routes().thread_input(
+        THREAD_ID,
+        _tt_routes().ThreadInputRequest(content="lite"),
+        MagicMock(),
+        dependencies=_tt_deps(orch_main),
     )
 
     assert out["accepted"] is True
@@ -626,16 +669,22 @@ async def test_stateless_input_owner_gate(monkeypatch):
     _patch_common(monkeypatch, orch_main, db)
 
     with pytest.raises(HTTPException) as exc:
-        await orch_main.thread_input(
-            THREAD_ID, orch_main.ThreadInputRequest(content="x"), MagicMock()
+        await _tt_routes().thread_input(
+            THREAD_ID,
+            _tt_routes().ThreadInputRequest(content="x"),
+            MagicMock(),
+            dependencies=_tt_deps(orch_main),
         )
     assert exc.value.status_code == 403
 
     db_missing = FakeDB(None, conn)
     monkeypatch.setattr(orch_main, "postgres_db", db_missing)
     with pytest.raises(HTTPException) as exc:
-        await orch_main.thread_input(
-            THREAD_ID, orch_main.ThreadInputRequest(content="x"), MagicMock()
+        await _tt_routes().thread_input(
+            THREAD_ID,
+            _tt_routes().ThreadInputRequest(content="x"),
+            MagicMock(),
+            dependencies=_tt_deps(orch_main),
         )
     assert exc.value.status_code == 404
 
@@ -656,31 +705,34 @@ async def test_pinned_thread_takes_legacy_forward_with_lock(monkeypatch):
 
     binding = _pinned_binding()
     resolve_spy = AsyncMock(return_value=(pinned, binding))
-    monkeypatch.setattr(orch_main, "_resolve_thread_for_forwarding", resolve_spy)
+    monkeypatch.setattr(_tt_routes(), "_resolve_thread_for_forwarding", resolve_spy)
     revalidate_spy = AsyncMock(return_value=binding)
     monkeypatch.setattr(
-        orch_main,
+        _tt_routes(),
         "_revalidate_pinned_forwarding_binding",
         revalidate_spy,
     )
     forward_spy = AsyncMock(
         return_value={"accepted": True, "turn_id": 5, "queue_depth": 1}
     )
-    monkeypatch.setattr(orch_main, "_forward_to_agent", forward_spy)
-    real_lock = orch_main._ensure_thread_turn_lock
+    monkeypatch.setattr(_tt_routes(), "_forward_to_agent", forward_spy)
+    real_lock = _tt_routes()._ensure_thread_turn_lock
     lock_spy = MagicMock(side_effect=real_lock)
-    monkeypatch.setattr(orch_main, "_ensure_thread_turn_lock", lock_spy)
+    monkeypatch.setattr(_tt_routes(), "_ensure_thread_turn_lock", lock_spy)
     # Neutralize the 5-minute deferred cleanup task so the loop closes clean.
-    monkeypatch.setattr(orch_main, "_schedule_turn_lock_cleanup", MagicMock())
+    monkeypatch.setattr(_tt_routes(), "_schedule_turn_lock_cleanup", MagicMock())
 
-    out = await orch_main.thread_input(
-        THREAD_ID, orch_main.ThreadInputRequest(content="hi"), MagicMock()
+    out = await _tt_routes().thread_input(
+        THREAD_ID,
+        _tt_routes().ThreadInputRequest(content="hi"),
+        MagicMock(),
+        dependencies=_tt_deps(orch_main),
     )
     await asyncio.sleep(0)
 
     resolve_spy.assert_awaited_once()
     lock_spy.assert_called_once_with(THREAD_ID, 6)
-    revalidate_spy.assert_awaited_once_with(binding)
+    revalidate_spy.assert_awaited_once_with(binding, db=db)
     forward_spy.assert_awaited_once()
     args = forward_spy.await_args.args
     assert args[1] == "/api/input"
@@ -700,13 +752,15 @@ async def test_uncorrelated_interrupt_on_stateless_lane_returns_422(monkeypatch)
     db = FakeDB(_stateless_thread(), conn)
     _patch_common(monkeypatch, orch_main, db)
     monkeypatch.setattr(
-        orch_main,
+        _tt_routes(),
         "require_thread_owner",
         AsyncMock(return_value=(dict(USER), _stateless_thread())),
     )
 
     with pytest.raises(HTTPException) as exc:
-        await orch_main.thread_interrupt(THREAD_ID, MagicMock(), None)
+        await _tt_routes().thread_interrupt(
+            THREAD_ID, MagicMock(), None, dependencies=_tt_deps(orch_main)
+        )
     assert exc.value.status_code == 422
     assert "target_turn_id" in exc.value.detail
 
@@ -719,21 +773,23 @@ async def test_interrupt_on_pinned_lane_still_forwards(monkeypatch):
     db = FakeDB(pinned, FakeConn())
     _patch_common(monkeypatch, orch_main, db)
     monkeypatch.setattr(
-        orch_main,
+        _tt_routes(),
         "require_thread_owner",
         AsyncMock(return_value=(dict(USER), pinned)),
     )
     binding = _pinned_binding()
     monkeypatch.setattr(
-        orch_main,
+        _tt_routes(),
         "_resolve_thread_for_forwarding",
         AsyncMock(return_value=(pinned, binding)),
     )
     forward_spy = AsyncMock(return_value={"ok": True})
-    monkeypatch.setattr(orch_main, "_forward_to_agent", forward_spy)
+    monkeypatch.setattr(_tt_routes(), "_forward_to_agent", forward_spy)
 
-    out = await orch_main.thread_interrupt(THREAD_ID, MagicMock(), None)
-    forward_spy.assert_awaited_once_with(binding, "/api/interrupt", {})
+    out = await _tt_routes().thread_interrupt(
+        THREAD_ID, MagicMock(), None, dependencies=_tt_deps(orch_main)
+    )
+    forward_spy.assert_awaited_once_with(binding, "/api/interrupt", {}, db=db)
     assert out == {"accepted": True, "agent": {"ok": True}}
 
 
@@ -741,7 +797,6 @@ async def test_interrupt_on_pinned_lane_still_forwards(monkeypatch):
 async def test_exact_forward_rechecks_after_client_entry_and_adds_fingerprint(
     monkeypatch,
 ):
-    from orchestrator import main as orch_main
 
     binding = _pinned_binding()
     order: list[str] = []
@@ -772,22 +827,23 @@ async def test_exact_forward_rechecks_after_client_entry_and_adds_fingerprint(
             observed.update(url=url, json=json)
             return _Response()
 
-    async def _revalidate(current):
+    async def _revalidate(current, *, db=None):
         order.append("db_recheck")
         assert current is binding
         return binding
 
-    monkeypatch.setattr(orch_main.httpx, "AsyncClient", _Client)
+    monkeypatch.setattr(_tt_service().httpx, "AsyncClient", _Client)
     monkeypatch.setattr(
-        orch_main,
+        _tt_service(),
         "_revalidate_pinned_forwarding_binding",
         _revalidate,
     )
 
-    result = await orch_main._forward_to_agent(
+    result = await _tt_service()._forward_to_agent(
         binding,
         "/api/input",
         {"content": "hello", "turn_id": 6},
+        db=MagicMock(),
     )
 
     assert result == {"accepted": True}
@@ -808,7 +864,6 @@ async def test_exact_forward_binding_loss_after_client_entry_sends_nothing(
 ):
     from fastapi import HTTPException
 
-    from orchestrator import main as orch_main
 
     binding = _pinned_binding()
     post = AsyncMock()
@@ -834,18 +889,19 @@ async def test_exact_forward_binding_loss_after_client_entry_sends_nothing(
             "session_runtime_generation": binding.runtime_generation,
         },
     )
-    monkeypatch.setattr(orch_main.httpx, "AsyncClient", _Client)
+    monkeypatch.setattr(_tt_service().httpx, "AsyncClient", _Client)
     monkeypatch.setattr(
-        orch_main,
+        _tt_service(),
         "_revalidate_pinned_forwarding_binding",
         AsyncMock(side_effect=refusal),
     )
 
     with pytest.raises(HTTPException) as caught:
-        await orch_main._forward_to_agent(
+        await _tt_service()._forward_to_agent(
             binding,
             "/api/input",
             {"content": "must not move"},
+            db=MagicMock(),
         )
 
     assert caught.value is refusal
@@ -856,7 +912,6 @@ async def test_exact_forward_binding_loss_after_client_entry_sends_nothing(
 async def test_agent_identity_mismatch_becomes_generation_bound_refusal(monkeypatch):
     from fastapi import HTTPException
 
-    from orchestrator import main as orch_main
 
     binding = _pinned_binding()
 
@@ -882,15 +937,17 @@ async def test_agent_identity_mismatch_becomes_generation_bound_refusal(monkeypa
         async def post(self, *args, **kwargs):
             return _Response()
 
-    monkeypatch.setattr(orch_main.httpx, "AsyncClient", _Client)
+    monkeypatch.setattr(_tt_service().httpx, "AsyncClient", _Client)
     monkeypatch.setattr(
-        orch_main,
+        _tt_service(),
         "_revalidate_pinned_forwarding_binding",
         AsyncMock(return_value=binding),
     )
 
     with pytest.raises(HTTPException) as caught:
-        await orch_main._forward_to_agent(binding, "/api/interrupt", {})
+        await _tt_service()._forward_to_agent(
+            binding, "/api/interrupt", {}, db=MagicMock()
+        )
 
     assert caught.value.status_code == 409
     assert caught.value.detail == {
@@ -914,7 +971,7 @@ async def test_pinned_input_rechecks_binding_after_turn_lock_before_forward(
     db = FakeDB(pinned, FakeConn())
     _patch_common(monkeypatch, orch_main, db)
     monkeypatch.setattr(
-        orch_main,
+        _tt_routes(),
         "_resolve_thread_for_forwarding",
         AsyncMock(return_value=(pinned, binding)),
     )
@@ -933,30 +990,31 @@ async def test_pinned_input_rechecks_binding_after_turn_lock_before_forward(
             order.append("lock_exit")
             return False
 
-    monkeypatch.setattr(orch_main, "_ensure_thread_turn_lock", lambda *_: _Lock())
-    monkeypatch.setattr(orch_main, "_schedule_turn_lock_cleanup", MagicMock())
+    monkeypatch.setattr(_tt_routes(), "_ensure_thread_turn_lock", lambda *_: _Lock())
+    monkeypatch.setattr(_tt_routes(), "_schedule_turn_lock_cleanup", MagicMock())
     refusal = HTTPException(
         status_code=409,
         detail={"code": "session_binding_invalid"},
     )
 
-    async def _reject(_binding):
+    async def _reject(_binding, *, db=None):
         order.append("binding_recheck")
         raise refusal
 
     monkeypatch.setattr(
-        orch_main,
+        _tt_routes(),
         "_revalidate_pinned_forwarding_binding",
         _reject,
     )
     forward = AsyncMock()
-    monkeypatch.setattr(orch_main, "_forward_to_agent", forward)
+    monkeypatch.setattr(_tt_routes(), "_forward_to_agent", forward)
 
     with pytest.raises(HTTPException) as caught:
-        await orch_main.thread_input(
+        await _tt_routes().thread_input(
             THREAD_ID,
-            orch_main.ThreadInputRequest(content="stay exact"),
+            _tt_routes().ThreadInputRequest(content="stay exact"),
             MagicMock(),
+            dependencies=_tt_deps(orch_main),
         )
 
     assert caught.value is refusal

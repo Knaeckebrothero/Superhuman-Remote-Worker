@@ -21,6 +21,21 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import orchestrator.services.thread_transport as tt_service
+from orchestrator.routers import thread_transport as tt_routes
+
+
+def _tt_deps(orch_main):
+    from orchestrator.routers.thread_transport import ThreadTransportDependencies
+
+    return ThreadTransportDependencies(
+        store=orch_main.postgres_db,
+        schedule_stateless_workspace_ensure=(
+            orch_main._schedule_stateless_workspace_ensure
+        ),
+        protected_cloud_delivery_state=(orch_main._protected_cloud_delivery_state),
+    )
+
 
 def test_pruner_preserves_receipts_until_owner_request_is_terminal():
     import orchestrator.main as om
@@ -967,38 +982,28 @@ class TestPerTurnLock:
     second sees lock.locked() and returns 409."""
 
     def setup_method(self):
-        import orchestrator.main as om
-
-        om._thread_turn_locks.clear()
-        om._thread_turn_inflight.clear()
+        tt_service._thread_turn_locks.clear()
+        tt_service._thread_turn_inflight.clear()
 
     def teardown_method(self):
-        import orchestrator.main as om
-
-        om._thread_turn_locks.clear()
-        om._thread_turn_inflight.clear()
+        tt_service._thread_turn_locks.clear()
+        tt_service._thread_turn_inflight.clear()
 
     def test_same_key_shares_one_lock(self):
-        import orchestrator.main as om
-
-        lock_a = om._ensure_thread_turn_lock("thread-x", 5)
-        lock_b = om._ensure_thread_turn_lock("thread-x", 5)
+        lock_a = tt_service._ensure_thread_turn_lock("thread-x", 5)
+        lock_b = tt_service._ensure_thread_turn_lock("thread-x", 5)
         assert lock_a is lock_b
 
     def test_different_keys_distinct_locks(self):
-        import orchestrator.main as om
-
-        l_thread = om._ensure_thread_turn_lock("thread-x", 5)
-        l_other_thread = om._ensure_thread_turn_lock("thread-y", 5)
-        l_other_turn = om._ensure_thread_turn_lock("thread-x", 6)
+        l_thread = tt_service._ensure_thread_turn_lock("thread-x", 5)
+        l_other_thread = tt_service._ensure_thread_turn_lock("thread-y", 5)
+        l_other_turn = tt_service._ensure_thread_turn_lock("thread-x", 6)
         assert l_thread is not l_other_thread
         assert l_thread is not l_other_turn
 
     @pytest.mark.asyncio
     async def test_concurrent_acquire_returns_locked_for_second(self):
-        import orchestrator.main as om
-
-        lock = om._ensure_thread_turn_lock("thread-x", 1)
+        lock = tt_service._ensure_thread_turn_lock("thread-x", 1)
         await lock.acquire()
         try:
             # Second caller sees the lock held; the HTTP handler returns
@@ -1237,8 +1242,6 @@ class TestNoCursorReplayStart:
 
     @pytest.mark.asyncio
     async def test_anchors_past_last_terminal_event(self):
-        import orchestrator.main as om
-
         captured = {}
 
         class _Conn:
@@ -1248,7 +1251,7 @@ class TestNoCursorReplayStart:
                 # Simulate MAX(seq) of the epoch's terminal events.
                 return 7
 
-        start = await om._no_cursor_replay_start(_Conn(), "thread-x", 3)
+        start = await tt_service._no_cursor_replay_start(_Conn(), "thread-x", 3)
 
         # Replay only seq > 7 (the in-flight turn), NOT the whole epoch.
         assert start == 7
@@ -1263,24 +1266,21 @@ class TestNoCursorReplayStart:
     async def test_returns_zero_when_no_turn_has_finished(self):
         """First turn still in flight (no terminal event yet) → replay from 0
         so the in-flight first turn, absent from REST history, is delivered."""
-        import orchestrator.main as om
 
         class _Conn:
             async def fetchval(self, sql, *args):
                 return 0  # COALESCE(MAX(seq), 0) with no terminal rows
 
-        start = await om._no_cursor_replay_start(_Conn(), "thread-x", 0)
+        start = await tt_service._no_cursor_replay_start(_Conn(), "thread-x", 0)
         assert start == 0
 
     @pytest.mark.asyncio
     async def test_coerces_null_max_to_zero(self):
-        import orchestrator.main as om
-
         class _Conn:
             async def fetchval(self, sql, *args):
                 return None
 
-        start = await om._no_cursor_replay_start(_Conn(), "thread-x", 0)
+        start = await tt_service._no_cursor_replay_start(_Conn(), "thread-x", 0)
         assert start == 0
 
 
@@ -1353,9 +1353,9 @@ class TestThreadEventStreamEpochRecheck:
     def _patch(self, monkeypatch, conn, *, server_epoch=3, recheck_s=0.0):
         import orchestrator.main as om
 
-        monkeypatch.setattr(om, "THREAD_EVENTS_EPOCH_RECHECK_S", recheck_s)
+        monkeypatch.setattr(tt_routes, "THREAD_EVENTS_EPOCH_RECHECK_S", recheck_s)
         monkeypatch.setattr(
-            om,
+            tt_routes,
             "require_thread_owner",
             AsyncMock(return_value=(MagicMock(), {"events_epoch": server_epoch})),
         )
@@ -1389,7 +1389,9 @@ class TestThreadEventStreamEpochRecheck:
         # Matching cursor (epoch 3) so the open path skips the mismatch/
         # retention branches and the loop starts clean.
         req = _FakeRequest(last_event_id="3:100")
-        resp = await om.thread_event_stream("thread-x", req)
+        resp = await tt_routes.thread_event_stream(
+            "thread-x", req, dependencies=_tt_deps(om)
+        )
         chunks = await self._drain(resp)
 
         assert chunks[0] == ": open\n\n"
@@ -1423,7 +1425,9 @@ class TestThreadEventStreamEpochRecheck:
         self._patch(monkeypatch, conn, server_epoch=3)
 
         req = _FakeRequest(last_event_id="3:100")
-        resp = await om.thread_event_stream("thread-x", req)
+        resp = await tt_routes.thread_event_stream(
+            "thread-x", req, dependencies=_tt_deps(om)
+        )
         chunks = await self._drain(resp)
 
         horizon = [c for c in chunks if "gone_beyond_horizon" in c]
@@ -1444,7 +1448,9 @@ class TestThreadEventStreamEpochRecheck:
         self._patch(monkeypatch, conn, server_epoch=3)
 
         req = _FakeRequest(last_event_id="3:100")
-        resp = await om.thread_event_stream("thread-x", req)
+        resp = await tt_routes.thread_event_stream(
+            "thread-x", req, dependencies=_tt_deps(om)
+        )
         chunks = await self._drain(resp)
 
         assert chunks == [": open\n\n"]
@@ -1466,7 +1472,9 @@ class TestThreadEventStreamEpochRecheck:
         self._patch(monkeypatch, conn, server_epoch=3, recheck_s=999.0)
 
         req = _FakeRequest(last_event_id="3:0")
-        resp = await om.thread_event_stream("thread-x", req)
+        resp = await tt_routes.thread_event_stream(
+            "thread-x", req, dependencies=_tt_deps(om)
+        )
 
         # Pull exactly the open comment + the two row frames, then close —
         # the post-batch idle loop spins without yielding, so don't ask for a
@@ -1497,15 +1505,17 @@ class TestThreadEventStreamPresence:
 
         auth = AsyncMock(return_value=self._owner_row("stateless"))
         refresh = AsyncMock(return_value=PresenceRefresh(True, True))
-        monkeypatch.setattr(om, "require_thread_owner", auth)
-        monkeypatch.setattr(om, "refresh_thread_presence", refresh)
+        monkeypatch.setattr(tt_routes, "require_thread_owner", auth)
+        monkeypatch.setattr(tt_routes, "refresh_thread_presence", refresh)
 
-        response = await om.thread_event_stream("thread-x", _FakeRequest())
+        response = await tt_routes.thread_event_stream(
+            "thread-x", _FakeRequest(), dependencies=_tt_deps(om)
+        )
         assert auth.await_count == 1
         refresh.assert_awaited_once_with(
             om.postgres_db,
             thread_id="thread-x",
-            ttl_seconds=om.THREAD_CLIENT_PRESENCE_TTL_S,
+            ttl_seconds=tt_routes.THREAD_CLIENT_PRESENCE_TTL_S,
             establish=True,
         )
         iterator = response.body_iterator
@@ -1528,14 +1538,16 @@ class TestThreadEventStreamPresence:
         refresh = AsyncMock(
             side_effect=[PresenceRefresh(True, True), RuntimeError("renew failed")]
         )
-        monkeypatch.setattr(om, "require_thread_owner", auth)
-        monkeypatch.setattr(om, "refresh_thread_presence", refresh)
-        monkeypatch.setattr(om, "THREAD_CLIENT_PRESENCE_RENEW_S", 0.0)
+        monkeypatch.setattr(tt_routes, "require_thread_owner", auth)
+        monkeypatch.setattr(tt_routes, "refresh_thread_presence", refresh)
+        monkeypatch.setattr(tt_routes, "THREAD_CLIENT_PRESENCE_RENEW_S", 0.0)
         fake_db = MagicMock()
         fake_db.acquire = lambda: _Acquire(_ScriptedConn(epochs=[], min_seq=0))
         monkeypatch.setattr(om, "postgres_db", fake_db)
 
-        response = await om.thread_event_stream("thread-x", _FakeRequest())
+        response = await tt_routes.thread_event_stream(
+            "thread-x", _FakeRequest(), dependencies=_tt_deps(om)
+        )
         iterator = response.body_iterator
         assert await iterator.__anext__() == ": open\n\n"
         with pytest.raises(StopAsyncIteration):
@@ -1558,14 +1570,16 @@ class TestThreadEventStreamPresence:
             ]
         )
         refresh = AsyncMock(return_value=PresenceRefresh(True, True))
-        monkeypatch.setattr(om, "require_thread_owner", auth)
-        monkeypatch.setattr(om, "refresh_thread_presence", refresh)
-        monkeypatch.setattr(om, "THREAD_CLIENT_PRESENCE_RENEW_S", 0.0)
+        monkeypatch.setattr(tt_routes, "require_thread_owner", auth)
+        monkeypatch.setattr(tt_routes, "refresh_thread_presence", refresh)
+        monkeypatch.setattr(tt_routes, "THREAD_CLIENT_PRESENCE_RENEW_S", 0.0)
         fake_db = MagicMock()
         fake_db.acquire = lambda: _Acquire(_ScriptedConn(epochs=[], min_seq=0))
         monkeypatch.setattr(om, "postgres_db", fake_db)
 
-        response = await om.thread_event_stream("thread-x", _FakeRequest())
+        response = await tt_routes.thread_event_stream(
+            "thread-x", _FakeRequest(), dependencies=_tt_deps(om)
+        )
         iterator = response.body_iterator
         assert await iterator.__anext__() == ": open\n\n"
         with pytest.raises(StopAsyncIteration):
@@ -1579,14 +1593,16 @@ class TestThreadEventStreamPresence:
         import orchestrator.main as om
 
         monkeypatch.setattr(
-            om,
+            tt_routes,
             "require_thread_owner",
             AsyncMock(return_value=self._owner_row("pinned")),
         )
         refresh = AsyncMock()
-        monkeypatch.setattr(om, "refresh_thread_presence", refresh)
+        monkeypatch.setattr(tt_routes, "refresh_thread_presence", refresh)
 
-        response = await om.thread_event_stream("thread-x", _FakeRequest())
+        response = await tt_routes.thread_event_stream(
+            "thread-x", _FakeRequest(), dependencies=_tt_deps(om)
+        )
         iterator = response.body_iterator
         assert await iterator.__anext__() == ": open\n\n"
         await iterator.aclose()
