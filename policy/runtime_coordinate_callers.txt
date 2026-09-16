@@ -13,7 +13,6 @@
 #
 # <file>  <enclosing qualname>  <kind>  <callee>  <fingerprint>  #<ordinal>  <classification>
 
-src/orchestrator/main.py  _forward_to_agent  http  client.post  354d7ac9ee96  #1  exact-runtime-recipient
 src/orchestrator/routers/thread_files.py  upload_files_to_thread  remote-effect  upload_files_to_attested_vm_workspace  8f1a01b30667  #1  fresh-k8s-attestation
 src/orchestrator/services/agent_cloud_mounts.py  _build_agent_cloud_mount  remote-effect  _build_rclone_mount_from_row  0e83b668f377  #1  local-only
 src/orchestrator/services/agent_cloud_mounts.py  _build_agent_cloud_mount  remote-effect  _build_rclone_session_mount  ee81a67b673b  #1  local-only
@@ -95,6 +94,7 @@ src/orchestrator/services/ssh_helpers.py  wait_for_agent_ssh  ssh  build_agent_s
 src/orchestrator/services/thread_cloud_diff.py  _reset_thread_overlay  http  client.post  92db99489add  #1  exact-runtime-recipient
 src/orchestrator/services/thread_retirement.py  detach_agent_session  http  client.post  5e8b40a94fa6  #1  exact-runtime-recipient
 src/orchestrator/services/thread_retirement.py  thread_turn_in_flight  http  client.post  5e8b40a94fa6  #1  exact-runtime-recipient
+src/orchestrator/services/thread_transport.py  _forward_to_agent  http  client.post  354d7ac9ee96  #1  exact-runtime-recipient
 src/orchestrator/services/thread_uploads.py  resolve_thread_upload_destination  ssh  _SshTarget  4b9010b50487  #1  pinned-host-key
 src/orchestrator/services/thread_workspace_delivery.py  agent_get_thread_workspace_locked  remote-effect  remote_canvas_presentation_available  f40229a0ebf2  #1  fresh-k8s-attestation
 src/orchestrator/services/thread_workspace_delivery.py  agent_get_thread_workspace_locked  remote-effect  remote_canvas_presentation_available  f40229a0ebf2  #2  fresh-k8s-attestation
