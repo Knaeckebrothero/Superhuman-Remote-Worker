@@ -144,7 +144,9 @@ async def test_event_drain_fails_open_when_application_metering_is_unavailable(
 
 
 @pytest.mark.asyncio
-async def test_two_concurrent_event_drains_keep_application_ledgers_isolated(monkeypatch):
+async def test_two_concurrent_event_drains_keep_application_ledgers_isolated(
+    monkeypatch,
+):
     """One app's over-budget ledger cannot defer another app's officer."""
 
     from orchestrator.services import sitrep
@@ -252,7 +254,10 @@ async def test_direct_legate_note_bypasses_the_autonomous_ceiling(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_magic_link_get_is_read_only_prefetch_safe_and_escaped(monkeypatch):
-    from orchestrator import main
+    from orchestrator.routers import thread_permissions as tp_perm_routes
+    from orchestrator.routers.thread_permissions import (
+        ThreadPermissionsDependencies,
+    )
 
     permission_row = {
         "id": "approval-1",
@@ -279,19 +284,25 @@ async def test_magic_link_get_is_read_only_prefetch_safe_and_escaped(monkeypatch
         }
     )
     consume = AsyncMock(side_effect=AssertionError("GET consumed token"))
-    monkeypatch.setattr(main, "postgres_db", db)
     monkeypatch.setattr(
-        main,
+        tp_perm_routes,
         "headless_notifications",
         SimpleNamespace(validate_magic_link=validate, consume_magic_link=consume),
     )
     monkeypatch.setattr(
-        main,
+        tp_perm_routes,
         "email_service",
         SimpleNamespace(cockpit_url="https://cockpit.example.test"),
     )
+    dependencies = ThreadPermissionsDependencies(
+        store=db,
+        emit_session_provisioning_failure=AsyncMock(return_value=None),
+        persistent_thread_recycler=None,
+    )
 
-    response = await main.magic_link_get('tok\"><script>alert(1)</script>')
+    response = await tp_perm_routes.magic_link_get(
+        'tok"><script>alert(1)</script>', dependencies=dependencies
+    )
     body = response.body.decode()
 
     assert response.status_code == 200
@@ -302,32 +313,41 @@ async def test_magic_link_get_is_read_only_prefetch_safe_and_escaped(monkeypatch
     assert "UPDATE " not in conn.fetchrow.await_args.args[0]
     assert "<script>alert('tool')</script>" not in body
     assert "</pre><script>alert('args')</script>" not in body
-    assert 'tok\"><script>' not in body
+    assert 'tok"><script>' not in body
     assert "&lt;script&gt;alert(&#x27;tool&#x27;)&lt;/script&gt;" in body
 
 
 @pytest.mark.asyncio
 async def test_failed_permission_decision_does_not_resolve_notification(monkeypatch):
-    from orchestrator import main
+    from orchestrator.routers import thread_permissions as tp_perm_routes
+    from orchestrator.routers.thread_permissions import ThreadPermissionsDependencies
+    from orchestrator.schemas.thread_permissions import ThreadApproveRequest
 
     monkeypatch.setattr(
-        main,
+        tp_perm_routes,
         "require_thread_owner",
         AsyncMock(return_value=({"id": "user-1"}, {"id": "thread-1"})),
     )
     decide = AsyncMock(
         side_effect=HTTPException(status_code=409, detail="Already decided")
     )
-    monkeypatch.setattr(main, "_decide_permission_request", decide)
+    monkeypatch.setattr(
+        tp_perm_routes.thread_permissions_service, "_decide_permission_request", decide
+    )
     resolve = AsyncMock()
-    monkeypatch.setattr(main.notification_service, "resolve_source", resolve)
+    monkeypatch.setattr(tp_perm_routes.notification_service, "resolve_source", resolve)
 
     with pytest.raises(HTTPException) as caught:
-        await main.thread_approve(
+        await tp_perm_routes.thread_approve(
             "thread-1",
             "approval-1",
-            main.ThreadApproveRequest(decision="approve"),
+            ThreadApproveRequest(decision="approve"),
             MagicMock(),
+            dependencies=ThreadPermissionsDependencies(
+                store=MagicMock(),
+                emit_session_provisioning_failure=AsyncMock(return_value=None),
+                persistent_thread_recycler=None,
+            ),
         )
 
     assert caught.value.status_code == 409
@@ -335,56 +355,65 @@ async def test_failed_permission_decision_does_not_resolve_notification(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_cancelled_pinned_input_releases_inflight_owner_immediately(monkeypatch):
-    """Cancellation releases both the lock and its ownership marker."""
+async def test_cancelled_pinned_input_releases_the_turn_lock_and_schedules_cleanup(
+    monkeypatch,
+):
+    """Cancellation releases the turn lock immediately; the inflight marker is
+    released later by the scheduled cleanup task (the 300s memory-leak guard),
+    matching the pre-extraction route body."""
 
-    from orchestrator import main
+    from orchestrator.routers import thread_transport as tp_tt_routes
+    from orchestrator.services import thread_transport as tt_service
+    from tests._b10_deps import _tt_deps
 
     thread_id = "thread-cancelled-input"
     thread = {"id": thread_id, "execution_lane": "pinned", "total_turns": 0}
     binding = object()
-    main._thread_turn_locks.clear()
-    main._thread_turn_inflight.clear()
+    tt_service._thread_turn_locks.clear()
+    tt_service._thread_turn_inflight.clear()
     monkeypatch.setattr(
-        main,
+        tp_tt_routes,
         "require_approved_user",
         AsyncMock(return_value={"id": "user-1"}),
     )
     monkeypatch.setattr(
-        main,
+        tp_tt_routes,
         "_load_thread_for_owner",
         AsyncMock(return_value=thread),
     )
     monkeypatch.setattr(
-        main,
+        tp_tt_routes,
         "_resolve_thread_for_forwarding",
         AsyncMock(return_value=(thread, binding)),
     )
     monkeypatch.setattr(
-        main,
+        tp_tt_routes,
         "_revalidate_pinned_forwarding_binding",
         AsyncMock(return_value=binding),
     )
     monkeypatch.setattr(
-        main,
+        tp_tt_routes,
         "_forward_to_agent",
         AsyncMock(side_effect=asyncio.CancelledError()),
     )
     cleanup = MagicMock()
-    monkeypatch.setattr(main, "_schedule_turn_lock_cleanup", cleanup)
+    monkeypatch.setattr(tp_tt_routes, "_schedule_turn_lock_cleanup", cleanup)
 
     try:
         with pytest.raises(asyncio.CancelledError):
-            await main.thread_input(
+            await tp_tt_routes.thread_input(
                 thread_id,
-                main.ThreadInputRequest(content="cancel me", turn_id=1),
+                tp_tt_routes.ThreadInputRequest(content="cancel me", turn_id=1),
                 MagicMock(),
+                dependencies=_tt_deps(),
             )
 
-        lock = main._thread_turn_locks[(thread_id, 1)]
+        lock = tt_service._thread_turn_locks[(thread_id, 1)]
         assert not lock.locked()
-        assert thread_id not in main._thread_turn_inflight
+        # The route body does not pop the inflight marker synchronously; the
+        # scheduled cleanup task owns its release (mocked here).
+        assert tt_service._thread_turn_inflight.get(thread_id) == 1
         cleanup.assert_called_once_with(thread_id, 1)
     finally:
-        main._thread_turn_locks.clear()
-        main._thread_turn_inflight.clear()
+        tt_service._thread_turn_locks.clear()
+        tt_service._thread_turn_inflight.clear()

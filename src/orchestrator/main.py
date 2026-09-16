@@ -982,9 +982,7 @@ _ssh_gateway_host_key_cache = ssh_access_operations.SshGatewayHostKeyCache(
 usage_ledger: UsageLedger | None = None
 
 
-async def maybe_wake_session(
-    db: Any, job_id: str, terminal_status: str
-) -> bool:
+async def maybe_wake_session(db: Any, job_id: str, terminal_status: str) -> bool:
     """Bind the session-wake fast path to this application's ledger."""
 
     return await _maybe_wake_session_service(

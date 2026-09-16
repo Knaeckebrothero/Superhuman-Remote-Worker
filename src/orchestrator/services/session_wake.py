@@ -300,9 +300,7 @@ async def drain_pending_wakes(
 
     async def _one(row: dict[str, Any]) -> bool:
         async with gate:
-            return await _deliver_and_settle(
-                db, row, usage_ledger=usage_ledger
-            )
+            return await _deliver_and_settle(db, row, usage_ledger=usage_ledger)
 
     results = await asyncio.gather(
         *(_one(row) for row in claimed), return_exceptions=True
@@ -809,9 +807,7 @@ async def session_wake_sweeper_loop(
         # Officer event outbox (centurion.md §4): same claim discipline,
         # separate table — timers become due here, events retry here.
         try:
-            sent = await drain_pending_event_wakes(
-                db, usage_ledger=usage_ledger
-            )
+            sent = await drain_pending_event_wakes(db, usage_ledger=usage_ledger)
             if sent:
                 logger.info("Session wake sweeper delivered %d officer wake(s)", sent)
         except Exception:
